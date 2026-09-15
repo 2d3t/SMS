@@ -819,6 +819,24 @@
         .share-btn:hover { background: rgba(0,184,148,0.2); }
         .share-btn:active { transform: scale(0.9); }
 
+        .sound-btn {
+            background: rgba(108,92,231,0.1);
+            border: 1px solid rgba(108,92,231,0.25);
+            color: #a78bfa;
+            width: 38px; height: 38px;
+            border-radius: 50%; cursor: pointer; font-size: 16px;
+            flex-shrink: 0;
+            display: flex; align-items: center; justify-content: center;
+            transition: all 0.2s;
+        }
+        .sound-btn:hover { background: rgba(108,92,231,0.2); }
+        .sound-btn:active { transform: scale(0.9); }
+        .sound-btn.muted {
+            background: rgba(255,107,107,0.1);
+            border-color: rgba(255,107,107,0.25);
+            color: #ff6b6b;
+        }
+
         .password-row {
             display: flex; gap: 8px; margin-bottom: 14px;
         }
@@ -908,6 +926,7 @@
             .autorun-btn { width: 30px; height: 30px; font-size: 14px; }
             .rename-btn { width: 30px; height: 30px; font-size: 12px; }
             .share-btn { width: 30px; height: 30px; font-size: 12px; }
+            .sound-btn { width: 34px; height: 34px; font-size: 14px; }
             .password-row .icon-btn { width: 40px; height: 40px; font-size: 16px; }
             .image-modal .gallery-counter { font-size: 12px; padding: 5px 12px; top: 14px; }
             .image-modal .gallery-dots { bottom: 18px; padding: 5px 10px; }
@@ -927,6 +946,7 @@
             <span class="brand-icon">📱</span>
             <span>SMS Чат</span>
         </div>
+        <button class="sound-btn" id="soundBtnAuth" title="Звук вкл/выкл">🔊</button>
     </div>
     <div class="auth-content">
         <h1>💬 Добро пожаловать</h1>
@@ -961,6 +981,7 @@
         </div>
         <div style="display:flex;align-items:center;gap:8px;">
             <span id="chatsUserLabel" style="font-size:13px;color:#888;"></span>
+            <button class="sound-btn" id="soundBtnChats" title="Звук вкл/выкл">🔊</button>
             <button class="exit-btn" id="chatsLogoutBtn" title="Выйти">✕</button>
         </div>
     </div>
@@ -991,6 +1012,7 @@
             </div>
         </div>
         <div style="display:flex;align-items:center;">
+            <button class="sound-btn" id="soundBtnChat" title="Звук вкл/выкл" style="margin-right:8px;">🔊</button>
             <button class="exit-btn" id="backToChatsBtn" title="К списку чатов" style="margin-right:8px;">←</button>
             <button class="exit-btn" id="forgetBtn" title="Забыть пароль этого чата" style="margin-right:8px;">🔓</button>
             <button class="exit-btn" id="exitBtn" title="Выйти">✕</button>
@@ -1217,14 +1239,12 @@ const CONFIG = {
     pollIdleThresholdMs: 60000,
     maxMessages: 100,
     maxImageSize: 200 * 1024 * 1024,
-    // ⬆️ Качество фото — 1600×1600 q0.75
     compressMaxWidth: 1600,
     compressMaxHeight: 1600,
     compressQuality: 0.75,
     maxAudioDuration: 10000,
     audioMimeType: 'audio/webm;codecs=opus',
     audioBitsPerSecond: 8000,
-    // ─── Медиа-контейнеры ───
     mediaBucketCount: 50,
     mediaBucketSizeBytes: 900 * 1024,
     mediaBucketSafeBytes: 850 * 1024,
@@ -1386,35 +1406,173 @@ function resetFailedAttempts() {
 }
 
 // ===================================================================
-//  ЗВУКИ
+//  ЗВУКИ (расширенная версия с уведомлениями)
 // ===================================================================
+const SOUND_PREFS_KEY = 'chathub_sound_enabled';
+
 class SoundManager {
-    constructor() { this.enabled = true; this.sounds = {}; this.initSounds(); }
-    initSounds() {
-        this.sounds.send = this.createBeep(600, 0.1);
-        this.sounds.receive = this.createBeep(800, 0.15);
-        this.sounds.error = this.createBeep(300, 0.3);
-        this.sounds.delete = this.createBeep(400, 0.1);
-        this.sounds.click = this.createBeep(500, 0.05);
-    }
-    createBeep(freq, duration) {
-        return {
-            play: () => {
-                try {
-                    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-                    const osc = ctx.createOscillator();
-                    const gain = ctx.createGain();
-                    osc.connect(gain); gain.connect(ctx.destination);
-                    osc.frequency.value = freq; osc.type = 'sine';
-                    gain.gain.setValueAtTime(0.1, ctx.currentTime);
-                    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
-                    osc.start(ctx.currentTime); osc.stop(ctx.currentTime + duration);
-                } catch (e) {}
-            }
+    constructor() {
+        this.enabled = localStorage.getItem(SOUND_PREFS_KEY) !== '0';
+        this._ctx = null;
+        this._unlocked = false;
+        // Антиспам: не более 1 уведомления в 2 секунды на тип
+        this._lastPlayed = {};
+        this._minInterval = {
+            receive: 2000,        // в чате, входящее
+            receiveChats: 2000,   // в списке чатов
         };
+        this._initUnlock();
     }
-    play(type) { if (!this.enabled) return; if (this.sounds[type]) this.sounds[type].play(); }
-    toggle() { this.enabled = !this.enabled; return this.enabled; }
+
+    // Разблокировка AudioContext (требуется браузерами)
+    _initUnlock() {
+        const unlock = () => {
+            try {
+                if (!this._ctx) {
+                    this._ctx = new (window.AudioContext || window.webkitAudioContext)();
+                }
+                if (this._ctx.state === 'suspended') {
+                    this._ctx.resume().then(() => {
+                        this._unlocked = true;
+                    });
+                } else {
+                    this._unlocked = true;
+                }
+            } catch (e) {}
+        };
+        document.addEventListener('click', unlock, { once: true });
+        document.addEventListener('touchstart', unlock, { once: true });
+        document.addEventListener('keydown', unlock, { once: true });
+    }
+
+    _getCtx() {
+        if (!this._ctx) {
+            try {
+                this._ctx = new (window.AudioContext || window.webkitAudioContext)();
+            } catch (e) { return null; }
+        }
+        if (this._ctx.state === 'suspended') {
+            this._ctx.resume().catch(() => {});
+        }
+        return this._ctx;
+    }
+
+    _canPlay(type) {
+        if (!this.enabled) return false;
+        const min = this._minInterval[type];
+        if (!min) return true;
+        const now = Date.now();
+        const last = this._lastPlayed[type] || 0;
+        if (now - last < min) return false;
+        this._lastPlayed[type] = now;
+        return true;
+    }
+
+    // Универсальный тон
+    _beep(freq, duration, opts = {}) {
+        if (!this.enabled) return;
+        const ctx = this._getCtx();
+        if (!ctx) return;
+        try {
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            const volume = opts.volume != null ? opts.volume : 0.15;
+            const type = opts.type || 'sine';
+
+            osc.type = type;
+            osc.frequency.setValueAtTime(freq, ctx.currentTime);
+            if (opts.slideTo) {
+                osc.frequency.exponentialRampToValueAtTime(opts.slideTo, ctx.currentTime + duration);
+            }
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+
+            gain.gain.setValueAtTime(0, ctx.currentTime);
+            gain.gain.linearRampToValueAtTime(volume, ctx.currentTime + 0.01);
+            gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
+
+            osc.start(ctx.currentTime);
+            osc.stop(ctx.currentTime + duration + 0.02);
+        } catch (e) {}
+    }
+
+    // Составной звук из последовательности нот
+    _melody(notes) {
+        if (!this.enabled) return;
+        const ctx = this._getCtx();
+        if (!ctx) return;
+        try {
+            let time = ctx.currentTime;
+            for (const note of notes) {
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.type = note.type || 'sine';
+                osc.frequency.setValueAtTime(note.freq, time);
+                osc.connect(gain);
+                gain.connect(ctx.destination);
+                gain.gain.setValueAtTime(0, time);
+                gain.gain.linearRampToValueAtTime(note.vol != null ? note.vol : 0.12, time + 0.01);
+                gain.gain.exponentialRampToValueAtTime(0.001, time + note.dur);
+                osc.start(time);
+                osc.stop(time + note.dur + 0.02);
+                time += note.dur * (note.gap || 0.85);
+            }
+        } catch (e) {}
+    }
+
+    play(type) {
+        if (!this.enabled) return;
+        switch (type) {
+            case 'send':
+                // Короткий "вжух" при отправке
+                this._beep(880, 0.08, { volume: 0.08, slideTo: 1200 });
+                break;
+            case 'receive':
+                // Входящее сообщение в открытом чате — двойной мягкий сигнал
+                if (!this._canPlay('receive')) return;
+                this._melody([
+                    { freq: 880, dur: 0.10, vol: 0.13, type: 'sine' },
+                    { freq: 1175, dur: 0.15, vol: 0.11, type: 'sine', gap: 1.1 },
+                ]);
+                break;
+            case 'receiveChats':
+                // Входящее, когда мы в списке чатов — более выразительный
+                if (!this._canPlay('receiveChats')) return;
+                this._melody([
+                    { freq: 660, dur: 0.10, vol: 0.14, type: 'triangle' },
+                    { freq: 880, dur: 0.10, vol: 0.13, type: 'triangle', gap: 1.1 },
+                    { freq: 1320, dur: 0.18, vol: 0.11, type: 'triangle', gap: 1.1 },
+                ]);
+                break;
+            case 'error':
+                // Ошибка — низкий короткий
+                this._beep(220, 0.25, { volume: 0.15, type: 'square' });
+                break;
+            case 'delete':
+                this._beep(400, 0.08, { volume: 0.1, slideTo: 200 });
+                break;
+            case 'click':
+                this._beep(600, 0.04, { volume: 0.05 });
+                break;
+        }
+    }
+
+    toggle() {
+        this.enabled = !this.enabled;
+        localStorage.setItem(SOUND_PREFS_KEY, this.enabled ? '1' : '0');
+        this._updateButtons();
+        return this.enabled;
+    }
+
+    _updateButtons() {
+        ['soundBtnAuth', 'soundBtnChats', 'soundBtnChat'].forEach(id => {
+            const btn = document.getElementById(id);
+            if (!btn) return;
+            btn.textContent = this.enabled ? '🔊' : '🔇';
+            btn.classList.toggle('muted', !this.enabled);
+            btn.title = this.enabled ? 'Звук включён — нажмите чтобы выключить' : 'Звук выключен — нажмите чтобы включить';
+        });
+    }
 }
 const soundManager = new SoundManager();
 
@@ -1434,6 +1592,7 @@ let state = {
     chats: [], savedPasswords: {},
     currentScreen: 'auth',
     _metaEtagsByFile: {},
+    _pageHidden: false,
 };
 
 let networkState = { isOnline: navigator.onLine };
@@ -1675,7 +1834,27 @@ async function checkUnreadForAllChats() {
 
 async function refreshUnreadBadges() {
     if (state.currentScreen !== 'chats') return;
+    const before = new Map(state.chats.map(c => [c.file, {
+        hasUnread: !!c.hasUnread,
+        unreadCount: c.unreadCount || 0,
+    }]));
     const unread = await checkUnreadForAllChats();
+
+    // Определяем, появились ли НОВЫЕ непрочитанные
+    let hasNewUnread = false;
+    for (const [file, info] of Object.entries(unread)) {
+        const old = before.get(file);
+        if (!old || !old.hasUnread) {
+            // Был прочитан → стал непрочитан
+            hasNewUnread = true;
+            break;
+        }
+        if ((info.count || 0) > (old.unreadCount || 0)) {
+            hasNewUnread = true;
+            break;
+        }
+    }
+
     state.chats.forEach(c => {
         const u = unread[c.file];
         if (u) {
@@ -1688,6 +1867,11 @@ async function refreshUnreadBadges() {
     });
     saveChatsList();
     renderChatsList();
+
+    // 🔊 Звук в списке чатов: если новое непрочитанное и мы в списке — играем
+    if (hasNewUnread && state.currentScreen === 'chats' && state.isAuthorized && !state._pageHidden) {
+        soundManager.play('receiveChats');
+    }
 }
 
 // ===================================================================
@@ -2157,6 +2341,11 @@ setInterval(() => {
     if (chatScreen.style.display === 'flex' && state.isAuthorized && state.chatFile) checkNetwork();
 }, 15000);
 
+// Отслеживаем видимость страницы — не играем звуки в фоне
+document.addEventListener('visibilitychange', () => {
+    state._pageHidden = document.hidden;
+});
+
 // ===================================================================
 //  ИЗОБРАЖЕНИЯ
 // ===================================================================
@@ -2364,23 +2553,85 @@ const MEDIA = {
         throw new Error('MEDIA: config не записан после 5 попыток');
     },
 
-    async get(chat, itemId) {
+    // ✅ FIX 1 + FIX 3: retry с backoff + проверка expectedType
+    async get(chat, itemId, opts = {}) {
         const cached = MEDIA._cacheGet(itemId);
         if (cached) return cached;
-        const cfgRes = await MEDIA._readConfig(chat);
-        if (!cfgRes) return null;
-        const cfg = cfgRes.content;
-        let bucketIdx = -1;
-        for (const r of cfg.ring) {
-            if (r.itemIds && r.itemIds.includes(itemId)) { bucketIdx = r.i; break; }
+
+        const maxAttempts = opts.maxAttempts || 4;
+        const baseDelay = opts.baseDelay || 400;
+        const expectedType = opts.expectedType || null;
+
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+            try {
+                const cfgRes = await MEDIA._readConfig(chat);
+                if (!cfgRes) {
+                    if (attempt < maxAttempts - 1) {
+                        await new Promise(r => setTimeout(r, baseDelay * (attempt + 1)));
+                        continue;
+                    }
+                    return null;
+                }
+                const cfg = cfgRes.content;
+                let bucketIdx = -1;
+                for (const r of cfg.ring) {
+                    if (r.itemIds && r.itemIds.includes(itemId)) { bucketIdx = r.i; break; }
+                }
+                if (bucketIdx === -1) {
+                    if (attempt < maxAttempts - 1) {
+                        console.log(`⏳ media ${itemId} ещё не в config, попытка ${attempt + 1}`);
+                        await new Promise(r => setTimeout(r, baseDelay * (attempt + 1)));
+                        continue;
+                    }
+                    return null;
+                }
+
+                // ✅ FIX 3: проверяем, что ring действительно содержит наш id
+                const ringEntry = cfg.ring[bucketIdx];
+                if (!ringEntry.itemIds || !ringEntry.itemIds.includes(itemId)) {
+                    console.warn(`⚠️ media ${itemId}: bucket ${bucketIdx} уже перезаписан`);
+                    return null;
+                }
+
+                const bucketRes = await MEDIA._readBucket(chat, bucketIdx);
+                if (!bucketRes) {
+                    if (attempt < maxAttempts - 1) {
+                        console.log(`⏳ bucket ${bucketIdx} ещё не доступен, попытка ${attempt + 1}`);
+                        await new Promise(r => setTimeout(r, baseDelay * (attempt + 1)));
+                        continue;
+                    }
+                    return null;
+                }
+
+                const item = bucketRes.content.items.find(it => it.id === itemId);
+                if (!item) {
+                    if (attempt < maxAttempts - 1) {
+                        console.log(`⏳ item ${itemId} ещё не в bucket, попытка ${attempt + 1}`);
+                        await new Promise(r => setTimeout(r, baseDelay * (attempt + 1)));
+                        continue;
+                    }
+                    return null;
+                }
+
+                // ✅ FIX 3: проверяем тип
+                if (expectedType && item.type !== expectedType) {
+                    console.warn(`⚠️ media ${itemId}: ожидался ${expectedType}, найден ${item.type}`);
+                    return null;
+                }
+
+                MEDIA._cacheSet(itemId, item.data);
+                return item.data;
+            } catch (e) {
+                if (e.message.includes('401') || e.message.includes('403')) throw e;
+                if (attempt < maxAttempts - 1) {
+                    await new Promise(r => setTimeout(r, baseDelay * (attempt + 1)));
+                    continue;
+                }
+                console.warn('MEDIA.get final failure:', e.message);
+                return null;
+            }
         }
-        if (bucketIdx === -1) return null;
-        const bucketRes = await MEDIA._readBucket(chat, bucketIdx);
-        if (!bucketRes) return null;
-        const item = bucketRes.content.items.find(it => it.id === itemId);
-        if (!item) return null;
-        MEDIA._cacheSet(itemId, item.data);
-        return item.data;
+        return null;
     },
 
     async delete(chat, itemId) {
@@ -2962,7 +3213,6 @@ async function sendMessage(text, imageData = null, audioData = null) {
         const messageId = Date.now();
         let mediaRef = null, audioRef = null;
 
-        // Кладём фото в bucket
         if (hasImage) {
             try {
                 const r = await MEDIA.put(state.chatFile, {
@@ -2983,7 +3233,6 @@ async function sendMessage(text, imageData = null, audioData = null) {
             }
         }
 
-        // Кладём аудио в bucket
         if (hasAudio) {
             try {
                 const r = await MEDIA.put(state.chatFile, {
@@ -3030,7 +3279,6 @@ async function sendMessage(text, imageData = null, audioData = null) {
         state._metaEtag = null;
         state._metaEtagsByFile[state.chatFile] = null;
 
-        // Обновляем глобальный индекс
         try {
             await INDEX.updateChat(state.chatFile, {
                 name: state.chatName,
@@ -3098,7 +3346,6 @@ async function deleteMessage(messageId) {
         fileContent.messages = encMessages;
         const saved = await saveFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path, fileContent, result.sha);
 
-        // Удаляем медиа из bucket'а
         if (plain.mediaRef || plain.audioRef) {
             try { await MEDIA.delete(state.chatFile, messageId); }
             catch (e) { console.warn('MEDIA.delete failed:', e.message); }
@@ -3295,7 +3542,6 @@ function renderMessages(messages) {
         let content = '';
         if (msg.text) content += `<span class="text">${escapeHtml(msg.text)}</span>`;
 
-        // Новая схема — mediaRef/audioRef
         if (msg.mediaRef) {
             const mid = msg.mediaRef.id;
             const cached = MEDIA._cacheGet(mid);
@@ -3350,7 +3596,7 @@ function renderMessages(messages) {
 }
 
 // ===================================================================
-//  ЛЕНИВАЯ ЗАГРУЗКА МЕДИА
+//  ЛЕНИВАЯ ЗАГРУЗКА МЕДИА (с автоповтором)
 // ===================================================================
 let _lazyLoading = false;
 
@@ -3378,17 +3624,31 @@ async function loadVisibleMedia() {
             const batch = toLoad.slice(i, i + limit);
             await Promise.all(batch.map(async ({ el, id }) => {
                 try {
-                    const data = await MEDIA.get(state.chatFile, id);
+                    const msg = state.messages.find(m =>
+                        (m.mediaRef && m.mediaRef.id === id) ||
+                        (m.audioRef && m.audioRef.id === id)
+                    );
+                    const expectedType = msg?.mediaRef ? 'image' : (msg?.audioRef ? 'audio' : null);
+
+                    const data = await MEDIA.get(state.chatFile, id, {
+                        maxAttempts: 4,
+                        baseDelay: 500,
+                        expectedType,
+                    });
+
                     if (!data) {
-                        el.innerHTML = '<div class="img-skeleton" style="color:#ff6b6b;">❌ Медиа вытеснено</div>';
+                        el.innerHTML = `<div class="img-skeleton" style="color:#ff9f43;">
+                            📷 Фото ещё не готово — нажмите, чтобы попробовать снова
+                        </div>`;
+                        el.style.cursor = 'pointer';
                         return;
                     }
+
                     if (el.classList.contains('image-placeholder')) {
                         el.outerHTML = `<div class="image-container" onclick="openImageModalById(${id})">
                             <img src="${data}" alt="Изображение">
                         </div>`;
                     } else if (el.classList.contains('audio-placeholder')) {
-                        const msg = state.messages.find(m => m.audioRef && m.audioRef.id === id);
                         const dur = msg?.audioRef?.duration || 0;
                         const mime = msg?.audioRef?.mime || 'audio/webm';
                         el.outerHTML = createAudioPlayerHTML(id, data, dur, mime);
@@ -3404,6 +3664,15 @@ async function loadVisibleMedia() {
     }
 }
 
+// Автоповтор для "не готовых" плейсхолдеров
+setInterval(() => {
+    if (state.currentScreen !== 'chat' || !state.chatFile) return;
+    if (state._pageHidden) return;
+    const pending = messagesInner.querySelectorAll('.image-placeholder .img-skeleton[style*="ff9f43"]');
+    if (pending.length === 0) return;
+    loadVisibleMedia();
+}, 3000);
+
 messagesContainer.addEventListener('scroll', () => {
     clearTimeout(window._lazyMediaTimer);
     window._lazyMediaTimer = setTimeout(loadVisibleMedia, 120);
@@ -3414,12 +3683,17 @@ async function openImageModalById(id) {
     if (!data) {
         showToast('⏳ Загрузка...', 800);
         try {
-            data = await MEDIA.get(state.chatFile, id);
+            const msg = state.messages.find(m => m.mediaRef && m.mediaRef.id === id);
+            data = await MEDIA.get(state.chatFile, id, {
+                maxAttempts: 4,
+                baseDelay: 500,
+                expectedType: 'image',
+            });
         } catch (e) {
             showToast('❌ Не удалось загрузить', 2000);
             return;
         }
-        if (!data) { showToast('❌ Медиа вытеснено', 2000); return; }
+        if (!data) { showToast('❌ Медиа вытеснено или ещё не готово', 2500); return; }
     }
     openImageModal(data);
 }
@@ -3429,12 +3703,16 @@ async function loadAndPlayAudio(id) {
     if (!data) {
         showToast('⏳ Загрузка аудио...', 800);
         try {
-            data = await MEDIA.get(state.chatFile, id);
+            data = await MEDIA.get(state.chatFile, id, {
+                maxAttempts: 4,
+                baseDelay: 500,
+                expectedType: 'audio',
+            });
         } catch (e) {
             showToast('❌ Не удалось загрузить аудио', 2000);
             return;
         }
-        if (!data) { showToast('❌ Аудио вытеснено', 2000); return; }
+        if (!data) { showToast('❌ Аудио вытеснено или ещё не готово', 2500); return; }
     }
     const placeholder = messagesInner.querySelector(`.audio-placeholder[data-audio-id="${id}"]`);
     const msg = state.messages.find(m => m.audioRef && m.audioRef.id === id);
@@ -4142,7 +4420,8 @@ async function pollUpdates() {
                 saveChatsList();
                 if (state.currentScreen === 'chats') renderChatsList();
             }
-            if (!hasOwnMessage) soundManager.play('receive');
+            // 🔊 Звук: новое сообщение пришли, а мы не в чате
+            if (!hasOwnMessage) soundManager.play('receiveChats');
             return;
         }
 
@@ -4157,6 +4436,7 @@ async function pollUpdates() {
             updateScrollBadge();
             updateScrollButton();
         }
+        // 🔊 Звук: новое сообщение в открытом чате
         if (!hasOwnMessage) soundManager.play('receive');
         else state._lastSentMessageId = null;
     } catch (error) {
@@ -4212,6 +4492,7 @@ function showAuthScreen() {
     chatsScreen.style.display = 'none';
     chatScreen.style.display = 'none';
     authScreen.style.display = 'flex';
+    soundManager._updateButtons();
 }
 function showChatsScreen() {
     state.currentScreen = 'chats';
@@ -4220,6 +4501,7 @@ function showChatsScreen() {
     chatsScreen.style.display = 'flex';
     $('chatsUserLabel').textContent = state.username;
     renderChatsList();
+    soundManager._updateButtons();
     setTimeout(refreshUnreadBadges, 100);
 }
 function showChatScreen() {
@@ -4227,6 +4509,7 @@ function showChatScreen() {
     authScreen.style.display = 'none';
     chatsScreen.style.display = 'none';
     chatScreen.style.display = 'flex';
+    soundManager._updateButtons();
 }
 
 // ===================================================================
@@ -4387,7 +4670,6 @@ async function confirmCreateChat() {
         const initialVersion = Date.now();
         await updateMeta(file, initialVersion, 0);
 
-        // Инициализируем bucket-хранилище
         try { await MEDIA.init(file); }
         catch (e) { console.warn('MEDIA.init failed:', e.message); }
 
@@ -4475,7 +4757,6 @@ async function enterChat(file, name, password) {
         throw e;
     }
 
-    // Инициализируем bucket'ы, если их нет
     try { await MEDIA.init(file); }
     catch (e) { console.warn('MEDIA.init on enter failed:', e.message); }
 
@@ -4966,6 +5247,18 @@ $('importFileInput').addEventListener('change', (e) => {
     if (e.target.files && e.target.files[0]) handleImportFile(e.target.files[0]);
 });
 
+// 🔊 Кнопки звука
+['soundBtnAuth', 'soundBtnChats', 'soundBtnChat'].forEach(id => {
+    const btn = document.getElementById(id);
+    if (btn) {
+        btn.addEventListener('click', () => {
+            const enabled = soundManager.toggle();
+            showToast(enabled ? '🔊 Звук включён' : '🔇 Звук выключен', 1200);
+        });
+    }
+});
+soundManager._updateButtons();
+
 buildEmojiPanel();
 $('emojiBtn').addEventListener('click', (e) => {
     e.stopPropagation();
@@ -5011,6 +5304,7 @@ document.addEventListener('keydown', (e) => {
     else if (e.key === 'ArrowRight') { e.preventDefault(); ImageZoom.navigateGallery(1); }
 });
 
+// Ctrl+M — быстрый toggle звука
 document.addEventListener('keydown', (e) => {
     if (e.ctrlKey && e.key === 'm') {
         e.preventDefault();
@@ -5056,7 +5350,6 @@ async function restoreSession() {
 // ===================================================================
 restoreSession();
 
-// Автопроверка squash — раз в сутки
 setTimeout(() => { if (state.isAuthorized) SQUASH.maybeRun(); }, 8000);
 setInterval(() => { if (state.isAuthorized) SQUASH.maybeRun(); }, 60 * 60 * 1000);
 document.addEventListener('visibilitychange', () => {
@@ -5080,12 +5373,15 @@ setInterval(() => {
     }
 }, 1000);
 
-console.log('✅ SMS Чат v2 с bucket-хранилищем загружен!');
+console.log('✅ SMS Чат v2.1 (фиксы + звуки) загружен!');
 console.log('🔐 AES-256-GCM + PBKDF2 (200k)');
 console.log('📦 Фото: 1600×1600 q0.75, до 50 buckets × 900 КБ');
-console.log('🗂️ meta/index.json — глобальный индекс');
-console.log('🧹 Автоочистка blob раз в сутки от клиента');
-console.log('🖼️ Ленивая загрузка, кэш 8 МБ в памяти');
+console.log('🔧 MEDIA.get с retry (4 попытки, backoff)');
+console.log('🔧 Автоповтор загрузки медиа каждые 3 сек');
+console.log('🔧 Защита от подмены старых фото (expectedType + ring)');
+console.log('🔊 Звуки: чат / список чатов / отправка / ошибка / удаление');
+console.log('🔊 Антиспам: не более 1 уведомления в 2 сек на тип');
+console.log('🔊 Кнопки звука в шапке каждого экрана');
 </script>
 </body>
 </html>
