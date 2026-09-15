@@ -1,0 +1,158 @@
+name: 🧹 Safe squash (media history)
+
+on:
+  push:
+    paths:
+      - 'meta/index.json'
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      triggered_by:
+        description: 'Кто запросил'
+        required: false
+        default: 'manual'
+
+permissions:
+  contents: write
+
+jobs:
+  squash:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "sms-chat-squash-bot"
+          git config user.email "squash-bot@users.noreply.github.com"
+
+      - name: Check pending flag
+        id: pending
+        run: |
+          if [ ! -f meta/index.json ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "ℹ️ Нет meta/index.json"
+            exit 0
+          fi
+          PENDING=$(jq -r '.squashPending // false' meta/index.json)
+          LAST=$(jq -r '.lastSquash // 0' meta/index.json)
+          NOW_MS=$(date +%s%3N)
+          ELAPSED_MS=$((NOW_MS - LAST))
+          ELAPSED_H=$((ELAPSED_MS / 3600000))
+          echo "pending=$PENDING, last=${ELAPSED_H}ч назад"
+
+          if [ "$PENDING" != "true" ]; then
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              echo "skip=false" >> $GITHUB_OUTPUT
+            else
+              echo "skip=true" >> $GITHUB_OUTPUT
+            fi
+          elif [ "$ELAPSED_MS" -lt 86400000 ]; then
+            echo "⏸ Рано — сбрасываем флаг"
+            jq '.squashPending = false | .version = (now * 1000 | floor)' meta/index.json > meta/index.json.tmp
+            mv meta/index.json.tmp meta/index.json
+            git add meta/index.json
+            git commit -m "🧹 Squash skip (too early)" || true
+            git push || true
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Snapshot protected SHAs
+        if: steps.pending.outputs.skip == 'false'
+        id: protect
+        run: |
+          ORIGINAL_SHA=$(git rev-parse HEAD)
+          echo "ORIGINAL_SHA=$ORIGINAL_SHA" >> $GITHUB_ENV
+          for f in index.html manifest.json sw.js icon-192.png icon-512.png; do
+            if [ -f "$f" ]; then
+              BLOB=$(git hash-object "$f")
+              SAFE=$(echo "$f" | tr '.-' '__')
+              echo "PROTECT_${SAFE}=${BLOB}" >> $GITHUB_ENV
+              echo "🔒 $f = $BLOB"
+            fi
+          done
+
+      - name: Count commits
+        if: steps.pending.outputs.skip == 'false'
+        id: count
+        run: |
+          N=$(git rev-list --count HEAD)
+          echo "Всего коммитов: $N"
+          if [ "$N" -lt 50 ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Squash
+        if: steps.pending.outputs.skip == 'false' && steps.count.outputs.skip == 'false'
+        run: |
+          git checkout --orphan squashed
+          git add -A
+          BY=$(jq -r '.squashBy // "unknown"' meta/index.json 2>/dev/null || echo "unknown")
+          git commit -m "🧹 Squash $(date -u +'%Y-%m-%d %H:%M UTC') | by: $BY | from: ${ORIGINAL_SHA:0:7}"
+          git branch -M squashed main
+
+      - name: Verify protected files
+        if: steps.pending.outputs.skip == 'false' && steps.count.outputs.skip == 'false'
+        run: |
+          FAIL=0
+          for f in index.html manifest.json sw.js icon-192.png icon-512.png; do
+            if [ -f "$f" ]; then
+              NEW=$(git hash-object "$f")
+              SAFE=$(echo "$f" | tr '.-' '__')
+              EXPECTED=$(eval echo \$PROTECT_${SAFE})
+              if [ "$NEW" != "$EXPECTED" ]; then
+                echo "❌ $f ИЗМЕНЁН: $EXPECTED → $NEW"
+                FAIL=1
+              else
+                echo "✅ $f"
+              fi
+            fi
+          done
+          [ "$FAIL" = "1" ] && exit 1 || true
+
+      - name: Verify tree
+        if: steps.pending.outputs.skip == 'false' && steps.count.outputs.skip == 'false'
+        run: |
+          if ! git diff --quiet $ORIGINAL_SHA HEAD; then
+            echo "❌ Дерево отличается!"
+            git diff --stat $ORIGINAL_SHA HEAD
+            exit 1
+          fi
+          echo "✅ Дерево идентично"
+
+      - name: Update index
+        if: steps.pending.outputs.skip == 'false' && steps.count.outputs.skip == 'false'
+        run: |
+          NOW_MS=$(date +%s%3N)
+          BY=$(jq -r '.squashBy // "unknown"' meta/index.json)
+          jq --argjson now "$NOW_MS" --arg by "$BY" \
+             '.lastSquash = $now | .lastSquashBy = $by | .squashPending = false | .version = $now' \
+             meta/index.json > meta/index.json.tmp
+          mv meta/index.json.tmp meta/index.json
+          git add meta/index.json
+          git commit -m "📌 Squash done ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+
+      - name: Push
+        if: steps.pending.outputs.skip == 'false' && steps.count.outputs.skip == 'false'
+        run: git push origin main --force
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### 🧹 Squash" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.pending.outputs.skip }}" = "true" ]; then
+            echo "⏸ Пропущено: нет флага или рано" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.count.outputs.skip }}" = "true" ]; then
+            echo "⏸ Пропущено: <50 коммитов" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ Squash выполнен" >> $GITHUB_STEP_SUMMARY
+          fi
