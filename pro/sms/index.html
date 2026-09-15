@@ -239,36 +239,6 @@
             object-fit: contain; border-radius: 12px; transition: transform 0.2s;
         }
         .message .image-container img:active { transform: scale(0.98); }
-        .image-placeholder {
-            cursor: pointer;
-            min-height: 120px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-        .img-skeleton {
-            color: #888;
-            font-size: 13px;
-            padding: 30px 20px;
-            text-align: center;
-            background: rgba(255,255,255,0.04);
-            border: 1px dashed rgba(255,255,255,0.12);
-            border-radius: 12px;
-            width: 100%;
-        }
-        .audio-placeholder { padding: 6px 0; }
-        .audio-load-btn {
-            background: rgba(108,92,231,0.15);
-            border: 1px solid rgba(108,92,231,0.3);
-            color: #a78bfa;
-            padding: 8px 16px;
-            border-radius: 20px;
-            font-size: 13px;
-            cursor: pointer;
-            transition: all 0.2s;
-        }
-        .audio-load-btn:active { transform: scale(0.95); }
-        .audio-load-btn:hover { background: rgba(108,92,231,0.25); }
 
         .message .audio-container {
             display: flex; align-items: center; gap: 10px;
@@ -937,7 +907,7 @@
             <label>🔑 GitHub Token</label>
             <input type="password" id="tokenInput" placeholder="Вставьте токен доступа" autocomplete="off" spellcheck="false">
             <div class="hint-msg" id="tokenHint"></div>
-            <div class="help-text"><a href="https://github.com/settings/tokens/new" target="_blank" rel="noopener">Создать токен</a> (права <strong>repo</strong> + <strong>workflow</strong>)</div>
+            <div class="help-text"><a href="https://github.com/settings/tokens/new" target="_blank" rel="noopener">Создать токен</a> (права <strong>repo</strong>)</div>
             <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-top:14px;margin-bottom:14px;font-size:14px;color:#ccc;user-select:none;">
                 <input type="checkbox" id="rememberMeInput" style="width:18px;height:18px;accent-color:#6c5ce7;cursor:pointer;margin:0;">
                 <span>Запомнить меня на этом устройстве</span>
@@ -1063,7 +1033,7 @@
         </div>
         <div class="warn-box">⚠️ Запомните пароль — без него сообщения не расшифруются. Восстановления нет.</div>
         <div class="file-preview" id="chatFilePreview" style="font-size:11px;color:#666;margin-bottom:14px;line-height:1.5;">
-            🔒 ID чата будет сгенерирован автоматически.
+            🔒 ID чата будет сгенерирован автоматически. После создания его можно будет передать тому, кого вы приглашаете.
         </div>
         <div class="modal-actions">
             <button class="btn btn-secondary" id="cancelCreateChatBtn">Отмена</button>
@@ -1212,25 +1182,18 @@ const CONFIG = {
     repoName: 'SMS',
     chatsPath: 'chats/',
     metaSuffix: '.meta',
+    // 🔧 FIX: уменышили интервалы — теперь безопасно благодаря ETag
     pollIntervalFast: 2000,
     pollIntervalSlow: 8000,
     pollIdleThresholdMs: 60000,
-    maxMessages: 100,
+    maxMessages: 15,
     maxImageSize: 200 * 1024 * 1024,
-    // ⬆️ Качество фото — 1600×1600 q0.75
-    compressMaxWidth: 1600,
-    compressMaxHeight: 1600,
-    compressQuality: 0.75,
+    compressMaxWidth: 1000,
+    compressMaxHeight: 1000,
+    compressQuality: 0.40,
     maxAudioDuration: 10000,
     audioMimeType: 'audio/webm;codecs=opus',
     audioBitsPerSecond: 8000,
-    // ─── Медиа-контейнеры ───
-    mediaBucketCount: 50,
-    mediaBucketSizeBytes: 900 * 1024,
-    mediaBucketSafeBytes: 850 * 1024,
-    mediaIndexPath: 'meta/index.json',
-    squashIntervalMs: 24 * 60 * 60 * 1000,
-    squashMinCommits: 50,
 };
 
 // ===================================================================
@@ -1426,13 +1389,14 @@ let state = {
     messages: [], sha: null,
     _lastCommitSha: null,
     _lastMetaVersion: null,
-    _metaEtag: null,
+    _metaEtag: null,               // 🔧 FIX: ETag для meta-файла
     _lastActivityAt: 0,
     isPolling: false, isSending: false, lastMessageCount: 0,
     isAuthorized: false, _lastSentMessageId: null,
     chatFile: null, chatName: null,
     chats: [], savedPasswords: {},
     currentScreen: 'auth',
+    // 🔧 FIX: кеш ETag для каждого чата в списке (для refreshUnreadBadges)
     _metaEtagsByFile: {},
 };
 
@@ -1574,6 +1538,7 @@ function markChatAsRead() {
     }
 }
 
+// 🔧 FIX: быстрый fetch meta через contents API с ETag (1 запрос, 304 не жрёт rate limit)
 async function fetchMetaFast(file, etag, token) {
     const path = getMetaPath(file);
     const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${path}`;
@@ -1603,10 +1568,12 @@ async function fetchMetaFast(file, etag, token) {
     }
 }
 
+// 🔧 FIX: переписали checkUnreadForAllChats с использованием fetchMetaFast + ETag-кеша
 async function checkUnreadForAllChats() {
     const result = {};
     const passwords = state.savedPasswords;
 
+    // Обрабатываем чаты параллельно, но с ограничением
     const tasks = state.chats.map(async (chat) => {
         const file = chat.file;
         try {
@@ -1615,24 +1582,29 @@ async function checkUnreadForAllChats() {
             try {
                 metaRes = await fetchMetaFast(file, cachedEtag);
             } catch (e) {
+                // Сетевая ошибка — оставляем прошлый статус
                 if (chat.hasUnread) result[file] = { hasUnread: true, count: chat.unreadCount || 0 };
                 return;
             }
 
             if (metaRes.notModified) {
+                // Ничего не поменялось
                 if (chat.hasUnread) result[file] = { hasUnread: true, count: chat.unreadCount || 0 };
                 return;
             }
 
             if (!metaRes.exists) {
+                // meta нет — считаем что чат пустой/удалён
                 state._metaEtagsByFile[file] = null;
                 return;
             }
 
             state._metaEtagsByFile[file] = metaRes.etag || null;
             const metaVersion = metaRes.content && metaRes.content.version;
+            const metaCount = metaRes.content && metaRes.content.count || 0;
             if (!metaVersion) return;
 
+            // Если metaVersion не изменился с прошлого раза — ничего не делаем
             if (chat._lastMetaVersion && chat._lastMetaVersion === metaVersion) {
                 if (chat.hasUnread) result[file] = { hasUnread: true, count: chat.unreadCount || 0 };
                 return;
@@ -1641,13 +1613,18 @@ async function checkUnreadForAllChats() {
             saveChatsList();
 
             const lastReadId = getLastReadId(file);
-            if (lastReadId && metaVersion <= lastReadId) return;
+            if (lastReadId && metaVersion <= lastReadId) {
+                // уже прочитано
+                return;
+            }
 
             if (!passwords[file]) {
+                // не знаем сколько непрочитанных без пароля — ставим точку
                 result[file] = { hasUnread: true, count: 0 };
                 return;
             }
 
+            // Тянем основной файл, чтобы посчитать количество непрочитанных
             const path = getChatPath(file);
             const res = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
             if (!res.exists) return;
@@ -2203,389 +2180,10 @@ function base64ToUtf8(base64) {
 }
 
 // ===================================================================
-//  MEDIA MANAGER — кольцевые buckets для фото/аудио
-// ===================================================================
-const MEDIA = {
-    V: 1,
-    PAD: n => String(n).padStart(2, '0'),
-    _cache: new Map(),
-    _cacheSize: 0,
-    _cacheMaxBytes: 8 * 1024 * 1024,
-
-    _configPath: (chat) => `chats/${chat}/media/config.json`,
-    _bucketPath: (chat, i) => `chats/${chat}/media/bucket_${MEDIA.PAD(i)}.json`,
-
-    _cacheSet(id, data) {
-        if (!data) return;
-        if (MEDIA._cache.has(id)) {
-            MEDIA._cacheSize -= (MEDIA._cache.get(id) || '').length;
-        }
-        MEDIA._cache.set(id, data);
-        MEDIA._cacheSize += data.length;
-        while (MEDIA._cacheSize > MEDIA._cacheMaxBytes && MEDIA._cache.size > 1) {
-            const firstKey = MEDIA._cache.keys().next().value;
-            MEDIA._cacheSize -= (MEDIA._cache.get(firstKey) || '').length;
-            MEDIA._cache.delete(firstKey);
-        }
-    },
-    _cacheGet(id) { return MEDIA._cache.get(id) || null; },
-    _cacheClear() { MEDIA._cache.clear(); MEDIA._cacheSize = 0; },
-
-    async _readConfig(chat) {
-        try {
-            const res = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, MEDIA._configPath(chat));
-            if (!res.exists) return null;
-            return { content: res.content, sha: res.sha };
-        } catch (e) {
-            if (e.message.includes('401') || e.message.includes('403')) throw e;
-            return null;
-        }
-    },
-    async _writeConfig(chat, cfg, sha) {
-        return saveFile(state.token, CONFIG.repoOwner, CONFIG.repoName, MEDIA._configPath(chat), cfg, sha);
-    },
-
-    async _readBucket(chat, i) {
-        try {
-            const res = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, MEDIA._bucketPath(chat, i));
-            if (!res.exists) return null;
-            return { content: res.content, sha: res.sha };
-        } catch (e) {
-            if (e.message.includes('401') || e.message.includes('403')) throw e;
-            return null;
-        }
-    },
-    async _writeBucket(chat, i, bucket, sha) {
-        return saveFile(state.token, CONFIG.repoOwner, CONFIG.repoName, MEDIA._bucketPath(chat, i), bucket, sha);
-    },
-
-    async init(chat) {
-        const existing = await MEDIA._readConfig(chat);
-        if (existing) return existing;
-        const cfg = {
-            v: MEDIA.V,
-            version: Date.now(),
-            bucketSizeBytes: CONFIG.mediaBucketSizeBytes,
-            bucketCount: CONFIG.mediaBucketCount,
-            head: 0,
-            ring: Array.from({ length: CONFIG.mediaBucketCount }, (_, i) => ({
-                i, itemIds: [], bytesUsed: 0, writtenAt: null,
-            })),
-        };
-        try {
-            await MEDIA._writeConfig(chat, cfg, null);
-        } catch (e) {
-            if (!e.message.includes('409')) throw e;
-        }
-        return { content: cfg, sha: null };
-    },
-
-    _findBucketForWrite(cfg, itemSize) {
-        const max = cfg.bucketSizeBytes;
-        const n = cfg.bucketCount;
-        for (let step = 0; step < n; step++) {
-            const i = (cfg.head + step) % n;
-            const r = cfg.ring[i];
-            if (r.bytesUsed + itemSize <= max) return i;
-        }
-        return null;
-    },
-
-    async put(chat, item) {
-        if (!item || !item.id || !item.data) throw new Error('MEDIA.put: нужны id и data');
-        let cfgRes = await MEDIA._readConfig(chat);
-        if (!cfgRes) cfgRes = await MEDIA.init(chat);
-        const cfg = cfgRes.content;
-        const cfgSha = cfgRes.sha;
-        const itemSize = item.data.length;
-        const evicted = [];
-
-        let targetIdx = MEDIA._findBucketForWrite(cfg, itemSize);
-
-        while (targetIdx === null) {
-            const sorted = cfg.ring
-                .map((r, i) => ({ ...r, idx: i }))
-                .filter(r => r.writtenAt)
-                .sort((a, b) => new Date(a.writtenAt) - new Date(b.writtenAt));
-            if (sorted.length === 0) throw new Error('MEDIA.put: нет bucket для вытеснения');
-            const oldest = sorted[0];
-            evicted.push(...oldest.itemIds);
-            for (const eid of oldest.itemIds) MEDIA._cache.delete(eid);
-            cfg.ring[oldest.idx] = { i: oldest.idx, itemIds: [], bytesUsed: 0, writtenAt: null };
-            targetIdx = MEDIA._findBucketForWrite(cfg, itemSize);
-        }
-
-        const bucketRes = await MEDIA._readBucket(chat, targetIdx);
-        let bucket = bucketRes ? bucketRes.content : {
-            v: MEDIA.V, items: [], bytesUsed: 0, updatedAt: null,
-        };
-        const bucketSha = bucketRes ? bucketRes.sha : null;
-
-        while (bucket.bytesUsed + itemSize > cfg.bucketSizeBytes && bucket.items.length > 0) {
-            bucket.items.sort((a, b) => a.id - b.id);
-            const removed = bucket.items.shift();
-            bucket.bytesUsed -= removed.data.length;
-            evicted.push(removed.id);
-            MEDIA._cache.delete(removed.id);
-        }
-
-        bucket.items.push(item);
-        bucket.bytesUsed += itemSize;
-        bucket.updatedAt = new Date().toISOString();
-
-        await MEDIA._writeBucket(chat, targetIdx, bucket, bucketSha);
-
-        cfg.ring[targetIdx] = {
-            i: targetIdx,
-            itemIds: bucket.items.map(it => it.id),
-            bytesUsed: bucket.bytesUsed,
-            writtenAt: new Date().toISOString(),
-        };
-        cfg.head = (targetIdx + 1) % cfg.bucketCount;
-        cfg.version = Date.now();
-
-        await MEDIA._writeConfigWithRetry(chat, cfg, cfgSha);
-        MEDIA._cacheSet(item.id, item.data);
-
-        return { bucketIndex: targetIdx, evicted };
-    },
-
-    async _writeConfigWithRetry(chat, cfg, sha) {
-        for (let attempt = 0; attempt < 5; attempt++) {
-            try {
-                await MEDIA._writeConfig(chat, cfg, sha);
-                return;
-            } catch (e) {
-                if (!e.message.includes('409')) throw e;
-                const fresh = await MEDIA._readConfig(chat);
-                if (fresh) sha = fresh.sha;
-            }
-        }
-        throw new Error('MEDIA: config не записан после 5 попыток');
-    },
-
-    async get(chat, itemId) {
-        const cached = MEDIA._cacheGet(itemId);
-        if (cached) return cached;
-        const cfgRes = await MEDIA._readConfig(chat);
-        if (!cfgRes) return null;
-        const cfg = cfgRes.content;
-        let bucketIdx = -1;
-        for (const r of cfg.ring) {
-            if (r.itemIds && r.itemIds.includes(itemId)) { bucketIdx = r.i; break; }
-        }
-        if (bucketIdx === -1) return null;
-        const bucketRes = await MEDIA._readBucket(chat, bucketIdx);
-        if (!bucketRes) return null;
-        const item = bucketRes.content.items.find(it => it.id === itemId);
-        if (!item) return null;
-        MEDIA._cacheSet(itemId, item.data);
-        return item.data;
-    },
-
-    async delete(chat, itemId) {
-        MEDIA._cache.delete(itemId);
-        const cfgRes = await MEDIA._readConfig(chat);
-        if (!cfgRes) return false;
-        const cfg = cfgRes.content;
-        const cfgSha = cfgRes.sha;
-        for (const r of cfg.ring) {
-            if (!r.itemIds || !r.itemIds.includes(itemId)) continue;
-            const bucketRes = await MEDIA._readBucket(chat, r.i);
-            if (!bucketRes) return false;
-            const bucket = bucketRes.content;
-            const before = bucket.items.length;
-            bucket.items = bucket.items.filter(it => it.id !== itemId);
-            if (bucket.items.length === before) return false;
-            bucket.bytesUsed = bucket.items.reduce((s, it) => s + it.data.length, 0);
-            bucket.updatedAt = new Date().toISOString();
-            await MEDIA._writeBucket(chat, r.i, bucket, bucketRes.sha);
-            r.itemIds = bucket.items.map(it => it.id);
-            r.bytesUsed = bucket.bytesUsed;
-            cfg.version = Date.now();
-            await MEDIA._writeConfigWithRetry(chat, cfg, cfgSha);
-            return true;
-        }
-        return false;
-    },
-
-    async countItems(chat) {
-        const cfgRes = await MEDIA._readConfig(chat);
-        if (!cfgRes) return 0;
-        return cfgRes.content.ring.reduce((s, r) => s + (r.itemIds?.length || 0), 0);
-    },
-};
-
-// ===================================================================
-//  INDEX — глобальный meta/index.json
-// ===================================================================
-const INDEX = {
-    V: 1,
-    PATH: () => CONFIG.mediaIndexPath,
-    _cache: null,
-    _cacheSha: null,
-    _cacheAt: 0,
-    _ttl: 30000,
-
-    async read(force = false) {
-        const now = Date.now();
-        if (!force && INDEX._cache && (now - INDEX._cacheAt) < INDEX._ttl) {
-            return { content: INDEX._cache, sha: INDEX._cacheSha };
-        }
-        try {
-            const res = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, INDEX.PATH());
-            if (!res.exists) return null;
-            INDEX._cache = res.content;
-            INDEX._cacheSha = res.sha;
-            INDEX._cacheAt = now;
-            return { content: res.content, sha: res.sha };
-        } catch (e) {
-            if (e.message.includes('401') || e.message.includes('403')) throw e;
-            return null;
-        }
-    },
-
-    async write(content, sha) {
-        const res = await saveFile(state.token, CONFIG.repoOwner, CONFIG.repoName, INDEX.PATH(), content, sha);
-        INDEX._cache = content;
-        INDEX._cacheSha = res.blobSha;
-        INDEX._cacheAt = Date.now();
-        return res;
-    },
-
-    invalidate() { INDEX._cache = null; INDEX._cacheSha = null; INDEX._cacheAt = 0; },
-
-    async ensure() {
-        const res = await INDEX.read(true);
-        if (res) return res;
-        const fresh = {
-            v: INDEX.V,
-            version: Date.now(),
-            lastSquash: 0,
-            lastSquashBy: null,
-            squashPending: false,
-            chats: {},
-        };
-        try {
-            await INDEX.write(fresh, null);
-        } catch (e) {
-            if (!e.message.includes('409')) throw e;
-        }
-        return { content: fresh, sha: null };
-    },
-
-    async updateChat(chatFile, patch) {
-        for (let attempt = 0; attempt < 3; attempt++) {
-            const res = await INDEX.read(true);
-            let cfg, sha;
-            if (!res) {
-                const ensured = await INDEX.ensure();
-                cfg = ensured.content;
-                sha = ensured.sha;
-            } else {
-                cfg = res.content;
-                sha = res.sha;
-            }
-            if (!cfg.chats) cfg.chats = {};
-            cfg.chats[chatFile] = { ...(cfg.chats[chatFile] || {}), ...patch };
-            cfg.version = Date.now();
-            try {
-                await INDEX.write(cfg, sha);
-                return;
-            } catch (e) {
-                if (!e.message.includes('409')) throw e;
-                INDEX.invalidate();
-            }
-        }
-        console.warn('INDEX.updateChat: не удалось после 3 попыток');
-    },
-};
-
-// ===================================================================
-//  SQUASH — автоочистка blob'ов раз в сутки
-// ===================================================================
-const SQUASH = {
-    WORKFLOW: 'squash.yml',
-    LOCAL_LOCK_KEY: 'chathub_squash_local_lock',
-    LOCAL_LOCK_MS: 5 * 60 * 1000,
-
-    async maybeRun() {
-        if (!state.isAuthorized || !state.token) return;
-        if (!navigator.onLine) return;
-        const lock = Number(localStorage.getItem(SQUASH.LOCAL_LOCK_KEY) || 0);
-        if (Date.now() - lock < SQUASH.LOCAL_LOCK_MS) return;
-
-        try {
-            const idxRes = await INDEX.read(true);
-            if (!idxRes) { await INDEX.ensure(); return; }
-            const idx = idxRes.content;
-
-            const lastSquash = idx.lastSquash || 0;
-            const elapsed = Date.now() - lastSquash;
-            if (elapsed < CONFIG.squashIntervalMs) {
-                localStorage.setItem(SQUASH.LOCAL_LOCK_KEY, String(Date.now()));
-                return;
-            }
-            if (idx.squashPending) {
-                const reqAt = idx.squashRequestedAt || 0;
-                if (Date.now() - reqAt < 60 * 60 * 1000) {
-                    console.log('⏳ Squash уже запрошен');
-                    localStorage.setItem(SQUASH.LOCAL_LOCK_KEY, String(Date.now()));
-                    return;
-                }
-                console.warn('⚠️ Squash-заявка зависла — перезапись');
-            }
-
-            idx.squashPending = true;
-            idx.squashBy = state.username;
-            idx.squashRequestedAt = Date.now();
-            idx.version = Date.now();
-
-            try {
-                await INDEX.write(idx, idxRes.sha);
-            } catch (e) {
-                if (e.message.includes('409')) { INDEX.invalidate(); return; }
-                throw e;
-            }
-            localStorage.setItem(SQUASH.LOCAL_LOCK_KEY, String(Date.now()));
-            console.log(`🧹 Squash запрошен: ${state.username}`);
-            await SQUASH.tryDispatch();
-        } catch (e) {
-            console.warn('squash error:', e.message);
-        }
-    },
-
-    async tryDispatch() {
-        try {
-            const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/actions/workflows/${SQUASH.WORKFLOW}/dispatches`;
-            const res = await fetch(url, {
-                method: 'POST',
-                headers: {
-                    'Authorization': `token ${state.token}`,
-                    'Accept': 'application/vnd.github.v3+json',
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    ref: 'main',
-                    inputs: { triggered_by: state.username || 'unknown' },
-                }),
-            });
-            if (res.status === 204) console.log('✅ workflow_dispatch OK');
-            else if (res.status === 403) console.log('ℹ️ Нет scope workflow — сработает по push');
-            else console.warn('dispatch:', res.status);
-        } catch (e) {
-            console.warn('dispatch error:', e.message);
-        }
-    },
-};
-
-// ===================================================================
 //  СООБЩЕНИЯ
 // ===================================================================
 async function encryptMessage(msg) {
     const payload = { username: msg.username, text: msg.text || '' };
-    if (msg.mediaRef) payload.mediaRef = msg.mediaRef;
-    if (msg.audioRef) payload.audioRef = msg.audioRef;
     if (msg.image) payload.image = msg.image;
     if (msg.audio) {
         payload.audio = msg.audio;
@@ -2595,13 +2193,10 @@ async function encryptMessage(msg) {
     const encrypted = await encryptObject(payload, CRYPTO._key);
     return { id: msg.id, time: msg.time, iv: encrypted.iv, data: encrypted.data };
 }
-
 async function decryptMessage(encMsg) {
     try {
         const payload = await decryptObject(encMsg.iv, encMsg.data, CRYPTO._key);
         const msg = { id: encMsg.id, time: encMsg.time, username: payload.username, text: payload.text || '' };
-        if (payload.mediaRef) msg.mediaRef = payload.mediaRef;
-        if (payload.audioRef) msg.audioRef = payload.audioRef;
         if (payload.image) msg.image = payload.image;
         if (payload.audio) {
             msg.audio = payload.audio;
@@ -2614,7 +2209,6 @@ async function decryptMessage(encMsg) {
         return null;
     }
 }
-
 async function loadAndDecrypt(saltBase64, encMessages) {
     const key = await deriveKey(state.chatPassword, saltBase64);
     CRYPTO._key = key;
@@ -2762,6 +2356,7 @@ async function saveFile(token, owner, repo, path, content, sha) {
     return { blobSha: data.content.sha, commitSha: data.commit.sha };
 }
 
+// ─── Meta-файл ───
 async function updateMeta(file, version, count) {
     const path = getMetaPath(file);
     const meta = {
@@ -2790,7 +2385,7 @@ async function updateMeta(file, version, count) {
                 cache: 'no-store',
             });
             if (res.ok) return true;
-            if (res.status === 409) continue;
+            if (res.status === 409) continue; // конфликт — повторим
         } catch (e) {
             console.warn(`Meta update attempt ${attempt + 1} failed:`, e.message);
         }
@@ -2960,61 +2555,17 @@ async function sendMessage(text, imageData = null, audioData = null) {
         }
 
         const messageId = Date.now();
-        let mediaRef = null, audioRef = null;
-
-        // Кладём фото в bucket
-        if (hasImage) {
-            try {
-                const r = await MEDIA.put(state.chatFile, {
-                    id: messageId,
-                    type: 'image',
-                    data: imageData,
-                    size: imageData.length,
-                    mime: 'image/jpeg',
-                });
-                mediaRef = { type: 'image', id: messageId, bucket: r.bucketIndex };
-                if (r.evicted && r.evicted.length > 0) {
-                    console.log(`📦 Вытеснено ${r.evicted.length} старых медиа`);
-                }
-            } catch (e) {
-                console.error('MEDIA.put image failed:', e);
-                showToast('❌ Не удалось сохранить фото', 2500);
-                throw e;
-            }
-        }
-
-        // Кладём аудио в bucket
-        if (hasAudio) {
-            try {
-                const r = await MEDIA.put(state.chatFile, {
-                    id: messageId,
-                    type: 'audio',
-                    data: audioData.data,
-                    size: audioData.data.length,
-                    mime: audioData.mime || 'audio/webm',
-                    duration: audioData.duration || 0,
-                });
-                audioRef = {
-                    id: messageId,
-                    bucket: r.bucketIndex,
-                    duration: audioData.duration || 0,
-                    mime: audioData.mime || 'audio/webm',
-                };
-            } catch (e) {
-                console.error('MEDIA.put audio failed:', e);
-                showToast('❌ Не удалось сохранить аудио', 2500);
-                throw e;
-            }
-        }
-
         const plainMsg = {
-            id: messageId,
-            username: state.username,
+            id: messageId, username: state.username,
             text: hasText ? text.trim() : '',
-            time: new Date().toISOString(),
-            mediaRef,
-            audioRef,
+            time: new Date().toISOString()
         };
+        if (hasImage) plainMsg.image = imageData;
+        if (hasAudio) {
+            plainMsg.audio = audioData.data;
+            plainMsg.audioDuration = audioData.duration || 0;
+            plainMsg.audioMime = audioData.mime || 'audio/webm';
+        }
         state._lastSentMessageId = messageId;
 
         const encMsg = await encryptMessage(plainMsg);
@@ -3025,22 +2576,12 @@ async function sendMessage(text, imageData = null, audioData = null) {
 
         const saved = await saveFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path, fileContent, sha);
 
+        // Обновляем meta
         await updateMeta(state.chatFile, messageId, fileContent.messages.length);
         state._lastMetaVersion = messageId;
+        // 🔧 FIX: инвалидируем ETag, чтобы следующий poll перечитал meta
         state._metaEtag = null;
         state._metaEtagsByFile[state.chatFile] = null;
-
-        // Обновляем глобальный индекс
-        try {
-            await INDEX.updateChat(state.chatFile, {
-                name: state.chatName,
-                lastMessageAt: plainMsg.time,
-                lastMessageId: messageId,
-                messageCount: fileContent.messages.length,
-            });
-        } catch (e) {
-            console.warn('INDEX.updateChat failed:', e.message);
-        }
 
         state.messages.push(plainMsg);
         if (state.messages.length > CONFIG.maxMessages) {
@@ -3098,24 +2639,13 @@ async function deleteMessage(messageId) {
         fileContent.messages = encMessages;
         const saved = await saveFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path, fileContent, result.sha);
 
-        // Удаляем медиа из bucket'а
-        if (plain.mediaRef || plain.audioRef) {
-            try { await MEDIA.delete(state.chatFile, messageId); }
-            catch (e) { console.warn('MEDIA.delete failed:', e.message); }
-        }
-
+        // Обновляем meta (даже при удалении — это тоже изменение)
         const newVersion = Date.now();
         await updateMeta(state.chatFile, newVersion, fileContent.messages.length);
         state._lastMetaVersion = newVersion;
+        // 🔧 FIX: инвалидируем ETag
         state._metaEtag = null;
         state._metaEtagsByFile[state.chatFile] = null;
-
-        try {
-            await INDEX.updateChat(state.chatFile, {
-                lastMessageAt: new Date().toISOString(),
-                messageCount: fileContent.messages.length,
-            });
-        } catch (e) { console.warn('INDEX update on delete failed:', e.message); }
 
         state.messages = state.messages.filter(m => m.id !== messageId);
         state.sha = saved.blobSha;
@@ -3294,41 +2824,10 @@ function renderMessages(messages) {
         const fullTime = formatFullTime(msg.time);
         let content = '';
         if (msg.text) content += `<span class="text">${escapeHtml(msg.text)}</span>`;
-
-        // Новая схема — mediaRef/audioRef
-        if (msg.mediaRef) {
-            const mid = msg.mediaRef.id;
-            const cached = MEDIA._cacheGet(mid);
-            if (cached) {
-                content += `<div class="image-container" onclick="openImageModalById(${mid})">
-                    <img src="${cached}" alt="Изображение">
-                </div>`;
-            } else {
-                content += `<div class="image-container image-placeholder" data-media-id="${mid}"
-                                 onclick="openImageModalById(${mid})">
-                    <div class="img-skeleton">📷 Нажмите, чтобы загрузить</div>
-                </div>`;
-            }
-        } else if (msg.image) {
-            content += `<div class="image-container" onclick="openImageModal('${msg.image}')">
-                <img src="${msg.image}" alt="Изображение" loading="lazy">
-            </div>`;
+        if (msg.image) {
+            content += `<div class="image-container" onclick="openImageModal('${msg.image}')"><img src="${msg.image}" alt="Изображение" loading="lazy"></div>`;
         }
-
-        if (msg.audioRef) {
-            const aid = msg.audioRef.id;
-            const cachedAudio = MEDIA._cacheGet(aid);
-            if (cachedAudio) {
-                content += createAudioPlayerHTML(msg.id, cachedAudio, msg.audioRef.duration, msg.audioRef.mime);
-            } else {
-                content += `<div class="audio-placeholder" data-audio-id="${aid}">
-                    <button class="audio-load-btn" onclick="loadAndPlayAudio(${aid})">▶ Загрузить аудио</button>
-                </div>`;
-            }
-        } else if (msg.audio) {
-            content += createAudioPlayerHTML(msg.id, msg.audio, msg.audioDuration, msg.audioMime);
-        }
-
+        if (msg.audio) content += createAudioPlayerHTML(msg.id, msg.audio, msg.audioDuration, msg.audioMime);
         html += `
             <div class="message-wrapper ${isOwn ? 'own' : 'other'}${isUnread ? ' unread' : ''}">
                 <div class="message">
@@ -3342,111 +2841,10 @@ function renderMessages(messages) {
     });
     messagesInner.innerHTML = html;
     setTimeout(initAudioPlayers, 0);
-    setTimeout(loadVisibleMedia, 50);
     setTimeout(() => {
         if (scrollState.isAtBottom) messagesContainer.scrollTop = messagesContainer.scrollHeight;
         updateScrollButton();
     }, 0);
-}
-
-// ===================================================================
-//  ЛЕНИВАЯ ЗАГРУЗКА МЕДИА
-// ===================================================================
-let _lazyLoading = false;
-
-async function loadVisibleMedia() {
-    if (_lazyLoading) return;
-    if (!state.chatFile || !state.isAuthorized) return;
-    _lazyLoading = true;
-    try {
-        const placeholders = messagesInner.querySelectorAll('.image-placeholder, .audio-placeholder');
-        const toLoad = [];
-        const viewportTop = messagesContainer.scrollTop - 200;
-        const viewportBottom = messagesContainer.scrollTop + messagesContainer.clientHeight + 200;
-
-        placeholders.forEach(el => {
-            const top = el.offsetTop;
-            const bottom = top + el.offsetHeight;
-            if (bottom >= viewportTop && top <= viewportBottom) {
-                const id = Number(el.dataset.mediaId || el.dataset.audioId);
-                if (id && !MEDIA._cacheGet(id)) toLoad.push({ el, id });
-            }
-        });
-
-        const limit = 4;
-        for (let i = 0; i < toLoad.length; i += limit) {
-            const batch = toLoad.slice(i, i + limit);
-            await Promise.all(batch.map(async ({ el, id }) => {
-                try {
-                    const data = await MEDIA.get(state.chatFile, id);
-                    if (!data) {
-                        el.innerHTML = '<div class="img-skeleton" style="color:#ff6b6b;">❌ Медиа вытеснено</div>';
-                        return;
-                    }
-                    if (el.classList.contains('image-placeholder')) {
-                        el.outerHTML = `<div class="image-container" onclick="openImageModalById(${id})">
-                            <img src="${data}" alt="Изображение">
-                        </div>`;
-                    } else if (el.classList.contains('audio-placeholder')) {
-                        const msg = state.messages.find(m => m.audioRef && m.audioRef.id === id);
-                        const dur = msg?.audioRef?.duration || 0;
-                        const mime = msg?.audioRef?.mime || 'audio/webm';
-                        el.outerHTML = createAudioPlayerHTML(id, data, dur, mime);
-                        setTimeout(initAudioPlayers, 0);
-                    }
-                } catch (e) {
-                    console.warn('media load failed', id, e.message);
-                }
-            }));
-        }
-    } finally {
-        _lazyLoading = false;
-    }
-}
-
-messagesContainer.addEventListener('scroll', () => {
-    clearTimeout(window._lazyMediaTimer);
-    window._lazyMediaTimer = setTimeout(loadVisibleMedia, 120);
-}, { passive: true });
-
-async function openImageModalById(id) {
-    let data = MEDIA._cacheGet(id);
-    if (!data) {
-        showToast('⏳ Загрузка...', 800);
-        try {
-            data = await MEDIA.get(state.chatFile, id);
-        } catch (e) {
-            showToast('❌ Не удалось загрузить', 2000);
-            return;
-        }
-        if (!data) { showToast('❌ Медиа вытеснено', 2000); return; }
-    }
-    openImageModal(data);
-}
-
-async function loadAndPlayAudio(id) {
-    let data = MEDIA._cacheGet(id);
-    if (!data) {
-        showToast('⏳ Загрузка аудио...', 800);
-        try {
-            data = await MEDIA.get(state.chatFile, id);
-        } catch (e) {
-            showToast('❌ Не удалось загрузить аудио', 2000);
-            return;
-        }
-        if (!data) { showToast('❌ Аудио вытеснено', 2000); return; }
-    }
-    const placeholder = messagesInner.querySelector(`.audio-placeholder[data-audio-id="${id}"]`);
-    const msg = state.messages.find(m => m.audioRef && m.audioRef.id === id);
-    if (placeholder && msg) {
-        const dur = msg.audioRef.duration || 0;
-        const mime = msg.audioRef.mime || 'audio/webm';
-        placeholder.outerHTML = createAudioPlayerHTML(id, data, dur, mime);
-        setTimeout(() => {
-            initAudioPlayers();
-            toggleAudioPlayback(id);
-        }, 50);
-    }
 }
 
 // ===================================================================
@@ -4012,7 +3410,7 @@ function toggleEmojiPanel(force) {
 }
 
 // ===================================================================
-//  POLLING
+//  POLLING (с meta-файлом и ETag)
 // ===================================================================
 async function pollUpdates() {
     if (state.isPolling || !state.token || !state.isAuthorized || !CRYPTO._key || !state.chatFile) return;
@@ -4020,15 +3418,20 @@ async function pollUpdates() {
     try {
         const chatPath = getChatPath(state.chatFile);
 
+        // 🔧 FIX: используем быстрый meta-запрос с ETag (1 запрос вместо 3)
         let metaRes = null;
         try {
             metaRes = await fetchMetaFast(state.chatFile, state._metaEtag);
         } catch (e) {
             console.warn('Meta fetch failed:', e.message);
-            if (e.message.includes('401') || e.message.includes('403')) throw e;
+            // сетевые ошибки не роняют polling
+            if (e.message.includes('401') || e.message.includes('403')) {
+                throw e; // пробрасываем выше для lockChatUI
+            }
             return;
         }
 
+        // Если meta не менялась — вообще ничего не делаем (0 запросов к основному файлу!)
         if (metaRes.notModified) {
             if (!networkState.isOnline) {
                 networkState.isOnline = true;
@@ -4036,12 +3439,19 @@ async function pollUpdates() {
             }
             return;
         }
-        if (!metaRes.exists) return;
 
+        if (!metaRes.exists) {
+            // Чата нет — ничего не делаем
+            return;
+        }
+
+        // Сохраняем новый ETag
         state._metaEtag = metaRes.etag || null;
+
         const metaVersion = metaRes.content && metaRes.content.version;
         if (!metaVersion) return;
 
+        // Если версия в meta совпадает с нашей — файл не менялся с нашей последней операции
         if (metaVersion === state._lastMetaVersion) {
             if (!networkState.isOnline) {
                 networkState.isOnline = true;
@@ -4050,10 +3460,13 @@ async function pollUpdates() {
             return;
         }
 
+        // Версия изменилась — тянем основной файл
         state._lastMetaVersion = metaVersion;
         state._lastActivityAt = Date.now();
 
-        const commitSha = await getLatestCommitSha(state.token, CONFIG.repoOwner, CONFIG.repoName, chatPath);
+        const commitSha = await getLatestCommitSha(
+            state.token, CONFIG.repoOwner, CONFIG.repoName, chatPath
+        );
 
         if (!networkState.isOnline) {
             networkState.isOnline = true;
@@ -4104,6 +3517,7 @@ async function pollUpdates() {
             }
             state.messages = decrypted;
             state.lastMessageCount = decrypted.length;
+            // 🔧 FIX: если мы в списке чатов — обновляем бейджи, иначе — рендерим
             if (state.currentScreen === 'chat') {
                 renderMessages(state.messages);
             } else {
@@ -4134,7 +3548,10 @@ async function pollUpdates() {
         }
         state.lastMessageCount = encMessages.length;
 
+        // 🔧 FIX: главное изменение — если мы не в чате, не рендерим сообщения,
+        // а обновляем бейджи непрочитанных
         if (state.currentScreen !== 'chat') {
+            // обновляем бейдж
             const chat = state.chats.find(c => c.file === state.chatFile);
             if (chat) {
                 chat.hasUnread = true;
@@ -4176,9 +3593,11 @@ async function pollUpdates() {
     }
 }
 
+// Умный polling: быстрый при активности, медленный при бездействии
 let _pollTimerHandle = null;
 let _currentPollInterval = 0;
 
+// 🔧 FIX: главное — обёртка try/finally, чтобы polling никогда не останавливался
 function scheduleNextPoll() {
     if (_pollTimerHandle) clearTimeout(_pollTimerHandle);
     const idle = Date.now() - state._lastActivityAt > CONFIG.pollIdleThresholdMs;
@@ -4190,6 +3609,7 @@ function scheduleNextPoll() {
         } catch (e) {
             console.error('Polling crashed, but will continue:', e);
         } finally {
+            // 🔧 FIX: всегда планируем следующий poll, что бы ни случилось
             scheduleNextPoll();
         }
     }, interval);
@@ -4384,12 +3804,9 @@ async function confirmCreateChat() {
         await deriveKey(password, salt);
         const content = { v: CRYPTO.VERSION, salt, messages: [] };
         await saveFile(state.token, CONFIG.repoOwner, CONFIG.repoName, getChatPath(file), content, null);
+        // Создаём meta
         const initialVersion = Date.now();
         await updateMeta(file, initialVersion, 0);
-
-        // Инициализируем bucket-хранилище
-        try { await MEDIA.init(file); }
-        catch (e) { console.warn('MEDIA.init failed:', e.message); }
 
         state.chats.push({ name: displayName, file, createdAt: new Date().toISOString() });
         saveChatsList();
@@ -4449,7 +3866,7 @@ async function enterChat(file, name, password) {
     state.messages = []; state.sha = null; state.lastMessageCount = 0;
     state._lastCommitSha = null;
     state._lastMetaVersion = null;
-    state._metaEtag = null;
+    state._metaEtag = null;    // 🔧 FIX
     state._lastSentMessageId = null; CRYPTO._key = null; state.salt = null;
 
     state.chatFile = file;
@@ -4474,10 +3891,6 @@ async function enterChat(file, name, password) {
         showChatsScreen();
         throw e;
     }
-
-    // Инициализируем bucket'ы, если их нет
-    try { await MEDIA.init(file); }
-    catch (e) { console.warn('MEDIA.init on enter failed:', e.message); }
 
     if (!result.exists) {
         const saltBytes = generateSalt();
@@ -4527,6 +3940,7 @@ async function enterChat(file, name, password) {
     state._lastCommitSha = result.commitSha;
     state.lastMessageCount = decrypted.length;
 
+    // 🔧 FIX: читаем meta через быстрый запрос, получаем ETag
     try {
         const metaRes = await fetchMetaFast(file, null);
         if (metaRes.exists) {
@@ -4673,11 +4087,9 @@ async function login() {
     showChatsScreen();
     loginBtn.disabled = false;
     loginBtn.textContent = '🚀 Войти';
-    setTimeout(() => SQUASH.maybeRun(), 5000);
 }
 
 function logout() {
-    MEDIA._cacheClear();
     if (audioRecorder.isRecording) audioRecorder.cancel();
     markChatAsRead();
     stopPolling();
@@ -4689,13 +4101,13 @@ function logout() {
     state.isAuthorized = false;
     state._lastSentMessageId = null;
     state._lastMetaVersion = null;
-    state._metaEtag = null;
+    state._metaEtag = null;    // 🔧 FIX
     state._lastActivityAt = 0;
     state.messages = []; state.sha = null; state.lastMessageCount = 0;
     state.chatPassword = ''; state.salt = null;
     state.chatFile = null; state.chatName = null;
     state._lastCommitSha = null;
-    state._metaEtagsByFile = {};
+    state._metaEtagsByFile = {};    // 🔧 FIX
     CRYPTO._key = null;
     if (localStorage.getItem('chathub_remember') !== '1') {
         tokenInput.value = '';
@@ -4725,7 +4137,7 @@ function lockChatUI(reason) {
     state.isAuthorized = false;
     state.messages = []; state.sha = null; state.lastMessageCount = 0;
     state._lastCommitSha = null;
-    state._metaEtag = null;
+    state._metaEtag = null;    // 🔧 FIX
     CRYPTO._key = null;
     stopPolling();
     messagesInner.innerHTML = `
@@ -4744,10 +4156,13 @@ function lockChatUI(reason) {
 
 // ===================================================================
 //  НАЗАД К СПИСКУ
+// 🔧 FIX: НЕ останавливаем polling — он продолжит обновлять бейджи
 // ===================================================================
 function backToChats() {
     markChatAsRead();
     if (audioRecorder.isRecording) audioRecorder.cancel();
+    // 🔧 FIX: убрали stopPolling() — polling продолжит работать в фоне
+    // и будет обновлять бейджи непрочитанных
     Object.keys(audioPlayers).forEach(id => {
         try { audioPlayers[id].audio.pause(); } catch (e) {}
         delete audioPlayers[id];
@@ -4755,7 +4170,7 @@ function backToChats() {
     state.messages = []; state.sha = null; state.lastMessageCount = 0;
     state._lastSentMessageId = null;
     state._lastMetaVersion = null;
-    state._metaEtag = null;
+    state._metaEtag = null;    // 🔧 FIX
     state._lastCommitSha = null;
     state.chatFile = null; state.chatName = null;
     state.chatPassword = ''; state.salt = null;
@@ -4850,11 +4265,13 @@ messageInput.addEventListener('keydown', (e) => {
         }
     }
 });
+// 🔧 FIX: обновляем активность при вводе — держим быстрый polling
 messageInput.addEventListener('input', () => {
     messageInput.style.height = 'auto';
     messageInput.style.height = Math.min(messageInput.scrollHeight, 120) + 'px';
     state._lastActivityAt = Date.now();
 });
+// 🔧 FIX: фокус тоже считается активностью
 messageInput.addEventListener('focus', () => {
     state._lastActivityAt = Date.now();
     if (state.chatFile) scrollToBottom();
@@ -5056,15 +4473,7 @@ async function restoreSession() {
 // ===================================================================
 restoreSession();
 
-// Автопроверка squash — раз в сутки
-setTimeout(() => { if (state.isAuthorized) SQUASH.maybeRun(); }, 8000);
-setInterval(() => { if (state.isAuthorized) SQUASH.maybeRun(); }, 60 * 60 * 1000);
-document.addEventListener('visibilitychange', () => {
-    if (!document.hidden && state.isAuthorized) {
-        setTimeout(() => SQUASH.maybeRun(), 3000);
-    }
-});
-
+// 🔧 FIX: периодическое обновление бейджей в списке чатов (страховка)
 setInterval(() => {
     if (state.currentScreen === 'chats' && state.isAuthorized) {
         refreshUnreadBadges();
@@ -5080,12 +4489,16 @@ setInterval(() => {
     }
 }, 1000);
 
-console.log('✅ SMS Чат v2 с bucket-хранилищем загружен!');
+console.log('✅ SMS Чат с meta-файлами загружен!');
 console.log('🔐 AES-256-GCM + PBKDF2 (200k)');
-console.log('📦 Фото: 1600×1600 q0.75, до 50 buckets × 900 КБ');
-console.log('🗂️ meta/index.json — глобальный индекс');
-console.log('🧹 Автоочистка blob раз в сутки от клиента');
-console.log('🖼️ Ленивая загрузка, кэш 8 МБ в памяти');
+console.log('📌 Meta-файл: ~200 байт вместо 2 МБ при опросе');
+console.log('⚡ Умный polling: 2 сек при активности, 8 сек при бездействии');
+console.log('🔧 FIX: ETag для meta (304 не жрёт rate limit)');
+console.log('🔧 FIX: polling не останавливается при выходе в список чатов');
+console.log('🔧 FIX: try/finally в scheduleNextPoll — цепочка не рвётся');
+console.log('🗜️ Сжатие фото: 1200×1200, q0.80');
+console.log('🖼️ Галерея: перекрытие фаз, pinch-zoom, свайпы');
+console.log('😊 Эмодзи: настраиваются в EMOJI_LIST');
 </script>
 </body>
 </html>
