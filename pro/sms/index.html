@@ -635,6 +635,10 @@
             transition: all 0.3s;
         }
         .input-bar .file-btn:active { transform: scale(0.9); background: rgba(255,255,255,0.12); }
+        .input-bar .file-btn.active {
+            background: linear-gradient(135deg, rgba(108,92,231,0.25), rgba(0,184,148,0.25));
+            color: #fff;
+        }
         .input-bar .send-btn {
             width: 48px; height: 48px; border-radius: 50%; border: none;
             background: linear-gradient(135deg, #6c5ce7, #00b894);
@@ -709,6 +713,80 @@
         .emoji-item:active {
             transform: scale(0.85);
             background: rgba(108,92,231,0.25);
+        }
+
+        /* ═══ Мини-меню выбора типа файла ═══ */
+        .attach-menu {
+            position: absolute;
+            bottom: calc(100% + 8px);
+            right: 14px;
+            width: 240px;
+            max-width: calc(100vw - 28px);
+            background: #1a1a2e;
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 16px;
+            padding: 6px;
+            box-shadow: 0 12px 40px rgba(0,0,0,0.6);
+            backdrop-filter: blur(20px);
+            display: none;
+            z-index: 100;
+            animation: emojiPanelIn 0.18s ease-out;
+        }
+        .attach-menu.show { display: block; }
+
+        .attach-menu-item {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 10px 12px;
+            border-radius: 12px;
+            cursor: pointer;
+            transition: background 0.15s, transform 0.1s;
+            user-select: none;
+        }
+        .attach-menu-item:hover { background: rgba(255,255,255,0.06); }
+        .attach-menu-item:active {
+            transform: scale(0.97);
+            background: rgba(108,92,231,0.15);
+        }
+        .attach-menu-item + .attach-menu-item {
+            margin-top: 2px;
+        }
+        .attach-menu-item .icon {
+            width: 40px;
+            height: 40px;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+            flex-shrink: 0;
+        }
+        .attach-menu-item.image .icon {
+            background: linear-gradient(135deg, rgba(108,92,231,0.25), rgba(167,139,250,0.15));
+            color: #a78bfa;
+        }
+        .attach-menu-item.file .icon {
+            background: linear-gradient(135deg, rgba(0,184,148,0.2), rgba(0,184,148,0.1));
+            color: #00b894;
+        }
+        .attach-menu-item .text {
+            flex: 1;
+            min-width: 0;
+        }
+        .attach-menu-item .title {
+            font-size: 14px;
+            font-weight: 600;
+            color: #fff;
+            margin-bottom: 2px;
+        }
+        .attach-menu-item .subtitle {
+            font-size: 11px;
+            color: #888;
+            line-height: 1.3;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
 
         .floating-keyboard-btn {
@@ -1093,6 +1171,11 @@
                 grid-template-columns: repeat(auto-fill, 32px);
             }
             .emoji-item { width: 32px; height: 32px; font-size: 20px; }
+            .attach-menu {
+                width: calc(100vw - 20px);
+                max-width: 280px;
+                right: 10px;
+            }
             .audio-container { min-width: 140px; padding: 4px 10px 4px 4px; }
             .audio-play-btn { width: 30px; height: 30px; font-size: 14px; }
             .gallery-slide { max-height: 80vh; }
@@ -1221,6 +1304,22 @@
             <button class="send-btn" id="sendBtn">➤</button>
         </div>
         <div class="emoji-panel" id="emojiPanel"></div>
+        <div class="attach-menu" id="attachMenu">
+            <div class="attach-menu-item image" data-action="image">
+                <div class="icon">🖼️</div>
+                <div class="text">
+                    <div class="title">Изображение</div>
+                    <div class="subtitle">Сожмётся автоматически</div>
+                </div>
+            </div>
+            <div class="attach-menu-item file" data-action="file">
+                <div class="icon">📄</div>
+                <div class="text">
+                    <div class="title">Любой файл</div>
+                    <div class="subtitle">HTML, JSON, PDF, ZIP…</div>
+                </div>
+            </div>
+        </div>
     </div>
 </div>
 
@@ -2273,6 +2372,11 @@ function scrollToBottomNow() {
     scrollState.isAtBottom = true;
     setTimeout(updateScrollButton, 300);
 }
+function hideScrollDownBtn() {
+    scrollDownBtn.classList.remove('show');
+    scrollState.unreadCount = 0;
+    updateScrollBadge();
+}
 
 let _scrollRaf = null;
 messagesContainer.addEventListener('scroll', () => {
@@ -2302,6 +2406,7 @@ function hideInputBar() {
     floatingKeyboardBtn.classList.add('show');
     messageInput.blur();
     if (_emojiPanelOpen) toggleEmojiPanel(false);
+    if (_attachMenuOpen) toggleAttachMenu(false);
 }
 
 // ===================================================================
@@ -3056,6 +3161,7 @@ async function sendMessage(text, imageBlob = null, audioData = null, fileAttachm
     if ((!hasText && !hasImage && !hasAudio && !hasFile) || state.isSending) return;
 
     if (_emojiPanelOpen) toggleEmojiPanel(false);
+    if (_attachMenuOpen) toggleAttachMenu(false);
 
     state.isSending = true;
     sendBtn.disabled = true;
@@ -3376,8 +3482,7 @@ function seekAudio(event, msgId) {
     player.audio.currentTime = pct * player.audio.duration;
 }
 
-// ===================================================================
-//  КАРТОЧКА ФАЙЛА
+// ===================================================================//  КАРТОЧКА ФАЙЛА
 // ===================================================================
 function getFileIcon(fileName) {
     const ext = (fileName.split('.').pop() || '').toLowerCase();
@@ -3405,6 +3510,7 @@ function createFileCardHTML(attachName, url, fileName, fileSize) {
     const icon = getFileIcon(fileName);
     const safeName = escapeHtml(fileName);
     const escapedForAttr = fileName.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    const canShare = !!navigator.share;
     return `
         <div class="file-card">
             <div class="file-icon">${icon}</div>
@@ -3414,7 +3520,9 @@ function createFileCardHTML(attachName, url, fileName, fileSize) {
             </div>
             <div class="file-actions">
                 <button class="file-action-btn" onclick="downloadAttachedFile('${url}', '${escapedForAttr}')" title="Скачать">⬇</button>
-                <button class="file-action-btn" onclick="openAttachedFile('${url}')" title="Открыть в новой вкладке">↗</button>
+                ${canShare
+                    ? `<button class="file-action-btn" onclick="shareAttachedFile('${url}', '${escapedForAttr}')" title="Поделиться">↗</button>`
+                    : `<button class="file-action-btn" onclick="openAttachedFile('${url}')" title="Открыть">↗</button>`}
             </div>
         </div>
     `;
@@ -3432,6 +3540,38 @@ function downloadAttachedFile(url, fileName) {
 
 function openAttachedFile(url) {
     window.open(url, '_blank', 'noopener,noreferrer');
+}
+
+async function shareAttachedFile(url, fileName) {
+    try {
+        if (!navigator.share) {
+            showToast('📤 Открываем в новой вкладке', 1500);
+            window.open(url, '_blank', 'noopener,noreferrer');
+            return;
+        }
+        const res = await fetch(url);
+        const blob = await res.blob();
+        if (blob.size > 20 * 1024 * 1024) {
+            showToast('📤 Файл большой, скачайте его вручную', 2500);
+            return;
+        }
+        const file = new File([blob], fileName || 'file', {
+            type: blob.type || 'application/octet-stream'
+        });
+        const shareData = { files: [file], title: fileName || 'Файл' };
+        if (navigator.canShare && navigator.canShare(shareData)) {
+            await navigator.share(shareData);
+        } else if (navigator.canShare && !navigator.canShare(shareData)) {
+            // Файлы не поддерживаются — шарим хотя бы текст
+            await navigator.share({ title: fileName || 'Файл', text: `Файл: ${fileName}` });
+        } else {
+            await navigator.share(shareData);
+        }
+    } catch (e) {
+        if (e.name === 'AbortError') return;
+        console.error('share error:', e);
+        showToast('❌ Не удалось поделиться', 2500);
+    }
 }
 
 // ===================================================================
@@ -4106,6 +4246,38 @@ function toggleEmojiPanel(force) {
     _emojiPanelOpen = shouldOpen;
     panel.classList.toggle('show', shouldOpen);
     btn.classList.toggle('active', shouldOpen);
+    if (shouldOpen && _attachMenuOpen) toggleAttachMenu(false);
+}
+
+// ===================================================================
+//  МЕНЮ ВЛОЖЕНИЙ
+// ===================================================================
+let _attachMenuOpen = false;
+
+function toggleAttachMenu(force) {
+    const menu = $('attachMenu');
+    const btn = $('fileBtn');
+    if (!menu || !btn) return;
+    const shouldOpen = typeof force === 'boolean' ? force : !_attachMenuOpen;
+    if (shouldOpen === _attachMenuOpen) return;
+    _attachMenuOpen = shouldOpen;
+    menu.classList.toggle('show', shouldOpen);
+    btn.classList.toggle('active', shouldOpen);
+    if (shouldOpen && _emojiPanelOpen) toggleEmojiPanel(false);
+}
+
+function openFilePicker(mode) {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = mode === 'image' ? 'image/*' : '*/*';
+    input.onchange = (e) => {
+        if (e.target.files.length > 0) {
+            if (mode === 'image') handleFileUpload(e.target.files[0]);
+            else handleAnyFileUpload(e.target.files[0]);
+        }
+        input.remove();
+    };
+    input.click();
 }
 
 // ===================================================================
@@ -4290,6 +4462,11 @@ function showAuthScreen() {
     chatsScreen.style.display = 'none';
     chatScreen.style.display = 'none';
     authScreen.style.display = 'flex';
+    // 🔧 Скрываем плавающие элементы
+    scrollDownBtn.classList.remove('show');
+    floatingKeyboardBtn.classList.remove('show');
+    scrollState.unreadCount = 0;
+    updateScrollBadge();
 }
 function showChatsScreen() {
     state.currentScreen = 'chats';
@@ -4299,6 +4476,11 @@ function showChatsScreen() {
     $('chatsUserLabel').textContent = state.username;
     renderChatsList();
     setTimeout(refreshUnreadBadges, 100);
+    // 🔧 Скрываем плавающие элементы
+    scrollDownBtn.classList.remove('show');
+    floatingKeyboardBtn.classList.remove('show');
+    scrollState.unreadCount = 0;
+    updateScrollBadge();
 }
 function showChatScreen() {
     state.currentScreen = 'chat';
@@ -4781,9 +4963,7 @@ function logout() {
     closeImageModal();
     hideInputBar();
     floatingKeyboardBtn.classList.remove('show');
-    scrollDownBtn.classList.remove('show');
-    scrollState.unreadCount = 0;
-    updateScrollBadge();
+    hideScrollDownBtn();
     messageInput.disabled = false;
     sendBtn.disabled = false;
     fileBtn.disabled = false;
@@ -4805,9 +4985,7 @@ function lockChatUI(reason) {
     micBtn.disabled = true;
     hideInputBar();
     floatingKeyboardBtn.classList.remove('show');
-    scrollDownBtn.classList.remove('show');
-    scrollState.unreadCount = 0;
-    updateScrollBadge();
+    hideScrollDownBtn();
 }
 
 function backToChats() {
@@ -4828,6 +5006,11 @@ function backToChats() {
     state.chatPassword = ''; state.salt = null;
     CRYPTO._key = null;
     messagesInner.dataset.lastDate = '';
+
+    // 🔧 Скрываем плавающие элементы при выходе
+    hideScrollDownBtn();
+    floatingKeyboardBtn.classList.remove('show');
+
     showChatsScreen();
 }
 
@@ -4927,25 +5110,33 @@ messageInput.addEventListener('focus', () => {
     state._lastActivityAt = Date.now();
     if (state.chatFile) scrollToBottom();
 });
-fileBtn.addEventListener('click', () => {
+
+// 📎 — открывает мини-меню
+fileBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
     if (!state.isAuthorized || !state.chatFile) { showToast('🔒 Требуется вход в чат', 1500); return; }
-    const chooseImage = confirm(
-        '📎 Что отправить?\n\n' +
-        'ОК — изображение (сожмётся автоматически)\n' +
-        'Отмена — любой файл (HTML, JSON, PDF, ZIP…)'
-    );
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.accept = chooseImage ? 'image/*' : '*/*';
-    input.onchange = (e) => {
-        if (e.target.files.length > 0) {
-            if (chooseImage) handleFileUpload(e.target.files[0]);
-            else handleAnyFileUpload(e.target.files[0]);
-        }
-        input.remove();
-    };
-    input.click();
+    toggleAttachMenu();
+    soundManager.play('click');
 });
+
+// Клик по пунктам мини-меню
+document.addEventListener('click', (e) => {
+    const item = e.target.closest('.attach-menu-item');
+    if (item) {
+        e.stopPropagation();
+        const action = item.dataset.action;
+        toggleAttachMenu(false);
+        setTimeout(() => openFilePicker(action), 80);
+        return;
+    }
+    // Клик вне меню — закрываем
+    if (_attachMenuOpen) {
+        if (e.target.closest('#attachMenu')) return;
+        if (e.target.closest('#fileBtn')) return;
+        toggleAttachMenu(false);
+    }
+});
+
 micBtn.addEventListener('click', handleMicClick);
 exitBtn.addEventListener('click', logout);
 $('backToChatsBtn').addEventListener('click', backToChats);
@@ -5065,6 +5256,7 @@ scrollDownBtn.addEventListener('click', () => { scrollToBottomNow(); soundManage
 
 document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
+        if (_attachMenuOpen) { toggleAttachMenu(false); return; }
         if (_emojiPanelOpen) { toggleEmojiPanel(false); return; }
         if (UploadProgress.isVisible()) return;
         if (audioRecorder.isRecording) { audioRecorder.cancel(); showToast('🎤 Отменено', 1200); }
@@ -5143,22 +5335,29 @@ setInterval(() => {
 }, 15000);
 
 setInterval(() => {
-    if (chatScreen.style.display === 'flex' && state.isAuthorized && state.chatFile) {
+    const inChat = chatScreen.style.display === 'flex' && state.isAuthorized && state.chatFile;
+    if (inChat) {
         if (inputBar.classList.contains('hidden')) floatingKeyboardBtn.classList.add('show');
         else floatingKeyboardBtn.classList.remove('show');
     } else {
         floatingKeyboardBtn.classList.remove('show');
+        // 🔧 Страховка: если не в чате — прячем и кнопку вниз
+        if (scrollDownBtn.classList.contains('show')) {
+            scrollDownBtn.classList.remove('show');
+            scrollState.unreadCount = 0;
+            updateScrollBadge();
+        }
     }
 }, 1000);
 
-console.log('✅ SMS Чат с файловыми вложениями и прогресс-баром загружен!');
-console.log('🔐 AES-256-GCM + PBKDF2 (200k) для сообщений и вложений');
-console.log('📎 Вложения в chats/<chatId>/ — отдельные файлы');
-console.log('📥 Любой файл (HTML, JSON, PDF, ZIP…) через кнопку 📎');
-console.log('📊 Прогресс-бар для больших файлов (>500 КБ) с отменой');
+console.log('✅ SMS Чат собран!');
+console.log('🔐 AES-256-GCM + PBKDF2 (200k)');
+console.log('📎 Мини-меню выбора типа вложения');
+console.log('📊 Прогресс-бар загрузки больших файлов с отменой');
+console.log('📤 Web Share API для кнопки «Поделиться» в карточке файла');
 console.log('🗑️ Удаление сообщения удаляет и вложение');
 console.log('📜 История: 5 последних, при скролле вверх по 10');
-console.log('⚡ Умный polling: 2 сек при активности, 8 сек при бездействии');
+console.log('🔧 Кнопка «вниз» скрывается при выходе из чата');
 </script>
 </body>
 </html>
