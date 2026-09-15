@@ -197,6 +197,7 @@
             display: flex; flex-direction: column;
             max-width: 82%; animation: fadeIn 0.3s ease;
             position: relative; flex-shrink: 0;
+            contain: layout style paint;
         }
         .message-wrapper.own { align-self: flex-end; }
         .message-wrapper.other { align-self: flex-start; }
@@ -279,6 +280,28 @@
             height: 100%; width: 0%;
             background: linear-gradient(90deg, #6c5ce7, #00b894);
             border-radius: 3px; transition: width 0.1s linear;
+        }
+
+        .attach-placeholder {
+            min-height: 120px;
+            display: flex; align-items: center; justify-content: center;
+            color: #555; font-size: 13px;
+            background: rgba(0,0,0,0.15); border-radius: 12px;
+            padding: 20px;
+        }
+        .attach-error {
+            padding: 12px; color: #ff6b6b; font-size: 13px;
+            text-align: center;
+        }
+        .history-sentinel {
+            text-align: center; color: #666; font-size: 12px;
+            padding: 12px; margin: 4px auto 8px;
+            letter-spacing: 0.3px;
+        }
+        .history-start {
+            text-align: center; color: #444; font-size: 11px;
+            padding: 10px; letter-spacing: 0.5px;
+            text-transform: uppercase;
         }
 
         .recording-indicator {
@@ -1182,11 +1205,13 @@ const CONFIG = {
     repoName: 'SMS',
     chatsPath: 'chats/',
     metaSuffix: '.meta',
-    // 🔧 FIX: уменышили интервалы — теперь безопасно благодаря ETag
     pollIntervalFast: 2000,
     pollIntervalSlow: 8000,
     pollIdleThresholdMs: 60000,
-    maxMessages: 14,
+    maxMessages: 500,           // увеличен: файл лёгкий, вложения отдельно
+    renderInitial: 5,           // сколько показываем сразу
+    renderPageSize: 10,         // сколько подгружаем при скролле вверх
+    maxDomNodes: 40,            // максимум DOM-узлов сообщений
     maxImageSize: 7 * 1024 * 1024,
     compressMaxWidth: 900,
     compressMaxHeight: 900,
@@ -1389,16 +1414,39 @@ let state = {
     messages: [], sha: null,
     _lastCommitSha: null,
     _lastMetaVersion: null,
-    _metaEtag: null,               // 🔧 FIX: ETag для meta-файла
+    _metaEtag: null,
     _lastActivityAt: 0,
     isPolling: false, isSending: false, lastMessageCount: 0,
     isAuthorized: false, _lastSentMessageId: null,
     chatFile: null, chatName: null,
     chats: [], savedPasswords: {},
     currentScreen: 'auth',
-    // 🔧 FIX: кеш ETag для каждого чата в списке (для refreshUnreadBadges)
     _metaEtagsByFile: {},
 };
+
+// ===================================================================
+//  ИСТОРИЯ + КЕШ ВЛОЖЕНИЙ
+// ===================================================================
+let historyState = {
+    allMessages: [],
+    startIndex: 0,
+    renderedCount: 0,
+    hasMoreOnServer: false,
+};
+
+const _attachmentCache = new Map();        // attachName -> blobUrl
+const _pendingAttachmentLoads = new Map(); // attachName -> Promise
+let _loadingOlder = false;
+
+function resetHistoryState() {
+    historyState = { allMessages: [], startIndex: 0, renderedCount: 0, hasMoreOnServer: false };
+    _loadingOlder = false;
+}
+function clearAttachmentCache() {
+    _attachmentCache.forEach(url => { try { URL.revokeObjectURL(url); } catch (e) {} });
+    _attachmentCache.clear();
+    _pendingAttachmentLoads.clear();
+}
 
 let networkState = { isOnline: navigator.onLine };
 let pendingOpenChat = null;
@@ -1475,6 +1523,28 @@ function generateChatPassword() {
 
 function getChatPath(file) { return `${CONFIG.chatsPath}${file}.json`; }
 function getMetaPath(file) { return `${CONFIG.chatsPath}${file}${CONFIG.metaSuffix}.json`; }
+function getAttachmentPath(file, attachName) { return `${CONFIG.chatsPath}${file}/${attachName}`; }
+
+function generateAttachmentName(prefix, ext) {
+    const rand = crypto.getRandomValues(new Uint8Array(4));
+    const hex = Array.from(rand).map(b => b.toString(16).padStart(2, '0')).join('');
+    const ts = Date.now().toString(36);
+    return `${prefix}_${ts}_${hex}.${ext}`;
+}
+
+function guessMimeFromName(name) {
+    const ext = name.split('.').pop().toLowerCase();
+    return {
+        jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
+        webm: 'audio/webm', mp3: 'audio/mpeg', ogg: 'audio/ogg',
+    }[ext] || 'application/octet-stream';
+}
+
+function isAttachmentRef(value) {
+    return typeof value === 'string'
+        && !value.startsWith('data:')
+        && /\.(jpg|jpeg|png|webm|mp3|ogg)$/i.test(value);
+}
 
 function loadChatsList() {
     try {
@@ -1527,8 +1597,8 @@ function setLastReadId(file, messageId) {
     saveReadState(rs);
 }
 function markChatAsRead() {
-    if (!state.chatFile || state.messages.length === 0) return;
-    const lastId = state.messages[state.messages.length - 1].id;
+    if (!state.chatFile || historyState.allMessages.length === 0) return;
+    const lastId = historyState.allMessages[historyState.allMessages.length - 1].id;
     setLastReadId(state.chatFile, lastId);
     const idx = state.chats.findIndex(c => c.file === state.chatFile);
     if (idx >= 0) {
@@ -1538,7 +1608,6 @@ function markChatAsRead() {
     }
 }
 
-// 🔧 FIX: быстрый fetch meta через contents API с ETag (1 запрос, 304 не жрёт rate limit)
 async function fetchMetaFast(file, etag, token) {
     const path = getMetaPath(file);
     const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${path}`;
@@ -1568,12 +1637,10 @@ async function fetchMetaFast(file, etag, token) {
     }
 }
 
-// 🔧 FIX: переписали checkUnreadForAllChats с использованием fetchMetaFast + ETag-кеша
 async function checkUnreadForAllChats() {
     const result = {};
     const passwords = state.savedPasswords;
 
-    // Обрабатываем чаты параллельно, но с ограничением
     const tasks = state.chats.map(async (chat) => {
         const file = chat.file;
         try {
@@ -1582,29 +1649,24 @@ async function checkUnreadForAllChats() {
             try {
                 metaRes = await fetchMetaFast(file, cachedEtag);
             } catch (e) {
-                // Сетевая ошибка — оставляем прошлый статус
                 if (chat.hasUnread) result[file] = { hasUnread: true, count: chat.unreadCount || 0 };
                 return;
             }
 
             if (metaRes.notModified) {
-                // Ничего не поменялось
                 if (chat.hasUnread) result[file] = { hasUnread: true, count: chat.unreadCount || 0 };
                 return;
             }
 
             if (!metaRes.exists) {
-                // meta нет — считаем что чат пустой/удалён
                 state._metaEtagsByFile[file] = null;
                 return;
             }
 
             state._metaEtagsByFile[file] = metaRes.etag || null;
             const metaVersion = metaRes.content && metaRes.content.version;
-            const metaCount = metaRes.content && metaRes.content.count || 0;
             if (!metaVersion) return;
 
-            // Если metaVersion не изменился с прошлого раза — ничего не делаем
             if (chat._lastMetaVersion && chat._lastMetaVersion === metaVersion) {
                 if (chat.hasUnread) result[file] = { hasUnread: true, count: chat.unreadCount || 0 };
                 return;
@@ -1613,18 +1675,13 @@ async function checkUnreadForAllChats() {
             saveChatsList();
 
             const lastReadId = getLastReadId(file);
-            if (lastReadId && metaVersion <= lastReadId) {
-                // уже прочитано
-                return;
-            }
+            if (lastReadId && metaVersion <= lastReadId) return;
 
             if (!passwords[file]) {
-                // не знаем сколько непрочитанных без пароля — ставим точку
                 result[file] = { hasUnread: true, count: 0 };
                 return;
             }
 
-            // Тянем основной файл, чтобы посчитать количество непрочитанных
             const path = getChatPath(file);
             const res = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
             if (!res.exists) return;
@@ -1637,9 +1694,7 @@ async function checkUnreadForAllChats() {
             for (const enc of encMessages) {
                 if (!lastReadId || enc.id > lastReadId) unreadCount++;
             }
-            if (unreadCount > 0) {
-                result[file] = { hasUnread: true, count: unreadCount };
-            }
+            if (unreadCount > 0) result[file] = { hasUnread: true, count: unreadCount };
         } catch (e) {
             console.warn('checkUnread error for', file, e.message);
             if (chat.hasUnread) result[file] = { hasUnread: true, count: chat.unreadCount || 0 };
@@ -1670,14 +1725,11 @@ async function refreshUnreadBadges() {
 // ===================================================================
 //  АВТОВХОД
 // ===================================================================
-function getAutorunChat() {
-    return localStorage.getItem('chathub_autorun') || null;
-}
+function getAutorunChat() { return localStorage.getItem('chathub_autorun') || null; }
 function setAutorunChat(file) {
     if (file) localStorage.setItem('chathub_autorun', file);
     else localStorage.removeItem('chathub_autorun');
 }
-
 function toggleAutorun(file) {
     const current = getAutorunChat();
     if (current === file) {
@@ -1697,46 +1749,31 @@ function toggleAutorun(file) {
     }
     renderChatsList();
 }
-
 function clearAutorunIfInvalid() {
     const file = getAutorunChat();
     if (!file) return;
     const chatExists = state.chats.some(c => c.file === file);
     const hasPwd = !!state.savedPasswords[file];
-    if (!chatExists || !hasPwd) {
-        setAutorunChat(null);
-    }
+    if (!chatExists || !hasPwd) setAutorunChat(null);
 }
 
 // ===================================================================
 //  ЭКСПОРТ / ИМПОРТ
 // ===================================================================
-const PROFILE_FORMAT = {
-    APP: 'sms-chat',
-    VERSION: 1,
-    EXTENSION: '.smschat',
-};
+const PROFILE_FORMAT = { APP: 'sms-chat', VERSION: 1, EXTENSION: '.smschat' };
 
 function buildProfileObject({ includePasswords, includeUsername }) {
     const profile = {
         app: PROFILE_FORMAT.APP,
         version: PROFILE_FORMAT.VERSION,
         exportedAt: new Date().toISOString(),
-        chats: state.chats.map(c => ({
-            name: c.name || c.file,
-            file: c.file,
-            createdAt: c.createdAt || null,
-        })),
+        chats: state.chats.map(c => ({ name: c.name || c.file, file: c.file, createdAt: c.createdAt || null })),
         savedPasswords: includePasswords ? { ...state.savedPasswords } : {},
-        _meta: {
-            includesPasswords: !!includePasswords,
-            includesUsername: !!includeUsername,
-        },
+        _meta: { includesPasswords: !!includePasswords, includesUsername: !!includeUsername },
     };
     if (includeUsername) profile.username = state.username;
     return profile;
 }
-
 function downloadProfileFile() {
     const includePasswords = $('exportIncludePasswords').checked;
     const includeUsername = $('exportIncludeUsername').checked;
@@ -1748,28 +1785,22 @@ function downloadProfileFile() {
     const safeUser = (state.username || 'user').replace(/[^a-zA-Z0-9_-]/g, '');
     const filename = `smschat-${safeUser}-${dateStr}${PROFILE_FORMAT.EXTENSION}`;
     const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
     setTimeout(() => URL.revokeObjectURL(url), 1000);
     $('exportModal').classList.remove('active');
     showToast('💾 Файл сохранён', 2000);
     soundManager.play('click');
 }
-
 function openExportModal() {
     if (state.chats.length === 0 && Object.keys(state.savedPasswords).length === 0) {
-        showToast('❌ Нечего экспортировать', 2000);
-        return;
+        showToast('❌ Нечего экспортировать', 2000); return;
     }
     $('exportIncludePasswords').checked = true;
     $('exportIncludeUsername').checked = true;
     updateExportWarning();
     $('exportModal').classList.add('active');
 }
-
 function updateExportWarning() {
     const withPwd = $('exportIncludePasswords').checked;
     const warn = $('exportWarning');
@@ -1789,7 +1820,6 @@ function updateExportWarning() {
 }
 
 let _pendingShareFile = null;
-
 function openShareChatModal(file) {
     const chat = state.chats.find(c => c.file === file);
     if (!chat) { showToast('❌ Чат не найден', 1500); return; }
@@ -1808,18 +1838,13 @@ function openShareChatModal(file) {
     }
     $('shareChatModal').classList.add('active');
 }
-
 function exportSingleChat() {
     if (!_pendingShareFile) return;
     const file = _pendingShareFile;
     const chat = state.chats.find(c => c.file === file);
     if (!chat) { showToast('❌ Чат не найден', 1500); return; }
     const password = state.savedPasswords[file];
-    if (!password) {
-        showToast('🔐 Пароль чата не сохранён', 2500);
-        soundManager.play('error');
-        return;
-    }
+    if (!password) { showToast('🔐 Пароль чата не сохранён', 2500); soundManager.play('error'); return; }
     const profile = {
         app: PROFILE_FORMAT.APP,
         version: PROFILE_FORMAT.VERSION,
@@ -1835,11 +1860,8 @@ function exportSingleChat() {
     const safeName = (chat.name || chat.file).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 30);
     const filename = `smschat-share-${safeName}-${dateStr}${PROFILE_FORMAT.EXTENSION}`;
     const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
     setTimeout(() => URL.revokeObjectURL(url), 1000);
     $('shareChatModal').classList.remove('active');
     _pendingShareFile = null;
@@ -1848,7 +1870,6 @@ function exportSingleChat() {
 }
 
 let _pendingImportProfile = null;
-
 function openImportModal() {
     $('importFileInput').value = '';
     $('importPreview').style.display = 'none';
@@ -1859,13 +1880,9 @@ function openImportModal() {
     _pendingImportProfile = null;
     $('importModal').classList.add('active');
 }
-
 async function handleImportFile(file) {
     if (!file) return;
-    if (file.size > 5 * 1024 * 1024) {
-        showToast('❌ Файл слишком большой (>5MB)', 2500);
-        return;
-    }
+    if (file.size > 5 * 1024 * 1024) { showToast('❌ Файл слишком большой (>5MB)', 2500); return; }
     try {
         const text = await file.text();
         const data = JSON.parse(text);
@@ -1919,9 +1936,7 @@ async function handleImportFile(file) {
         if (data.savedPasswords && typeof data.savedPasswords === 'object') {
             for (const [k, v] of Object.entries(data.savedPasswords)) {
                 const file_ = sanitizeChatFile(k);
-                if (file_ && typeof v === 'string' && v.length > 0) {
-                    importedPasswords[file_] = v;
-                }
+                if (file_ && typeof v === 'string' && v.length > 0) importedPasswords[file_] = v;
             }
         }
         const username = typeof data.username === 'string' ? data.username.slice(0, 20) : null;
@@ -1954,52 +1969,37 @@ async function handleImportFile(file) {
         soundManager.play('error');
     }
 }
-
 function applyImport() {
     if (!_pendingImportProfile) return;
     const profile = _pendingImportProfile;
     const replace = profile.isSingleChat ? false : $('importReplaceMode').checked;
 
-    if (replace) {
-        state.chats = profile.chats;
-    } else {
+    if (replace) state.chats = profile.chats;
+    else {
         const existing = new Map(state.chats.map(c => [c.file, c]));
         for (const c of profile.chats) {
-            if (existing.has(c.file)) {
-                const old = existing.get(c.file);
-                old.name = c.name || old.name;
-            } else {
-                state.chats.push(c);
-            }
+            if (existing.has(c.file)) existing.get(c.file).name = c.name || existing.get(c.file).name;
+            else state.chats.push(c);
         }
     }
-
-    if (replace) {
-        state.savedPasswords = { ...profile.savedPasswords };
-    } else {
+    if (replace) state.savedPasswords = { ...profile.savedPasswords };
+    else {
         for (const [k, v] of Object.entries(profile.savedPasswords)) {
             if (!state.savedPasswords[k]) state.savedPasswords[k] = v;
         }
     }
-
     if (profile.username && !state.username) {
         state.username = profile.username;
         if (!usernameInput.value) usernameInput.value = profile.username;
     }
-
     saveChatsList();
     saveSavedPasswords();
     clearAutorunIfInvalid();
     $('importModal').classList.remove('active');
     _pendingImportProfile = null;
 
-    if (profile.isSingleChat) {
-        showToast(`✅ Чат «${profile.chats[0].name}» добавлен`, 2500);
-    } else {
-        const totalChats = state.chats.length;
-        const totalPwd = Object.keys(state.savedPasswords).length;
-        showToast(`✅ Импортировано: ${totalChats} чатов, ${totalPwd} паролей`, 2500);
-    }
+    if (profile.isSingleChat) showToast(`✅ Чат «${profile.chats[0].name}» добавлен`, 2500);
+    else showToast(`✅ Импортировано: ${state.chats.length} чатов, ${Object.keys(state.savedPasswords).length} паролей`, 2500);
     soundManager.play('send');
     if (state.currentScreen === 'chats') {
         renderChatsList();
@@ -2012,6 +2012,7 @@ function applyImport() {
 // ===================================================================
 const SCROLL_THRESHOLD = 80;
 const SCROLL_BTN_SHOW = 150;
+const SCROLL_TOP_TRIGGER = 80;
 let scrollState = { isAtBottom: true, unreadCount: 0 };
 
 function isNearBottom() {
@@ -2057,10 +2058,19 @@ function scrollToBottomNow() {
     scrollState.isAtBottom = true;
     setTimeout(updateScrollButton, 300);
 }
+
+let _scrollRaf = null;
 messagesContainer.addEventListener('scroll', () => {
-    scrollState.isAtBottom = isNearBottom();
-    if (scrollState.isAtBottom) { scrollState.unreadCount = 0; updateScrollBadge(); }
-    updateScrollButton();
+    if (_scrollRaf) return;
+    _scrollRaf = requestAnimationFrame(() => {
+        _scrollRaf = null;
+        scrollState.isAtBottom = isNearBottom();
+        if (scrollState.isAtBottom) { scrollState.unreadCount = 0; updateScrollBadge(); }
+        updateScrollButton();
+        if (messagesContainer.scrollTop < SCROLL_TOP_TRIGGER && !_loadingOlder) {
+            loadOlderMessages();
+        }
+    });
 }, { passive: true });
 
 // ===================================================================
@@ -2155,7 +2165,7 @@ function compressImage(file, maxWidth, maxHeight, quality) {
                 canvas.width = width; canvas.height = height;
                 const ctx = canvas.getContext('2d');
                 ctx.drawImage(img, 0, 0, width, height);
-                resolve(canvas.toDataURL('image/jpeg', quality));
+                canvas.toBlob((blob) => resolve(blob), 'image/jpeg', quality);
             };
             img.src = e.target.result;
         };
@@ -2180,7 +2190,106 @@ function base64ToUtf8(base64) {
 }
 
 // ===================================================================
-//  СООБЩЕНИЯ
+//  ШИФРОВАНИЕ ВЛОЖЕНИЙ
+// ===================================================================
+async function encryptAttachment(arrayBuffer, key) {
+    const iv = generateIV();
+    const cipher = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, arrayBuffer);
+    return { iv: arrayBufferToBase64(iv), cipher };
+}
+
+async function decryptAttachment(combinedArrayBuffer, key) {
+    const combined = new Uint8Array(combinedArrayBuffer);
+    const ivLen = new DataView(combined.buffer, combined.byteOffset, 4).getUint32(0);
+    const iv = combined.slice(4, 4 + ivLen);
+    const cipher = combined.slice(4 + ivLen);
+    return crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, cipher);
+}
+
+async function uploadAttachment(chatFile, attachName, cipherArrayBuffer, ivBase64) {
+    const ivBytes = new Uint8Array(base64ToArrayBuffer(ivBase64));
+    const combined = new Uint8Array(4 + ivBytes.length + cipherArrayBuffer.byteLength);
+    new DataView(combined.buffer).setUint32(0, ivBytes.length);
+    combined.set(ivBytes, 4);
+    combined.set(new Uint8Array(cipherArrayBuffer), 4 + ivBytes.length);
+
+    const path = getAttachmentPath(chatFile, attachName);
+    const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${path}`;
+    const res = await fetch(url, {
+        method: 'PUT',
+        headers: getHeaders(state.token),
+        body: JSON.stringify({
+            message: `📎 ${attachName}`,
+            content: arrayBufferToBase64(combined.buffer),
+        }),
+    });
+    if (res.status === 401) throw new Error('401');
+    if (res.status === 403) throw new Error('403');
+    if (res.status === 409) throw new Error('409 CONFLICT');
+    if (!res.ok) {
+        const error = await res.json().catch(() => ({}));
+        throw new Error(error.message || `upload: ${res.status}`);
+    }
+    return await res.json();
+}
+
+async function loadAttachment(chatFile, attachName) {
+    if (_attachmentCache.has(attachName)) return _attachmentCache.get(attachName);
+    if (_pendingAttachmentLoads.has(attachName)) return _pendingAttachmentLoads.get(attachName);
+
+    const promise = (async () => {
+        const path = getAttachmentPath(chatFile, attachName);
+        const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${path}`;
+        const res = await fetch(url, { headers: getHeaders(state.token), cache: 'force-cache' });
+        if (!res.ok) throw new Error(`attachment: ${res.status}`);
+        const data = await res.json();
+        const binary = base64ToArrayBuffer((data.content || '').replace(/\n/g, ''));
+        const plain = await decryptAttachment(binary, CRYPTO._key);
+        const blob = new Blob([plain], { type: guessMimeFromName(attachName) });
+        const blobUrl = URL.createObjectURL(blob);
+        _attachmentCache.set(attachName, blobUrl);
+        _pendingAttachmentLoads.delete(attachName);
+        return blobUrl;
+    })();
+
+    _pendingAttachmentLoads.set(attachName, promise);
+    try { return await promise; }
+    catch (e) { _pendingAttachmentLoads.delete(attachName); throw e; }
+}
+
+async function loadAttachmentsIn(root) {
+    const placeholders = root.querySelectorAll('[data-attach]:not([data-loaded])');
+    if (placeholders.length === 0) return;
+    const tasks = [];
+    placeholders.forEach(el => {
+        el.dataset.loaded = '1';
+        const name = el.dataset.attach;
+        const isImage = /\.(jpg|jpeg|png)$/i.test(name);
+        tasks.push((async () => {
+            try {
+                const url = await loadAttachment(state.chatFile, name);
+                if (isImage) {
+                    el.innerHTML = `<img src="${url}" alt="Изображение" onclick="openImageModal('${url}')">`;
+                } else {
+                    const msgId = el.dataset.msgid || '';
+                    const duration = parseFloat(el.dataset.duration) || 0;
+                    const wrapper = document.createElement('div');
+                    wrapper.innerHTML = createAudioPlayerHTML(msgId, url, duration, '');
+                    const node = wrapper.firstElementChild;
+                    el.replaceWith(node);
+                }
+            } catch (e) {
+                console.error('attach load error', name, e);
+                el.innerHTML = `<div class="attach-error">⚠️ не загрузилось</div>`;
+            }
+        })());
+    });
+    await Promise.allSettled(tasks);
+    setTimeout(initAudioPlayers, 0);
+}
+
+// ===================================================================
+//  СООБЩЕНИЯ (шифрование payload)
 // ===================================================================
 async function encryptMessage(msg) {
     const payload = { username: msg.username, text: msg.text || '' };
@@ -2300,9 +2409,7 @@ async function tryGetFileBlobSha(token, owner, repo, commitSha, path) {
         const normalized = path.replace(/^\/+/, '');
         const entry = (data.tree || []).find(t => t.path === normalized || t.path.endsWith('/' + normalized));
         return entry ? entry.sha : null;
-    } catch (e) {
-        return null;
-    }
+    } catch (e) { return null; }
 }
 
 async function tryGetBlobContent(token, owner, repo, blobSha) {
@@ -2317,9 +2424,7 @@ async function tryGetBlobContent(token, owner, repo, blobSha) {
         if (data.encoding === 'none' || !data.content) return null;
         const decoded = base64ToUtf8(data.content.replace(/\n/g, ''));
         return JSON.parse(decoded);
-    } catch (e) {
-        return null;
-    }
+    } catch (e) { return null; }
 }
 
 async function fetchFile(token, owner, repo, path) {
@@ -2356,25 +2461,16 @@ async function saveFile(token, owner, repo, path, content, sha) {
     return { blobSha: data.content.sha, commitSha: data.commit.sha };
 }
 
-// ─── Meta-файл ───
 async function updateMeta(file, version, count) {
     const path = getMetaPath(file);
-    const meta = {
-        v: 1,
-        version: version,
-        count: count,
-        updatedAt: new Date().toISOString(),
-    };
+    const meta = { v: 1, version, count, updatedAt: new Date().toISOString() };
     const jsonString = JSON.stringify(meta);
     const encoded = utf8ToBase64(jsonString);
 
     for (let attempt = 0; attempt < 3; attempt++) {
         try {
             const existing = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
-            const body = {
-                message: `📌 meta ${file}`,
-                content: encoded,
-            };
+            const body = { message: `📌 meta ${file}`, content: encoded };
             if (existing.exists) body.sha = existing.sha;
 
             const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${path}`;
@@ -2385,7 +2481,7 @@ async function updateMeta(file, version, count) {
                 cache: 'no-store',
             });
             if (res.ok) return true;
-            if (res.status === 409) continue; // конфликт — повторим
+            if (res.status === 409) continue;
         } catch (e) {
             console.warn(`Meta update attempt ${attempt + 1} failed:`, e.message);
         }
@@ -2517,13 +2613,13 @@ async function handleMicClick() {
 }
 
 // ===================================================================
-//  ОТПРАВКА / УДАЛЕНИЕ
+//  ОТПРАВКА СООБЩЕНИЯ
 // ===================================================================
-async function sendMessage(text, imageData = null, audioData = null) {
+async function sendMessage(text, imageBlob = null, audioData = null) {
     if (!state.isAuthorized || !state.chatFile) { showToast('❌ Нет доступа', 2000); soundManager.play('error'); return; }
     if (!navigator.onLine || !networkState.isOnline) { showToast('📵 Нет подключения', 2500); soundManager.play('error'); return; }
     const hasText = text && text.trim();
-    const hasImage = imageData !== null;
+    const hasImage = imageBlob instanceof Blob;
     const hasAudio = audioData !== null;
     if ((!hasText && !hasImage && !hasAudio) || state.isSending) return;
 
@@ -2560,12 +2656,29 @@ async function sendMessage(text, imageData = null, audioData = null) {
             text: hasText ? text.trim() : '',
             time: new Date().toISOString()
         };
-        if (hasImage) plainMsg.image = imageData;
+
+        // Загружаем вложения отдельными файлами
+        if (hasImage) {
+            showToast('⏳ Загрузка фото...', 1200);
+            const attachName = generateAttachmentName('img', 'jpg');
+            const buf = await imageBlob.arrayBuffer();
+            const enc = await encryptAttachment(buf, CRYPTO._key);
+            await uploadAttachment(state.chatFile, attachName, enc.cipher, enc.iv);
+            plainMsg.image = attachName;
+        }
+
         if (hasAudio) {
-            plainMsg.audio = audioData.data;
+            showToast('⏳ Загрузка аудио...', 1200);
+            const attachName = generateAttachmentName('aud', 'webm');
+            const b64 = audioData.data.includes(',') ? audioData.data.split(',')[1] : audioData.data;
+            const buf = base64ToArrayBuffer(b64);
+            const enc = await encryptAttachment(buf, CRYPTO._key);
+            await uploadAttachment(state.chatFile, attachName, enc.cipher, enc.iv);
+            plainMsg.audio = attachName;
             plainMsg.audioDuration = audioData.duration || 0;
             plainMsg.audioMime = audioData.mime || 'audio/webm';
         }
+
         state._lastSentMessageId = messageId;
 
         const encMsg = await encryptMessage(plainMsg);
@@ -2576,27 +2689,23 @@ async function sendMessage(text, imageData = null, audioData = null) {
 
         const saved = await saveFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path, fileContent, sha);
 
-        // Обновляем meta
         await updateMeta(state.chatFile, messageId, fileContent.messages.length);
         state._lastMetaVersion = messageId;
-        // 🔧 FIX: инвалидируем ETag, чтобы следующий poll перечитал meta
         state._metaEtag = null;
         state._metaEtagsByFile[state.chatFile] = null;
 
+        // Локально добавляем и рендерим только новое
         state.messages.push(plainMsg);
-        if (state.messages.length > CONFIG.maxMessages) {
-            state.messages = state.messages.slice(-CONFIG.maxMessages);
-        }
         state.sha = saved.blobSha;
         state._lastCommitSha = saved.commitSha;
-        state.lastMessageCount = state.messages.length;
+        state.lastMessageCount = fileContent.messages.length;
         state._lastActivityAt = Date.now();
 
         messageInput.value = '';
         messageInput.style.height = 'auto';
         scrollState.isAtBottom = true;
 
-        renderMessages(state.messages);
+        appendMessages([plainMsg]);
         scrollToBottom(true);
         markChatAsRead();
         soundManager.play('click');
@@ -2639,20 +2748,27 @@ async function deleteMessage(messageId) {
         fileContent.messages = encMessages;
         const saved = await saveFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path, fileContent, result.sha);
 
-        // Обновляем meta (даже при удалении — это тоже изменение)
         const newVersion = Date.now();
         await updateMeta(state.chatFile, newVersion, fileContent.messages.length);
         state._lastMetaVersion = newVersion;
-        // 🔧 FIX: инвалидируем ETag
         state._metaEtag = null;
         state._metaEtagsByFile[state.chatFile] = null;
 
+        // Удаляем DOM-узел
+        const node = messagesInner.querySelector(`.message-wrapper[data-msg-id="${messageId}"]`);
+        if (node) node.remove();
+        historyState.allMessages = historyState.allMessages.filter(m => m.id !== messageId);
         state.messages = state.messages.filter(m => m.id !== messageId);
+
         state.sha = saved.blobSha;
         state._lastCommitSha = saved.commitSha;
-        state.lastMessageCount = state.messages.length;
+        state.lastMessageCount = fileContent.messages.length;
         state._lastActivityAt = Date.now();
-        renderMessages(state.messages);
+
+        // Если история короткая — обновим полностью
+        if (historyState.allMessages.length <= CONFIG.renderInitial) {
+            renderHistory();
+        }
         soundManager.play('delete');
         showToast('🗑️ Удалено', 1000);
     } catch (error) {
@@ -2672,8 +2788,8 @@ async function handleFileUpload(file) {
     if (file.size > CONFIG.maxImageSize) { showToast(`❌ Файл слишком большой`, 3000); return; }
     try {
         showToast('⏳ Обработка...', 1500);
-        const compressedImage = await compressImage(file);
-        await sendMessage('', compressedImage);
+        const compressedBlob = await compressImage(file);
+        await sendMessage('', compressedBlob);
     } catch (error) {
         console.error(error);
         showToast('❌ Ошибка обработки', 3000);
@@ -2781,81 +2897,178 @@ function seekAudio(event, msgId) {
 // ===================================================================
 //  РЕНДЕРИНГ СООБЩЕНИЙ
 // ===================================================================
-function renderMessages(messages) {
-    if (!state.isAuthorized) {
-        messagesInner.innerHTML = `<div class="message system locked">🔒 История недоступна</div>`;
-        return;
+function buildMessageHTML(msg, opts = {}) {
+    const isOwn = msg.username === state.username && state.isAuthorized;
+    const isUnread = opts.isUnread || false;
+    const senderName = msg.username || 'Аноним';
+    const fullTime = formatFullTime(msg.time);
+    let content = '';
+    if (msg.text) content += `<span class="text">${escapeHtml(msg.text)}</span>`;
+
+    if (msg.image) {
+        if (isAttachmentRef(msg.image)) {
+            content += `<div class="image-container attach-placeholder" data-attach="${msg.image}">⏳</div>`;
+        } else {
+            content += `<div class="image-container" onclick="openImageModal('${msg.image}')"><img src="${msg.image}" alt="Изображение"></div>`;
+        }
     }
-    if (!messages || messages.length === 0) {
+    if (msg.audio) {
+        if (isAttachmentRef(msg.audio)) {
+            content += `<div class="audio-container attach-placeholder" data-attach="${msg.audio}" data-msgid="${msg.id}" data-duration="${msg.audioDuration || 0}">⏳ аудио</div>`;
+        } else {
+            content += createAudioPlayerHTML(msg.id, msg.audio, msg.audioDuration, msg.audioMime);
+        }
+    }
+    return `
+        <div class="message-wrapper ${isOwn ? 'own' : 'other'}${isUnread ? ' unread' : ''}" data-msg-id="${msg.id}">
+            <div class="message">
+                <span class="sender">${isOwn ? 'Вы' : escapeHtml(senderName)}</span>
+                ${content}
+                <span class="time">${fullTime}</span>
+            </div>
+            ${isOwn ? `<button class="delete-btn" onclick="deleteMessage(${msg.id})" title="Удалить">✕</button>` : ''}
+        </div>
+    `;
+}
+
+function renderHistory() {
+    // Останавливаем все аудио
+    Object.keys(audioPlayers).forEach(id => {
+        try { audioPlayers[id].audio.pause(); } catch (e) {}
+        delete audioPlayers[id];
+    });
+
+    const all = historyState.allMessages;
+    const total = all.length;
+
+    if (total === 0) {
         messagesInner.innerHTML = `
             <div class="message system">💬 История пуста</div>
             <div class="message system" style="font-size:12px;color:#555;">Напишите первое сообщение!</div>
         `;
         return;
     }
-    Object.keys(audioPlayers).forEach(id => {
-        try { audioPlayers[id].audio.pause(); } catch (e) {}
-        delete audioPlayers[id];
-    });
+
+    const initial = Math.min(CONFIG.renderInitial, total);
+    const start = total - initial;
+    historyState.startIndex = start;
+    historyState.renderedCount = initial;
 
     const lastReadId = state.chatFile ? getLastReadId(state.chatFile) : null;
-    let firstUnreadIndex = -1;
-    for (let i = 0; i < messages.length; i++) {
-        const m = messages[i];
-        const isOwnMsg = m.username === state.username;
-        if (isOwnMsg) continue;
-        if (!lastReadId || m.id > lastReadId) {
-            firstUnreadIndex = i;
-            break;
-        }
+    let firstUnreadIdx = -1;
+    for (let i = start; i < total; i++) {
+        const m = all[i];
+        if (m.username === state.username) continue;
+        if (!lastReadId || m.id > lastReadId) { firstUnreadIdx = i; break; }
     }
 
-    let html = '', lastDate = '', dividerInserted = false;
-    messages.forEach((msg, idx) => {
-        const isOwn = msg.username === state.username && state.isAuthorized;
-        if (idx === firstUnreadIndex && firstUnreadIndex > 0 && !dividerInserted) {
+    let html = '';
+    if (start > 0) {
+        html += `<div class="history-sentinel" id="historySentinel">↑ Потяните вверх, чтобы загрузить ещё</div>`;
+    }
+
+    let lastDate = '';
+    for (let i = start; i < total; i++) {
+        const msg = all[i];
+        if (i === firstUnreadIdx && i > 0) {
             html += `<div class="unread-divider">Новые сообщения</div>`;
-            dividerInserted = true;
         }
         const msgDate = formatDate(msg.time);
         if (msgDate !== lastDate) { html += `<div class="message system">${msgDate}</div>`; lastDate = msgDate; }
-        const isUnread = idx >= firstUnreadIndex && firstUnreadIndex >= 0 && !isOwn;
-        const senderName = msg.username || 'Аноним';
-        const fullTime = formatFullTime(msg.time);
-        let content = '';
-        if (msg.text) content += `<span class="text">${escapeHtml(msg.text)}</span>`;
-        if (msg.image) {
-            content += `<div class="image-container" onclick="openImageModal('${msg.image}')"><img src="${msg.image}" alt="Изображение" loading="lazy"></div>`;
-        }
-        if (msg.audio) content += createAudioPlayerHTML(msg.id, msg.audio, msg.audioDuration, msg.audioMime);
-        html += `
-            <div class="message-wrapper ${isOwn ? 'own' : 'other'}${isUnread ? ' unread' : ''}">
-                <div class="message">
-                    <span class="sender">${isOwn ? 'Вы' : senderName}</span>
-                    ${content}
-                    <span class="time">${fullTime}</span>
-                </div>
-                ${isOwn ? `<button class="delete-btn" onclick="deleteMessage(${msg.id})" title="Удалить">✕</button>` : ''}
-            </div>
-        `;
-    });
+        const isUnread = firstUnreadIdx >= 0 && i >= firstUnreadIdx && msg.username !== state.username;
+        html += buildMessageHTML(msg, { isUnread });
+    }
+
     messagesInner.innerHTML = html;
-    setTimeout(initAudioPlayers, 0);
-    setTimeout(() => {
-        if (scrollState.isAtBottom) messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    loadAttachmentsIn(messagesInner);
+    requestAnimationFrame(() => {
+        messagesContainer.scrollTop = messagesContainer.scrollHeight;
         updateScrollButton();
-    }, 0);
+    });
+}
+
+function renderMessages(messages) {
+    historyState.allMessages = messages.slice();
+    renderHistory();
+}
+
+function appendMessages(newMsgs) {
+    if (!newMsgs || newMsgs.length === 0) return;
+    historyState.allMessages.push(...newMsgs);
+    let html = '';
+    let lastDate = messagesInner.dataset.lastDate || '';
+    for (const msg of newMsgs) {
+        const msgDate = formatDate(msg.time);
+        if (msgDate !== lastDate) { html += `<div class="message system">${msgDate}</div>`; lastDate = msgDate; }
+        html += buildMessageHTML(msg, { isUnread: true });
+    }
+    messagesInner.dataset.lastDate = lastDate;
+    messagesInner.insertAdjacentHTML('beforeend', html);
+    loadAttachmentsIn(messagesInner);
+    trimDomTop();
+}
+
+function trimDomTop() {
+    const wrappers = messagesInner.querySelectorAll('.message-wrapper');
+    if (wrappers.length <= CONFIG.maxDomNodes) return;
+    const toRemove = wrappers.length - CONFIG.maxDomNodes;
+    for (let i = 0; i < toRemove; i++) {
+        // Освобождаем blob URL у удаляемых
+        const imgs = wrappers[i].querySelectorAll('img[src^="blob:"]');
+        imgs.forEach(im => { try { URL.revokeObjectURL(im.src); } catch (e) {} });
+        wrappers[i].remove();
+        historyState.startIndex++;
+    }
+    if (historyState.startIndex > 0 && !$('historySentinel')) {
+        messagesInner.insertAdjacentHTML('afterbegin',
+            `<div class="history-sentinel" id="historySentinel">↑ Потяните вверх, чтобы загрузить ещё</div>`);
+    }
+}
+
+async function loadOlderMessages() {
+    if (_loadingOlder) return;
+    if (historyState.startIndex <= 0) return;
+    _loadingOlder = true;
+
+    const prevScrollHeight = messagesContainer.scrollHeight;
+    const prevScrollTop = messagesContainer.scrollTop;
+
+    const more = Math.min(CONFIG.renderPageSize, historyState.startIndex);
+    const newStart = historyState.startIndex - more;
+
+    let html = '';
+    let lastDate = '';
+    for (let i = newStart; i < historyState.startIndex; i++) {
+        const msg = historyState.allMessages[i];
+        const msgDate = formatDate(msg.time);
+        if (msgDate !== lastDate) { html += `<div class="message system">${msgDate}</div>`; lastDate = msgDate; }
+        html += buildMessageHTML(msg);
+    }
+
+    const sentinel = $('historySentinel');
+    if (sentinel) sentinel.insertAdjacentHTML('afterend', html);
+    else messagesInner.insertAdjacentHTML('afterbegin', html);
+
+    historyState.startIndex = newStart;
+    historyState.renderedCount += more;
+
+    await loadAttachmentsIn(messagesInner);
+
+    requestAnimationFrame(() => {
+        const newScrollHeight = messagesContainer.scrollHeight;
+        messagesContainer.scrollTop = prevScrollTop + (newScrollHeight - prevScrollHeight);
+        if (historyState.startIndex === 0) {
+            const s = $('historySentinel');
+            if (s) s.outerHTML = '<div class="history-start">— Начало истории —</div>';
+        }
+        _loadingOlder = false;
+    });
 }
 
 // ===================================================================
-//  ГАЛЕРЕЯ (двойной слой)
+//  ГАЛЕРЕЯ
 // ===================================================================
-const galleryState = {
-    images: [],
-    currentIndex: 0,
-    isOpen: false,
-};
-
+const galleryState = { images: [], currentIndex: 0, isOpen: false };
 const GALLERY_ANIM_MS = 500;
 
 const ImageZoom = (() => {
@@ -2895,7 +3108,6 @@ const ImageZoom = (() => {
         el.style.setProperty('--sc', `${opts.sc ?? 1}`);
         if (opts.opacity !== undefined) el.style.opacity = String(opts.opacity);
     }
-
     function applyActiveTransform(smooth = false) {
         const el = getActive();
         if (!el) return;
@@ -2904,7 +3116,6 @@ const ImageZoom = (() => {
         applySlideTransform(el, { tx, ty, sc: scale });
         if (smooth) setTimeout(() => el.classList.remove('smooth'), GALLERY_ANIM_MS + 100);
     }
-
     function clampTranslation() {
         if (scale <= 1) { tx = 0; ty = 0; return; }
         const el = getActive();
@@ -2915,19 +3126,12 @@ const ImageZoom = (() => {
         tx = Math.max(-maxX, Math.min(maxX, tx));
         ty = Math.max(-maxY, Math.min(maxY, ty));
     }
-
     function reset(smooth = true) {
         scale = 1; tx = 0; ty = 0;
         applyActiveTransform(smooth);
     }
-
-    function getTouchDistance(t1, t2) {
-        return Math.hypot(t1.clientX - t2.clientX, t1.clientY - t2.clientY);
-    }
-    function getMidpoint(t1, t2) {
-        return { x: (t1.clientX + t2.clientX) / 2, y: (t1.clientY + t2.clientY) / 2 };
-    }
-
+    function getTouchDistance(t1, t2) { return Math.hypot(t1.clientX - t2.clientX, t1.clientY - t2.clientY); }
+    function getMidpoint(t1, t2) { return { x: (t1.clientX + t2.clientX) / 2, y: (t1.clientY + t2.clientY) / 2 }; }
     function updateSwipeVisual(offsetY) {
         const el = getActive();
         applySlideTransform(el, { tx, ty: ty + offsetY, sc: scale });
@@ -2957,7 +3161,6 @@ const ImageZoom = (() => {
             closeImageModal();
         }, GALLERY_ANIM_MS);
     }
-
     function updateHorizVisual(offsetX) {
         const el = getActive();
         applySlideTransform(el, { tx: offsetX, ty: 0, sc: 1 });
@@ -2971,7 +3174,6 @@ const ImageZoom = (() => {
         applySlideTransform(el, { tx: 0, ty: 0, sc: 1, opacity: 1 });
         if (smooth) setTimeout(() => el.classList.remove('smooth'), GALLERY_ANIM_MS + 100);
     }
-
     function preloadImage(src) {
         return new Promise((resolve) => {
             const img = new Image();
@@ -2985,12 +3187,9 @@ const ImageZoom = (() => {
         if (!galleryState.isOpen || galleryState.images.length <= 1) return;
         const idx = galleryState.currentIndex;
         const total = galleryState.images.length;
-        const urls = [];
-        if (idx > 0) urls.push(galleryState.images[idx - 1]);
-        if (idx < total - 1) urls.push(galleryState.images[idx + 1]);
-        urls.forEach(src => { const im = new Image(); im.src = src; });
+        if (idx > 0) { const im = new Image(); im.src = galleryState.images[idx - 1]; }
+        if (idx < total - 1) { const im = new Image(); im.src = galleryState.images[idx + 1]; }
     }
-
     async function navigateGallery(direction) {
         if (galleryBusy) return false;
         const newIndex = galleryState.currentIndex + direction;
@@ -3019,12 +3218,10 @@ const ImageZoom = (() => {
         scale = 1; tx = 0; ty = 0;
         active.classList.remove('dragging');
         buffer.classList.remove('dragging');
-
         void buffer.offsetWidth;
 
         active.classList.add('smooth');
         buffer.classList.add('smooth');
-
         applySlideTransform(active, { tx: outX, ty: 0, sc: 1, opacity: 0 });
         applySlideTransform(buffer, { tx: 0, ty: 0, sc: 1, opacity: 1 });
 
@@ -3048,33 +3245,25 @@ const ImageZoom = (() => {
 
         return true;
     }
-
     function onTouchStart(e) {
         if (galleryBusy) return;
         const el = getActive();
         if (!el) return;
         if (e.touches.length === 2) {
-            isPinching = true;
-            isDragging = false;
-            isSwipingToClose = false;
-            isSwipingHoriz = false;
-            swipeDirection = null;
+            isPinching = true; isDragging = false; isSwipingToClose = false; isSwipingHoriz = false; swipeDirection = null;
             startDist = getTouchDistance(e.touches[0], e.touches[1]);
             startScale = scale;
             const mid = getMidpoint(e.touches[0], e.touches[1]);
-            startMidX = mid.x;
-            startMidY = mid.y;
-            startTx = tx;
-            startTy = ty;
+            startMidX = mid.x; startMidY = mid.y;
+            startTx = tx; startTy = ty;
             el.classList.add('dragging');
         } else if (e.touches.length === 1) {
             const now = Date.now();
             const tapX = e.touches[0].clientX;
             const tapY = e.touches[0].clientY;
             if (now - lastTapTime < 300 && !isPinching) {
-                if (scale > 1.05) {
-                    reset(true);
-                } else {
+                if (scale > 1.05) reset(true);
+                else {
                     const prevScale = scale;
                     scale = 2;
                     const rect = el.getBoundingClientRect();
@@ -3093,28 +3282,20 @@ const ImageZoom = (() => {
                 isDragging = true;
                 startX = tapX - tx;
                 startY = tapY - ty;
-                swipeStartX = tapX;
-                swipeStartY = tapY;
-                swipeOffsetY = 0;
-                swipeHorizOffsetX = 0;
-                isSwipingToClose = false;
-                isSwipingHoriz = false;
-                swipeDirection = null;
+                swipeStartX = tapX; swipeStartY = tapY;
+                swipeOffsetY = 0; swipeHorizOffsetX = 0;
+                isSwipingToClose = false; isSwipingHoriz = false; swipeDirection = null;
                 el.classList.add('dragging');
             }
         }
     }
-
     function onTouchMove(e) {
         if (galleryBusy) return;
         const el = getActive();
         if (!el) return;
         if (e.touches.length === 2) {
             e.preventDefault();
-            isPinching = true;
-            isSwipingToClose = false;
-            isSwipingHoriz = false;
-            swipeDirection = null;
+            isPinching = true; isSwipingToClose = false; isSwipingHoriz = false; swipeDirection = null;
             const dist = getTouchDistance(e.touches[0], e.touches[1]);
             if (startDist > 0) {
                 const ratio = dist / startDist;
@@ -3123,8 +3304,7 @@ const ImageZoom = (() => {
                 const mid = getMidpoint(e.touches[0], e.touches[1]);
                 const dx = mid.x - startMidX;
                 const dy = mid.y - startMidY;
-                tx = startTx + dx;
-                ty = startTy + dy;
+                tx = startTx + dx; ty = startTy + dy;
                 scale = newScale;
                 clampTranslation();
                 el.classList.remove('smooth');
@@ -3144,10 +3324,7 @@ const ImageZoom = (() => {
                             if (galleryState.images.length <= 1) swipeDirection = null;
                         } else if (Math.abs(dy) > Math.abs(dx) * 1.2) {
                             swipeDirection = 'v';
-                        } else {
-                            swipeDirection = null;
-                            return;
-                        }
+                        } else { swipeDirection = null; return; }
                     } else return;
                 }
                 if (swipeDirection === 'h') {
@@ -3177,7 +3354,6 @@ const ImageZoom = (() => {
             applySlideTransform(el, { tx, ty, sc: scale });
         }
     }
-
     function onTouchEnd(e) {
         if (galleryBusy) return;
         const el = getActive();
@@ -3185,51 +3361,38 @@ const ImageZoom = (() => {
         if (e.touches.length === 0) {
             if (isSwipingHoriz) {
                 const offset = swipeHorizOffsetX;
-                isSwipingHoriz = false;
-                swipeHorizOffsetX = 0;
-                swipeDirection = null;
+                isSwipingHoriz = false; swipeHorizOffsetX = 0; swipeDirection = null;
                 if (Math.abs(offset) > SWIPE_NAV_THRESHOLD) {
                     const dir = offset < 0 ? 1 : -1;
                     const moved = navigateGallery(dir);
                     if (!moved) resetHorizVisual(true);
-                } else {
-                    resetHorizVisual(true);
-                }
+                } else resetHorizVisual(true);
                 isDragging = false;
                 el.classList.remove('dragging');
                 return;
             }
             if (isSwipingToClose) {
                 const dy = swipeOffsetY;
-                isSwipingToClose = false;
-                swipeDirection = null;
+                isSwipingToClose = false; swipeDirection = null;
                 if (Math.abs(dy) > SWIPE_CLOSE_THRESHOLD) {
                     closeBySwipe();
-                    isDragging = false;
-                    isPinching = false;
+                    isDragging = false; isPinching = false;
                     el.classList.remove('dragging');
                     return;
                 }
                 swipeOffsetY = 0;
                 resetSwipeVisual(true);
             }
-            isPinching = false;
-            isDragging = false;
+            isPinching = false; isDragging = false;
             el.classList.remove('dragging');
-            if (scale < 1.02) {
-                reset(true);
-            } else {
-                clampTranslation();
-                applyActiveTransform(true);
-            }
+            if (scale < 1.02) reset(true);
+            else { clampTranslation(); applyActiveTransform(true); }
         } else if (e.touches.length === 1 && isPinching) {
-            isPinching = false;
-            isDragging = true;
+            isPinching = false; isDragging = true;
             startX = e.touches[0].clientX - tx;
             startY = e.touches[0].clientY - ty;
         }
     }
-
     function onWheel(e) {
         if (galleryBusy) return;
         e.preventDefault();
@@ -3242,7 +3405,6 @@ const ImageZoom = (() => {
         el.classList.remove('smooth');
         applySlideTransform(el, { tx, ty, sc: scale });
     }
-
     function bind() {
         [slideA, slideB].forEach(el => {
             if (!el) return;
@@ -3256,7 +3418,6 @@ const ImageZoom = (() => {
             el.addEventListener('mousedown', e => e.preventDefault());
         });
     }
-
     function unbind() {
         [slideA, slideB].forEach(el => {
             if (!el) return;
@@ -3273,7 +3434,6 @@ const ImageZoom = (() => {
             el.style.setProperty('--sc', '1');
         });
     }
-
     return {
         open() {
             slideA = document.getElementById('modalImage');
@@ -3326,7 +3486,6 @@ function updateGalleryUI() {
         dots.innerHTML = '';
     }
 }
-
 function openGallery(imageUrl) {
     const imgs = Array.from(
         messagesInner.querySelectorAll('.message .image-container img')
@@ -3370,18 +3529,12 @@ function closeImageModal() {
 //  ЭМОДЗИ
 // ===================================================================
 let _emojiPanelOpen = false;
-
 function buildEmojiPanel() {
     const panel = $('emojiPanel');
     if (!panel) return;
-    panel.innerHTML = EMOJI_LIST.map(e =>
-        `<div class="emoji-item" data-emoji="${e}">${e}</div>`
-    ).join('');
+    panel.innerHTML = EMOJI_LIST.map(e => `<div class="emoji-item" data-emoji="${e}">${e}</div>`).join('');
     panel.querySelectorAll('.emoji-item').forEach(el => {
-        el.addEventListener('click', (ev) => {
-            ev.stopPropagation();
-            insertEmoji(el.dataset.emoji);
-        });
+        el.addEventListener('click', (ev) => { ev.stopPropagation(); insertEmoji(el.dataset.emoji); });
     });
 }
 function insertEmoji(emoji) {
@@ -3410,7 +3563,7 @@ function toggleEmojiPanel(force) {
 }
 
 // ===================================================================
-//  POLLING (с meta-файлом и ETag)
+//  POLLING
 // ===================================================================
 async function pollUpdates() {
     if (state.isPolling || !state.token || !state.isAuthorized || !CRYPTO._key || !state.chatFile) return;
@@ -3418,20 +3571,15 @@ async function pollUpdates() {
     try {
         const chatPath = getChatPath(state.chatFile);
 
-        // 🔧 FIX: используем быстрый meta-запрос с ETag (1 запрос вместо 3)
         let metaRes = null;
         try {
             metaRes = await fetchMetaFast(state.chatFile, state._metaEtag);
         } catch (e) {
             console.warn('Meta fetch failed:', e.message);
-            // сетевые ошибки не роняют polling
-            if (e.message.includes('401') || e.message.includes('403')) {
-                throw e; // пробрасываем выше для lockChatUI
-            }
+            if (e.message.includes('401') || e.message.includes('403')) throw e;
             return;
         }
 
-        // Если meta не менялась — вообще ничего не делаем (0 запросов к основному файлу!)
         if (metaRes.notModified) {
             if (!networkState.isOnline) {
                 networkState.isOnline = true;
@@ -3439,19 +3587,12 @@ async function pollUpdates() {
             }
             return;
         }
+        if (!metaRes.exists) return;
 
-        if (!metaRes.exists) {
-            // Чата нет — ничего не делаем
-            return;
-        }
-
-        // Сохраняем новый ETag
         state._metaEtag = metaRes.etag || null;
-
         const metaVersion = metaRes.content && metaRes.content.version;
         if (!metaVersion) return;
 
-        // Если версия в meta совпадает с нашей — файл не менялся с нашей последней операции
         if (metaVersion === state._lastMetaVersion) {
             if (!networkState.isOnline) {
                 networkState.isOnline = true;
@@ -3460,19 +3601,14 @@ async function pollUpdates() {
             return;
         }
 
-        // Версия изменилась — тянем основной файл
         state._lastMetaVersion = metaVersion;
         state._lastActivityAt = Date.now();
 
-        const commitSha = await getLatestCommitSha(
-            state.token, CONFIG.repoOwner, CONFIG.repoName, chatPath
-        );
-
+        const commitSha = await getLatestCommitSha(state.token, CONFIG.repoOwner, CONFIG.repoName, chatPath);
         if (!networkState.isOnline) {
             networkState.isOnline = true;
             showToast('🌐 Соединение восстановлено', 2000);
         }
-
         if (!commitSha) return;
         if (commitSha === state._lastCommitSha) return;
 
@@ -3484,24 +3620,18 @@ async function pollUpdates() {
             const tryContent = await tryGetBlobContent(state.token, CONFIG.repoOwner, CONFIG.repoName, tryBlobSha);
             if (tryContent) { blobSha = tryBlobSha; content = tryContent; }
         }
-
         if (!content) {
             const fallback = await fetchViaContentsRef(state.token, CONFIG.repoOwner, CONFIG.repoName, chatPath, commitSha);
             if (!fallback) { state._lastCommitSha = commitSha; return; }
             blobSha = fallback.sha;
             content = fallback.content;
         }
-
-        if (blobSha === state.sha) {
-            state._lastCommitSha = commitSha;
-            return;
-        }
+        if (blobSha === state.sha) { state._lastCommitSha = commitSha; return; }
 
         state._lastCommitSha = commitSha;
         state.sha = blobSha;
 
         if (!content || content.v !== CRYPTO.VERSION) return;
-
         if (content.salt !== state.salt) {
             state.salt = content.salt;
             CRYPTO._key = await deriveKey(state.chatPassword, state.salt);
@@ -3517,7 +3647,6 @@ async function pollUpdates() {
             }
             state.messages = decrypted;
             state.lastMessageCount = decrypted.length;
-            // 🔧 FIX: если мы в списке чатов — обновляем бейджи, иначе — рендерим
             if (state.currentScreen === 'chat') {
                 renderMessages(state.messages);
             } else {
@@ -3543,15 +3672,9 @@ async function pollUpdates() {
         const addedCount = newPlainMessages.length;
 
         state.messages = state.messages.concat(newPlainMessages);
-        if (state.messages.length > CONFIG.maxMessages) {
-            state.messages = state.messages.slice(-CONFIG.maxMessages);
-        }
         state.lastMessageCount = encMessages.length;
 
-        // 🔧 FIX: главное изменение — если мы не в чате, не рендерим сообщения,
-        // а обновляем бейджи непрочитанных
         if (state.currentScreen !== 'chat') {
-            // обновляем бейдж
             const chat = state.chats.find(c => c.file === state.chatFile);
             if (chat) {
                 chat.hasUnread = true;
@@ -3564,7 +3687,7 @@ async function pollUpdates() {
         }
 
         scrollState.isAtBottom = wasAtBottom;
-        renderMessages(state.messages);
+        appendMessages(newPlainMessages);
 
         if (wasAtBottom) {
             scrollToBottom(true);
@@ -3593,28 +3716,17 @@ async function pollUpdates() {
     }
 }
 
-// Умный polling: быстрый при активности, медленный при бездействии
 let _pollTimerHandle = null;
-let _currentPollInterval = 0;
-
-// 🔧 FIX: главное — обёртка try/finally, чтобы polling никогда не останавливался
 function scheduleNextPoll() {
     if (_pollTimerHandle) clearTimeout(_pollTimerHandle);
     const idle = Date.now() - state._lastActivityAt > CONFIG.pollIdleThresholdMs;
     const interval = idle ? CONFIG.pollIntervalSlow : CONFIG.pollIntervalFast;
-    _currentPollInterval = interval;
     _pollTimerHandle = setTimeout(async () => {
-        try {
-            await pollUpdates();
-        } catch (e) {
-            console.error('Polling crashed, but will continue:', e);
-        } finally {
-            // 🔧 FIX: всегда планируем следующий poll, что бы ни случилось
-            scheduleNextPoll();
-        }
+        try { await pollUpdates(); }
+        catch (e) { console.error('Polling crashed, but will continue:', e); }
+        finally { scheduleNextPoll(); }
     }, interval);
 }
-
 function startPolling() {
     if (_pollTimerHandle) clearTimeout(_pollTimerHandle);
     state._lastActivityAt = Date.now();
@@ -3739,7 +3851,6 @@ function removeChatFromList(file) {
 //  ПЕРЕИМЕНОВАНИЕ
 // ===================================================================
 let _pendingRenameFile = null;
-
 function openRenameChatModal(file) {
     const chat = state.chats.find(c => c.file === file);
     if (!chat) { showToast('❌ Чат не найден', 1500); return; }
@@ -3804,7 +3915,6 @@ async function confirmCreateChat() {
         await deriveKey(password, salt);
         const content = { v: CRYPTO.VERSION, salt, messages: [] };
         await saveFile(state.token, CONFIG.repoOwner, CONFIG.repoName, getChatPath(file), content, null);
-        // Создаём meta
         const initialVersion = Date.now();
         await updateMeta(file, initialVersion, 0);
 
@@ -3859,15 +3969,15 @@ async function confirmOpenChat() {
 
 async function enterChat(file, name, password) {
     stopPolling();
-    Object.keys(audioPlayers).forEach(id => {
-        try { audioPlayers[id].audio.pause(); } catch (e) {}
-        delete audioPlayers[id];
-    });
+    clearAttachmentCache();
+    resetHistoryState();
+
     state.messages = []; state.sha = null; state.lastMessageCount = 0;
     state._lastCommitSha = null;
     state._lastMetaVersion = null;
-    state._metaEtag = null;    // 🔧 FIX
-    state._lastSentMessageId = null; CRYPTO._key = null; state.salt = null;
+    state._metaEtag = null;
+    state._lastSentMessageId = null;
+    CRYPTO._key = null; state.salt = null;
 
     state.chatFile = file;
     state.chatName = name;
@@ -3877,6 +3987,7 @@ async function enterChat(file, name, password) {
     chatTitle.textContent = `Чат: ${name}`;
     userAvatar.textContent = getInitials(state.username);
 
+    messagesInner.dataset.lastDate = '';
     showChatScreen();
     showInputBar();
 
@@ -3940,7 +4051,6 @@ async function enterChat(file, name, password) {
     state._lastCommitSha = result.commitSha;
     state.lastMessageCount = decrypted.length;
 
-    // 🔧 FIX: читаем meta через быстрый запрос, получаем ETag
     try {
         const metaRes = await fetchMetaFast(file, null);
         if (metaRes.exists) {
@@ -3951,8 +4061,8 @@ async function enterChat(file, name, password) {
         }
     } catch (e) { /* ok */ }
 
-    renderMessages(state.messages);
-    scrollToBottom(true);
+    historyState.allMessages = decrypted.slice();
+    renderHistory();
     startPolling();
     setTimeout(() => { if (state.chatFile === file) markChatAsRead(); }, 1500);
 }
@@ -4097,17 +4207,19 @@ function logout() {
         try { audioPlayers[id].audio.pause(); } catch (e) {}
         delete audioPlayers[id];
     });
+    clearAttachmentCache();
+    resetHistoryState();
     state.isPolling = false;
     state.isAuthorized = false;
     state._lastSentMessageId = null;
     state._lastMetaVersion = null;
-    state._metaEtag = null;    // 🔧 FIX
+    state._metaEtag = null;
     state._lastActivityAt = 0;
     state.messages = []; state.sha = null; state.lastMessageCount = 0;
     state.chatPassword = ''; state.salt = null;
     state.chatFile = null; state.chatName = null;
     state._lastCommitSha = null;
-    state._metaEtagsByFile = {};    // 🔧 FIX
+    state._metaEtagsByFile = {};
     CRYPTO._key = null;
     if (localStorage.getItem('chathub_remember') !== '1') {
         tokenInput.value = '';
@@ -4137,12 +4249,10 @@ function lockChatUI(reason) {
     state.isAuthorized = false;
     state.messages = []; state.sha = null; state.lastMessageCount = 0;
     state._lastCommitSha = null;
-    state._metaEtag = null;    // 🔧 FIX
+    state._metaEtag = null;
     CRYPTO._key = null;
     stopPolling();
-    messagesInner.innerHTML = `
-        <div class="message system locked">🔒 ${reason || 'Доступ закрыт'}</div>
-    `;
+    messagesInner.innerHTML = `<div class="message system locked">🔒 ${reason || 'Доступ закрыт'}</div>`;
     messageInput.disabled = true;
     sendBtn.disabled = true;
     fileBtn.disabled = true;
@@ -4154,27 +4264,24 @@ function lockChatUI(reason) {
     updateScrollBadge();
 }
 
-// ===================================================================
-//  НАЗАД К СПИСКУ
-// 🔧 FIX: НЕ останавливаем polling — он продолжит обновлять бейджи
-// ===================================================================
 function backToChats() {
     markChatAsRead();
     if (audioRecorder.isRecording) audioRecorder.cancel();
-    // 🔧 FIX: убрали stopPolling() — polling продолжит работать в фоне
-    // и будет обновлять бейджи непрочитанных
     Object.keys(audioPlayers).forEach(id => {
         try { audioPlayers[id].audio.pause(); } catch (e) {}
         delete audioPlayers[id];
     });
+    clearAttachmentCache();
+    resetHistoryState();
     state.messages = []; state.sha = null; state.lastMessageCount = 0;
     state._lastSentMessageId = null;
     state._lastMetaVersion = null;
-    state._metaEtag = null;    // 🔧 FIX
+    state._metaEtag = null;
     state._lastCommitSha = null;
     state.chatFile = null; state.chatName = null;
     state.chatPassword = ''; state.salt = null;
     CRYPTO._key = null;
+    messagesInner.dataset.lastDate = '';
     showChatsScreen();
 }
 
@@ -4265,13 +4372,11 @@ messageInput.addEventListener('keydown', (e) => {
         }
     }
 });
-// 🔧 FIX: обновляем активность при вводе — держим быстрый polling
 messageInput.addEventListener('input', () => {
     messageInput.style.height = 'auto';
     messageInput.style.height = Math.min(messageInput.scrollHeight, 120) + 'px';
     state._lastActivityAt = Date.now();
 });
-// 🔧 FIX: фокус тоже считается активностью
 messageInput.addEventListener('focus', () => {
     state._lastActivityAt = Date.now();
     if (state.chatFile) scrollToBottom();
@@ -4473,7 +4578,6 @@ async function restoreSession() {
 // ===================================================================
 restoreSession();
 
-// 🔧 FIX: периодическое обновление бейджей в списке чатов (страховка)
 setInterval(() => {
     if (state.currentScreen === 'chats' && state.isAuthorized) {
         refreshUnreadBadges();
@@ -4489,16 +4593,13 @@ setInterval(() => {
     }
 }, 1000);
 
-console.log('✅ SMS Чат с meta-файлами загружен!');
-console.log('🔐 AES-256-GCM + PBKDF2 (200k)');
-console.log('📌 Meta-файл: ~200 байт вместо 2 МБ при опросе');
+console.log('✅ SMS Чат с файловыми вложениями загружен!');
+console.log('🔐 AES-256-GCM + PBKDF2 (200k) для сообщений и вложений');
+console.log('📎 Вложения хранятся в chats/<chatId>/ — отдельные файлы, имена img_xxx.jpg / aud_xxx.webm');
+console.log('📌 chat.json содержит только текст и ссылки на вложения');
+console.log('📜 История: показываем 5 последних, при скролле вверх подгружаем по 10');
+console.log('🔧 ETag для meta — 304 не жрёт rate limit');
 console.log('⚡ Умный polling: 2 сек при активности, 8 сек при бездействии');
-console.log('🔧 FIX: ETag для meta (304 не жрёт rate limit)');
-console.log('🔧 FIX: polling не останавливается при выходе в список чатов');
-console.log('🔧 FIX: try/finally в scheduleNextPoll — цепочка не рвётся');
-console.log('🗜️ Сжатие фото: 1200×1200, q0.80');
-console.log('🖼️ Галерея: перекрытие фаз, pinch-zoom, свайпы');
-console.log('😊 Эмодзи: настраиваются в EMOJI_LIST');
 </script>
 </body>
 </html>
