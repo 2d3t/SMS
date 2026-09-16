@@ -239,6 +239,84 @@
             display: block; width: 100%; max-height: 300px;
             object-fit: contain; border-radius: 12px; transition: transform 0.2s;
         }
+
+/* ═══ Кнопки действий на изображении ═══ */
+.message .image-container {
+    position: relative;
+}
+.image-actions {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    display: flex;
+    gap: 6px;
+    opacity: 0;
+    transition: opacity 0.2s ease, transform 0.2s ease;
+    transform: translateY(-4px);
+    z-index: 5;
+}
+.message .image-container:hover .image-actions,
+.message .image-container.show-actions .image-actions {
+    opacity: 1;
+    transform: translateY(0);
+}
+.image-action-btn {
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    border: 1px solid rgba(255,255,255,0.15);
+    background: rgba(0,0,0,0.55);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    color: #fff;
+    font-size: 15px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.15s, transform 0.15s;
+    padding: 0;
+    line-height: 1;
+}
+.image-action-btn:hover {
+    background: rgba(0,0,0,0.75);
+}
+.image-action-btn:active {
+    transform: scale(0.88);
+}
+.image-action-btn.download {
+    color: #00b894;
+    border-color: rgba(0,184,148,0.35);
+}
+.image-action-btn.share {
+    color: #6c5ce7;
+    border-color: rgba(108,92,231,0.35);
+}
+.image-action-btn.close-actions {
+    color: #ff6b6b;
+    border-color: rgba(255,107,107,0.35);
+    width: 28px;
+    height: 28px;
+    font-size: 12px;
+}
+
+@media (max-width: 480px) {
+    .image-action-btn {
+        width: 30px;
+        height: 30px;
+        font-size: 13px;
+    }
+    .image-action-btn.close-actions {
+        width: 24px;
+        height: 24px;
+        font-size: 11px;
+    }
+    .image-actions {
+        top: 6px;
+        right: 6px;
+        gap: 4px;
+    }
+}
         .message .image-container img:active { transform: scale(0.98); }
 
         .message .audio-container {
@@ -2790,8 +2868,27 @@ async function loadAttachmentsIn(root) {
         tasks.push((async () => {
             try {
                 const url = await loadAttachment(state.chatFile, name);
-                if (isImage) {
-                    el.innerHTML = `<img src="${url}" alt="Изображение" onclick="openImageModal('${url}')">`;
+               
+
+ if (isImage) {
+    el.onclick = (ev) => handleImageContainerClick(ev, url);
+    el.innerHTML = `
+        <img src="${url}" alt="Изображение">
+        <div class="image-actions">
+            <button class="image-action-btn download"
+                    onclick="event.stopPropagation(); downloadImageFromChat('${url}')"
+                    title="Скачать">⬇</button>
+            <button class="image-action-btn share"
+                    onclick="event.stopPropagation(); shareImageFromChat('${url}')"
+                    title="Поделиться">↗</button>
+            <button class="image-action-btn close-actions"
+                    onclick="event.stopPropagation(); hideImageActions(this)"
+                    title="Закрыть">✕</button>
+        </div>
+    `;
+}
+
+
                 } else if (isAudio) {
                     const msgId = el.dataset.msgid || '';
                     const duration = parseFloat(el.dataset.duration) || 0;
@@ -3574,6 +3671,107 @@ async function shareAttachedFile(url, fileName) {
     }
 }
 
+
+// ═══ Действия с изображениями ═══
+function handleImageContainerClick(event, url) {
+    // Если кнопки уже показаны — открываем галерею
+    const container = event.currentTarget;
+    if (container.classList.contains('show-actions')) {
+        container.classList.remove('show-actions');
+        openImageModal(url);
+        return;
+    }
+    // На тач-устройствах — первый тап показывает кнопки
+    if (window.matchMedia('(hover: none)').matches) {
+        document.querySelectorAll('.image-container.show-actions').forEach(el => {
+            if (el !== container) el.classList.remove('show-actions');
+        });
+        container.classList.add('show-actions');
+        return;
+    }
+    // На десктопе — сразу галерея (кнопки видны по :hover)
+    openImageModal(url);
+}
+
+function hideImageActions(btn) {
+    const container = btn.closest('.image-container');
+    if (container) container.classList.remove('show-actions');
+}
+
+function getImageFileName(url) {
+    const ext = (url.split('.').pop() || 'jpg').split('?')[0].split('#')[0];
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    return `photo-${ts}.${ext}`;
+}
+
+async function downloadImageFromChat(url) {
+    try {
+        showToast('💾 Скачивание...', 1200);
+        // blob: URL можно качать напрямую через <a download>
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = getImageFileName(url);
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        soundManager.play('click');
+    } catch (e) {
+        console.error('download image error:', e);
+        showToast('❌ Не удалось скачать', 2000);
+        soundManager.play('error');
+    }
+}
+
+async function shareImageFromChat(url) {
+    try {
+        // Если Web Share API с файлами недоступен — просто открываем
+        if (!navigator.share) {
+            showToast('📤 Открываем в новой вкладке', 1500);
+            window.open(url, '_blank', 'noopener,noreferrer');
+            return;
+        }
+        // Получаем blob из blob: URL
+        let blob;
+        try {
+            const res = await fetch(url);
+            blob = await res.blob();
+        } catch (e) {
+            console.warn('fetch blob failed, opening in new tab', e);
+            window.open(url, '_blank', 'noopener,noreferrer');
+            return;
+        }
+        if (blob.size > 25 * 1024 * 1024) {
+            showToast('📤 Фото большое, скачайте вручную', 2500);
+            return;
+        }
+        const fileName = getImageFileName(url);
+        const file = new File([blob], fileName, {
+            type: blob.type || 'image/jpeg'
+        });
+        const shareData = { files: [file], title: 'Фото' };
+        if (navigator.canShare && navigator.canShare(shareData)) {
+            await navigator.share(shareData);
+            soundManager.play('send');
+        } else {
+            // Файлы не поддерживаются — шарим URL/текст
+            await navigator.share({ title: 'Фото', text: 'Фото из SMS Чата' });
+        }
+    } catch (e) {
+        if (e.name === 'AbortError') return;
+        console.error('share image error:', e);
+        showToast('❌ Не удалось поделиться', 2000);
+        soundManager.play('error');
+    }
+}
+
+// Закрываем открытые actions при клике вне
+document.addEventListener('click', (e) => {
+    if (e.target.closest('.image-container')) return;
+    document.querySelectorAll('.image-container.show-actions').forEach(el => {
+        el.classList.remove('show-actions');
+    });
+}, true);
+
 // ===================================================================
 //  РЕНДЕРИНГ СООБЩЕНИЙ
 // ===================================================================
@@ -3586,12 +3784,28 @@ function buildMessageHTML(msg, opts = {}) {
     if (msg.text) content += `<span class="text">${escapeHtml(msg.text)}</span>`;
 
     if (msg.image) {
-        if (isAttachmentRef(msg.image)) {
-            content += `<div class="image-container attach-placeholder" data-attach="${msg.image}">⏳</div>`;
-        } else {
-            content += `<div class="image-container" onclick="openImageModal('${msg.image}')"><img src="${msg.image}" alt="Изображение"></div>`;
-        }
+    if (isAttachmentRef(msg.image)) {
+        content += `<div class="image-container attach-placeholder" data-attach="${msg.image}">⏳</div>`;
+    } else {
+        content += `
+            <div class="image-container"
+                 onclick="handleImageContainerClick(event, '${msg.image}')">
+                <img src="${msg.image}" alt="Изображение">
+                <div class="image-actions">
+                    <button class="image-action-btn download"
+                            onclick="event.stopPropagation(); downloadImageFromChat('${msg.image}')"
+                            title="Скачать">⬇</button>
+                    <button class="image-action-btn share"
+                            onclick="event.stopPropagation(); shareImageFromChat('${msg.image}')"
+                            title="Поделиться">↗</button>
+                    <button class="image-action-btn close-actions"
+                            onclick="event.stopPropagation(); hideImageActions(this)"
+                            title="Закрыть">✕</button>
+                </div>
+            </div>
+        `;
     }
+}
     if (msg.audio) {
         if (isAttachmentRef(msg.audio)) {
             content += `<div class="audio-container attach-placeholder" data-attach="${msg.audio}" data-msgid="${msg.id}" data-duration="${msg.audioDuration || 0}">⏳ аудио</div>`;
