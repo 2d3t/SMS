@@ -564,23 +564,15 @@
         }
 
 
-
 /* ═══ Кнопки «Скачать / Отправить» в галерее ═══ */
 .gallery-actions {
     position: absolute;
     bottom: 70px;
     left: 50%;
-    transform: translateX(-50%) translateY(20px);
+    transform: translateX(-50%);
     display: flex;
     gap: 10px;
     z-index: 3;
-    pointer-events: none;
-    opacity: 0;
-    transition: opacity 0.25s ease, transform 0.25s ease;
-}
-.gallery-actions.visible {
-    opacity: 1;
-    transform: translateX(-50%) translateY(0);
     pointer-events: auto;
 }
 .gallery-action-btn {
@@ -601,10 +593,15 @@
     font-family: inherit;
     -webkit-tap-highlight-color: transparent;
 }
-.gallery-action-btn span { font-size: 20px; line-height: 1; }
+.gallery-action-btn span {
+    font-size: 20px;
+    line-height: 1;
+}
 .gallery-action-btn small {
-    font-size: 10px; font-weight: 500;
-    color: rgba(255,255,255,0.7); letter-spacing: 0.3px;
+    font-size: 10px;
+    font-weight: 500;
+    color: rgba(255,255,255,0.7);
+    letter-spacing: 0.3px;
 }
 .gallery-action-btn:hover {
     background: rgba(255,255,255,0.18);
@@ -616,25 +613,13 @@
     border-color: rgba(108,92,231,0.5);
 }
 
-/* ═══ Счётчик и стрелки — тоже прячем/показываем ═══ */
-.image-modal .gallery-counter,
-.image-modal .gallery-arrow {
-    transition: opacity 0.25s ease, transform 0.25s ease;
-}
-.image-modal.ui-hidden .gallery-counter,
-.image-modal.ui-hidden .gallery-arrow {
-    opacity: 0;
-    pointer-events: none;
-}
-.image-modal.ui-hidden .gallery-arrow.prev { transform: translateY(-50%) translateX(-10px); }
-.image-modal.ui-hidden .gallery-arrow.next { transform: translateY(-50%) translateX(10px); }
-
 @media (max-width: 480px) {
     .gallery-actions { bottom: 60px; gap: 8px; }
     .gallery-action-btn { min-width: 56px; padding: 6px 10px; border-radius: 12px; }
     .gallery-action-btn span { font-size: 18px; }
     .gallery-action-btn small { font-size: 9px; }
 }
+
 
 
         .image-modal.has-gallery .gallery-arrow { display: flex; }
@@ -3967,10 +3952,6 @@ const ImageZoom = (() => {
         const newIndex = galleryState.currentIndex + direction;
         if (newIndex < 0 || newIndex >= galleryState.images.length) return false;
 
-// Скрываем кнопки при перелистывании
-if (typeof window._galleryHideActions === 'function') window._galleryHideActions();
-
-
         galleryBusy = true;
         const nextSrc = galleryState.images[newIndex];
         galleryState.currentIndex = newIndex;
@@ -4262,10 +4243,6 @@ function updateGalleryUI() {
         dots.innerHTML = '';
     }
 }
-
-
-
-
 function openGallery(imageUrl) {
     const imgs = Array.from(
         messagesInner.querySelectorAll('.message .image-container img')
@@ -4284,21 +4261,9 @@ function openGallery(imageUrl) {
     pre.onerror = init;
     pre.src = src;
     if (pre.complete && pre.naturalWidth) init();
-// Кнопки скрыты при открытии
-if (typeof window._galleryHideActions === 'function') window._galleryHideActions();
-
 }
-
-
-
-
-
 function openImageModal(imageUrl) { openGallery(imageUrl); }
-
-
-
 function closeImageModal() {
-if (typeof window._galleryHideActions === 'function') window._galleryHideActions();
     galleryState.isOpen = false;
     galleryState.images = [];
     galleryState.currentIndex = 0;
@@ -5458,98 +5423,11 @@ setInterval(() => {
 
 
 // ═══════════════════════════════════════════════════════════════
-//  СКАЧАТЬ / ОТПРАВИТЬ + ПОКАЗ/СКРЫТИЕ ПО ТАПУ
+//  СКАЧАТЬ / ОТПРАВИТЬ ИЗ ГАЛЕРЕИ
 // ═══════════════════════════════════════════════════════════════
 (function initGalleryActions() {
     const downloadBtn = $('galleryDownloadBtn');
     const shareBtn = $('galleryShareBtn');
-    const galleryActions = $('galleryActions');
-
-    let actionsVisible = false;
-    let autoHideTimer = null;
-
-    function showActions() {
-        actionsVisible = true;
-        galleryActions.classList.add('visible');
-        imageModal.classList.remove('ui-hidden');
-        resetAutoHide();
-    }
-    function hideActions() {
-        actionsVisible = false;
-        galleryActions.classList.remove('visible');
-        imageModal.classList.add('ui-hidden');
-        if (autoHideTimer) { clearTimeout(autoHideTimer); autoHideTimer = null; }
-    }
-    function toggleActions() {
-        if (actionsVisible) hideActions();
-        else showActions();
-    }
-    function resetAutoHide() {
-        if (autoHideTimer) clearTimeout(autoHideTimer);
-        autoHideTimer = setTimeout(() => { hideActions(); }, 4000);
-    }
-    // Экспортируем наружу, чтобы вызывать из галереи
-    window._galleryHideActions = hideActions;
-    window._galleryShowActions = showActions;
-
-    function getCurrentSrc() {
-        if (!galleryState.isOpen || galleryState.images.length === 0) return null;
-        return galleryState.images[galleryState.currentIndex];
-    }
-
-    downloadBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        const src = getCurrentSrc();
-        if (!src) return;
-        const a = document.createElement('a');
-        a.href = src;
-        a.download = 'image_' + Date.now() + '.jpg';
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        showToast('💾 Скачивание...', 1200);
-        if (navigator.vibrate) navigator.vibrate(20);
-        resetAutoHide();
-    });
-
-    shareBtn.addEventListener('click', async (e) => {
-        e.stopPropagation();
-        const src = getCurrentSrc();
-        if (!src) return;
-        if (navigator.vibrate) navigator.vibrate(20);
-        try {
-            const res = await fetch(src);
-            const blob = await res.blob();
-            const file = new File([blob], 'image_' + Date.now() + '.jpg', { type: blob.type || 'image/jpeg' });
-            if (navigator.canShare && navigator.canShare({ files: [file] })) {
-                await navigator.share({ files: [file], title: 'Изображение' });
-                return;
-            }
-            if (navigator.share) {
-                await navigator.share({
-                    title: 'Изображение',
-                    text: 'Посмотри это изображение',
-                    url: src.startsWith('blob:') ? undefined : src,
-                });
-                return;
-            }
-            if (!src.startsWith('blob:')) {
-                await navigator.clipboard.writeText(src);
-                showToast('📋 Ссылка скопирована', 1500);
-            } else {
-                const a = document.createElement('a');
-                a.href = src; a.download = file.name;
-                document.body.appendChild(a); a.click(); document.body.removeChild(a);
-                showToast('💾 Скачано', 1800);
-            }
-        } catch (err) {
-            if (err.name === 'AbortError') return;
-            console.error(err);
-            showToast('❌ Не удалось поделиться', 2000);
-        }
-        resetAutoHide();
-    });
-})();
 
     function getCurrentSrc() {
         if (!galleryState.isOpen || galleryState.images.length === 0) return null;
