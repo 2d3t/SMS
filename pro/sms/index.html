@@ -541,6 +541,8 @@
             border-radius: 3px;
         }
 
+
+
         .gallery-arrow {
             position: absolute;
             top: 50%;
@@ -560,6 +562,66 @@
             z-index: 2;
             user-select: none;
         }
+
+
+/* ═══ Кнопки «Скачать / Отправить» в галерее ═══ */
+.gallery-actions {
+    position: absolute;
+    bottom: 70px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    gap: 10px;
+    z-index: 3;
+    pointer-events: auto;
+}
+.gallery-action-btn {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    min-width: 64px;
+    padding: 8px 12px;
+    background: rgba(255,255,255,0.1);
+    backdrop-filter: blur(10px);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 14px;
+    color: #fff;
+    cursor: pointer;
+    transition: all 0.2s;
+    font-family: inherit;
+    -webkit-tap-highlight-color: transparent;
+}
+.gallery-action-btn span {
+    font-size: 20px;
+    line-height: 1;
+}
+.gallery-action-btn small {
+    font-size: 10px;
+    font-weight: 500;
+    color: rgba(255,255,255,0.7);
+    letter-spacing: 0.3px;
+}
+.gallery-action-btn:hover {
+    background: rgba(255,255,255,0.18);
+    border-color: rgba(255,255,255,0.25);
+}
+.gallery-action-btn:active {
+    transform: scale(0.92);
+    background: rgba(108,92,231,0.3);
+    border-color: rgba(108,92,231,0.5);
+}
+
+@media (max-width: 480px) {
+    .gallery-actions { bottom: 60px; gap: 8px; }
+    .gallery-action-btn { min-width: 56px; padding: 6px 10px; border-radius: 12px; }
+    .gallery-action-btn span { font-size: 18px; }
+    .gallery-action-btn small { font-size: 9px; }
+}
+
+
+
         .image-modal.has-gallery .gallery-arrow { display: flex; }
         .image-modal.single-image .gallery-arrow { display: none !important; }
         .gallery-arrow:hover { background: rgba(255,255,255,0.2); }
@@ -1342,6 +1404,15 @@
         <img id="modalImage" class="gallery-slide" src="" alt="Текущее изображение">
         <img id="modalImageNext" class="gallery-slide next" src="" alt="Следующее изображение">
     </div>
+<div class="gallery-actions" id="galleryActions">
+    <button class="gallery-action-btn" id="galleryDownloadBtn" title="Скачать">
+        <span>⬇</span><small>Скачать</small>
+    </button>
+    <button class="gallery-action-btn" id="galleryShareBtn" title="Отправить">
+        <span>↗</span><small>Отправить</small>
+    </button>
+</div>
+
     <div class="gallery-dots" id="galleryDots"></div>
 </div>
 
@@ -5350,6 +5421,93 @@ setInterval(() => {
     }
 }, 1000);
 
+
+// ═══════════════════════════════════════════════════════════════
+//  СКАЧАТЬ / ОТПРАВИТЬ ИЗ ГАЛЕРЕИ
+// ═══════════════════════════════════════════════════════════════
+(function initGalleryActions() {
+    const downloadBtn = $('galleryDownloadBtn');
+    const shareBtn = $('galleryShareBtn');
+
+    function getCurrentSrc() {
+        if (!galleryState.isOpen || galleryState.images.length === 0) return null;
+        return galleryState.images[galleryState.currentIndex];
+    }
+
+    // ─── Скачать ───
+    downloadBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const src = getCurrentSrc();
+        if (!src) return;
+        const a = document.createElement('a');
+        a.href = src;
+        a.download = 'image_' + Date.now() + '.jpg';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        showToast('💾 Скачивание...', 1200);
+        if (navigator.vibrate) navigator.vibrate(20);
+    });
+
+    // ─── Отправить ───
+    shareBtn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const src = getCurrentSrc();
+        if (!src) return;
+        if (navigator.vibrate) navigator.vibrate(20);
+
+        try {
+            // Пытаемся получить файл
+            const res = await fetch(src);
+            const blob = await res.blob();
+            const file = new File(
+                [blob],
+                'image_' + Date.now() + '.jpg',
+                { type: blob.type || 'image/jpeg' }
+            );
+
+            // Web Share API с файлами
+            if (navigator.canShare && navigator.canShare({ files: [file] })) {
+                await navigator.share({
+                    files: [file],
+                    title: 'Изображение',
+                });
+                return;
+            }
+
+            // Web Share API без файлов (текст/ссылка)
+            if (navigator.share) {
+                await navigator.share({
+                    title: 'Изображение',
+                    text: 'Посмотри это изображение',
+                    url: src.startsWith('blob:') ? undefined : src,
+                });
+                return;
+            }
+
+            // Fallback: копируем ссылку (если это не blob)
+            if (!src.startsWith('blob:')) {
+                await navigator.clipboard.writeText(src);
+                showToast('📋 Ссылка скопирована', 1500);
+            } else {
+                // Для blob — скачиваем как fallback
+                const a = document.createElement('a');
+                a.href = src;
+                a.download = file.name;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                showToast('💾 Поделиться недоступно — скачано', 2000);
+            }
+        } catch (err) {
+            if (err.name === 'AbortError') return;
+            console.error('Share error:', err);
+            showToast('❌ Не удалось поделиться', 2000);
+        }
+    });
+})();
+
+
 console.log('✅ SMS Чат собран!');
 console.log('🔐 AES-256-GCM + PBKDF2 (200k)');
 console.log('📎 Мини-меню выбора типа вложения');
@@ -5358,164 +5516,6 @@ console.log('📤 Web Share API для кнопки «Поделиться» в 
 console.log('🗑️ Удаление сообщения удаляет и вложение');
 console.log('📜 История: 5 последних, при скролле вверх по 10');
 console.log('🔧 Кнопка «вниз» скрывается при выходе из чата');
-// ═══════════════════════════════════════════════════════════════
-//  ДОЛГОЕ НАЖАТИЕ НА ИЗОБРАЖЕНИЕ → МЕНЮ «СКАЧАТЬ / ОТПРАВИТЬ»
-// ═══════════════════════════════════════════════════════════════
-(function initImageLongPress() {
-    const LONG_PRESS_MS = 500;
-    let timer = null;
-    let startX = 0, startY = 0;
-    let targetImg = null;
-    let menuEl = null;
-
-    function closeMenu() {
-        if (menuEl) {
-            menuEl.remove();
-            menuEl = null;
-        }
-    }
-
-    function showMenu(imgEl, x, y) {
-        closeMenu();
-        const src = imgEl.getAttribute('src');
-        if (!src) return;
-
-        menuEl = document.createElement('div');
-        menuEl.style.cssText = `
-            position: fixed;
-            left: ${Math.min(x, window.innerWidth - 200)}px;
-            top: ${Math.min(y, window.innerHeight - 120)}px;
-            background: #1a1a2e;
-            border: 1px solid rgba(255,255,255,0.12);
-            border-radius: 14px;
-            padding: 6px;
-            box-shadow: 0 12px 40px rgba(0,0,0,0.7);
-            z-index: 9999;
-            min-width: 180px;
-            animation: fadeInModal 0.15s ease;
-        `;
-
-        const btnStyle = `
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            padding: 11px 14px;
-            border-radius: 10px;
-            color: #fff;
-            font-size: 14px;
-            cursor: pointer;
-            user-select: none;
-            transition: background 0.15s;
-        `;
-
-        const downloadBtn = document.createElement('div');
-        downloadBtn.style.cssText = btnStyle;
-        downloadBtn.innerHTML = '<span style="font-size:18px;">⬇</span> Скачать';
-        downloadBtn.addEventListener('mouseenter', () => downloadBtn.style.background = 'rgba(255,255,255,0.07)');
-        downloadBtn.addEventListener('mouseleave', () => downloadBtn.style.background = 'transparent');
-        downloadBtn.addEventListener('click', () => {
-            const a = document.createElement('a');
-            a.href = src;
-            a.download = 'image_' + Date.now() + '.jpg';
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            closeMenu();
-            showToast('💾 Скачивание...', 1200);
-        });
-
-        const shareBtn = document.createElement('div');
-        shareBtn.style.cssText = btnStyle;
-        shareBtn.innerHTML = '<span style="font-size:18px;">↗</span> Отправить';
-        shareBtn.addEventListener('mouseenter', () => shareBtn.style.background = 'rgba(255,255,255,0.07)');
-        shareBtn.addEventListener('mouseleave', () => shareBtn.style.background = 'transparent');
-        shareBtn.addEventListener('click', async () => {
-            closeMenu();
-            try {
-                const res = await fetch(src);
-                const blob = await res.blob();
-                const file = new File([blob], 'image.jpg', { type: blob.type || 'image/jpeg' });
-                if (navigator.canShare && navigator.canShare({ files: [file] })) {
-                    await navigator.share({ files: [file] });
-                } else if (navigator.share) {
-                    await navigator.share({ title: 'Изображение', text: src });
-                } else {
-                    // fallback: копируем ссылку
-                    await navigator.clipboard.writeText(src);
-                    showToast('📋 Ссылка скопирована', 1500);
-                }
-            } catch (e) {
-                if (e.name !== 'AbortError') {
-                    showToast('❌ Не удалось поделиться', 2000);
-                }
-            }
-        });
-
-        menuEl.appendChild(downloadBtn);
-        menuEl.appendChild(shareBtn);
-        document.body.appendChild(menuEl);
-    }
-
-    function onStart(e) {
-        const img = e.target.closest('.message .image-container img');
-        if (!img) return;
-        targetImg = img;
-        const touch = e.touches ? e.touches[0] : e;
-        startX = touch.clientX;
-        startY = touch.clientY;
-        timer = setTimeout(() => {
-            timer = null;
-            if (targetImg) {
-                if (navigator.vibrate) navigator.vibrate(30);
-                showMenu(targetImg, startX, startY);
-            }
-        }, LONG_PRESS_MS);
-    }
-
-    function onMove(e) {
-        if (!timer) return;
-        const touch = e.touches ? e.touches[0] : e;
-        const dx = Math.abs(touch.clientX - startX);
-        const dy = Math.abs(touch.clientY - startY);
-        if (dx > 10 || dy > 10) {
-            clearTimeout(timer);
-            timer = null;
-            targetImg = null;
-        }
-    }
-
-    function onEnd() {
-        if (timer) {
-            clearTimeout(timer);
-            timer = null;
-        }
-        targetImg = null;
-    }
-
-    messagesInner.addEventListener('touchstart', onStart, { passive: true });
-    messagesInner.addEventListener('touchmove', onMove, { passive: true });
-    messagesInner.addEventListener('touchend', onEnd);
-    messagesInner.addEventListener('touchcancel', onEnd);
-
-    // Для десктопа (пКМ не нужен, но пусть будет через mousedown)
-    messagesInner.addEventListener('mousedown', (e) => {
-        if (e.button !== 0) return;
-        onStart(e);
-    });
-    messagesInner.addEventListener('mousemove', onMove);
-    messagesInner.addEventListener('mouseup', onEnd);
-    messagesInner.addEventListener('mouseleave', onEnd);
-
-    // Закрытие меню по клику вне
-    document.addEventListener('click', (e) => {
-        if (menuEl && !menuEl.contains(e.target)) closeMenu();
-    }, true);
-    document.addEventListener('touchstart', (e) => {
-        if (menuEl && !menuEl.contains(e.target)) closeMenu();
-    }, { passive: true, capture: true });
-    document.addEventListener('scroll', closeMenu, { passive: true, capture: true });
-    window.addEventListener('resize', closeMenu);
-})();
 </script>
 </body>
 </html>
