@@ -6136,6 +6136,114 @@ document.addEventListener('keydown', (e) => {
     });
 })();
 
+
+// ═══ Долгое нажатие на фото → системное "Поделиться" ═══
+function setupLongPressShare() {
+    const LONG_PRESS_MS = 600;
+    let pressTimer = null;
+    let startX = 0, startY = 0;
+    let longPressFired = false;
+
+    function cancelPress() {
+        if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
+    }
+
+    function onStart(e) {
+        // Игнорируем мультитач (зум)
+        if (e.touches && e.touches.length > 1) { cancelPress(); return; }
+        const touch = e.touches ? e.touches[0] : e;
+        startX = touch.clientX;
+        startY = touch.clientY;
+        longPressFired = false;
+
+        pressTimer = setTimeout(async () => {
+            longPressFired = true;
+            if (navigator.vibrate) navigator.vibrate(30);
+            const src = galleryState.images[galleryState.currentIndex];
+            if (src) await systemShareImage(src);
+        }, LONG_PRESS_MS);
+    }
+
+    function onMove(e) {
+        if (!pressTimer) return;
+        const touch = e.touches ? e.touches[0] : e;
+        const dx = touch.clientX - startX;
+        const dy = touch.clientY - startY;
+        // Если палец сдвинулся — отменяем (это свайп/зум, а не долгое нажатие)
+        if (Math.hypot(dx, dy) > 10) cancelPress();
+    }
+
+    function onEnd(e) {
+        cancelPress();
+        // Если сработало долгое нажатие — гасим последующий click
+        if (longPressFired) {
+            e.preventDefault?.();
+            longPressFired = false;
+        }
+    }
+
+    const viewport = document.getElementById('galleryViewport');
+    // touch
+    viewport.addEventListener('touchstart', onStart, { passive: true });
+    viewport.addEventListener('touchmove', onMove, { passive: true });
+    viewport.addEventListener('touchend', onEnd);
+    viewport.addEventListener('touchcancel', onEnd);
+    // mouse (для десктопа)
+    viewport.addEventListener('mousedown', onStart);
+    viewport.addEventListener('mousemove', onMove);
+    viewport.addEventListener('mouseup', onEnd);
+    viewport.addEventListener('mouseleave', onEnd);
+}
+
+// ═══ Системный шаринг картинки ═══
+async function systemShareImage(src) {
+    try {
+        const res = await fetch(src);
+        const blob = await res.blob();
+        const file = new File(
+            [blob],
+            'image_' + Date.now() + '.jpg',
+            { type: blob.type || 'image/jpeg' }
+        );
+
+        // Web Share API с файлами (Android Chrome, iOS Safari 15+)
+        if (navigator.canShare && navigator.canShare({ files: [file] })) {
+            await navigator.share({
+                files: [file],
+                title: 'Изображение',
+            });
+            return;
+        }
+
+        // Fallback: шарим текстом (ссылка не сработает для blob:)
+        if (navigator.share) {
+            await navigator.share({
+                title: 'Изображение',
+                text: 'Посмотри это изображение',
+            });
+            return;
+        }
+
+        // Совсем нет Web Share → скачиваем
+        const a = document.createElement('a');
+        a.href = src;
+        a.download = file.name;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        showToast('💾 Файл скачан (системный шаринг недоступен)', 2500);
+
+    } catch (err) {
+        if (err.name === 'AbortError') return;
+        console.error('systemShare error:', err);
+        showToast('❌ Не удалось поделиться', 2000);
+    }
+}
+
+setupLongPressShare();
+
+
+
 // ===================================================================
 //  ВОССТАНОВЛЕНИЕ СЕССИИ
 // ===================================================================
