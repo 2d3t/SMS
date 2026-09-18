@@ -974,6 +974,35 @@
         .password-row .icon-btn.copy:hover { background: rgba(0,184,148,0.25); }
         .password-row .icon-btn:active { transform: scale(0.9); }
 
+
+
+/* ═══ Оверлей перехода между чатами ═══ */
+#chatTransitionOverlay {
+    position: fixed; inset: 0;
+    background: linear-gradient(135deg, #0a0a0f, #1a1a2e);
+    z-index: 1500;
+    display: none;
+    flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 18px;
+    animation: fadeInModal 0.2s ease;
+}
+#chatTransitionOverlay.show { display: flex; }
+#chatTransitionOverlay .spinner {
+    width: 46px; height: 46px;
+    border: 3px solid rgba(108,92,231,0.2);
+    border-top-color: #6c5ce7;
+    border-radius: 50%;
+    animation: spin 0.9s linear infinite;
+}
+#chatTransitionOverlay .label {
+    color: #888; font-size: 14px;
+}
+#chatTransitionOverlay .label strong { color: #fff; }
+
+
+
+
         #autostartOverlay {
             position: fixed; inset: 0;
             background: linear-gradient(135deg, #0a0a0f, #1a1a2e);
@@ -1569,6 +1598,15 @@
         </div>
     </div>
 </div>
+
+
+
+<!-- ═══════════ ОВЕРЛЕЙ ПЕРЕХОДА МЕЖДУ ЧАТАМИ ═══════════ -->
+<div id="chatTransitionOverlay">
+    <div class="spinner"></div>
+    <div class="label">Открываем <strong id="chatTransitionName">чат</strong>…</div>
+</div>
+
 
 <!-- ═══════════ ОВЕРЛЕЙ АВТОЗАПУСКА ═══════════ -->
 <div id="autostartOverlay">
@@ -5021,6 +5059,21 @@ function showChatsScreen() {
     scrollState.unreadCount = 0;
     updateScrollBadge();
 }
+
+
+
+
+// ═══ Оверлей перехода между чатами ═══
+function showChatTransition(chatName) {
+    $('chatTransitionName').textContent = `«${chatName}»`;
+    $('chatTransitionOverlay').classList.add('show');
+}
+function hideChatTransition() {
+    $('chatTransitionOverlay').classList.remove('show');
+}
+
+
+
 function showChatScreen() {
     state.currentScreen = 'chat';
     authScreen.style.display = 'none';
@@ -5231,6 +5284,22 @@ async function confirmOpenChat() {
         }
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 async function enterChat(file, name, password) {
     stopPolling();
@@ -5447,155 +5516,117 @@ async function confirmJoinChat() {
     }
 }
 
-// ===================================================================
-//  АВТОРИЗАЦИЯ
-// ===================================================================
-function setTokenHint(message, type = 'error') {
-    tokenHint.textContent = message;
-    tokenHint.classList.add('show');
-    tokenHint.style.color = type === 'error' ? '#ff6b6b' : '#feca57';
-}
-function clearTokenHint() { tokenHint.textContent = ''; tokenHint.classList.remove('show'); }
-function setAuthError(message) { authError.textContent = '❌ ' + message; authError.classList.add('show'); }
-function clearAuthError() { authError.classList.remove('show'); }
 
-async function login() {
-    const lock = isLockedOut();
-    if (lock.locked) { setAuthError(`Слишком много попыток. Повторите через ${lock.secondsLeft} сек.`); return; }
-    const username = usernameInput.value.trim();
-    const rawToken = tokenInput.value;
-    clearAuthError(); clearTokenHint();
-    tokenInput.classList.remove('invalid', 'valid');
-    if (!username) { setAuthError('Введите имя пользователя'); return; }
-    if (username.length < 2) { setAuthError('Имя минимум 2 символа'); return; }
-    if (username.length > 20) { setAuthError('Имя максимум 20 символов'); return; }
-    const formatCheck = validateTokenFormat(rawToken);
-    if (!formatCheck.ok) {
-        tokenInput.classList.add('invalid');
-        setTokenHint(formatCheck.reason, 'error');
-        setAuthError(formatCheck.reason);
-        const locked = registerFailedAttempt();
-        if (locked) {
-            setAuthError(`Много неудач. Блок на ${TOKEN_SECURITY.lockoutTime / 1000} сек.`);
-            loginBtn.disabled = true;
-            setTimeout(() => { loginBtn.disabled = false; }, TOKEN_SECURITY.lockoutTime);
-        }
-        soundManager.play('error');
-        return;
-    }
-    loginBtn.disabled = true;
-    loginBtn.textContent = '⏳ Проверка...';
-    setTokenHint('Проверяем доступ к репозиторию...', 'warning');
-    const accessCheck = await validateTokenAccess(rawToken.trim());
-    if (!accessCheck.ok) {
-        tokenInput.classList.add('invalid');
-        setTokenHint(accessCheck.message, 'error');
-        setAuthError(accessCheck.message);
-        const locked = registerFailedAttempt();
-        if (locked) {
-            setAuthError(`Много неудач. Блок на ${TOKEN_SECURITY.lockoutTime / 1000} сек.`);
-            loginBtn.disabled = true;
-            setTimeout(() => { loginBtn.disabled = false; }, TOKEN_SECURITY.lockoutTime);
-        }
-        loginBtn.disabled = false;
-        loginBtn.textContent = '🚀 Войти';
-        soundManager.play('error');
-        return;
-    }
-    resetFailedAttempts();
-    tokenInput.classList.add('valid');
-    clearTokenHint();
-    state.username = username;
-    state.token = rawToken.trim();
-    state.isAuthorized = true;
-    loadChatsList();
-    loadSavedPasswords();
-    if (rememberMeInput.checked) {
-        localStorage.setItem('chathub_username', username);
-        localStorage.setItem('chathub_token', state.token);
-        localStorage.setItem('chathub_remember', '1');
-    } else {
-        localStorage.setItem('chathub_username', username);
-        localStorage.removeItem('chathub_token');
-        localStorage.removeItem('chathub_remember');
-    }
-    const autorunFile = getAutorunChat();
-    if (autorunFile) {
-        const launched = await tryAutostartChat();
-        if (launched) {
-            loginBtn.disabled = false;
-            loginBtn.textContent = '🚀 Войти';
-            return;
-        }
-    }
-    showChatsScreen();
-    loginBtn.disabled = false;
-    loginBtn.textContent = '🚀 Войти';
-}
 
-function logout() {
-    if (audioRecorder.isRecording) audioRecorder.cancel();
-    markChatAsRead();
+
+
+
+
+async function enterChat(file, name, password) {
+    // Показываем оверлей СРАЗУ — до любых запросов
+    showChatTransition(name);
+    
+    // Даём браузеру отрисовать оверлей перед тяжёлой работой
+    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
     stopPolling();
-    Object.keys(audioPlayers).forEach(id => {
-        try { audioPlayers[id].audio.pause(); } catch (e) {}
-        delete audioPlayers[id];
-    });
     clearAttachmentCache();
     resetHistoryState();
-    state.isPolling = false;
-    state.isAuthorized = false;
-    state._lastSentMessageId = null;
+
+    state.messages = []; state.sha = null; state.lastMessageCount = 0;
+    state._lastCommitSha = null;
     state._lastMetaVersion = null;
     state._metaEtag = null;
-    state._lastActivityAt = 0;
-    state.messages = []; state.sha = null; state.lastMessageCount = 0;
-    state.chatPassword = ''; state.salt = null;
-    state.chatFile = null; state.chatName = null;
-    state._lastCommitSha = null;
-    state._metaEtagsByFile = {};
-    state.members = {};
-    state._verifiedSignatures = new Map();
-    state._myPublicKeyJwk = null;
-    CRYPTO._key = null;
-    if (localStorage.getItem('chathub_remember') !== '1') {
-        tokenInput.value = '';
-        localStorage.removeItem('chathub_token');
-    } else {
-        tokenInput.value = localStorage.getItem('chathub_token') || '';
-        rememberMeInput.checked = true;
-        rememberWarning.style.display = 'block';
+    state._lastSentMessageId = null;
+    CRYPTO._key = null; state.salt = null;
+
+    state.chatFile = file;
+    state.chatName = name;
+    state.chatPassword = password;
+    state._lastActivityAt = Date.now();
+
+    chatTitle.textContent = `Чат: ${name}`;
+    userAvatar.textContent = getInitials(state.username);
+
+    messagesInner.dataset.lastDate = '';
+    showChatScreen();
+    showInputBar();
+
+    try {
+        const path = getChatPath(file);
+        const result = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
+
+        if (!result.exists) {
+            const saltBytes = generateSalt();
+            state.salt = arrayBufferToBase64(saltBytes);
+            CRYPTO._key = await deriveKey(password, state.salt);
+            state.messages = [];
+            state.sha = null;
+            state._lastCommitSha = null;
+            state.lastMessageCount = 0;
+            renderMessages([]);
+            startPolling();
+            setTimeout(() => { if (state.chatFile === file) markChatAsRead(); }, 1500);
+            return;
+        }
+
+        const content = result.content;
+        if (!content || content.v !== CRYPTO.VERSION || !content.salt) {
+            throw new Error('Неверный формат файла');
+        }
+
+        state.salt = content.salt;
+        const encMessages = Array.isArray(content.messages) ? content.messages : [];
+        let decrypted;
+        try {
+            decrypted = await loadAndDecrypt(content.salt, encMessages);
+        } catch (e) {
+            throw new Error('Неверный пароль чата');
+        }
+        if (encMessages.length > 0 && decrypted.length === 0) {
+            throw new Error('Неверный пароль чата');
+        }
+
+        state.messages = decrypted;
+        state.sha = result.sha;
+        state._lastCommitSha = result.commitSha;
+        state.lastMessageCount = decrypted.length;
+
+        try {
+            const metaRes = await fetchMetaFast(file, null);
+            if (metaRes.exists) {
+                state._metaEtag = metaRes.etag || null;
+                if (metaRes.content && metaRes.content.version) {
+                    state._lastMetaVersion = metaRes.content.version;
+                }
+            }
+        } catch (e) { /* ok */ }
+
+        historyState.allMessages = decrypted.slice();
+        renderHistory();
+        startPolling();
+        setTimeout(() => { if (state.chatFile === file) markChatAsRead(); }, 1500);
+    } catch (e) {
+        // Сброс состояния — как было раньше
+        state.chatFile = null; state.chatName = null;
+        CRYPTO._key = null; state.chatPassword = ''; state.salt = null;
+        state._lastCommitSha = null;
+        showChatsScreen();
+        throw e;
+    } finally {
+        // Гарантированно скрываем оверлей — при успехе и при ошибке
+        hideChatTransition();
     }
-    showAuthScreen();
-    clearAuthError(); clearTokenHint();
-    tokenInput.classList.remove('valid', 'invalid');
-    closeImageModal();
-    hideInputBar();
-    floatingKeyboardBtn.classList.remove('show');
-    hideScrollDownBtn();
-    messageInput.disabled = false;
-    sendBtn.disabled = false;
-    fileBtn.disabled = false;
-    micBtn.disabled = false;
-    showToast('👋 Вы вышли', 1500);
 }
 
-function lockChatUI(reason) {
-    state.isAuthorized = false;
-    state.messages = []; state.sha = null; state.lastMessageCount = 0;
-    state._lastCommitSha = null;
-    state._metaEtag = null;
-    CRYPTO._key = null;
-    stopPolling();
-    messagesInner.innerHTML = `<div class="message system locked">🔒 ${reason || 'Доступ закрыт'}</div>`;
-    messageInput.disabled = true;
-    sendBtn.disabled = true;
-    fileBtn.disabled = true;
-    micBtn.disabled = true;
-    hideInputBar();
-    floatingKeyboardBtn.classList.remove('show');
-    hideScrollDownBtn();
-}
+
+
+
+
+
+
+
+        
 
 function backToChats() {
     markChatAsRead();
