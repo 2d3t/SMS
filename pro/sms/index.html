@@ -2047,6 +2047,7 @@ let state = {
     chats: [], savedPasswords: {},
     currentScreen: 'auth',
     _metaEtagsByFile: {},
+    _chatEntered: false,   // true = мы уже "зашли" в чат, зелёная подсветка больше не нужна
 };
 
 let historyState = {
@@ -4200,7 +4201,6 @@ function buildMessageHTML(msg, opts = {}) {
 
     const isBatch = !!msg.batchId;
     const isFirstInBatch = isBatch && msg.batchIndex === 0;
-    const isLastInBatch = isBatch && msg.batchIndex === (msg.batchTotal - 1);
 
     let batchClass = '';
     if (isBatch) {
@@ -4244,12 +4244,16 @@ function renderHistory() {
     historyState.startIndex = start;
     historyState.renderedCount = initial;
 
+    // ═══ Зелёная подсветка "новых" — только при ПЕРВОМ входе в чат ═══
     const lastReadId = state.chatFile ? getLastReadId(state.chatFile) : null;
     let firstUnreadIdx = -1;
-    for (let i = start; i < total; i++) {
-        const m = all[i];
-        if (m.username === state.username) continue;
-        if (!lastReadId || m.id > lastReadId) { firstUnreadIdx = i; break; }
+
+    if (!state._chatEntered) {
+        for (let i = start; i < total; i++) {
+            const m = all[i];
+            if (m.username === state.username) continue;
+            if (!lastReadId || m.id > lastReadId) { firstUnreadIdx = i; break; }
+        }
     }
 
     let html = '';
@@ -4286,12 +4290,17 @@ function renderMessages(messages) {
 function appendMessages(newMsgs) {
     if (!newMsgs || newMsgs.length === 0) return;
     historyState.allMessages.push(...newMsgs);
+
+    // ═══ Подсветка новых сообщений — только если мы ещё НЕ "вошли" ═══
+    // Во время активной переписки новые сообщения приходят без зелёной подсветки
+    const markUnread = !state._chatEntered;
+
     let html = '';
     let lastDate = messagesInner.dataset.lastDate || '';
     for (const msg of newMsgs) {
         const msgDate = formatDate(msg.time);
         if (msgDate !== lastDate) { html += `<div class="message system">${msgDate}</div>`; lastDate = msgDate; }
-        html += buildMessageHTML(msg, { isUnread: true });
+        html += buildMessageHTML(msg, { isUnread: markUnread });
     }
     messagesInner.dataset.lastDate = lastDate;
     messagesInner.insertAdjacentHTML('beforeend', html);
@@ -4919,8 +4928,6 @@ async function doShareToChat(targetFile, targetPassword, blob, fileName, mime) {
     try {
         const prevKey = CRYPTO._key;
         const prevSalt = state.salt;
-        const prevChatFile = state.chatFile;
-        const prevChatPassword = state.chatPassword;
 
         const path = getChatPath(targetFile);
         const result = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
@@ -5574,6 +5581,7 @@ async function enterChat(file, name, password) {
     state._lastMetaVersion = null;
     state._metaEtag = null;
     state._lastSentMessageId = null;
+    state._chatEntered = false;   // ← сброс: мы ещё не "вошли"
     CRYPTO._key = null; state.salt = null;
 
     state.chatFile = file;
@@ -5602,6 +5610,7 @@ async function enterChat(file, name, password) {
             state.lastMessageCount = 0;
             renderMessages([]);
             startPolling();
+            state._chatEntered = true;   // ← вошли
             setTimeout(() => { if (state.chatFile === file) markChatAsRead(); }, 1500);
             return;
         }
@@ -5641,12 +5650,17 @@ async function enterChat(file, name, password) {
         historyState.allMessages = decrypted.slice();
         renderHistory();
         startPolling();
+
+        // ✅ Мы вошли — дальше зелёная подсветка не нужна
+        state._chatEntered = true;
+
         setTimeout(() => { if (state.chatFile === file) markChatAsRead(); }, 1500);
     } catch (e) {
         // Сброс состояния — как было раньше
         state.chatFile = null; state.chatName = null;
         CRYPTO._key = null; state.chatPassword = ''; state.salt = null;
         state._lastCommitSha = null;
+        state._chatEntered = false;
         showChatsScreen();
         throw e;
     } finally {
@@ -5811,6 +5825,7 @@ function logout() {
     state.chatFile = null; state.chatName = null;
     state._lastCommitSha = null;
     state._metaEtagsByFile = {};
+    state._chatEntered = false;
     CRYPTO._key = null;
     if (localStorage.getItem('chathub_remember') !== '1') {
         tokenInput.value = '';
@@ -5839,6 +5854,7 @@ function lockChatUI(reason) {
     state.messages = []; state.sha = null; state.lastMessageCount = 0;
     state._lastCommitSha = null;
     state._metaEtag = null;
+    state._chatEntered = false;
     CRYPTO._key = null;
     stopPolling();
     messagesInner.innerHTML = `<div class="message system locked">🔒 ${reason || 'Доступ закрыт'}</div>`;
@@ -5867,6 +5883,7 @@ function backToChats() {
     state._lastCommitSha = null;
     state.chatFile = null; state.chatName = null;
     state.chatPassword = ''; state.salt = null;
+    state._chatEntered = false;
     CRYPTO._key = null;
     messagesInner.dataset.lastDate = '';
 
@@ -6380,9 +6397,7 @@ console.log('📎 Мини-меню выбора типа вложения');
 console.log('📊 Прогресс-бар загрузки больших файлов с отменой');
 console.log('🗑️ Удаление сообщения удаляет и вложение');
 console.log('📜 История: 5 последних, при скролле вверх по 10');
+console.log('🟢 Зелёная подсветка "новых" — только при ПЕРВОМ входе в чат');
 </script>
-</body>
-</html>
-
 </body>
 </html>
