@@ -1066,6 +1066,32 @@
         .password-row .icon-btn.copy:hover { background: rgba(0,184,148,0.25); }
         .password-row .icon-btn:active { transform: scale(0.9); }
 
+
+/* ═══ Оверлей перехода между чатами ═══ */
+#chatTransitionOverlay {
+    position: fixed; inset: 0;
+    background: linear-gradient(135deg, #0a0a0f, #1a1a2e);
+    z-index: 1500;
+    display: none;
+    flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 18px;
+    animation: fadeInModal 0.2s ease;
+}
+#chatTransitionOverlay.show { display: flex; }
+#chatTransitionOverlay .spinner {
+    width: 46px; height: 46px;
+    border: 3px solid rgba(108,92,231,0.2);
+    border-top-color: #6c5ce7;
+    border-radius: 50%;
+    animation: spin 0.9s linear infinite;
+}
+#chatTransitionOverlay .label {
+    color: #888; font-size: 14px;
+}
+#chatTransitionOverlay .label strong { color: #fff; }
+
+
         #autostartOverlay {
             position: fixed; inset: 0;
             background: linear-gradient(135deg, #0a0a0f, #1a1a2e);
@@ -1754,6 +1780,16 @@
         </div>
     </div>
 </div>
+
+
+
+<!-- ═══════════ ОВЕРЛЕЙ ПЕРЕХОДА МЕЖДУ ЧАТАМИ ═══════════ -->
+<div id="chatTransitionOverlay">
+    <div class="spinner"></div>
+    <div class="label">Открываем <strong id="chatTransitionName">чат</strong>…</div>
+</div>
+
+
 
 <!-- ═══════════ ОВЕРЛЕЙ АВТОЗАПУСКА ═══════════ -->
 <div id="autostartOverlay">
@@ -5282,6 +5318,22 @@ function showChatsScreen() {
     scrollState.unreadCount = 0;
     updateScrollBadge();
 }
+
+
+
+
+// ═══ Оверлей перехода между чатами ═══
+function showChatTransition(chatName) {
+    $('chatTransitionName').textContent = `«${chatName}»`;
+    $('chatTransitionOverlay').classList.add('show');
+}
+function hideChatTransition() {
+    $('chatTransitionOverlay').classList.remove('show');
+}
+
+
+
+
 function showChatScreen() {
     state.currentScreen = 'chat';
     authScreen.style.display = 'none';
@@ -5503,7 +5555,16 @@ async function confirmOpenChat() {
     }
 }
 
+
+
+
 async function enterChat(file, name, password) {
+    // Показываем оверлей СРАЗУ — до любых запросов
+    showChatTransition(name);
+    
+    // Даём браузеру отрисовать оверлей перед тяжёлой работой
+    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
     stopPolling();
     clearAttachmentCache();
     resetHistoryState();
@@ -5527,81 +5588,75 @@ async function enterChat(file, name, password) {
     showChatScreen();
     showInputBar();
 
-    const path = getChatPath(file);
-    let result;
     try {
-        result = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
+        const path = getChatPath(file);
+        const result = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
+
+        if (!result.exists) {
+            const saltBytes = generateSalt();
+            state.salt = arrayBufferToBase64(saltBytes);
+            CRYPTO._key = await deriveKey(password, state.salt);
+            state.messages = [];
+            state.sha = null;
+            state._lastCommitSha = null;
+            state.lastMessageCount = 0;
+            renderMessages([]);
+            startPolling();
+            setTimeout(() => { if (state.chatFile === file) markChatAsRead(); }, 1500);
+            return;
+        }
+
+        const content = result.content;
+        if (!content || content.v !== CRYPTO.VERSION || !content.salt) {
+            throw new Error('Неверный формат файла');
+        }
+
+        state.salt = content.salt;
+        const encMessages = Array.isArray(content.messages) ? content.messages : [];
+        let decrypted;
+        try {
+            decrypted = await loadAndDecrypt(content.salt, encMessages);
+        } catch (e) {
+            throw new Error('Неверный пароль чата');
+        }
+        if (encMessages.length > 0 && decrypted.length === 0) {
+            throw new Error('Неверный пароль чата');
+        }
+
+        state.messages = decrypted;
+        state.sha = result.sha;
+        state._lastCommitSha = result.commitSha;
+        state.lastMessageCount = decrypted.length;
+
+        try {
+            const metaRes = await fetchMetaFast(file, null);
+            if (metaRes.exists) {
+                state._metaEtag = metaRes.etag || null;
+                if (metaRes.content && metaRes.content.version) {
+                    state._lastMetaVersion = metaRes.content.version;
+                }
+            }
+        } catch (e) { /* ok */ }
+
+        historyState.allMessages = decrypted.slice();
+        renderHistory();
+        startPolling();
+        setTimeout(() => { if (state.chatFile === file) markChatAsRead(); }, 1500);
     } catch (e) {
+        // Сброс состояния — как было раньше
         state.chatFile = null; state.chatName = null;
         CRYPTO._key = null; state.chatPassword = ''; state.salt = null;
         state._lastCommitSha = null;
         showChatsScreen();
         throw e;
+    } finally {
+        // Гарантированно скрываем оверлей — при успехе и при ошибке
+        hideChatTransition();
     }
-
-    if (!result.exists) {
-        const saltBytes = generateSalt();
-        state.salt = arrayBufferToBase64(saltBytes);
-        CRYPTO._key = await deriveKey(password, state.salt);
-        state.messages = [];
-        state.sha = null;
-        state._lastCommitSha = null;
-        state.lastMessageCount = 0;
-        renderMessages([]);
-        startPolling();
-        setTimeout(() => { if (state.chatFile === file) markChatAsRead(); }, 1500);
-        return;
-    }
-
-    const content = result.content;
-    if (!content || content.v !== CRYPTO.VERSION || !content.salt) {
-        state.chatFile = null; state.chatName = null;
-        CRYPTO._key = null; state.chatPassword = ''; state.salt = null;
-        state._lastCommitSha = null;
-        showChatsScreen();
-        throw new Error('Неверный формат файла');
-    }
-
-    state.salt = content.salt;
-    const encMessages = Array.isArray(content.messages) ? content.messages : [];
-    let decrypted;
-    try {
-        decrypted = await loadAndDecrypt(content.salt, encMessages);
-    } catch (e) {
-        state.chatFile = null; state.chatName = null;
-        CRYPTO._key = null; state.chatPassword = ''; state.salt = null;
-        state._lastCommitSha = null;
-        showChatsScreen();
-        throw new Error('Неверный пароль чата');
-    }
-    if (encMessages.length > 0 && decrypted.length === 0) {
-        state.chatFile = null; state.chatName = null;
-        CRYPTO._key = null; state.chatPassword = ''; state.salt = null;
-        state._lastCommitSha = null;
-        showChatsScreen();
-        throw new Error('Неверный пароль чата');
-    }
-
-    state.messages = decrypted;
-    state.sha = result.sha;
-    state._lastCommitSha = result.commitSha;
-    state.lastMessageCount = decrypted.length;
-
-    try {
-        const metaRes = await fetchMetaFast(file, null);
-        if (metaRes.exists) {
-            state._metaEtag = metaRes.etag || null;
-            if (metaRes.content && metaRes.content.version) {
-                state._lastMetaVersion = metaRes.content.version;
-            }
-        }
-    } catch (e) { /* ok */ }
-
-    historyState.allMessages = decrypted.slice();
-    renderHistory();
-    startPolling();
-    setTimeout(() => { if (state.chatFile === file) markChatAsRead(); }, 1500);
 }
+
+
+        
 
 // ===================================================================
 //  ПРИСОЕДИНЕНИЕ
