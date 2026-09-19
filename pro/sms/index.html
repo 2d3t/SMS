@@ -2441,52 +2441,25 @@ async function refreshUnreadBadges() {
 
 
 // 🆕 Обнулить все уведомления во всех чатах
-function clearAllUnread() {
-    if (state.chats.length === 0) {
-        showToast('📭 Нет чатов', 1500);
-        return;
-    }
 
-    const rs = loadReadState();
-    let clearedCount = 0;
 
-    state.chats.forEach(c => {
-        if (!c.hasUnread) return;
-        clearedCount++;
 
-        // Помечаем чат как прочитанный в localStorage
-        const metaVersion = c._lastMetaVersion;
-        if (metaVersion) {
-            rs[c.file] = metaVersion;
-        } else {
-            // Если meta-версия неизвестна, ставим текущее время —
-            // при следующем открытии чата вся история будет считаться прочитанной
-            rs[c.file] = Date.now();
-        }
 
-        // Убираем флаги непрочитанного
-        delete c.hasUnread;
-        delete c.unreadCount;
-    });
 
-    saveReadState(rs);
-    saveChatsList();
-    renderChatsList();
 
-    // Обновляем бейдж на иконке PWA
-    updateAppBadge(0);
-    _lastKnownUnreadTotal = 0;
 
-    if (clearedCount === 0) {
-        showToast('✅ Уведомлений не было', 1500);
-    } else {
-        showToast(`✅ Очищено уведомлений: ${clearedCount}`, 1800);
-        soundManager.play('click');
-    }
-}
+
+
 
 
 // Обновление значка на иконке приложения (PWA)
+
+
+
+
+
+
+
 function updateAppBadge(totalUnread) {
     // Проверяем, поддерживается ли API (на Android setAppBadge может отсутствовать)
     if (!navigator.setAppBadge) return;
@@ -2504,7 +2477,76 @@ function updateAppBadge(totalUnread) {
 }
 
 
+async function clearAllUnread() {
+    if (state.chats.length === 0) {
+        showToast('📭 Нет чатов', 1500);
+        return;
+    }
+    if (!navigator.onLine || !networkState.isOnline) {
+        showToast('📵 Нет подключения', 2000);
+        return;
+    }
 
+    showToast('⏳ Обновляем статусы…', 1200);
+
+    const rs = loadReadState();
+    let clearedCount = 0;
+    let processed = 0;
+
+    const tasks = state.chats.map(async (chat) => {
+        try {
+            // Всегда тянем свежую meta-версию с GitHub (игнорируя ETag)
+            const metaRes = await fetchMetaFast(chat.file, null);
+            processed++;
+
+            if (!metaRes.exists || !metaRes.content || !metaRes.content.version) {
+                // Нет meta — нечего помечать
+                if (chat.hasUnread) {
+                    delete chat.hasUnread;
+                    delete chat.unreadCount;
+                    clearedCount++;
+                }
+                return;
+            }
+
+            // Фиксируем текущую версию как прочитанную
+            rs[chat.file] = metaRes.content.version;
+
+            if (chat.hasUnread) clearedCount++;
+
+            // Обновляем кэш ETag, чтобы polling не перезаписал
+            state._metaEtagsByFile[chat.file] = metaRes.etag || null;
+            chat._lastMetaVersion = metaRes.content.version;
+
+            delete chat.hasUnread;
+            delete chat.unreadCount;
+        } catch (e) {
+            console.warn('clearAllUnread: ошибка для', chat.file, e.message);
+            // Даже при ошибке снимаем локальную метку, чтобы UI очистился
+            if (chat.hasUnread) {
+                delete chat.hasUnread;
+                delete chat.unreadCount;
+                clearedCount++;
+            }
+        }
+    });
+
+    await Promise.all(tasks);
+
+    saveReadState(rs);
+    saveChatsList();
+    renderChatsList();
+
+    updateAppBadge(0);
+    _lastKnownUnreadTotal = 0;
+
+    if (clearedCount === 0) {
+        showToast('✅ Уведомлений не было', 1500);
+    } else {
+        showToast(`✅ Очищено уведомлений: ${clearedCount}`, 1800);
+        soundManager.play('click');
+    }
+}
 
 
 // ===================================================================
