@@ -2272,6 +2272,10 @@ async function fetchMetaFast(file, etag, token) {
     }
 }
 
+
+
+
+
 async function checkUnreadForAllChats() {
     const result = {};
     const passwords = state.savedPasswords;
@@ -2297,16 +2301,30 @@ async function checkUnreadForAllChats() {
             }
             state._metaEtagsByFile[file] = metaRes.etag || null;
             const metaVersion = metaRes.content && metaRes.content.version;
-            if (!metaVersion) return;
-            if (chat._lastMetaVersion && chat._lastMetaVersion === metaVersion) {
-                if (chat.hasUnread) result[file] = { hasUnread: true, count: chat.unreadCount || 0 };
-                return;
-            }
-            chat._lastMetaVersion = metaVersion;
-            saveChatsList();
+            
 
-            const lastReadId = getLastReadId(file);
-            if (lastReadId && metaVersion <= lastReadId) return;
+
+
+
+if (!metaVersion) return;
+
+
+
+
+
+            
+chat._lastMetaVersion = metaVersion;
+saveChatsList();
+
+const lastReadId = getLastReadId(file);
+if (lastReadId && metaVersion <= lastReadId) return;
+// ↓ дальше уже читается файл и считаются реальные непрочитанные
+
+
+
+
+
+
             if (!passwords[file]) {
                 result[file] = { hasUnread: true, count: 0 };
                 return;
@@ -6384,7 +6402,7 @@ setInterval(() => {
     if (state.currentScreen === 'chats' && state.isAuthorized) {
         refreshUnreadBadges();
     }
-}, 15000);
+}, 3000);
 
 setInterval(() => {
     const inChat = chatScreen.style.display === 'flex' && state.isAuthorized && state.chatFile;
