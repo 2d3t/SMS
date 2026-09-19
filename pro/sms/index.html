@@ -2003,13 +2003,50 @@ function resetFailedAttempts() {
 // ===================================================================
 class SoundManager {
     constructor() { this.enabled = true; this.sounds = {}; this.initSounds(); }
-    initSounds() {
-        this.sounds.send = this.createBeep(600, 0.1);
-        this.sounds.receive = this.createBeep(800, 0.15);
-        this.sounds.error = this.createBeep(300, 0.3);
-        this.sounds.delete = this.createBeep(400, 0.1);
-        this.sounds.click = this.createBeep(500, 0.05);
-    }
+
+
+
+    
+initSounds() {
+    this.sounds.send = this.createBeep(600, 0.1);
+    this.sounds.receive = this.createBeep(800, 0.15);
+    this.sounds.error = this.createBeep(300, 0.3);
+    this.sounds.delete = this.createBeep(400, 0.1);
+    this.sounds.click = this.createBeep(500, 0.05);
+    // 🔔 Уведомление для списка чатов — двойной мелодичный бип
+    this.sounds.notification = this.createNotificationSound();
+}
+
+createNotificationSound() {
+    return {
+        play: () => {
+            try {
+                const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                const now = ctx.currentTime;
+                const notes = [
+                    { freq: 880,  start: 0,    dur: 0.12 },
+                    { freq: 1174, start: 0.13, dur: 0.18 },
+                ];
+                notes.forEach(n => {
+                    const osc = ctx.createOscillator();
+                    const gain = ctx.createGain();
+                    osc.connect(gain);
+                    gain.connect(ctx.destination);
+                    osc.frequency.value = n.freq;
+                    osc.type = 'sine';
+                    gain.gain.setValueAtTime(0, now + n.start);
+                    gain.gain.linearRampToValueAtTime(0.15, now + n.start + 0.01);
+                    gain.gain.exponentialRampToValueAtTime(0.001, now + n.start + n.dur);
+                    osc.start(now + n.start);
+                    osc.stop(now + n.start + n.dur);
+                });
+            } catch (e) {}
+        }
+    };
+}
+
+
+
     createBeep(freq, duration) {
         return {
             play: () => {
@@ -2230,7 +2267,14 @@ function setLastReadId(file, messageId) {
     const rs = loadReadState();
     rs[file] = messageId;
     saveReadState(rs);
+// 🆕 Последнее ИЗВЕСТНОЕ общее число непрочитанных (-1 = ещё не инициализировано)
+let _lastKnownUnreadTotal = -1;
 }
+
+
+
+
+
 function markChatAsRead() {
     if (!state.chatFile || historyState.allMessages.length === 0) return;
     const lastId = historyState.allMessages[historyState.allMessages.length - 1].id;
@@ -2355,7 +2399,6 @@ if (lastReadId && metaVersion <= lastReadId) return;
 
 
 
-
 async function refreshUnreadBadges() {
     if (state.currentScreen !== 'chats') return;
     const unread = await checkUnreadForAllChats();
@@ -2365,12 +2408,38 @@ async function refreshUnreadBadges() {
         else { delete c.hasUnread; delete c.unreadCount; }
     });
     saveChatsList();
-renderChatsList();
+    renderChatsList();
 
-// 🆕 Обновляем значок на иконке PWA
-const totalUnread = state.chats.reduce((sum, c) => sum + (c.unreadCount || 0), 0);
-updateAppBadge(totalUnread);
+    // 🆕 Обновляем значок на иконке PWA
+    const totalUnread = state.chats.reduce((sum, c) => sum + (c.unreadCount || 0), 0);
+    updateAppBadge(totalUnread);
+
+    // ─── 🔔 Звук при изменении общего числа непрочитанных ───
+    // Считаем сумму: у чата с точным счётчиком — его число,
+    // у чата только с точкой (без пароля) — считаем как 1
+    const totalCount = state.chats.reduce(
+        (sum, c) => sum + (c.unreadCount || (c.hasUnread ? 1 : 0)),
+        0
+    );
+
+    if (_lastKnownUnreadTotal === -1) {
+        // Первый прогон — просто запоминаем, звук не играем
+        _lastKnownUnreadTotal = totalCount;
+    } else if (totalCount !== _lastKnownUnreadTotal) {
+        // Что-то изменилось
+        if (totalCount > _lastKnownUnreadTotal && !document.hidden) {
+            // Стало БОЛЬШЕ — играем звук ОДИН раз
+            soundManager.play('notification');
+            if (navigator.vibrate) navigator.vibrate([80, 40, 80]);
+        }
+        // Стало МЕНЬШЕ (прочитали) — просто обновляем, без звука
+        _lastKnownUnreadTotal = totalCount;
+    }
 }
+
+
+
+
 
 // Обновление значка на иконке приложения (PWA)
 function updateAppBadge(totalUnread) {
@@ -5895,7 +5964,20 @@ function logout() {
         rememberMeInput.checked = true;
         rememberWarning.style.display = 'block';
     }
+
+// 🆕 Сбрасываем звуковое состояние
+_lastKnownUnreadTotal = -1;
+
+showAuthScreen();
+
     showAuthScreen();
+
+
+
+
+
+
+
     clearAuthError(); clearTokenHint();
     tokenInput.classList.remove('valid', 'invalid');
     closeImageModal();
@@ -5952,6 +6034,26 @@ function backToChats() {
 
     showChatsScreen();
 }
+
+
+
+function backToChats() {
+    markChatAsRead();
+    // ... (весь существующий код) ...
+    messagesInner.dataset.lastDate = '';
+
+    hideScrollDownBtn();
+    floatingKeyboardBtn.classList.remove('show');
+
+    // 🆕 Сбрасываем "последнее известное" — пересчитаем при возврате в список
+    _lastKnownUnreadTotal = -1;
+
+    showChatsScreen();
+}
+
+
+
+
 
 // ===================================================================
 //  АВТОЗАПУСК
