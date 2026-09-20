@@ -454,15 +454,21 @@
             justify-content: center;
             touch-action: none;
             overflow: hidden;
+
             /* 🆕 Плавный поворот при смене ориентации */
             transition: transform 0.3s ease, width 0.3s ease, height 0.3s ease;
-        }
+transition: width 0.3s ease, height 0.3s ease;
+}
+        
+
+
+
         .gallery-slide {
             position: absolute;
             top: 50%;
             left: 50%;
-            max-width: 100%;
-            max-height: 90vh;
+            max-width: var(--vw, 100%);
+max-height: var(--vh, 90vh);
             object-fit: contain;
             border-radius: 12px;
             box-shadow: 0 20px 60px rgba(0,0,0,0.8);
@@ -5260,6 +5266,7 @@ function openGallery(imageUrl) {
     imageModal.classList.add('active');
     document.body.style.overflow = 'hidden';
     galleryState.isOpen = true;
+    if (window._updateGallerySizes) window._updateGallerySizes();
     // 🆕 Применяем текущую ориентацию экрана
     
     updateGalleryUI();
@@ -5298,34 +5305,33 @@ function closeImageModal() {
     imageModal.style.transition = '';
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  🆕 АВТОПОВОРОТ ГАЛЕРЕИ ПРИ ПОВОРОТЕ ТЕЛЕФОНА
-// ═══════════════════════════════════════════════════════════════
 
 
-    function applyOrientation() {
+// ═══════════════════════════════════════════════════════════════
+//  🔄 Автоповорот галереи при повороте телефона
+// ═══════════════════════════════════════════════════════════════
+(function initGalleryResize() {
+    const viewport = document.getElementById('galleryViewport');
+    if (!viewport) return;
+
+    function updateSizes() {
         if (!galleryState.isOpen) return;
-        const isLandscape = window.innerWidth > window.innerHeight;
-        // Проверяем, что это тач-устройство, чтобы не крутить на десктопе
-        const isTouch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
-        if (isLandscape && isTouch) {
-            viewport.classList.add('rotate');
-        } else {
-            viewport.classList.remove('rotate');
-        }
-        // Сброс зума/смещения — иначе картинка «улетает» после поворота
+        const w = window.innerWidth;
+        const h = window.innerHeight;
+        const slides = viewport.querySelectorAll('.gallery-slide');
+        slides.forEach(el => {
+            el.style.setProperty('--vw', Math.floor(w * 0.95) + 'px');
+            el.style.setProperty('--vh', Math.floor(h * 0.85) + 'px');
+        });
         try { ImageZoom.reset(false); } catch (e) {}
     }
 
-    window.addEventListener('orientationchange', () => {
-        // Небольшая задержка: iOS/Android меняют размеры не сразу
-        setTimeout(applyOrientation, 120);
-    });
-    window.addEventListener('resize', applyOrientation);
-
-    // Экспортируем, чтобы вызывать при открытии галереи
-    window._applyGalleryOrientation = applyOrientation;
+    window.addEventListener('orientationchange', () => setTimeout(updateSizes, 150));
+    window.addEventListener('resize', updateSizes);
+    window._updateGallerySizes = updateSizes;
 })();
+
+    
 
 // ===================================================================
 //  ПОДЕЛИТЬСЯ С ЧАТОМ
