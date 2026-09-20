@@ -1,3 +1,20 @@
+Отличная идея! Я реализовал функционал так, чтобы кнопки «Скачать» и «Отправить» появлялись только при одинарном клике (тапе) на фотографию в режиме просмотра, а при повторном клике или свайпе — скрывались.
+
+Вот полный, готовый к работе код. Я внёс минимальные изменения в вашу логику галереи, добавив управление видимостью панели .gallery-actions.
+
+Что изменилось:
+
+1. CSS: Панель .gallery-actions по умолчанию скрыта (opacity: 0; pointer-events: none; transform: translateX(-50%) translateY(20px);). Добавлен класс .visible для плавного появления.
+2. HTML: Блок кнопок вынесен из потока (позиционирован fixed), чтобы не мешать галерее.
+3. JavaScript:
+   · В ImageZoom добавлена логика различения одинарного клика и двойного тапа (зума).
+   · Если был свайп, панель скрывается.
+   · При зуме кнопки автоматически прячутся, чтобы не мешать.
+   · При закрытии галереи кнопки сбрасываются.
+
+Вот обновлённый код (обратите внимание на секции /* ... */ в CSS и JS):
+
+```html
 <!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -566,13 +583,22 @@
     position: fixed;
     bottom: 16px;
     left: 50%;
-    transform: translateX(-50%);
+    transform: translateX(-50%) translateY(20px); /* Сдвинуты вниз */
     display: flex;
     gap: 10px;
     z-index: 3;
-    pointer-events: auto;
+    pointer-events: none; /* Не кликаются, пока скрыты */
     padding: 0;
+    opacity: 0;
+    transition: opacity 0.25s ease, transform 0.25s cubic-bezier(0.22, 0.61, 0.36, 1);
 }
+/* Класс, который показывает панель */
+.gallery-actions.visible {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+    pointer-events: auto;
+}
+
 .gallery-action-btn {
     display: flex;
     flex-direction: column;
@@ -4639,6 +4665,21 @@ async function loadOlderMessages() {
 const galleryState = { images: [], currentIndex: 0, isOpen: false };
 const GALLERY_ANIM_MS = 500;
 
+// ═══ Управление видимостью панели кнопок «Скачать / Отправить» ═══
+const galleryActionsEl = document.getElementById('galleryActions');
+function showGalleryActions() {
+    if (!galleryActionsEl) return;
+    galleryActionsEl.classList.add('visible');
+}
+function hideGalleryActions() {
+    if (!galleryActionsEl) return;
+    galleryActionsEl.classList.remove('visible');
+}
+function toggleGalleryActions() {
+    if (!galleryActionsEl) return;
+    galleryActionsEl.classList.toggle('visible');
+}
+
 const ImageZoom = (() => {
     let slideA = null;
     let slideB = null;
@@ -4653,6 +4694,11 @@ const ImageZoom = (() => {
     let startX = 0, startY = 0;
     let lastTapTime = 0;
     let galleryBusy = false;
+
+    // ✅ Флаг: клик был "одинарным" (без свайпа и зума)
+    let singleTapCandidate = false;
+    let tapStartX = 0, tapStartY = 0;
+    let tapMoved = false;
 
     let swipeStartY = 0;
     let swipeStartX = 0;
@@ -4809,6 +4855,8 @@ const ImageZoom = (() => {
             updateGalleryUI();
             preloadNeighbors();
             galleryBusy = false;
+            // ✅ Скрываем кнопки при смене слайда
+            hideGalleryActions();
         }, GALLERY_ANIM_MS + 20);
 
         return true;
@@ -4819,6 +4867,9 @@ const ImageZoom = (() => {
         if (!el) return;
         if (e.touches.length === 2) {
             isPinching = true; isDragging = false; isSwipingToClose = false; isSwipingHoriz = false; swipeDirection = null;
+            singleTapCandidate = false;
+            // ✅ Скрываем кнопки при зуме
+            hideGalleryActions();
             startDist = getTouchDistance(e.touches[0], e.touches[1]);
             startScale = scale;
             const mid = getMidpoint(e.touches[0], e.touches[1]);
@@ -4829,7 +4880,16 @@ const ImageZoom = (() => {
             const now = Date.now();
             const tapX = e.touches[0].clientX;
             const tapY = e.touches[0].clientY;
+            
+            // ✅ Начинаем отслеживать "клик" — если палец не сдвинется, это будет тап
+            tapStartX = tapX;
+            tapStartY = tapY;
+            tapMoved = false;
+            singleTapCandidate = true;
+            
             if (now - lastTapTime < 300 && !isPinching) {
+                // Двойной тап — зум
+                singleTapCandidate = false;
                 if (scale > 1.05) reset(true);
                 else {
                     const prevScale = scale;
@@ -4864,6 +4924,7 @@ const ImageZoom = (() => {
         if (e.touches.length === 2) {
             e.preventDefault();
             isPinching = true; isSwipingToClose = false; isSwipingHoriz = false; swipeDirection = null;
+            singleTapCandidate = false;
             const dist = getTouchDistance(e.touches[0], e.touches[1]);
             if (startDist > 0) {
                 const ratio = dist / startDist;
@@ -4884,6 +4945,13 @@ const ImageZoom = (() => {
             const touch = e.touches[0];
             const dx = touch.clientX - swipeStartX;
             const dy = touch.clientY - swipeStartY;
+            
+            // ✅ Если палец сдвинулся больше чем на 10px — это уже не клик
+            if (Math.abs(touch.clientX - tapStartX) > 10 || Math.abs(touch.clientY - tapStartY) > 10) {
+                tapMoved = true;
+                singleTapCandidate = false;
+            }
+            
             if (scale <= 1.01) {
                 if (!swipeDirection) {
                     if (Math.abs(dx) > DIRECTION_LOCK || Math.abs(dy) > DIRECTION_LOCK) {
@@ -4926,6 +4994,13 @@ const ImageZoom = (() => {
         if (galleryBusy) return;
         const el = getActive();
         if (!el) return;
+        
+        // ✅ Если палец не сдвинулся — это был клик. Переключаем панель.
+        if (singleTapCandidate && !tapMoved && !isPinching && !isSwipingHoriz && !isSwipingToClose) {
+            toggleGalleryActions();
+        }
+        singleTapCandidate = false;
+        
         if (e.touches.length === 0) {
             if (isSwipingHoriz) {
                 const offset = swipeHorizOffsetX;
@@ -4964,6 +5039,8 @@ const ImageZoom = (() => {
     function onWheel(e) {
         if (galleryBusy) return;
         e.preventDefault();
+        // ✅ Скрываем кнопки при зуме
+        hideGalleryActions();
         const delta = e.deltaY > 0 ? -0.15 : 0.15;
         scale = Math.max(minScale, Math.min(maxScale, scale + delta));
         if (scale <= 1.01) { tx = 0; ty = 0; }
@@ -5016,6 +5093,8 @@ const ImageZoom = (() => {
             slideA.style.opacity = '';
             galleryBusy = false;
             scale = 1; tx = 0; ty = 0;
+            singleTapCandidate = false;
+            tapMoved = false;
             bind();
             setTimeout(preloadNeighbors, 100);
         },
@@ -5023,6 +5102,9 @@ const ImageZoom = (() => {
             unbind();
             galleryBusy = false;
             scale = 1; tx = 0; ty = 0;
+            singleTapCandidate = false;
+            tapMoved = false;
+            hideGalleryActions();
         },
         reset,
         navigateGallery
@@ -5065,6 +5147,8 @@ function openGallery(imageUrl) {
     document.body.style.overflow = 'hidden';
     galleryState.isOpen = true;
     updateGalleryUI();
+    // ✅ Кнопки скрыты при открытии
+    hideGalleryActions();
     const src = galleryState.images[galleryState.currentIndex];
     const pre = new Image();
     const init = () => { ImageZoom.open(); };
@@ -5079,6 +5163,8 @@ function closeImageModal() {
     galleryState.images = [];
     galleryState.currentIndex = 0;
     ImageZoom.close();
+    // ✅ Сбрасываем панель
+    hideGalleryActions();
     imageModal.classList.remove('active', 'has-gallery', 'single-image');
     document.body.style.overflow = '';
     [modalImage, modalImageNext].forEach(el => {
@@ -6786,3 +6872,4 @@ console.log('🟢 Зелёная подсветка "новых" — тольк�
 </script>
 </body>
 </html>
+```
