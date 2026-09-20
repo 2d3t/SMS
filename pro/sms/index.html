@@ -454,6 +454,8 @@
             justify-content: center;
             touch-action: none;
             overflow: hidden;
+            /* 🆕 Плавный поворот при смене ориентации */
+            transition: transform 0.3s ease, width 0.3s ease, height 0.3s ease;
         }
         .gallery-slide {
             position: absolute;
@@ -1446,6 +1448,21 @@
     margin-bottom: 20px;
     white-space: pre-wrap;
     word-break: break-word;
+}
+
+/* ═══ Автоповорот галереи в ландшафт ═══ */
+#galleryViewport.rotate {
+    width: 100vh;
+    height: 100vw;
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%) rotate(90deg);
+    transform-origin: center center;
+}
+#galleryViewport.rotate .gallery-slide {
+    max-width: 90vh;
+    max-height: 90vw;
 }
     </style>
 </head>
@@ -5256,6 +5273,8 @@ function openGallery(imageUrl) {
     imageModal.classList.add('active');
     document.body.style.overflow = 'hidden';
     galleryState.isOpen = true;
+    // 🆕 Применяем текущую ориентацию экрана
+    if (window._applyGalleryOrientation) window._applyGalleryOrientation();
     updateGalleryUI();
     hideGalleryActions();
     const src = galleryState.images[galleryState.currentIndex];
@@ -5274,6 +5293,9 @@ function closeImageModal() {
     ImageZoom.close();
     hideGalleryActions();
     imageModal.classList.remove('active', 'has-gallery', 'single-image');
+    // 🆕 Сбрасываем поворот
+    const viewport = document.getElementById('galleryViewport');
+    if (viewport) viewport.classList.remove('rotate');
     document.body.style.overflow = '';
     [modalImage, modalImageNext].forEach(el => {
         if (!el) return;
@@ -5286,6 +5308,37 @@ function closeImageModal() {
     imageModal.style.background = '';
     imageModal.style.transition = '';
 }
+
+// ═══════════════════════════════════════════════════════════════
+//  🆕 АВТОПОВОРОТ ГАЛЕРЕИ ПРИ ПОВОРОТЕ ТЕЛЕФОНА
+// ═══════════════════════════════════════════════════════════════
+(function initGalleryOrientation() {
+    const viewport = document.getElementById('galleryViewport');
+    if (!viewport) return;
+
+    function applyOrientation() {
+        if (!galleryState.isOpen) return;
+        const isLandscape = window.innerWidth > window.innerHeight;
+        // Проверяем, что это тач-устройство, чтобы не крутить на десктопе
+        const isTouch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+        if (isLandscape && isTouch) {
+            viewport.classList.add('rotate');
+        } else {
+            viewport.classList.remove('rotate');
+        }
+        // Сброс зума/смещения — иначе картинка «улетает» после поворота
+        try { ImageZoom.reset(false); } catch (e) {}
+    }
+
+    window.addEventListener('orientationchange', () => {
+        // Небольшая задержка: iOS/Android меняют размеры не сразу
+        setTimeout(applyOrientation, 120);
+    });
+    window.addEventListener('resize', applyOrientation);
+
+    // Экспортируем, чтобы вызывать при открытии галереи
+    window._applyGalleryOrientation = applyOrientation;
+})();
 
 // ===================================================================
 //  ПОДЕЛИТЬСЯ С ЧАТОМ
@@ -6922,6 +6975,7 @@ console.log('⚠️ Предупреждение при превышении 1 �
 console.log('🗑️ Удаление сообщения удаляет и вложение');
 console.log('📜 История: 5 последних, при скролле вверх по 10');
 console.log('🟢 Зелёная подсветка "новых" — только при ПЕРВОМ входе в чат');
+console.log('🔄 Автоповорот галереи при повороте телефона');
 </script>
 </body>
 </html>
