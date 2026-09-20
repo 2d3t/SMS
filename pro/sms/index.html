@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -788,7 +787,7 @@
             position: absolute;
             bottom: calc(100% + 8px);
             right: 14px;
-            width: 240px;
+            width: 250px;
             max-width: calc(100vw - 28px);
             background: #1a1a2e;
             border: 1px solid rgba(255,255,255,0.1);
@@ -837,6 +836,10 @@
         .attach-menu-item.file .icon {
             background: linear-gradient(135deg, rgba(0,184,148,0.2), rgba(0,184,148,0.1));
             color: #00b894;
+        }
+        .attach-menu-item.doc .icon {
+            background: linear-gradient(135deg, rgba(255,159,67,0.2), rgba(254,202,87,0.1));
+            color: #ff9f43;
         }
         .attach-menu-item .text {
             flex: 1;
@@ -1376,7 +1379,7 @@
             .emoji-item { width: 32px; height: 32px; font-size: 20px; }
             .attach-menu {
                 width: calc(100vw - 20px);
-                max-width: 280px;
+                max-width: 290px;
                 right: 10px;
             }
             .audio-container { min-width: 140px; padding: 4px 10px 4px 4px; }
@@ -1429,6 +1432,20 @@
 }
 @keyframes sendSpin {
     to { transform: rotate(360deg); }
+}
+
+/* ═══ Модалка подтверждения (крупные файлы) ═══ */
+#confirmModal .form-modal-content {
+    animation: slideUp 0.25s ease;
+    max-width: 420px;
+}
+#confirmModal .confirm-text {
+    font-size: 14px;
+    color: #ccc;
+    line-height: 1.6;
+    margin-bottom: 20px;
+    white-space: pre-wrap;
+    word-break: break-word;
 }
     </style>
 </head>
@@ -1541,14 +1558,21 @@
                 <div class="icon">🖼️</div>
                 <div class="text">
                     <div class="title">Изображения</div>
-                    <div class="subtitle">Можно выбрать несколько</div>
+                    <div class="subtitle">До 20 шт, каждая до 25 МБ</div>
                 </div>
             </div>
             <div class="attach-menu-item file" data-action="file">
                 <div class="icon">📄</div>
                 <div class="text">
                     <div class="title">Любой файл</div>
-                    <div class="subtitle">HTML, JSON, PDF, ZIP…</div>
+                    <div class="subtitle">ZIP, MP4, PDF… до 25 МБ</div>
+                </div>
+            </div>
+            <div class="attach-menu-item doc" data-action="document">
+                <div class="icon">📚</div>
+                <div class="text">
+                    <div class="title">Документы</div>
+                    <div class="subtitle">PDF, DOCX, XLSX, TXT</div>
                 </div>
             </div>
         </div>
@@ -1881,6 +1905,18 @@
     </div>
 </div>
 
+<!-- ═══════════ УНИВЕРСАЛЬНАЯ МОДАЛКА ПОДТВЕРЖДЕНИЯ ═══════════ -->
+<div class="image-modal" id="confirmModal">
+    <div class="form-modal-content">
+        <h2 id="confirmModalTitle" style="font-size:18px;margin-bottom:14px;">Подтверждение</h2>
+        <div id="confirmModalText" class="confirm-text"></div>
+        <div class="modal-actions">
+            <button class="btn btn-secondary" id="confirmModalNoBtn">Отмена</button>
+            <button class="btn" id="confirmModalYesBtn">OK</button>
+        </div>
+    </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -1909,6 +1945,13 @@ const CONFIG = {
     maxFileSize: 25 * 1024 * 1024,
     maxBatchImages: 20,
     maxBatchTotalSize: 100 * 1024 * 1024,
+
+    // ═══ Лимиты GitHub Contents API ═══
+    // Мягкий лимит на прямую загрузку через base64 в JSON
+    softLimitBytes: 1 * 1024 * 1024,        // 1 МБ — рекомендуемый максимум
+    hardLimitBytes: 25 * 1024 * 1024,       // 25 МБ — абсолютный максимум для Contents API
+    warnLimitBytes: 900 * 1024,             // 900 КБ — начинаем предупреждать
+    maxAttachmentSize: 25 * 1024 * 1024,
 };
 
 // ===================================================================
@@ -2068,20 +2111,14 @@ function resetFailedAttempts() {
 // ===================================================================
 class SoundManager {
     constructor() { this.enabled = true; this.sounds = {}; this.initSounds(); }
-
-
-
-    
 initSounds() {
     this.sounds.send = this.createBeep(600, 0.1);
     this.sounds.receive = this.createBeep(800, 0.15);
     this.sounds.error = this.createBeep(300, 0.3);
     this.sounds.delete = this.createBeep(400, 0.1);
     this.sounds.click = this.createBeep(500, 0.05);
-    // 🔔 Уведомление для списка чатов — двойной мелодичный бип
     this.sounds.notification = this.createNotificationSound();
 }
-
 createNotificationSound() {
     return {
         play: () => {
@@ -2109,9 +2146,6 @@ createNotificationSound() {
         }
     };
 }
-
-
-
     createBeep(freq, duration) {
         return {
             play: () => {
@@ -2149,7 +2183,7 @@ let state = {
     chats: [], savedPasswords: {},
     currentScreen: 'auth',
     _metaEtagsByFile: {},
-    _chatEntered: false,   // true = мы уже "зашли" в чат, зелёная подсветка больше не нужна
+    _chatEntered: false,
 };
 
 let historyState = {
@@ -2177,7 +2211,6 @@ let networkState = { isOnline: navigator.onLine };
 let pendingOpenChat = null;
 let _pendingShareAfterUnlock = null;
 
-// ═══ Состояние "поделиться с чатом" ═══
 let _shareToChat = {
     blob: null,
     fileName: null,
@@ -2269,18 +2302,80 @@ function generateAttachmentName(prefix, ext) {
 
 function guessMimeFromName(name) {
     const ext = name.split('.').pop().toLowerCase();
-    return {
+    const mimeMap = {
+        // Изображения
         jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
+        gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp',
+        svg: 'image/svg+xml', ico: 'image/x-icon', avif: 'image/avif',
+        // Аудио
         webm: 'audio/webm', mp3: 'audio/mpeg', ogg: 'audio/ogg',
-        html: 'text/html', htm: 'text/html', json: 'application/json',
-        txt: 'text/plain', pdf: 'application/pdf', zip: 'application/zip',
-    }[ext] || 'application/octet-stream';
+        wav: 'audio/wav', m4a: 'audio/mp4', aac: 'audio/aac', flac: 'audio/flac',
+        // Видео
+        mp4: 'video/mp4', mov: 'video/quicktime', avi: 'video/x-msvideo',
+        mkv: 'video/x-matroska',
+        // Документы
+        pdf: 'application/pdf',
+        doc: 'application/msword',
+        docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        xls: 'application/vnd.ms-excel',
+        xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        ppt: 'application/vnd.ms-powerpoint',
+        pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        odt: 'application/vnd.oasis.opendocument.text',
+        ods: 'application/vnd.oasis.opendocument.spreadsheet',
+        rtf: 'application/rtf',
+        // Текст / код
+        html: 'text/html', htm: 'text/html',
+        json: 'application/json',
+        xml: 'application/xml',
+        csv: 'text/csv',
+        txt: 'text/plain',
+        md: 'text/markdown',
+        yaml: 'text/yaml', yml: 'text/yaml',
+        js: 'application/javascript', mjs: 'application/javascript',
+        ts: 'application/typescript',
+        jsx: 'text/jsx', tsx: 'text/tsx',
+        css: 'text/css', scss: 'text/x-scss', sass: 'text/x-sass',
+        less: 'text/x-less',
+        py: 'text/x-python', rb: 'text/x-ruby', go: 'text/x-go',
+        rs: 'text/x-rust', java: 'text/x-java', kt: 'text/x-kotlin',
+        swift: 'text/x-swift', php: 'application/x-php',
+        c: 'text/x-c', cpp: 'text/x-c++', h: 'text/x-c',
+        hpp: 'text/x-c++', cs: 'text/x-csharp',
+        sh: 'application/x-sh', bat: 'application/x-bat',
+        ps1: 'application/x-powershell',
+        sql: 'application/sql',
+        // Архивы
+        zip: 'application/zip',
+        rar: 'application/vnd.rar',
+        '7z': 'application/x-7z-compressed',
+        tar: 'application/x-tar',
+        gz: 'application/gzip',
+        bz2: 'application/x-bzip2',
+        xz: 'application/x-xz',
+        // Прочее
+        bin: 'application/octet-stream',
+        exe: 'application/x-msdownload',
+        apk: 'application/vnd.android.package-archive',
+        dmg: 'application/x-apple-diskimage',
+        iso: 'application/x-iso9660-image',
+        db: 'application/x-sqlite3',
+        sqlite: 'application/x-sqlite3',
+        epub: 'application/epub+zip',
+        mobi: 'application/x-mobipocket-ebook',
+        ttf: 'font/ttf', otf: 'font/otf', woff: 'font/woff', woff2: 'font/woff2',
+        stl: 'model/stl', obj: 'model/obj',
+    };
+    return mimeMap[ext] || 'application/octet-stream';
 }
 
 function isAttachmentRef(value) {
-    return typeof value === 'string'
-        && !value.startsWith('data:')
-        && /\.(jpg|jpeg|png|webm|mp3|ogg|html|htm|json|txt|pdf|zip|rar|7z|tar|gz|csv|xls|xlsx|doc|docx|mp4|mov|avi|mkv|svg|ico|sql|db|sqlite|sh|bat|exe|apk|dmg|iso|xml|yaml|yml|js|ts|jsx|tsx|css|scss|py|rb|go|rs|java|php|md|rtf|bin)$/i.test(value);
+    if (typeof value !== 'string') return false;
+    if (value.startsWith('data:')) return false;
+    if (value.startsWith('blob:')) return false;
+    if (value.startsWith('http://') || value.startsWith('https://')) return false;
+    return /^[a-z]+_[a-z0-9]+_[a-f0-9]+\.[a-z0-9]{1,8}$/i.test(value)
+        || /\.(jpg|jpeg|png|gif|webp|bmp|svg|ico|avif|webm|mp3|ogg|wav|m4a|aac|flac|mp4|mov|avi|mkv|pdf|doc|docx|xls|xlsx|ppt|pptx|odt|ods|rtf|html|htm|json|xml|csv|txt|md|yaml|yml|js|mjs|ts|jsx|tsx|css|scss|sass|less|py|rb|go|rs|java|kt|swift|php|c|cpp|h|hpp|cs|sh|bat|ps1|sql|zip|rar|7z|tar|gz|bz2|xz|bin|exe|apk|dmg|iso|db|sqlite|epub|mobi|ttf|otf|woff|woff2|stl|obj)$/i.test(value);
 }
 
 function loadChatsList() {
@@ -2332,13 +2427,10 @@ function setLastReadId(file, messageId) {
     const rs = loadReadState();
     rs[file] = messageId;
     saveReadState(rs);
-// 🆕 Последнее ИЗВЕСТНОЕ общее число непрочитанных (-1 = ещё не инициализировано)
-let _lastKnownUnreadTotal = -1;
 }
 
-
-
-
+// 🆕 Последнее ИЗВЕСТНОЕ общее число непрочитанных (-1 = ещё не инициализировано)
+let _lastKnownUnreadTotal = -1;
 
 function markChatAsRead() {
     if (!state.chatFile || historyState.allMessages.length === 0) return;
@@ -2381,10 +2473,6 @@ async function fetchMetaFast(file, etag, token) {
     }
 }
 
-
-
-
-
 async function checkUnreadForAllChats() {
     const result = {};
     const passwords = state.savedPasswords;
@@ -2410,29 +2498,13 @@ async function checkUnreadForAllChats() {
             }
             state._metaEtagsByFile[file] = metaRes.etag || null;
             const metaVersion = metaRes.content && metaRes.content.version;
-            
+            if (!metaVersion) return;
 
+            chat._lastMetaVersion = metaVersion;
+            saveChatsList();
 
-
-
-if (!metaVersion) return;
-
-
-
-
-
-            
-chat._lastMetaVersion = metaVersion;
-saveChatsList();
-
-const lastReadId = getLastReadId(file);
-if (lastReadId && metaVersion <= lastReadId) return;
-// ↓ дальше уже читается файл и считаются реальные непрочитанные
-
-
-
-
-
+            const lastReadId = getLastReadId(file);
+            if (lastReadId && metaVersion <= lastReadId) return;
 
             if (!passwords[file]) {
                 result[file] = { hasUnread: true, count: 0 };
@@ -2460,10 +2532,6 @@ if (lastReadId && metaVersion <= lastReadId) return;
     return result;
 }
 
-
-
-
-
 async function refreshUnreadBadges() {
     if (state.currentScreen !== 'chats') return;
     const unread = await checkUnreadForAllChats();
@@ -2475,70 +2543,35 @@ async function refreshUnreadBadges() {
     saveChatsList();
     renderChatsList();
 
-    // 🆕 Обновляем значок на иконке PWA
     const totalUnread = state.chats.reduce((sum, c) => sum + (c.unreadCount || 0), 0);
     updateAppBadge(totalUnread);
 
-    // ─── 🔔 Звук при изменении общего числа непрочитанных ───
-    // Считаем сумму: у чата с точным счётчиком — его число,
-    // у чата только с точкой (без пароля) — считаем как 1
     const totalCount = state.chats.reduce(
         (sum, c) => sum + (c.unreadCount || (c.hasUnread ? 1 : 0)),
         0
     );
 
     if (_lastKnownUnreadTotal === -1) {
-        // Первый прогон — просто запоминаем, звук не играем
         _lastKnownUnreadTotal = totalCount;
     } else if (totalCount !== _lastKnownUnreadTotal) {
-        // Что-то изменилось
         if (totalCount > _lastKnownUnreadTotal && !document.hidden) {
-            // Стало БОЛЬШЕ — играем звук ОДИН раз
             soundManager.play('notification');
             if (navigator.vibrate) navigator.vibrate([80, 40, 80]);
         }
-        // Стало МЕНЬШЕ (прочитали) — просто обновляем, без звука
         _lastKnownUnreadTotal = totalCount;
     }
 }
 
-
-// 🆕 Обнулить все уведомления во всех чатах
-
-
-
-
-
-
-
-
-
-
-
-// Обновление значка на иконке приложения (PWA)
-
-
-
-
-
-
-
 function updateAppBadge(totalUnread) {
-    // Проверяем, поддерживается ли API (на Android setAppBadge может отсутствовать)
     if (!navigator.setAppBadge) return;
-
     try {
         if (totalUnread > 0) {
-            // Передаём число. Браузер сам решит, показать цифру или точку.
             navigator.setAppBadge(totalUnread).catch(() => {});
         } else {
             navigator.clearAppBadge().catch(() => {});
         }
-    } catch (e) {
-        // Тихо игнорируем — если не поддерживается, просто не будет значка
-    }
+    } catch (e) {}
 }
-
 
 async function clearAllUnread() {
     if (state.chats.length === 0) {
@@ -2554,16 +2587,11 @@ async function clearAllUnread() {
 
     const rs = loadReadState();
     let clearedCount = 0;
-    let processed = 0;
 
     const tasks = state.chats.map(async (chat) => {
         try {
-            // Всегда тянем свежую meta-версию с GitHub (игнорируя ETag)
             const metaRes = await fetchMetaFast(chat.file, null);
-            processed++;
-
             if (!metaRes.exists || !metaRes.content || !metaRes.content.version) {
-                // Нет meta — нечего помечать
                 if (chat.hasUnread) {
                     delete chat.hasUnread;
                     delete chat.unreadCount;
@@ -2571,21 +2599,14 @@ async function clearAllUnread() {
                 }
                 return;
             }
-
-            // Фиксируем текущую версию как прочитанную
             rs[chat.file] = metaRes.content.version;
-
             if (chat.hasUnread) clearedCount++;
-
-            // Обновляем кэш ETag, чтобы polling не перезаписал
             state._metaEtagsByFile[chat.file] = metaRes.etag || null;
             chat._lastMetaVersion = metaRes.content.version;
-
             delete chat.hasUnread;
             delete chat.unreadCount;
         } catch (e) {
             console.warn('clearAllUnread: ошибка для', chat.file, e.message);
-            // Даже при ошибке снимаем локальную метку, чтобы UI очистился
             if (chat.hasUnread) {
                 delete chat.hasUnread;
                 delete chat.unreadCount;
@@ -2610,7 +2631,6 @@ async function clearAllUnread() {
         soundManager.play('click');
     }
 }
-
 
 // ===================================================================
 //  АВТОВХОД
@@ -3018,6 +3038,109 @@ function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+}
+
+// ===================================================================
+//  ПРОВЕРКА РАЗМЕРА ФАЙЛА (новое)
+// ===================================================================
+function checkFileSizeLimit(fileSize, fileName) {
+    const { softLimitBytes, hardLimitBytes, warnLimitBytes } = CONFIG;
+
+    if (fileSize > hardLimitBytes) {
+        return {
+            ok: false,
+            level: 'hard',
+            message: `Файл «${fileName}» (${formatFileSize(fileSize)}) превышает максимум ${formatFileSize(hardLimitBytes)}.\nGitHub не примет его через API.`
+        };
+    }
+
+    if (fileSize > softLimitBytes) {
+        return {
+            ok: true,
+            level: 'hard',
+            message: `Файл «${fileName}» (${formatFileSize(fileSize)}) больше 1 МБ.\n\nGitHub может отклонить загрузку или она займёт много времени.\n\nПродолжить?`
+        };
+    }
+
+    if (fileSize > warnLimitBytes) {
+        return {
+            ok: true,
+            level: 'warn',
+            message: `⚠️ Файл «${fileName}» (${formatFileSize(fileSize)}) близок к лимиту 1 МБ. Возможны проблемы.`
+        };
+    }
+
+    return { ok: true, level: 'ok', message: '' };
+}
+
+async function confirmLargeFile(fileSize, fileName) {
+    const check = checkFileSizeLimit(fileSize, fileName);
+
+    if (!check.ok) {
+        await showConfirmModal(
+            '🚫 Файл слишком большой',
+            check.message,
+            'OK', null
+        );
+        soundManager.play('error');
+        return false;
+    }
+
+    if (check.level === 'hard') {
+        const confirmed = await showConfirmModal(
+            '⚠️ Превышен рекомендуемый лимит',
+            check.message + `\n\nРекомендуемый максимум: 1 МБ.\nАбсолютный максимум: ${formatFileSize(CONFIG.hardLimitBytes)}.`,
+            'Всё равно отправить',
+            'Отмена'
+        );
+        return confirmed;
+    }
+
+    if (check.level === 'warn') {
+        showToast(check.message, 3500);
+    }
+
+    return true;
+}
+
+// ===================================================================
+//  УНИВЕРСАЛЬНАЯ МОДАЛКА ПОДТВЕРЖДЕНИЯ (новое)
+// ===================================================================
+function showConfirmModal(title, text, yesLabel = 'OK', noLabel = 'Отмена') {
+    return new Promise((resolve) => {
+        const modal = $('confirmModal');
+        const titleEl = $('confirmModalTitle');
+        const textEl = $('confirmModalText');
+        const yesBtn = $('confirmModalYesBtn');
+        const noBtn = $('confirmModalNoBtn');
+
+        titleEl.textContent = title;
+        textEl.textContent = text;
+        yesBtn.textContent = yesLabel;
+
+        if (noLabel === null) {
+            noBtn.style.display = 'none';
+        } else {
+            noBtn.style.display = 'block';
+            noBtn.textContent = noLabel;
+        }
+
+        modal.classList.add('active');
+
+        const cleanup = () => {
+            modal.classList.remove('active');
+            yesBtn.removeEventListener('click', onYes);
+            noBtn.removeEventListener('click', onNo);
+            modal.removeEventListener('click', onBackdrop);
+        };
+        const onYes = () => { cleanup(); resolve(true); };
+        const onNo = () => { cleanup(); resolve(false); };
+        const onBackdrop = (e) => { if (e.target === modal) onNo(); };
+
+        yesBtn.addEventListener('click', onYes);
+        noBtn.addEventListener('click', onNo);
+        modal.addEventListener('click', onBackdrop);
+    });
 }
 
 // ===================================================================
@@ -4021,7 +4144,6 @@ async function handleMultipleImageUpload(files) {
     micBtn.disabled = true;
 
     try {
-        // Шаг 1: шифруем все вложения
         const encrypted = [];
         for (let i = 0; i < valid.length; i++) {
             if (BatchUploadIndicator.isCancelled()) throw new Error('ABORTED');
@@ -4051,7 +4173,6 @@ async function handleMultipleImageUpload(files) {
             return;
         }
 
-        // Шаг 2: загружаем вложения
         for (let i = 0; i < encrypted.length; i++) {
             if (BatchUploadIndicator.isCancelled()) throw new Error('ABORTED');
             const item = encrypted[i];
@@ -4062,7 +4183,6 @@ async function handleMultipleImageUpload(files) {
             });
         }
 
-        // Шаг 3: читаем файл чата и добавляем N сообщений одним коммитом
         const path = getChatPath(state.chatFile);
         const result = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
         let fileContent, sha;
@@ -4228,13 +4348,30 @@ async function deleteMessage(messageId) {
 // ===================================================================
 async function handleFileUpload(file) {
     if (!file) return;
-    if (!state.isAuthorized || !state.chatFile) { showToast('❌ Нет доступа', 2000); return; }
-    if (!navigator.onLine || !networkState.isOnline) { showToast('📵 Нет подключения', 2500); return; }
-    if (!file.type.startsWith('image/')) { showToast('❌ Только изображения', 2000); return; }
-    if (file.size > CONFIG.maxImageSize) { showToast(`❌ Файл слишком большой`, 3000); return; }
+    if (!state.isAuthorized || !state.chatFile) {
+        showToast('❌ Нет доступа', 2000);
+        return;
+    }
+    if (!navigator.onLine || !networkState.isOnline) {
+        showToast('📵 Нет подключения', 2500);
+        return;
+    }
+    if (!file.type.startsWith('image/')) {
+        showToast('❌ Только изображения', 2000);
+        return;
+    }
+
+    // ═══ Проверка размера с предупреждением ═══
+    const confirmed = await confirmLargeFile(file.size, file.name || 'image.jpg');
+    if (!confirmed) return;
+
     try {
         showToast('⏳ Обработка...', 1500);
         const compressedBlob = await compressImage(file);
+        if (compressedBlob.size > CONFIG.hardLimitBytes) {
+            showToast(`❌ Даже после сжатия файл ${formatFileSize(compressedBlob.size)} слишком большой`, 3500);
+            return;
+        }
         await sendMessage('', compressedBlob);
     } catch (error) {
         console.error(error);
@@ -4244,16 +4381,24 @@ async function handleFileUpload(file) {
 
 async function handleAnyFileUpload(file) {
     if (!file) return;
-    if (!state.isAuthorized || !state.chatFile) { showToast('❌ Нет доступа', 2000); return; }
-    if (!navigator.onLine || !networkState.isOnline) { showToast('📵 Нет подключения', 2500); return; }
-    if (file.size > CONFIG.maxFileSize) {
-        showToast(`❌ Файл больше ${formatFileSize(CONFIG.maxFileSize)}`, 3000);
+    if (!state.isAuthorized || !state.chatFile) {
+        showToast('❌ Нет доступа', 2000);
         return;
     }
+    if (!navigator.onLine || !networkState.isOnline) {
+        showToast('📵 Нет подключения', 2500);
+        return;
+    }
+
+    // ═══ Проверка размера с предупреждением ═══
+    const confirmed = await confirmLargeFile(file.size, file.name || 'file.bin');
+    if (!confirmed) return;
+
     if (file.size === 0) {
         showToast('❌ Файл пустой', 2000);
         return;
     }
+
     try {
         await sendMessage('', null, null, {
             blob: file,
@@ -4262,7 +4407,7 @@ async function handleAnyFileUpload(file) {
         });
     } catch (e) {
         console.error('File upload error:', e);
-        showToast('❌ Ошибка отправки файла', 3000);
+        showToast('❌ Ошибка отправки файла: ' + e.message, 3000);
     }
 }
 
@@ -4511,7 +4656,6 @@ function renderHistory() {
     historyState.startIndex = start;
     historyState.renderedCount = initial;
 
-    // ═══ Зелёная подсветка "новых" — только при ПЕРВОМ входе в чат ═══
     const lastReadId = state.chatFile ? getLastReadId(state.chatFile) : null;
     let firstUnreadIdx = -1;
 
@@ -4554,19 +4698,15 @@ function renderMessages(messages) {
     renderHistory();
 }
 
-
-
 function appendMessages(newMsgs) {
     if (!newMsgs || newMsgs.length === 0) return;
 
-    // ═══ Как только пришло/отправлено новое сообщение — снимаем ВСЕ "новые" метки ═══
     const divider = messagesInner.querySelector('.unread-divider');
     if (divider) divider.remove();
     messagesInner.querySelectorAll('.message-wrapper.unread').forEach(el => el.classList.remove('unread'));
 
     historyState.allMessages.push(...newMsgs);
 
-    // Подсветка новых сообщений — только если мы ещё НЕ "вошли"
     const markUnread = !state._chatEntered;
 
     let html = '';
@@ -4581,11 +4721,6 @@ function appendMessages(newMsgs) {
     loadAttachmentsIn(messagesInner);
     trimDomTop();
 }
-
-
-
-
-
 
 function trimDomTop() {
     const wrappers = messagesInner.querySelectorAll('.message-wrapper');
@@ -4649,7 +4784,6 @@ async function loadOlderMessages() {
 const galleryState = { images: [], currentIndex: 0, isOpen: false };
 const GALLERY_ANIM_MS = 500;
 
-// ═══ Управление видимостью панели кнопок «Скачать / Отправить» ═══
 const galleryActionsEl = document.getElementById('galleryActions');
 function showGalleryActions() {
     if (!galleryActionsEl) return;
@@ -4679,7 +4813,6 @@ const ImageZoom = (() => {
     let lastTapTime = 0;
     let galleryBusy = false;
 
-    // ✅ Флаг: клик был "одинарным" (без свайпа и зума)
     let singleTapCandidate = false;
     let tapStartX = 0, tapStartY = 0;
     let tapMoved = false;
@@ -4839,7 +4972,6 @@ const ImageZoom = (() => {
             updateGalleryUI();
             preloadNeighbors();
             galleryBusy = false;
-            // ✅ Скрываем кнопки при смене слайда
             hideGalleryActions();
         }, GALLERY_ANIM_MS + 20);
 
@@ -4852,7 +4984,6 @@ const ImageZoom = (() => {
         if (e.touches.length === 2) {
             isPinching = true; isDragging = false; isSwipingToClose = false; isSwipingHoriz = false; swipeDirection = null;
             singleTapCandidate = false;
-            // ✅ Скрываем кнопки при зуме
             hideGalleryActions();
             startDist = getTouchDistance(e.touches[0], e.touches[1]);
             startScale = scale;
@@ -4865,14 +4996,12 @@ const ImageZoom = (() => {
             const tapX = e.touches[0].clientX;
             const tapY = e.touches[0].clientY;
             
-            // ✅ Начинаем отслеживать "клик" — если палец не сдвинется, это будет тап
             tapStartX = tapX;
             tapStartY = tapY;
             tapMoved = false;
             singleTapCandidate = true;
             
             if (now - lastTapTime < 300 && !isPinching) {
-                // Двойной тап — зум
                 singleTapCandidate = false;
                 if (scale > 1.05) reset(true);
                 else {
@@ -4930,7 +5059,6 @@ const ImageZoom = (() => {
             const dx = touch.clientX - swipeStartX;
             const dy = touch.clientY - swipeStartY;
             
-            // ✅ Если палец сдвинулся больше чем на 10px — это уже не клик
             if (Math.abs(touch.clientX - tapStartX) > 10 || Math.abs(touch.clientY - tapStartY) > 10) {
                 tapMoved = true;
                 singleTapCandidate = false;
@@ -4979,7 +5107,6 @@ const ImageZoom = (() => {
         const el = getActive();
         if (!el) return;
         
-        // ✅ Если палец не сдвинулся — это был клик. Переключаем панель.
         if (singleTapCandidate && !tapMoved && !isPinching && !isSwipingHoriz && !isSwipingToClose) {
             toggleGalleryActions();
         }
@@ -5023,7 +5150,6 @@ const ImageZoom = (() => {
     function onWheel(e) {
         if (galleryBusy) return;
         e.preventDefault();
-        // ✅ Скрываем кнопки при зуме
         hideGalleryActions();
         const delta = e.deltaY > 0 ? -0.15 : 0.15;
         scale = Math.max(minScale, Math.min(maxScale, scale + delta));
@@ -5131,7 +5257,6 @@ function openGallery(imageUrl) {
     document.body.style.overflow = 'hidden';
     galleryState.isOpen = true;
     updateGalleryUI();
-    // ✅ Кнопки скрыты при открытии
     hideGalleryActions();
     const src = galleryState.images[galleryState.currentIndex];
     const pre = new Image();
@@ -5147,7 +5272,6 @@ function closeImageModal() {
     galleryState.images = [];
     galleryState.currentIndex = 0;
     ImageZoom.close();
-    // ✅ Сбрасываем панель
     hideGalleryActions();
     imageModal.classList.remove('active', 'has-gallery', 'single-image');
     document.body.style.overflow = '';
@@ -5443,8 +5567,19 @@ function openFilePicker(mode) {
     if (mode === 'image') {
         input.accept = 'image/*';
         input.multiple = true;
+    } else if (mode === 'document') {
+        input.accept = '.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.ods,.rtf,.txt,.md,.csv,.epub,.mobi';
     } else {
-        input.accept = '*/*';
+        // Любой файл — расширенный список
+        input.accept = [
+            '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.odt', '.ods', '.rtf',
+            '.zip', '.rar', '.7z', '.tar', '.gz',
+            '.txt', '.md', '.html', '.htm', '.json', '.xml', '.csv',
+            '.js', '.ts', '.jsx', '.tsx', '.css', '.scss', '.py', '.rb', '.go', '.rs', '.java', '.php',
+            '.yaml', '.yml', '.sql', '.sh', '.bat',
+            'image/*', 'video/*', 'audio/*',
+            '.apk', '.exe', '.dmg', '.iso', '.epub', '.mobi',
+        ].join(',');
     }
     input.onchange = async (e) => {
         const files = Array.from(e.target.files || []);
@@ -5458,7 +5593,9 @@ function openFilePicker(mode) {
                 handleMultipleImageUpload(files);
             }
         } else {
-            handleAnyFileUpload(files[0]);
+            const file = files[0];
+            showToast(`📎 ${file.name} — ${formatFileSize(file.size)}`, 2000);
+            handleAnyFileUpload(file);
         }
     };
     input.click();
@@ -5665,10 +5802,6 @@ function showChatsScreen() {
     updateScrollBadge();
 }
 
-
-
-
-// ═══ Оверлей перехода между чатами ═══
 function showChatTransition(chatName) {
     $('chatTransitionName').textContent = `«${chatName}»`;
     $('chatTransitionOverlay').classList.add('show');
@@ -5676,9 +5809,6 @@ function showChatTransition(chatName) {
 function hideChatTransition() {
     $('chatTransitionOverlay').classList.remove('show');
 }
-
-
-
 
 function showChatScreen() {
     state.currentScreen = 'chat';
@@ -5901,14 +6031,8 @@ async function confirmOpenChat() {
     }
 }
 
-
-
-
 async function enterChat(file, name, password) {
-    // Показываем оверлей СРАЗУ — до любых запросов
     showChatTransition(name);
-    
-    // Даём браузеру отрисовать оверлей перед тяжёлой работой
     await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
 
     stopPolling();
@@ -5920,7 +6044,7 @@ async function enterChat(file, name, password) {
     state._lastMetaVersion = null;
     state._metaEtag = null;
     state._lastSentMessageId = null;
-    state._chatEntered = false;   // ← сброс: мы ещё не "вошли"
+    state._chatEntered = false;
     CRYPTO._key = null; state.salt = null;
 
     state.chatFile = file;
@@ -5949,7 +6073,7 @@ async function enterChat(file, name, password) {
             state.lastMessageCount = 0;
             renderMessages([]);
             startPolling();
-            state._chatEntered = true;   // ← вошли
+            state._chatEntered = true;
             setTimeout(() => { if (state.chatFile === file) markChatAsRead(); }, 1500);
             return;
         }
@@ -5990,12 +6114,10 @@ async function enterChat(file, name, password) {
         renderHistory();
         startPolling();
 
-        // ✅ Мы вошли — дальше зелёная подсветка не нужна
         state._chatEntered = true;
 
         setTimeout(() => { if (state.chatFile === file) markChatAsRead(); }, 1500);
     } catch (e) {
-        // Сброс состояния — как было раньше
         state.chatFile = null; state.chatName = null;
         CRYPTO._key = null; state.chatPassword = ''; state.salt = null;
         state._lastCommitSha = null;
@@ -6003,13 +6125,9 @@ async function enterChat(file, name, password) {
         showChatsScreen();
         throw e;
     } finally {
-        // Гарантированно скрываем оверлей — при успехе и при ошибке
         hideChatTransition();
     }
 }
-
-
-        
 
 // ===================================================================
 //  ПРИСОЕДИНЕНИЕ
@@ -6175,18 +6293,9 @@ function logout() {
         rememberWarning.style.display = 'block';
     }
 
-// 🆕 Сбрасываем звуковое состояние
-_lastKnownUnreadTotal = -1;
-
-showAuthScreen();
+    _lastKnownUnreadTotal = -1;
 
     showAuthScreen();
-
-
-
-
-
-
 
     clearAuthError(); clearTokenHint();
     tokenInput.classList.remove('valid', 'invalid');
@@ -6242,28 +6351,10 @@ function backToChats() {
     hideScrollDownBtn();
     floatingKeyboardBtn.classList.remove('show');
 
-    showChatsScreen();
-}
-
-
-
-function backToChats() {
-    markChatAsRead();
-    // ... (весь существующий код) ...
-    messagesInner.dataset.lastDate = '';
-
-    hideScrollDownBtn();
-    floatingKeyboardBtn.classList.remove('show');
-
-    // 🆕 Сбрасываем "последнее известное" — пересчитаем при возврате в список
     _lastKnownUnreadTotal = -1;
 
     showChatsScreen();
 }
-
-
-
-
 
 // ===================================================================
 //  АВТОЗАПУСК
@@ -6424,8 +6515,6 @@ clearDataBtn.addEventListener('click', () => {
     showToast(alsoChats ? '🗑️ Все данные очищены' : '🗑️ Токен очищен', 1800);
 });
 
-
-
 $('clearAllUnreadBtn').addEventListener('click', clearAllUnread);
 $('chatsLogoutBtn').addEventListener('click', logout);
 $('createChatBtn').addEventListener('click', openCreateChatModal);
@@ -6488,7 +6577,6 @@ $('importFileInput').addEventListener('change', (e) => {
     if (e.target.files && e.target.files[0]) handleImportFile(e.target.files[0]);
 });
 
-// Обработчики модалки "Поделиться с чатом"
 $('cancelShareToChatBtn').addEventListener('click', () => {
     $('shareToChatModal').classList.remove('active');
     _shareToChat = { blob: null, fileName: null, mime: null, imageUrl: null, selectedFile: null };
@@ -6528,6 +6616,7 @@ document.addEventListener('keydown', (e) => {
         $('importModal').classList.remove('active');
         $('shareChatModal').classList.remove('active');
         $('shareToChatModal').classList.remove('active');
+        $('confirmModal').classList.remove('active');
         if (!inputBar.classList.contains('hidden')) hideInputBar();
     }
 });
@@ -6557,86 +6646,6 @@ document.addEventListener('keydown', (e) => {
 (function initGalleryActions() {
     const downloadBtn = $('galleryDownloadBtn');
     const shareBtn = $('galleryShareBtn');
-
-
-
-// ═══════════════════════════════════════════════════════════════
-//  ПОДЕЛИТЬСЯ ВО ВНЕШНИЕ ПРИЛОЖЕНИЯ (Telegram, WhatsApp и т.п.)
-// ═══════════════════════════════════════════════════════════════
-(async function initExternalShare() {
-    const btn = document.getElementById('shareToExternalBtn');
-    if (!btn) return;
-
-    btn.addEventListener('mouseenter', () => {
-        btn.style.background = 'rgba(0,184,148,0.15)';
-        btn.style.borderColor = 'rgba(0,184,148,0.4)';
-    });
-    btn.addEventListener('mouseleave', () => {
-        btn.style.background = 'rgba(0,184,148,0.08)';
-        btn.style.borderColor = 'rgba(0,184,148,0.25)';
-    });
-    btn.addEventListener('mousedown', () => btn.style.transform = 'scale(0.98)');
-    btn.addEventListener('mouseup',   () => btn.style.transform = 'scale(1)');
-    btn.addEventListener('touchstart',() => btn.style.transform = 'scale(0.98)', { passive: true });
-    btn.addEventListener('touchend',  () => btn.style.transform = 'scale(1)');
-
-    btn.addEventListener('click', async () => {
-        const blob = _shareToChat.blob;
-        const fileName = _shareToChat.fileName || 'file.bin';
-        const mime = _shareToChat.mime || 'application/octet-stream';
-
-        if (!blob) {
-            showToast('❌ Нет файла для отправки', 2000);
-            return;
-        }
-
-        // Закрываем модалку, чтобы не мешала системному шиту
-        document.getElementById('shareToChatModal').classList.remove('active');
-        if (navigator.vibrate) navigator.vibrate(20);
-
-        try {
-            const file = new File([blob], fileName, { type: mime });
-
-            // 1) Web Share API с файлами (Android Chrome 89+, iOS Safari 15+)
-            if (navigator.canShare && navigator.canShare({ files: [file] })) {
-                await navigator.share({
-                    files: [file],
-                    title: fileName,
-                });
-                showToast('✅ Отправлено', 1500);
-                return;
-            }
-
-            // 2) Web Share без файлов (fallback) — редко срабатывает,
-            //    но вдруг пользователь захочет скопировать текст
-            if (navigator.share) {
-                await navigator.share({
-                    title: fileName,
-                    text: 'Посмотри этот файл',
-                });
-                return;
-            }
-
-            // 3) Совсем нет Web Share → скачиваем файл
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = fileName;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            setTimeout(() => URL.revokeObjectURL(url), 2000);
-            showToast('💾 Системный ширинг недоступен — файл скачан', 2500);
-
-        } catch (err) {
-            if (err.name === 'AbortError') return; // пользователь закрыл шит
-            console.error('externalShare error:', err);
-            showToast('❌ Не удалось поделиться', 2000);
-        }
-    });
-})();
-
-
 
     function getCurrentSrc() {
         if (!galleryState.isOpen || galleryState.images.length === 0) return null;
@@ -6678,6 +6687,76 @@ document.addEventListener('keydown', (e) => {
     });
 })();
 
+// ═══════════════════════════════════════════════════════════════
+//  ПОДЕЛИТЬСЯ ВО ВНЕШНИЕ ПРИЛОЖЕНИЯ
+// ═══════════════════════════════════════════════════════════════
+(async function initExternalShare() {
+    const btn = document.getElementById('shareToExternalBtn');
+    if (!btn) return;
+
+    btn.addEventListener('mouseenter', () => {
+        btn.style.background = 'rgba(0,184,148,0.15)';
+        btn.style.borderColor = 'rgba(0,184,148,0.4)';
+    });
+    btn.addEventListener('mouseleave', () => {
+        btn.style.background = 'rgba(0,184,148,0.08)';
+        btn.style.borderColor = 'rgba(0,184,148,0.25)';
+    });
+    btn.addEventListener('mousedown', () => btn.style.transform = 'scale(0.98)');
+    btn.addEventListener('mouseup',   () => btn.style.transform = 'scale(1)');
+    btn.addEventListener('touchstart',() => btn.style.transform = 'scale(0.98)', { passive: true });
+    btn.addEventListener('touchend',  () => btn.style.transform = 'scale(1)');
+
+    btn.addEventListener('click', async () => {
+        const blob = _shareToChat.blob;
+        const fileName = _shareToChat.fileName || 'file.bin';
+        const mime = _shareToChat.mime || 'application/octet-stream';
+
+        if (!blob) {
+            showToast('❌ Нет файла для отправки', 2000);
+            return;
+        }
+
+        document.getElementById('shareToChatModal').classList.remove('active');
+        if (navigator.vibrate) navigator.vibrate(20);
+
+        try {
+            const file = new File([blob], fileName, { type: mime });
+
+            if (navigator.canShare && navigator.canShare({ files: [file] })) {
+                await navigator.share({
+                    files: [file],
+                    title: fileName,
+                });
+                showToast('✅ Отправлено', 1500);
+                return;
+            }
+
+            if (navigator.share) {
+                await navigator.share({
+                    title: fileName,
+                    text: 'Посмотри этот файл',
+                });
+                return;
+            }
+
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = fileName;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            setTimeout(() => URL.revokeObjectURL(url), 2000);
+            showToast('💾 Системный ширинг недоступен — файл скачан', 2500);
+
+        } catch (err) {
+            if (err.name === 'AbortError') return;
+            console.error('externalShare error:', err);
+            showToast('❌ Не удалось поделиться', 2000);
+        }
+    });
+})();
 
 // ═══ Долгое нажатие на фото → системное "Поделиться" ═══
 function setupLongPressShare() {
@@ -6691,7 +6770,6 @@ function setupLongPressShare() {
     }
 
     function onStart(e) {
-        // Игнорируем мультитач (зум)
         if (e.touches && e.touches.length > 1) { cancelPress(); return; }
         const touch = e.touches ? e.touches[0] : e;
         startX = touch.clientX;
@@ -6711,13 +6789,11 @@ function setupLongPressShare() {
         const touch = e.touches ? e.touches[0] : e;
         const dx = touch.clientX - startX;
         const dy = touch.clientY - startY;
-        // Если палец сдвинулся — отменяем (это свайп/зум, а не долгое нажатие)
         if (Math.hypot(dx, dy) > 10) cancelPress();
     }
 
     function onEnd(e) {
         cancelPress();
-        // Если сработало долгое нажатие — гасим последующий click
         if (longPressFired) {
             e.preventDefault?.();
             longPressFired = false;
@@ -6725,19 +6801,16 @@ function setupLongPressShare() {
     }
 
     const viewport = document.getElementById('galleryViewport');
-    // touch
     viewport.addEventListener('touchstart', onStart, { passive: true });
     viewport.addEventListener('touchmove', onMove, { passive: true });
     viewport.addEventListener('touchend', onEnd);
     viewport.addEventListener('touchcancel', onEnd);
-    // mouse (для десктопа)
     viewport.addEventListener('mousedown', onStart);
     viewport.addEventListener('mousemove', onMove);
     viewport.addEventListener('mouseup', onEnd);
     viewport.addEventListener('mouseleave', onEnd);
 }
 
-// ═══ Системный шаринг картинки ═══
 async function systemShareImage(src) {
     try {
         const res = await fetch(src);
@@ -6748,7 +6821,6 @@ async function systemShareImage(src) {
             { type: blob.type || 'image/jpeg' }
         );
 
-        // Web Share API с файлами (Android Chrome, iOS Safari 15+)
         if (navigator.canShare && navigator.canShare({ files: [file] })) {
             await navigator.share({
                 files: [file],
@@ -6757,7 +6829,6 @@ async function systemShareImage(src) {
             return;
         }
 
-        // Fallback: шарим текстом (ссылка не сработает для blob:)
         if (navigator.share) {
             await navigator.share({
                 title: 'Изображение',
@@ -6766,7 +6837,6 @@ async function systemShareImage(src) {
             return;
         }
 
-        // Совсем нет Web Share → скачиваем
         const a = document.createElement('a');
         a.href = src;
         a.download = file.name;
@@ -6783,8 +6853,6 @@ async function systemShareImage(src) {
 }
 
 setupLongPressShare();
-
-
 
 // ===================================================================
 //  ВОССТАНОВЛЕНИЕ СЕССИИ
@@ -6848,8 +6916,9 @@ console.log('✅ SMS Чат собран!');
 console.log('🔐 AES-256-GCM + PBKDF2 (200k)');
 console.log('📷 Множественная отправка фото (до 20 за раз) с batch-индикатором');
 console.log('📤 Кнопка «Поделиться» → выбор чата из списка');
-console.log('📎 Мини-меню выбора типа вложения');
+console.log('📎 Мини-меню выбора типа вложения (фото / любой / документы)');
 console.log('📊 Прогресс-бар загрузки больших файлов с отменой');
+console.log('⚠️ Предупреждение при превышении 1 МБ (soft) и 25 МБ (hard)');
 console.log('🗑️ Удаление сообщения удаляет и вложение');
 console.log('📜 История: 5 последних, при скролле вверх по 10');
 console.log('🟢 Зелёная подсветка "новых" — только при ПЕРВОМ входе в чат');
