@@ -5306,30 +5306,146 @@ function closeImageModal() {
 }
 
 
-
 // ═══════════════════════════════════════════════════════════════
-//  🔄 Автоповорот галереи при повороте телефона
+//  🔄 Автоповорот галереи — Android PWA + Browser
 // ═══════════════════════════════════════════════════════════════
 (function initGalleryResize() {
     const viewport = document.getElementById('galleryViewport');
     if (!viewport) return;
 
-    function updateSizes() {
+    let _lastW = 0, _lastH = 0;
+    let _rafId = null;
+    let _pollTimer = null;
+
+    function readViewportSize() {
+        // На Android в PWA берём максимум из всех источников —
+        // иногда innerHeight на миг "залипает" на старом значении
+        const vv = window.visualViewport;
+        const w = Math.max(
+            window.innerWidth || 0,
+            document.documentElement.clientWidth || 0,
+            vv ? vv.width : 0
+        );
+        const h = Math.max(
+            window.innerHeight || 0,
+            document.documentElement.clientHeight || 0,
+            vv ? vv.height : 0
+        );
+        return { w, h };
+    }
+
+    function applySizes() {
         if (!galleryState.isOpen) return;
-        const w = window.innerWidth;
-        const h = window.innerHeight;
+
+        const { w, h } = readViewportSize();
+        if (w === _lastW && h === _lastH) return;
+        _lastW = w;
+        _lastH = h;
+
+        console.log('[Gallery] resize →', w, 'x', h);
+
+        // Обновляем CSS-переменные у слайдов
         const slides = viewport.querySelectorAll('.gallery-slide');
         slides.forEach(el => {
             el.style.setProperty('--vw', Math.floor(w * 0.95) + 'px');
             el.style.setProperty('--vh', Math.floor(h * 0.85) + 'px');
         });
-        try { ImageZoom.reset(false); } catch (e) {}
+
+        // Сбрасываем зум и смещение — иначе фото "улетит" за экран
+        try {
+            if (typeof ImageZoom !== 'undefined' && ImageZoom.reset) {
+                ImageZoom.reset(false);
+            }
+        } catch (e) { console.warn('ImageZoom.reset failed:', e); }
     }
 
-    window.addEventListener('orientationchange', () => setTimeout(updateSizes, 150));
-    window.addEventListener('resize', updateSizes);
-    window._updateGallerySizes = updateSizes;
+    function scheduleApply(delay = 0) {
+        if (_rafId) cancelAnimationFrame(_rafId);
+        _rafId = requestAnimationFrame(() => {
+            _rafId = null;
+            if (delay > 0) setTimeout(applySizes, delay);
+            else applySizes();
+        });
+    }
+
+    // ═══ 1. resize (основное событие на Android) ═══
+    window.addEventListener('resize', () => {
+        // Android часто обновляет viewport с задержкой 100–300 мс
+        scheduleApply(0);
+        setTimeout(applySizes, 120);
+        setTimeout(applySizes, 300);
+    });
+
+    // ═══ 2. orientationchange (для старых Android/WebView) ═══
+    window.addEventListener('orientationchange', () => {
+        // На Android стреляет ДО обновления innerHeight — нужна серия вызовов
+        setTimeout(applySizes, 80);
+        setTimeout(applySizes, 200);
+        setTimeout(applySizes, 400);
+    });
+
+    // ═══ 3. screen.orientation API (Chrome PWA) ═══
+    if (screen.orientation && screen.orientation.addEventListener) {
+        screen.orientation.addEventListener('change', () => {
+            // Тоже стреляет рано — ждём обновления viewport
+            setTimeout(applySizes, 100);
+            setTimeout(applySizes, 250);
+            setTimeout(applySizes, 500);
+        });
+    }
+
+    // ═══ 4. visualViewport (надёжно, но не всегда есть в PWA) ═══
+    if (window.visualViewport) {
+        window.visualViewport.addEventListener('resize', () => scheduleApply(0));
+    }
+
+    // ═══ 5. СТРАХОВКА: поллинг каждые 400 мс, пока галерея открыта ═══
+    // На Android PWA бывает, что ни одно событие не приходит при повороте,
+    // особенно если WebView "залип". Поллинг решает проблему на 100%.
+    function startPolling() {
+        if (_pollTimer) return;
+        _pollTimer = setInterval(() => {
+            if (!galleryState.isOpen) {
+                stopPolling();
+                return;
+            }
+            const { w, h } = readViewportSize();
+            if (w !== _lastW || h !== _lastH) {
+                console.log('[Gallery] polling detected change:', w, 'x', h);
+                applySizes();
+            }
+        }, 400);
+    }
+    function stopPolling() {
+        if (_pollTimer) { clearInterval(_pollTimer); _pollTimer = null; }
+    }
+
+    // Запускаем поллинг при открытии галереи и останавливаем при закрытии
+    const _origOpenGallery = window.openGallery;
+    if (typeof _origOpenGallery === 'function') {
+        window.openGallery = function(...args) {
+            _lastW = 0; _lastH = 0; // сброс, чтобы первый applySizes точно сработал
+            const r = _origOpenGallery.apply(this, args);
+            startPolling();
+            return r;
+        };
+    }
+
+    const _origClose = window.closeImageModal;
+    if (typeof _origClose === 'function') {
+        window.closeImageModal = function(...args) {
+            stopPolling();
+            return _origClose.apply(this, args);
+        };
+    }
+
+    window._updateGallerySizes = applySizes;
 })();
+
+
+
+
+
 
     
 
