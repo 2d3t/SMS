@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -3064,20 +3065,12 @@ function checkFileSizeLimit(fileSize, fileName) {
         };
     }
 
-    if (fileSize > softLimitBytes) {
-        return {
-            ok: true,
-            level: 'hard',
-            message: `Файл «${fileName}» (${formatFileSize(fileSize)}) больше 1 МБ.\n\nGitHub может отклонить загрузку или она займёт много времени.\n\nПродолжить?`
-        };
-    }
+    // Убрано предупреждение для softLimitBytes
+    // Файл размером от 1 МБ до 25 МБ будет загружен без диалога
 
     if (fileSize > warnLimitBytes) {
-        return {
-            ok: true,
-            level: 'warn',
-            message: `⚠️ Файл «${fileName}» (${formatFileSize(fileSize)}) близок к лимиту 1 МБ. Возможны проблемы.`
-        };
+        // Оставляем только всплывающее уведомление без диалога
+        return { ok: true, level: 'warn', message: `⚠️ Файл «${fileName}» (${formatFileSize(fileSize)}) близок к лимиту 1 МБ. Возможны проблемы.` };
     }
 
     return { ok: true, level: 'ok', message: '' };
@@ -3096,16 +3089,7 @@ async function confirmLargeFile(fileSize, fileName) {
         return false;
     }
 
-    if (check.level === 'hard') {
-        const confirmed = await showConfirmModal(
-            '⚠️ Превышен рекомендуемый лимит',
-            check.message + `\n\nРекомендуемый максимум: 1 МБ.\nАбсолютный максимум: ${formatFileSize(CONFIG.hardLimitBytes)}.`,
-            'Всё равно отправить',
-            'Отмена'
-        );
-        return confirmed;
-    }
-
+    // Показываем тост для файлов > 900 КБ, но не блокируем загрузку
     if (check.level === 'warn') {
         showToast(check.message, 3500);
     }
