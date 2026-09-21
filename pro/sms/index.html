@@ -849,6 +849,13 @@ max-height: var(--vh, 90vh);
             background: linear-gradient(135deg, rgba(255,159,67,0.2), rgba(254,202,87,0.1));
             color: #ff9f43;
         }
+
+.attach-menu-item.audio .icon {
+    background: linear-gradient(135deg, rgba(108,92,231,0.25), rgba(0,184,148,0.2));
+    color: #a78bfa;
+}
+
+
         .attach-menu-item .text {
             flex: 1;
             min-width: 0;
@@ -1824,6 +1831,40 @@ max-height: var(--vh, 90vh);
         </div>
         <div class="emoji-panel" id="emojiPanel"></div>
         <div class="attach-menu" id="attachMenu">
+
+
+<div class="attach-menu" id="attachMenu">
+    <div class="attach-menu-item image" data-action="image">
+        <div class="icon">🖼️</div>
+        <div class="text">
+            <div class="title">Изображения</div>
+            <div class="subtitle">До 20 шт, каждая до 25 МБ</div>
+        </div>
+    </div>
+    <div class="attach-menu-item audio" data-action="audio">
+        <div class="icon">🎵</div>
+        <div class="text">
+            <div class="title">Аудиофайл</div>
+            <div class="subtitle">MP3, OGG, WAV, M4A… до 25 МБ</div>
+        </div>
+    </div>
+    <div class="attach-menu-item file" data-action="file">
+        <div class="icon">📄</div>
+        <div class="text">
+            <div class="title">Любой файл</div>
+            <div class="subtitle">ZIP, MP4, PDF… до 25 МБ</div>
+        </div>
+    </div>
+    <div class="attach-menu-item doc" data-action="document">
+        <div class="icon">📚</div>
+        <div class="text">
+            <div class="title">Документы</div>
+            <div class="subtitle">PDF, DOCX, XLSX, TXT</div>
+        </div>
+    </div>
+</div>
+
+
             <div class="attach-menu-item image" data-action="image">
                 <div class="icon">🖼️</div>
                 <div class="text">
@@ -3840,6 +3881,9 @@ async function deleteAttachment(chatFile, attachName) {
     }
 }
 
+
+
+
 async function loadAttachmentsIn(root) {
     const placeholders = root.querySelectorAll('[data-attach]:not([data-loaded])');
     if (placeholders.length === 0) return;
@@ -3848,7 +3892,7 @@ async function loadAttachmentsIn(root) {
         el.dataset.loaded = '1';
         const name = el.dataset.attach;
         const isImage = /\.(jpg|jpeg|png)$/i.test(name);
-        const isAudio = /\.(webm|mp3|ogg)$/i.test(name);
+        const isAudio = /\.(webm|mp3|ogg|wav|m4a|aac|flac|opus)$/i.test(name);
         const isFile = el.classList.contains('file-attach-placeholder');
 
         tasks.push((async () => {
@@ -3859,8 +3903,9 @@ async function loadAttachmentsIn(root) {
                 } else if (isAudio) {
                     const msgId = el.dataset.msgid || '';
                     const duration = parseFloat(el.dataset.duration) || 0;
+                    const mime = el.dataset.audiomime || '';
                     const wrapper = document.createElement('div');
-                    wrapper.innerHTML = createAudioPlayerHTML(msgId, url, duration, '');
+                    wrapper.innerHTML = createAudioPlayerHTML(msgId, url, duration, mime);
                     el.replaceWith(wrapper.firstElementChild);
                 } else if (isFile) {
                     const fileName = el.dataset.filename || 'file';
@@ -3876,6 +3921,13 @@ async function loadAttachmentsIn(root) {
     await Promise.allSettled(tasks);
     setTimeout(initAudioPlayers, 0);
 }
+
+
+
+
+
+
+                    
 
 // ===================================================================
 //  СООБЩЕНИЯ (шифрование payload)
@@ -4231,14 +4283,17 @@ async function handleMicClick() {
 // ===================================================================
 //  ОТПРАВКА СООБЩЕНИЯ (одиночная)
 // ===================================================================
-async function sendMessage(text, imageBlob = null, audioData = null, fileAttachment = null) {
+
+
+async function sendMessage(text, imageBlob = null, audioData = null, fileAttachment = null, audioFile = null) {
     if (!state.isAuthorized || !state.chatFile) { showToast('❌ Нет доступа', 2000); soundManager.play('error'); return; }
     if (!navigator.onLine || !networkState.isOnline) { showToast('📵 Нет подключения', 2500); soundManager.play('error'); return; }
     const hasText = text && text.trim();
     const hasImage = imageBlob instanceof Blob;
     const hasAudio = audioData !== null;
     const hasFile = fileAttachment && fileAttachment.blob instanceof Blob;
-    if ((!hasText && !hasImage && !hasAudio && !hasFile) || state.isSending) return;
+    const hasAudioFile = audioFile && audioFile.blob instanceof Blob;
+    if ((!hasText && !hasImage && !hasAudio && !hasFile && !hasAudioFile) || state.isSending) return;
 
     if (_emojiPanelOpen) toggleEmojiPanel(false);
     if (_attachMenuOpen) toggleAttachMenu(false);
@@ -4296,6 +4351,21 @@ async function sendMessage(text, imageBlob = null, audioData = null, fileAttachm
             plainMsg.audio = attachName;
             plainMsg.audioDuration = audioData.duration || 0;
             plainMsg.audioMime = audioData.mime || 'audio/webm';
+        }
+
+        // 🆕 Отправка аудиофайла
+        if (hasAudioFile) {
+            const ext = (audioFile.name.split('.').pop() || 'mp3')
+                .toLowerCase().replace(/[^a-z0-9]/g, '') || 'mp3';
+            const attachName = generateAttachmentName('aud', ext);
+            const buf = await audioFile.blob.arrayBuffer();
+            const enc = await encryptAttachment(buf, CRYPTO._key);
+            await uploadAttachment(state.chatFile, attachName, enc.cipher, enc.iv, {
+                displayName: `🎵 ${audioFile.name}`
+            });
+            plainMsg.audio = attachName;
+            plainMsg.audioDuration = audioFile.duration || 0;
+            plainMsg.audioMime = audioFile.mime || guessMimeFromName(audioFile.name);
         }
 
         if (hasFile) {
@@ -4362,6 +4432,7 @@ async function sendMessage(text, imageBlob = null, audioData = null, fileAttachm
         if (state.isAuthorized && state.chatFile) messageInput.focus();
     }
 }
+
 
 // ===================================================================
 //  МНОЖЕСТВЕННАЯ ОТПРАВКА ФОТО (batch)
@@ -4670,13 +4741,100 @@ async function handleAnyFileUpload(file) {
     }
 }
 
+
+// 🆕 Загрузка и отправка аудиофайла
+async function handleAudioFileUpload(file) {
+    if (!file) return;
+    if (!state.isAuthorized || !state.chatFile) {
+        showToast('❌ Нет доступа', 2000);
+        return;
+    }
+    if (!navigator.onLine || !networkState.isOnline) {
+        showToast('📵 Нет подключения', 2500);
+        return;
+    }
+
+    // Проверка, что это действительно аудио
+    const isAudio = file.type.startsWith('audio/') ||
+        /\.(mp3|ogg|wav|m4a|aac|flac|opus|webm)$/i.test(file.name);
+    if (!isAudio) {
+        showToast('❌ Это не аудиофайл', 2000);
+        return;
+    }
+
+    // Проверка размера с предупреждением
+    const confirmed = await confirmLargeFile(file.size, file.name || 'audio.mp3');
+    if (!confirmed) return;
+
+    if (file.size === 0) {
+        showToast('❌ Файл пустой', 2000);
+        return;
+    }
+
+    // Определяем длительность через Audio API
+    let duration = 0;
+    try {
+        duration = await getAudioDuration(file);
+    } catch (e) {
+        console.warn('Не удалось получить длительность:', e);
+    }
+
+    // Определяем расширение
+    const ext = (file.name.split('.').pop() || 'mp3')
+        .toLowerCase().replace(/[^a-z0-9]/g, '') || 'mp3';
+
+    try {
+        await sendMessage('', null, null, null, {
+            blob: file,
+            name: file.name || `audio.${ext}`,
+            mime: file.type || guessMimeFromName(file.name),
+            duration: duration,
+        });
+    } catch (e) {
+        console.error('Audio upload error:', e);
+        showToast('❌ Ошибка отправки аудио: ' + e.message, 3000);
+    }
+}
+
+// 🆕 Получение длительности аудиофайла
+function getAudioDuration(file) {
+    return new Promise((resolve, reject) => {
+        const url = URL.createObjectURL(file);
+        const audio = new Audio();
+        audio.preload = 'metadata';
+        const cleanup = () => {
+            URL.revokeObjectURL(url);
+            audio.src = '';
+        };
+        audio.onloadedmetadata = () => {
+            const d = audio.duration;
+            cleanup();
+            if (isFinite(d) && d > 0) resolve(d);
+            else resolve(0);
+        };
+        audio.onerror = () => {
+            cleanup();
+            resolve(0); // не падаем, просто без длительности
+        };
+        setTimeout(() => { cleanup(); resolve(0); }, 5000);
+        audio.src = url;
+    });
+}
+
+
+
 // ===================================================================
 //  АУДИО-ПЛЕЕР
 // ===================================================================
 const audioPlayers = {};
+
+
 function createAudioPlayerHTML(msgId, audioSrc, duration, mime) {
     const safeDuration = duration || 0;
     const displayTime = formatAudioTime(safeDuration);
+    const isVoice = (mime || '').includes('webm') || (mime || '').includes('opus');
+    const icon = isVoice ? '🎤' : '🎵'; // 🆕
+    
     let waveBars = '';
     for (let i = 0; i < 24; i++) {
         const h = 4 + Math.floor(Math.random() * 14);
@@ -4684,8 +4842,9 @@ function createAudioPlayerHTML(msgId, audioSrc, duration, mime) {
     }
     return `
         <div class="audio-container" data-audio-id="${msgId}">
-            <button class="audio-play-btn" onclick="toggleAudioPlayback(${msgId})">▶</button>
+            <button class="audio-play-btn" onclick="toggleAudioPlayback(${msgId})" title="${icon} Воспроизвести">▶</button>
             <div class="audio-info">
+                <div style="font-size:11px;color:rgba(255,255,255,0.5);margin-bottom:2px;">${icon}</div>
                 <div class="audio-wave" id="wave-${msgId}">${waveBars}</div>
                 <div class="audio-progress" id="progress-${msgId}" onclick="seekAudio(event, ${msgId})">
                     <div class="audio-progress-fill" id="progress-fill-${msgId}"></div>
@@ -4696,6 +4855,8 @@ function createAudioPlayerHTML(msgId, audioSrc, duration, mime) {
         </div>
     `;
 }
+
+
 function initAudioPlayers() {
     document.querySelectorAll('.audio-container').forEach(container => {
         const msgId = container.dataset.audioId;
@@ -4855,13 +5016,26 @@ function buildMessageHTML(msg, opts = {}) {
             content += `<div class="image-container" onclick="openImageModal('${msg.image}')"><img src="${msg.image}" alt="Изображение"></div>`;
         }
     }
-    if (msg.audio) {
-        if (isAttachmentRef(msg.audio)) {
-            content += `<div class="audio-container attach-placeholder" data-attach="${msg.audio}" data-msgid="${msg.id}" data-duration="${msg.audioDuration || 0}">⏳ аудио</div>`;
-        } else {
-            content += createAudioPlayerHTML(msg.id, msg.audio, msg.audioDuration, msg.audioMime);
-        }
+   
+
+if (msg.audio) {
+    if (isAttachmentRef(msg.audio)) {
+        // Иконка зависит от mime: webm/opus = голосовое, иначе — файл
+        const isVoice = (msg.audioMime || '').includes('webm') || (msg.audioMime || '').includes('opus');
+        const icon = isVoice ? '🎤' : '🎵';
+        content += `<div class="audio-container attach-placeholder" 
+                         data-attach="${msg.audio}" 
+                         data-msgid="${msg.id}" 
+                         data-duration="${msg.audioDuration || 0}"
+                         data-audiomime="${escapeHtml(msg.audioMime || '')}">⏳ ${icon} аудио</div>`;
+    } else {
+        content += createAudioPlayerHTML(msg.id, msg.audio, msg.audioDuration, msg.audioMime);
     }
+}
+ 
+
+
+
     if (msg.file) {
         if (isAttachmentRef(msg.file)) {
             content += `<div class="file-attach-placeholder" data-attach="${msg.file}" data-filename="${escapeHtml(msg.fileName || 'file')}" data-filesize="${msg.fileSize || 0}" data-filemime="${escapeHtml(msg.fileMime || '')}" data-msgid="${msg.id}">⏳ ${escapeHtml(msg.fileName || 'file')}</div>`;
@@ -5973,12 +6147,20 @@ function toggleAttachMenu(force) {
     if (shouldOpen && _emojiPanelOpen) toggleEmojiPanel(false);
 }
 
+
+
+
+
+
 function openFilePicker(mode) {
     const input = document.createElement('input');
     input.type = 'file';
     if (mode === 'image') {
         input.accept = 'image/*';
         input.multiple = true;
+    } else if (mode === 'audio') {
+        // 🆕 Аудиофайлы
+        input.accept = 'audio/*,.mp3,.ogg,.wav,.m4a,.aac,.flac,.opus,.webm';
     } else if (mode === 'document') {
         input.accept = '.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.ods,.rtf,.txt,.md,.csv,.epub,.mobi';
     } else {
@@ -6004,6 +6186,9 @@ function openFilePicker(mode) {
             } else {
                 handleMultipleImageUpload(files);
             }
+        } else if (mode === 'audio') {
+            // 🆕 Отправка аудиофайла
+            handleAudioFileUpload(files[0]);
         } else {
             const file = files[0];
             showToast(`📎 ${file.name} — ${formatFileSize(file.size)}`, 2000);
@@ -6012,6 +6197,11 @@ function openFilePicker(mode) {
     };
     input.click();
 }
+
+
+
+
+
 
 // ===================================================================
 //  POLLING
