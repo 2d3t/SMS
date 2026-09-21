@@ -1791,6 +1791,40 @@ max-height: var(--vh, 90vh);
     30% { box-shadow: 0 0 0 3px rgba(0,184,148,0.6); }
 }
 
+
+.search-result-item {
+    display: flex; align-items: flex-start; gap: 10px;
+    padding: 10px 12px;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 10px; cursor: pointer;
+    transition: all 0.15s; margin-bottom: 6px;
+}
+.search-result-item:hover {
+    background: rgba(108,92,231,0.12);
+    border-color: rgba(108,92,231,0.35);
+}
+.search-result-item:active { transform: scale(0.98); }
+.search-result-item .sr-icon {
+    font-size: 18px; flex-shrink: 0; margin-top: 2px;
+}
+.search-result-item .sr-body { flex: 1; min-width: 0; }
+.search-result-item .sr-header {
+    font-size: 11px; color: #888;
+    display: flex; justify-content: space-between;
+    margin-bottom: 3px;
+}
+.search-result-item .sr-author { color: #a78bfa; font-weight: 600; }
+.search-result-item .sr-text {
+    font-size: 13px; color: #ccc; line-height: 1.4;
+    word-break: break-word;
+}
+.search-result-item .sr-text mark {
+    background: rgba(254,202,87,0.35);
+    color: #feca57; padding: 0 2px; border-radius: 3px;
+}
+.search-counter { text-align: center; color: #666; font-size: 12px; padding: 8px; }
+
     </style>
 </head>
 <body>
@@ -1869,6 +1903,8 @@ max-height: var(--vh, 90vh);
         </div>
         <div style="display:flex;align-items:center;">
             <button class="exit-btn" id="backToChatsBtn" title="К списку чатов" style="margin-right:8px;">←</button>
+
+<button class="exit-btn" id="searchChatBtn" title="Поиск" style="margin-right:8px;">🔍</button>
             <button class="exit-btn" id="forgetBtn" title="Забыть пароль этого чата" style="margin-right:8px;">🔓</button>
             <button class="exit-btn" id="exitBtn" title="Выйти">✕</button>
         </div>
@@ -2304,6 +2340,27 @@ max-height: var(--vh, 90vh);
         <div class="rp-text" id="replyPreviewText">—</div>
     </div>
     <button class="rp-cancel" id="replyCancelBtn">✕</button>
+</div>
+
+
+
+<!-- ═══════════ ПОИСК ПО ЧАТУ ═══════════ -->
+<div class="image-modal" id="searchModal">
+    <div class="form-modal-content" style="max-width:500px;max-height:85vh;display:flex;flex-direction:column;">
+        <h2>🔍 Поиск в чате</h2>
+        <input type="text" id="searchInput" placeholder="Введите текст или имя отправителя..." 
+               style="width:100%;padding:12px 14px;background:rgba(255,255,255,0.06);
+                      border:1px solid rgba(255,255,255,0.1);border-radius:12px;
+                      color:#fff;font-size:15px;outline:none;margin-bottom:12px;">
+        <div id="searchResults" style="flex:1;overflow-y:auto;max-height:55vh;padding-right:4px;">
+            <div style="text-align:center;color:#666;font-size:13px;padding:20px;">
+                Начните вводить запрос…
+            </div>
+        </div>
+        <div class="modal-actions" style="margin-top:12px;">
+            <button class="btn btn-secondary" id="cancelSearchBtn">Закрыть</button>
+        </div>
+    </div>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -8107,6 +8164,101 @@ window.encryptMessage = async function(msg) {
 };
 
 console.log('↩ Система ответов активна (свайп вправо)');
+
+
+// ═══════════════════════════════════════════════════════════════
+//  ПОИСК ПО ЧАТУ
+// ═══════════════════════════════════════════════════════════════
+(function initSearch() {
+    const modal = $('searchModal');
+    const input = $('searchInput');
+    const results = $('searchResults');
+    let _debounce = null;
+
+    $('searchChatBtn').addEventListener('click', () => {
+        if (!state.isAuthorized || !state.chatFile) {
+            showToast('🔒 Требуется вход в чат', 1500); return;
+        }
+        modal.classList.add('active');
+        input.value = '';
+        results.innerHTML = '<div style="text-align:center;color:#666;font-size:13px;padding:20px;">Начните вводить запрос…</div>';
+        setTimeout(() => input.focus(), 100);
+    });
+
+    $('cancelSearchBtn').addEventListener('click', () => {
+        modal.classList.remove('active');
+    });
+
+    input.addEventListener('input', () => {
+        clearTimeout(_debounce);
+        _debounce = setTimeout(() => performSearch(input.value.trim()), 200);
+    });
+
+    function performSearch(query) {
+        if (query.length < 2) {
+            results.innerHTML = '<div style="text-align:center;color:#666;font-size:13px;padding:20px;">Минимум 2 символа…</div>';
+            return;
+        }
+        const q = query.toLowerCase();
+        const matches = [];
+        for (const msg of historyState.allMessages) {
+            const text = (msg.text || '').toLowerCase();
+            const author = (msg.username || '').toLowerCase();
+            const fname = (msg.fileName || '').toLowerCase();
+            if (text.includes(q) || author.includes(q) || fname.includes(q)) {
+                matches.push(msg);
+            }
+        }
+        matches.reverse();
+
+        if (matches.length === 0) {
+            results.innerHTML = '<div style="text-align:center;color:#666;font-size:13px;padding:20px;">🔍 Ничего не найдено</div>';
+            return;
+        }
+
+        results.innerHTML = `<div class="search-counter">Найдено: <strong style="color:#a78bfa">${matches.length}</strong> из ${historyState.allMessages.length}</div>` +
+            matches.slice(0, 100).map(m => {
+                let icon = '💬', preview = m.text || '';
+                if (m.image) { icon = '📷'; preview = preview || 'Изображение'; }
+                else if (m.audio) { icon = '🎤'; preview = preview || 'Голосовое'; }
+                else if (m.file) { icon = '📎'; preview = preview || (m.fileName || 'Файл'); }
+
+                const safePreview = highlightMatch(escapeHtml(preview), query);
+                const isOwn = m.username === state.username;
+                const author = isOwn ? 'Вы' : escapeHtml(m.username || 'Аноним');
+                const time = formatFullTime(m.time);
+
+                return `<div class="search-result-item" data-msg-id="${m.id}">
+                    <span class="sr-icon">${icon}</span>
+                    <div class="sr-body">
+                        <div class="sr-header">
+                            <span class="sr-author">${author}</span>
+                            <span>${time}</span>
+                        </div>
+                        <div class="sr-text">${safePreview || '—'}</div>
+                    </div>
+                </div>`;
+            }).join('');
+
+        results.querySelectorAll('.search-result-item').forEach(el => {
+            el.addEventListener('click', () => {
+                const msgId = parseInt(el.dataset.msgId);
+                modal.classList.remove('active');
+                // Прокрутка и подсветка
+                setTimeout(() => scrollToMessage(msgId), 150);
+            });
+        });
+    }
+
+    function highlightMatch(html, query) {
+        if (!query) return html;
+        const safeQ = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const regex = new RegExp('(' + safeQ + ')', 'gi');
+        return html.replace(regex, '<mark>$1</mark>');
+    }
+
+    console.log('🔍 Поиск по чату активен');
+})();
 
 </script>
 </body>
