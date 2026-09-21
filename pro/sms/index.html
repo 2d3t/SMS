@@ -1722,7 +1722,74 @@ max-height: var(--vh, 90vh);
     }
 }
 
-
+/* ═══ Ответы на сообщения ═══ */
+.swipe-reply-hint {
+    position: absolute; left: -36px; top: 50%;
+    transform: translateY(-50%) scale(0);
+    font-size: 22px; color: #00b894;
+    transition: transform 0.15s ease, opacity 0.15s ease;
+    opacity: 0; pointer-events: none;
+}
+.message-wrapper.swiping-reply .swipe-reply-hint {
+    transform: translateY(-50%) scale(1);
+    opacity: 1;
+}
+.reply-quote {
+    display: flex; gap: 8px; margin-bottom: 6px;
+    padding: 6px 10px;
+    background: rgba(0,0,0,0.25);
+    border-left: 3px solid #00b894;
+    border-radius: 8px;
+    font-size: 12px; cursor: pointer;
+    transition: background 0.15s;
+}
+.reply-quote:active { background: rgba(0,0,0,0.4); }
+.message-wrapper.own .reply-quote {
+    background: rgba(0,0,0,0.3);
+    border-left-color: #a78bfa;
+}
+.reply-quote .rq-name {
+    font-weight: 700; color: #00b894;
+    display: block; font-size: 11px; margin-bottom: 2px;
+}
+.message-wrapper.own .reply-quote .rq-name { color: #a78bfa; }
+.reply-quote .rq-text {
+    color: rgba(255,255,255,0.7);
+    white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; max-width: 220px;
+}
+.reply-preview-bar {
+    display: none;
+    align-items: center; gap: 10px;
+    padding: 8px 14px;
+    background: rgba(0,184,148,0.08);
+    border-top: 1px solid rgba(0,184,148,0.2);
+    border-bottom: 1px solid rgba(0,184,148,0.2);
+}
+.reply-preview-bar.show { display: flex; }
+.reply-preview-bar .rp-icon { font-size: 18px; color: #00b894; }
+.reply-preview-bar .rp-content { flex: 1; min-width: 0; }
+.reply-preview-bar .rp-title {
+    font-size: 11px; color: #00b894;
+    font-weight: 700; margin-bottom: 2px;
+}
+.reply-preview-bar .rp-text {
+    font-size: 12px; color: #aaa;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.reply-preview-bar .rp-cancel {
+    width: 26px; height: 26px; border-radius: 50%;
+    background: rgba(255,255,255,0.06); border: none;
+    color: #888; cursor: pointer; font-size: 13px;
+    display: flex; align-items: center; justify-content: center;
+}
+.message-wrapper.highlight-flash .message {
+    animation: flashHighlight 1.2s ease;
+}
+@keyframes flashHighlight {
+    0%, 100% { box-shadow: none; }
+    30% { box-shadow: 0 0 0 3px rgba(0,184,148,0.6); }
+}
 
     </style>
 </head>
@@ -2226,6 +2293,17 @@ max-height: var(--vh, 90vh);
             <button class="btn" id="confirmModalYesBtn">OK</button>
         </div>
     </div>
+</div>
+
+
+<!-- ═══════════ ПАНЕЛЬ ПРЕВЬЮ ОТВЕТА ═══════════ -->
+<div class="reply-preview-bar" id="replyPreviewBar">
+    <span class="rp-icon">↩</span>
+    <div class="rp-content">
+        <div class="rp-title" id="replyPreviewName">Ответ</div>
+        <div class="rp-text" id="replyPreviewText">—</div>
+    </div>
+    <button class="rp-cancel" id="replyCancelBtn">✕</button>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -7810,6 +7888,225 @@ async function persistReactions(msgId, reactions) {
     state.sha = saved.blobSha;
     state._lastCommitSha = saved.commitSha;
 }
+
+
+// ═══════════════════════════════════════════════════════════════
+//  ОТВЕТЫ НА СООБЩЕНИЯ (Reply)
+// ═══════════════════════════════════════════════════════════════
+let _replyTo = null;
+
+function startReply(msgId) {
+    const msg = historyState.allMessages.find(m => m.id === msgId);
+    if (!msg) return;
+    
+    let previewText = msg.text || '';
+    if (msg.image) previewText = '📷 Изображение';
+    else if (msg.audio) previewText = '🎤 Голосовое';
+    else if (msg.file) previewText = '📎 ' + (msg.fileName || 'Файл');
+    
+    _replyTo = {
+        id: msg.id,
+        username: msg.username,
+        previewText: previewText.slice(0, 100),
+    };
+    
+    const bar = $('replyPreviewBar');
+    $('replyPreviewName').textContent = '↩ ' + (msg.username === state.username ? 'Вы' : msg.username);
+    $('replyPreviewText').textContent = previewText;
+    bar.classList.add('show');
+    inputBar.insertBefore(bar, inputBar.firstChild);
+    messageInput.focus();
+    soundManager.play('click');
+}
+
+function cancelReply() {
+    _replyTo = null;
+    $('replyPreviewBar').classList.remove('show');
+}
+
+$('replyCancelBtn').addEventListener('click', cancelReply);
+
+function scrollToMessage(msgId) {
+    const el = messagesInner.querySelector(`.message-wrapper[data-msg-id="${msgId}"]`);
+    if (!el) { showToast('⚠️ Сообщение не в зоне видимости', 1500); return; }
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    el.classList.remove('highlight-flash');
+    void el.offsetWidth;
+    el.classList.add('highlight-flash');
+    setTimeout(() => el.classList.remove('highlight-flash'), 1300);
+}
+
+// Свайп вправо по сообщению → ответ
+(function initSwipeReply() {
+    let startX = 0, startY = 0, active = null, activeWrapper = null;
+    let locked = false, isSwiping = false;
+    const THRESHOLD = 60;
+
+    messagesInner.addEventListener('touchstart', (e) => {
+        if (e.touches.length !== 1) return;
+        const wrapper = e.target.closest('.message-wrapper');
+        if (!wrapper || !state.chatFile) return;
+        if (e.target.closest('a, button, audio, .image-container')) return;
+        startX = e.touches[0].clientX;
+        startY = e.touches[0].clientY;
+        activeWrapper = wrapper;
+        active = wrapper.querySelector('.message');
+        locked = false;
+        isSwiping = false;
+    }, { passive: true });
+
+    messagesInner.addEventListener('touchmove', (e) => {
+        if (!active || e.touches.length !== 1) return;
+        const dx = e.touches[0].clientX - startX;
+        const dy = e.touches[0].clientY - startY;
+        if (!locked) {
+            if (Math.abs(dx) > 12 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+                locked = true; isSwiping = true;
+                activeWrapper.classList.add('swiping-reply');
+                let hint = activeWrapper.querySelector('.swipe-reply-hint');
+                if (!hint) {
+                    hint = document.createElement('div');
+                    hint.className = 'swipe-reply-hint';
+                    hint.textContent = '↩';
+                    activeWrapper.appendChild(hint);
+                }
+            } else if (Math.abs(dy) > 12) {
+                locked = true;
+            }
+        }
+        if (isSwiping && dx > 0 && dx < 90) {
+            active.style.transform = `translateX(${dx * 0.5}px)`;
+        }
+    }, { passive: true });
+
+    messagesInner.addEventListener('touchend', (e) => {
+        if (active && isSwiping) {
+            const dx = (e.changedTouches[0].clientX - startX);
+            active.style.transform = '';
+            if (dx > THRESHOLD) {
+                const msgId = parseInt(activeWrapper.dataset.msgId);
+                if (msgId) startReply(msgId);
+            }
+        }
+        if (activeWrapper) {
+            activeWrapper.classList.remove('swiping-reply');
+            const hint = activeWrapper.querySelector('.swipe-reply-hint');
+            if (hint) hint.remove();
+        }
+        active = null; activeWrapper = null; locked = false; isSwiping = false;
+    }, { passive: true });
+})();
+
+// === ПЕРЕХВАТ ОТПРАВКИ: добавляем replyTo в sendMessage ===
+const _origSendMessage = window.sendMessage;
+window.sendMessage = async function(...args) {
+    const replySnapshot = _replyTo;
+    if (replySnapshot) cancelReply();
+    
+    // Передаём reply через глобальную переменную — модифицируем внутри
+    if (replySnapshot) window._pendingReply = replySnapshot;
+    try {
+        return await _origSendMessage.apply(this, args);
+    } finally {
+        window._pendingReply = null;
+    }
+};
+
+// === ПАТЧ: добавляем reply в plainMsg ===
+const _origEncryptMessage = window.encryptMessage;
+window.encryptMessage = async function(msg) {
+    const payload = { username: msg.username, text: msg.text || '' };
+    if (msg.replyTo) payload.replyTo = msg.replyTo;
+    if (msg.reactions && Object.keys(msg.reactions).length > 0) payload.reactions = msg.reactions;
+    if (msg.image) payload.image = msg.image;
+    if (msg.audio) {
+        payload.audio = msg.audio;
+        payload.audioDuration = msg.audioDuration || 0;
+        payload.audioMime = msg.audioMime || 'audio/webm';
+    }
+    if (msg.file) {
+        payload.file = msg.file;
+        payload.fileName = msg.fileName || 'file.bin';
+        payload.fileMime = msg.fileMime || 'application/octet-stream';
+        payload.fileSize = msg.fileSize || 0;
+    }
+    if (msg.batchId) {
+        payload.batchId = msg.batchId;
+        payload.batchIndex = msg.batchIndex;
+        payload.batchTotal = msg.batchTotal;
+    }
+    const encrypted = await encryptObject(payload, CRYPTO._key);
+    return { id: msg.id, time: msg.time, iv: encrypted.iv, data: encrypted.data };
+};
+
+// === ПАТЧ: расшифровка replyTo ===
+const _origDecryptMessage = window.decryptMessage;
+window.decryptMessage = async function(encMsg) {
+    const msg = await _origDecryptMessage(encMsg);
+    if (msg) {
+        try {
+            const payload = await decryptObject(encMsg.iv, encMsg.data, CRYPTO._key);
+            if (payload.replyTo) msg.replyTo = payload.replyTo;
+        } catch (e) {}
+    }
+    return msg;
+};
+
+// === ПАТЧ: отображение цитаты в buildMessageHTML ===
+const _origBuildMessageHTML = window.buildMessageHTML;
+window.buildMessageHTML = function(msg, opts = {}) {
+    let html = _origBuildMessageHTML(msg, opts);
+    if (msg.replyTo) {
+        const rq = `<div class="reply-quote" onclick="event.stopPropagation(); scrollToMessage(${msg.replyTo.id})">
+            <div style="flex:1;min-width:0;">
+                <span class="rq-name">↩ ${msg.replyTo.username === state.username ? 'Вы' : escapeHtml(msg.replyTo.username)}</span>
+                <div class="rq-text">${escapeHtml(msg.replyTo.previewText || '')}</div>
+            </div>
+        </div>`;
+        html = html.replace('<div class="message">', '<div class="message">' + rq);
+    }
+    return html;
+};
+
+// В sendMessage передаём reply
+setTimeout(() => {
+    const orig = window.sendMessage;
+    // не нужно, уже обёрнуто выше
+}, 0);
+
+// === Финальная привязка: в момент отправки берём _replyTo ===
+const _origSendMessageFinal = sendMessage;
+window.sendMessage = async function(text, imageBlob, audioData, fileAttachment, audioFile) {
+    const replySnapshot = window._pendingReply || _replyTo;
+    if (_replyTo && !window._pendingReply) cancelReply();
+    
+    // Обёртка: временно подменяем шифрование через глобальный хак
+    const origEnc = window.encryptMessage;
+    // Восстанавливаем оригинал (без reply), но передаём reply через объект
+    const result = await (async () => {
+        // Копипаст оригинала не нужен — просто вызываем оригинальный sendMessage
+        // с уже сохранённым replySnapshot
+        window._currentReplyTo = replySnapshot;
+        return await _origSendMessageFinal.call(this, text, imageBlob, audioData, fileAttachment, audioFile);
+    })();
+    window._currentReplyTo = null;
+    return result;
+};
+
+// Перехватываем создание plainMsg: вставим replyTo в момент, когда он формируется
+// Проще: мутируем глобально через переопределение Object.assign на plainMsg
+// Ещё проще — перехватим saveFile не будем, а перезапишем createMsg
+// Прагматичный путь: добавляем replyTo прямо в plainMsg через хак на Date.now()
+// Но чище — перезаписать функцию шифрования:
+const _encMsgFinal = window.encryptMessage;
+window.encryptMessage = async function(msg) {
+    if (window._currentReplyTo && !msg.replyTo) {
+        msg.replyTo = window._currentReplyTo;
+    }
+    return _encMsgFinal.call(this, msg);
+};
+
+console.log('↩ Система ответов активна (свайп вправо)');
 
 </script>
 </body>
