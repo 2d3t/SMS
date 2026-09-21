@@ -5406,6 +5406,7 @@ const ImageZoom = (() => {
     let galleryBusy = false;
 
     let singleTapCandidate = false;
+let singleTapTimer = null;
     let tapStartX = 0, tapStartY = 0;
     let tapMoved = false;
 
@@ -5569,10 +5570,19 @@ const ImageZoom = (() => {
 
         return true;
     }
-    function onTouchStart(e) {
-        if (galleryBusy) return;
-        const el = getActive();
-        if (!el) return;
+
+
+function onTouchStart(e) {
+    if (galleryBusy) return;
+    const el = getActive();
+    if (!el) return;
+
+    // 🆕 Новый жест отменяет отложенный показ меню
+    if (singleTapTimer) {
+        clearTimeout(singleTapTimer);
+        singleTapTimer = null;
+    }
+    
         if (e.touches.length === 2) {
             isPinching = true; isDragging = false; isSwipingToClose = false; isSwipingHoriz = false; swipeDirection = null;
             singleTapCandidate = false;
@@ -5593,8 +5603,11 @@ const ImageZoom = (() => {
             tapMoved = false;
             singleTapCandidate = true;
             
-            if (now - lastTapTime < 300 && !isPinching) {
-                singleTapCandidate = false;
+           
+
+ if (now - lastTapTime < 300 && !isPinching) {
+    if (singleTapTimer) { clearTimeout(singleTapTimer); singleTapTimer = null; }
+    singleTapCandidate = false;
                 if (scale > 1.05) reset(true);
                 else {
                     const prevScale = scale;
@@ -5694,51 +5707,67 @@ const ImageZoom = (() => {
             applySlideTransform(el, { tx, ty, sc: scale });
         }
     }
-    function onTouchEnd(e) {
-        if (galleryBusy) return;
-        const el = getActive();
-        if (!el) return;
-        
-        if (singleTapCandidate && !tapMoved && !isPinching && !isSwipingHoriz && !isSwipingToClose) {
-            toggleGalleryActions();
+
+
+
+    
+            function onTouchEnd(e) {
+    if (galleryBusy) return;
+    const el = getActive();
+    if (!el) return;
+
+    // 🆕 Показываем меню с задержкой — чтобы двойной тап успел сработать
+    if (singleTapCandidate && !tapMoved && !isPinching && !isSwipingHoriz && !isSwipingToClose) {
+        if (singleTapTimer) clearTimeout(singleTapTimer);
+        singleTapTimer = setTimeout(() => {
+            singleTapTimer = null;
+            if (!isPinching && !isDragging && !isSwipingHoriz && !isSwipingToClose && !galleryBusy) {
+                toggleGalleryActions();
+            }
+        }, 260);
+    }
+    singleTapCandidate = false;
+
+    if (e.touches.length === 0) {
+        if (isSwipingHoriz) {
+            const offset = swipeHorizOffsetX;
+            isSwipingHoriz = false; swipeHorizOffsetX = 0; swipeDirection = null;
+            if (Math.abs(offset) > SWIPE_NAV_THRESHOLD) {
+                const dir = offset < 0 ? 1 : -1;
+                const moved = navigateGallery(dir);
+                if (!moved) resetHorizVisual(true);
+            } else resetHorizVisual(true);
+            isDragging = false;
+            el.classList.remove('dragging');
+            return;
         }
-        singleTapCandidate = false;
-        
-        if (e.touches.length === 0) {
-            if (isSwipingHoriz) {
-                const offset = swipeHorizOffsetX;
-                isSwipingHoriz = false; swipeHorizOffsetX = 0; swipeDirection = null;
-                if (Math.abs(offset) > SWIPE_NAV_THRESHOLD) {
-                    const dir = offset < 0 ? 1 : -1;
-                    const moved = navigateGallery(dir);
-                    if (!moved) resetHorizVisual(true);
-                } else resetHorizVisual(true);
-                isDragging = false;
+        if (isSwipingToClose) {
+            const dy = swipeOffsetY;
+            isSwipingToClose = false; swipeDirection = null;
+            if (Math.abs(dy) > SWIPE_CLOSE_THRESHOLD) {
+                closeBySwipe();
+                isDragging = false; isPinching = false;
                 el.classList.remove('dragging');
                 return;
             }
-            if (isSwipingToClose) {
-                const dy = swipeOffsetY;
-                isSwipingToClose = false; swipeDirection = null;
-                if (Math.abs(dy) > SWIPE_CLOSE_THRESHOLD) {
-                    closeBySwipe();
-                    isDragging = false; isPinching = false;
-                    el.classList.remove('dragging');
-                    return;
-                }
-                swipeOffsetY = 0;
-                resetSwipeVisual(true);
-            }
-            isPinching = false; isDragging = false;
-            el.classList.remove('dragging');
-            if (scale < 1.02) reset(true);
-            else { clampTranslation(); applyActiveTransform(true); }
-        } else if (e.touches.length === 1 && isPinching) {
-            isPinching = false; isDragging = true;
-            startX = e.touches[0].clientX - tx;
-            startY = e.touches[0].clientY - ty;
+            swipeOffsetY = 0;
+            resetSwipeVisual(true);
         }
+        isPinching = false; isDragging = false;
+        el.classList.remove('dragging');
+        if (scale < 1.02) reset(true);
+        else { clampTranslation(); applyActiveTransform(true); }
+    } else if (e.touches.length === 1 && isPinching) {
+        isPinching = false; isDragging = true;
+        startX = e.touches[0].clientX - tx;
+        startY = e.touches[0].clientY - ty;
     }
+}
+
+
+
+
+
     function onWheel(e) {
         if (galleryBusy) return;
         e.preventDefault();
@@ -5803,6 +5832,7 @@ const ImageZoom = (() => {
         close() {
             unbind();
             galleryBusy = false;
+if (singleTapTimer) { clearTimeout(singleTapTimer); singleTapTimer = null; }
             scale = 1; tx = 0; ty = 0;
             singleTapCandidate = false;
             tapMoved = false;
