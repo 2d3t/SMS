@@ -1848,6 +1848,25 @@ max-height: var(--vh, 90vh);
     }
 }
 
+/* ═══ Крупные эмодзи в сообщениях ═══ */
+.message .text.emoji-only {
+    font-size: 56px;
+    line-height: 1.1;
+    letter-spacing: 2px;
+    padding: 2px 0;
+    display: inline-block;
+    word-break: break-word;
+}
+.message .text.emoji-only.emoji-1 { font-size: 64px; }
+.message .text.emoji-only.emoji-2 { font-size: 52px; }
+.message .text.emoji-only.emoji-3 { font-size: 40px; }
+
+@media (max-width: 480px) {
+    .message .text.emoji-only.emoji-1 { font-size: 56px; }
+    .message .text.emoji-only.emoji-2 { font-size: 46px; }
+    .message .text.emoji-only.emoji-3 { font-size: 36px; }
+}
+
     </style>
 </head>
 <body>
@@ -5159,14 +5178,29 @@ async function shareFileToChat(url, fileName) {
 // ===================================================================
 //  РЕНДЕРИНГ СООБЩЕНИЙ
 // ===================================================================
+
+ 
 function buildMessageHTML(msg, opts = {}) {
     const isOwn = msg.username === state.username && state.isAuthorized;
     const isUnread = opts.isUnread || false;
     const senderName = msg.username || 'Аноним';
     const fullTime = formatFullTime(msg.time);
     let content = '';
-    if (msg.text) content += `<span class="text">${renderTextWithLinks(msg.text)}</span>`;
 
+    // ═══ Текст / крупные эмодзи ═══
+    if (msg.text) {
+        const hasAttachments = !!(msg.image || msg.audio || msg.file);
+        const emojiInfo = hasAttachments ? null : analyzeEmojiOnly(msg.text);
+
+        if (emojiInfo) {
+            const sizeClass = `emoji-${Math.min(emojiInfo.count, 3)}`;
+            content += `<span class="text emoji-only ${sizeClass}">${escapeHtml(msg.text.trim())}</span>`;
+        } else {
+            content += `<span class="text">${renderTextWithLinks(msg.text)}</span>`;
+        }
+    }
+
+    // ═══ Картинка ═══
     if (msg.image) {
         if (isAttachmentRef(msg.image)) {
             content += `<div class="image-container attach-placeholder" data-attach="${msg.image}">⏳</div>`;
@@ -5174,26 +5208,23 @@ function buildMessageHTML(msg, opts = {}) {
             content += `<div class="image-container" onclick="openImageModal('${msg.image}')"><img src="${msg.image}" alt="Изображение"></div>`;
         }
     }
-   
 
-if (msg.audio) {
-    if (isAttachmentRef(msg.audio)) {
-        // Иконка зависит от mime: webm/opus = голосовое, иначе — файл
-        const isVoice = (msg.audioMime || '').includes('webm') || (msg.audioMime || '').includes('opus');
-        const icon = isVoice ? '🎤' : '🎵';
-        content += `<div class="audio-container attach-placeholder" 
-                         data-attach="${msg.audio}" 
-                         data-msgid="${msg.id}" 
-                         data-duration="${msg.audioDuration || 0}"
-                         data-audiomime="${escapeHtml(msg.audioMime || '')}">⏳ ${icon} аудио</div>`;
-    } else {
-        content += createAudioPlayerHTML(msg.id, msg.audio, msg.audioDuration, msg.audioMime);
+    // ═══ Аудио ═══
+    if (msg.audio) {
+        if (isAttachmentRef(msg.audio)) {
+            const isVoice = (msg.audioMime || '').includes('webm') || (msg.audioMime || '').includes('opus');
+            const icon = isVoice ? '🎤' : '🎵';
+            content += `<div class="audio-container attach-placeholder" 
+                             data-attach="${msg.audio}" 
+                             data-msgid="${msg.id}" 
+                             data-duration="${msg.audioDuration || 0}"
+                             data-audiomime="${escapeHtml(msg.audioMime || '')}">⏳ ${icon} аудио</div>`;
+        } else {
+            content += createAudioPlayerHTML(msg.id, msg.audio, msg.audioDuration, msg.audioMime);
+        }
     }
-}
- 
 
-
-
+    // ═══ Файл ═══
     if (msg.file) {
         if (isAttachmentRef(msg.file)) {
             content += `<div class="file-attach-placeholder" data-attach="${msg.file}" data-filename="${escapeHtml(msg.fileName || 'file')}" data-filesize="${msg.fileSize || 0}" data-filemime="${escapeHtml(msg.fileMime || '')}" data-msgid="${msg.id}">⏳ ${escapeHtml(msg.fileName || 'file')}</div>`;
@@ -5202,6 +5233,7 @@ if (msg.audio) {
         }
     }
 
+    // ═══ Батч-группировка фото ═══
     const isBatch = !!msg.batchId;
     const isFirstInBatch = isBatch && msg.batchIndex === 0;
 
@@ -5212,19 +5244,36 @@ if (msg.audio) {
         if (msg.batchIndex < msg.batchTotal - 1) batchClass += ' batch-top';
     }
 
+    // ═══ Цитата (reply) ═══
+    let replyQuote = '';
+    if (msg.replyTo) {
+        replyQuote = `<div class="reply-quote" onclick="event.stopPropagation(); scrollToMessage(${msg.replyTo.id})">
+            <div style="flex:1;min-width:0;">
+                <span class="rq-name">↩ ${msg.replyTo.username === state.username ? 'Вы' : escapeHtml(msg.replyTo.username)}</span>
+                <div class="rq-text">${escapeHtml(msg.replyTo.previewText || '')}</div>
+            </div>
+        </div>`;
+    }
+
     return `
         <div class="message-wrapper ${isOwn ? 'own' : 'other'}${isUnread ? ' unread' : ''}${batchClass}" data-msg-id="${msg.id}" ${isBatch ? `data-batch="${msg.batchId}"` : ''}>
             <div class="message">
                 ${isFirstInBatch ? `<div class="batch-label">📷 ${msg.batchTotal} фото</div>` : ''}
                 ${(!isBatch || isFirstInBatch) ? `<span class="sender">${isOwn ? 'Вы' : escapeHtml(senderName)}</span>` : ''}
+                ${replyQuote}
                 ${content}
-${buildReactionsHTML(msg)}
-<span class="time">${fullTime}</span>
+                ${buildReactionsHTML(msg)}
+                <span class="time">${fullTime}</span>
             </div>
             ${isOwn ? `<button class="delete-btn" onclick="deleteMessage(${msg.id})" title="Удалить">✕</button>` : ''}
         </div>
     `;
 }
+
+
+    
+
+    
 
 function renderHistory() {
     Object.keys(audioPlayers).forEach(id => {
@@ -8312,6 +8361,30 @@ console.log('↩ Система ответов активна (свайп впр
 
     console.log('🔍 Поиск по чату активен');
 })();
+
+
+// ═══ Детектор «чисто эмодзи» ═══
+const EMOJI_REGEX = /^(?:\p{Extended_Pictographic}|\p{Emoji_Component}|\u200D|\uFE0F|\s)+$/u;
+const EMOJI_SPLIT_REGEX = /(\p{Extended_Pictographic}(?:\u200D\p{Extended_Pictographic})*[\uFE0F\u20E3]?)/gu;
+
+function analyzeEmojiOnly(text) {
+    if (!text) return null;
+    const trimmed = text.trim();
+    if (!trimmed) return null;
+    if (!EMOJI_REGEX.test(trimmed)) return null;
+    
+    // Считаем именно эмодзи, а не codepoints
+    const matches = trimmed.match(EMOJI_SPLIT_REGEX);
+    if (!matches || matches.length === 0) return null;
+    if (matches.length > 3) return null;
+    
+    // Проверяем, что после удаления всех эмодзи не осталось "мусора"
+    const stripped = trimmed.replace(EMOJI_SPLIT_REGEX, '').replace(/\s/g, '');
+    if (stripped.length > 0) return null;
+    
+    return { count: matches.length };
+}
+
 
 </script>
 </body>
