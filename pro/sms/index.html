@@ -1534,14 +1534,17 @@ max-height: var(--vh, 90vh);
             margin-bottom: 12px;
             position: relative;
         }
+
         .upload-progress-fill {
-            height: 100%;
-            width: 0%;
-            background: linear-gradient(90deg, #6c5ce7, #00b894);
-            border-radius: 4px;
-            transition: width 0.15s ease-out;
-            position: relative;
-        }
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, #6c5ce7, #00b894);
+    border-radius: 4px;
+    transition: width 0.45s cubic-bezier(0.22, 0.61, 0.36, 1);
+    position: relative;
+}
+
+
         .upload-progress-fill::after {
             content: '';
             position: absolute;
@@ -4190,30 +4193,61 @@ function uploadAttachment(chatFile, attachName, cipherArrayBuffer, ivBase64, opt
     });
 }
 
+function uploadAttachmentSilent(chatFile, attachName, cipherArrayBuffer, ivBase64) {
+    const ivBytes = new Uint8Array(base64ToArrayBuffer(ivBase64));
+    const combined = new Uint8Array(4 + ivBytes.length + cipherArrayBuffer.byteLength);
+    new DataView(combined.buffer).setUint32(0, ivBytes.length);
+    combined.set(ivBytes, 4);
+    combined.set(new Uint8Array(cipherArrayBuffer), 4 + ivBytes.length);
 
+    const base64Content = arrayBufferToBase64(combined.buffer);
+    const path = getAttachmentPath(chatFile, attachName);
+    const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${path}`;
+    const body = JSON.stringify({
+        message: `📎 ${attachName}`,
+        content: base64Content,
+    });
+
+    return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('PUT', url, true);
+        xhr.setRequestHeader('Authorization', `token ${state.token}`);
+        xhr.setRequestHeader('Accept', 'application/vnd.github.v3+json');
+        xhr.setRequestHeader('Content-Type', 'application/json');
+        xhr.onload = () => {
+            if (xhr.status < 200 || xhr.status >= 300) {
+                let msg = `upload: ${xhr.status}`;
+                try { msg = JSON.parse(xhr.responseText).message || msg; } catch (e) {}
+                reject(new Error(msg));
+                return;
+            }
+            try { resolve(JSON.parse(xhr.responseText)); } catch (e) { resolve({}); }
+        };
+        xhr.onerror = () => reject(new Error('NetworkError'));
+        xhr.onabort = () => reject(new Error('ABORTED'));
+        xhr.send(body);
+    });
+}
 
 /**
  * 🆕 Умная загрузка: если файл влезает в 1 МБ — грузит напрямую,
  * иначе — чанками.
  */
+
+
+
 async function uploadAttachmentAuto(chatFile, attachName, plainBuffer, mime, displayName) {
     const size = plainBuffer.byteLength;
 
-    // Маленький файл → обычная загрузка
     if (size <= CONFIG.autoCompressTargetBytes) {
         const enc = await encryptAttachment(plainBuffer, CRYPTO._key);
         await uploadAttachment(chatFile, attachName, enc.cipher, enc.iv, { displayName });
         return { mode: 'direct', size };
     }
 
-    // Большой файл → чанки
-    const baseName = attachName.replace(/\.[^.]+$/, '');  // без расширения
-    const result = await uploadFileAsChunks(chatFile, baseName, plainBuffer, mime, (i, total, uploaded, totalBytes) => {
-        const pct = ((i / total) * 100).toFixed(0);
-        showToast(`📦 Часть ${i + 1}/${total} (${pct}%)`, 800);
-    });
+    const baseName = attachName.replace(/\.[^.]+$/, '');
+    const result = await uploadFileAsChunks(chatFile, baseName, plainBuffer, mime);
 
-    // Сохраняем метаданные чанков (зашифрованно)
     const meta = {
         chunkNames: result.chunkNames,
         totalChunks: result.totalChunks,
@@ -4222,12 +4256,13 @@ async function uploadAttachmentAuto(chatFile, attachName, plainBuffer, mime, dis
     };
     const metaBuffer = new TextEncoder().encode(JSON.stringify(meta)).buffer;
     const metaEnc = await encryptAttachment(metaBuffer, CRYPTO._key);
-    await uploadAttachment(chatFile, `${attachName}.__chunkmeta.json`, metaEnc.cipher, metaEnc.iv, {
-        displayName: `📋 метаданные`
-    });
+    await uploadAttachmentSilent(chatFile, `${attachName}.__chunkmeta.json`, metaEnc.cipher, metaEnc.iv);
 
     return { mode: 'chunks', size, chunks: result.totalChunks };
 }
+
+
+
 
 
 async function loadAttachment(chatFile, attachName) {
@@ -4897,6 +4932,8 @@ function splitIntoChunks(buffer, chunkSize) {
  * Загружает файл через чанки.
  * @returns {{chunkNames: string[], totalChunks: number, totalSize: number}}
  */
+
+
 async function uploadFileAsChunks(chatFile, baseName, arrayBuffer, mime, onProgress) {
     const chunks = splitIntoChunks(arrayBuffer, CONFIG.chunkSizeBytes);
 
@@ -4908,29 +4945,34 @@ async function uploadFileAsChunks(chatFile, baseName, arrayBuffer, mime, onProgr
     const totalBytes = arrayBuffer.byteLength;
     let uploadedBytes = 0;
 
+    const displayName = `📦 ${baseName} (${chunks.length} частей)`;
+    UploadProgress.open(displayName, totalBytes);
+
     for (let i = 0; i < chunks.length; i++) {
-        if (BatchUploadIndicator.isCancelled?.()) throw new Error('ABORTED');
+        if (UploadProgress.isCancelled()) throw new Error('ABORTED');
 
         const chunk = chunks[i];
         const chunkName = `${baseName}.part${i}`;
         const enc = await encryptAttachment(chunk, CRYPTO._key);
 
-        if (onProgress) onProgress(i, chunks.length, uploadedBytes, totalBytes);
-
-        await uploadAttachment(chatFile, chunkName, enc.cipher, enc.iv, {
-            displayName: `📦 часть ${i + 1}/${chunks.length}`
-        });
+        await uploadAttachmentSilent(chatFile, chunkName, enc.cipher, enc.iv);
 
         chunkNames.push(chunkName);
         uploadedBytes += chunk.byteLength;
+        UploadProgress.update(uploadedBytes, totalBytes);
     }
 
+    UploadProgress.finish(baseName);
     return { chunkNames, totalChunks: chunks.length, totalSize: totalBytes, mime };
 }
 
 /**
  * Скачивает и собирает файл из чанков.
  */
+
+
+
+
 async function downloadFileFromChunks(chatFile, chunkNames) {
     const buffers = [];
     for (const name of chunkNames) {
@@ -4949,6 +4991,8 @@ async function downloadFileFromChunks(chatFile, chunkNames) {
     }
     return combined.buffer;
 }
+
+
 
 
 
@@ -5791,12 +5835,15 @@ async function shareAudioToChat(url, fileName) {
     try {
         const res = await fetch(url);
         const blob = await res.blob();
-        openShareToChatModal(blob, fileName, null);
+        openShareToChatModal(blob, fileName, null, { isAudio: true });
     } catch (e) {
         console.error(e);
         showToast('❌ Не удалось подготовить аудио', 2000);
     }
 }
+
+
+
 
 // ===================================================================
 //  РЕНДЕРИНГ СООБЩЕНИЙ
@@ -6789,7 +6836,11 @@ function closeImageModal() {
 // ===================================================================
 //  ПОДЕЛИТЬСЯ С ЧАТОМ
 // ===================================================================
-function openShareToChatModal(blob, fileName, imageUrl) {
+
+
+
+
+function openShareToChatModal(blob, fileName, imageUrl, meta = {}) {
     if (!state.chats || state.chats.length === 0) {
         showToast('❌ Нет чатов для отправки', 2500);
         return;
@@ -6800,6 +6851,7 @@ function openShareToChatModal(blob, fileName, imageUrl) {
     _shareToChat.mime = blob.type || 'image/jpeg';
     _shareToChat.imageUrl = imageUrl || null;
     _shareToChat.selectedFile = null;
+    _shareToChat.meta = meta || {};
 
     const thumb = $('shareToChatThumb');
     if (imageUrl) {
@@ -6860,6 +6912,10 @@ function openShareToChatModal(blob, fileName, imageUrl) {
     $('shareToChatModal').classList.add('active');
 }
 
+
+
+
+
 async function confirmShareToChat() {
     if (!_shareToChat.blob || !_shareToChat.selectedFile) return;
     const targetFile = _shareToChat.selectedFile;
@@ -6880,14 +6936,16 @@ async function confirmShareToChat() {
     }
 
 
-    await doShareToChat(targetFile, password, blob, fileName, mime);
+    await doShareToChat(targetFile, password, blob, fileName, mime, _shareToChat.meta || {});
 }
 
 
 
 
-async function doShareToChat(targetFile, targetPassword, blob, fileName, mime) {
+async function doShareToChat(targetFile, targetPassword, blob, fileName, mime, meta = {}) {
     const isImage = mime.startsWith('image/');
+    const isAudio = mime.startsWith('audio/') ||
+        /\.(mp3|ogg|wav|m4a|aac|flac|opus|webm)$/i.test(fileName);
 
     showToast(`📤 Отправка в чат…`, 1500);
 
@@ -6916,7 +6974,7 @@ async function doShareToChat(targetFile, targetPassword, blob, fileName, mime) {
         const ext = isImage
             ? 'jpg'
             : (fileName.split('.').pop() || 'bin').toLowerCase().replace(/[^a-z0-9]/g, '') || 'bin';
-        const attachName = generateAttachmentName(isImage ? 'img' : 'file', ext);
+        const attachName = generateAttachmentName(isImage ? 'img' : (isAudio ? 'aud' : 'file'), ext);
         const buf = await blob.arrayBuffer();
 
         const saveState = {
@@ -6930,14 +6988,8 @@ async function doShareToChat(targetFile, targetPassword, blob, fileName, mime) {
         CRYPTO._key = targetKey;
 
         try {
-            // 🆕 Авто-режим: сжатие для маленьких, чанки для больших
-            await uploadAttachmentAuto(
-                targetFile,
-                attachName,
-                buf,
-                mime,
-                isImage ? `📷 ${fileName}` : `📎 ${fileName}`
-            );
+            const label = isImage ? `📷 ${fileName}` : (isAudio ? `🎵 ${fileName}` : `📎 ${fileName}`);
+            await uploadAttachmentAuto(targetFile, attachName, buf, mime, label);
         } finally {
             state.chatFile = saveState.chatFile;
             state.chatPassword = saveState.chatPassword;
@@ -6952,8 +7004,14 @@ async function doShareToChat(targetFile, targetPassword, blob, fileName, mime) {
             text: '',
             time: new Date().toISOString(),
         };
-        if (isImage) plainMsg.image = attachName;
-        else {
+        if (isImage) {
+            plainMsg.image = attachName;
+        } else if (isAudio) {
+            plainMsg.audio = attachName;
+            plainMsg.audioName = fileName;
+            plainMsg.audioDuration = 0;
+            plainMsg.audioMime = mime;
+        } else {
             plainMsg.file = attachName;
             plainMsg.fileName = fileName;
             plainMsg.fileMime = mime;
@@ -6961,8 +7019,14 @@ async function doShareToChat(targetFile, targetPassword, blob, fileName, mime) {
         }
 
         const payload = { username: state.username, text: '' };
-        if (isImage) payload.image = attachName;
-        if (!isImage) {
+        if (isImage) {
+            payload.image = attachName;
+        } else if (isAudio) {
+            payload.audio = attachName;
+            payload.audioName = fileName;
+            payload.audioDuration = 0;
+            payload.audioMime = mime;
+        } else {
             payload.file = attachName;
             payload.fileName = fileName;
             payload.fileMime = mime;
@@ -7012,6 +7076,8 @@ async function doShareToChat(targetFile, targetPassword, blob, fileName, mime) {
         soundManager.play('error');
     }
 }
+
+
 
 
 
