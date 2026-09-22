@@ -2006,6 +2006,70 @@ max-height: var(--vh, 90vh);
     .message .text.emoji-only.emoji-3 { font-size: 36px; }
 }
 
+
+/* ═══ Стили для названия трека и кнопок в аудио-плеере ═══ */
+.audio-track-name {
+    font-size: 12px;
+    font-weight: 600;
+    color: #fff;
+    margin-bottom: 2px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 180px;
+}
+
+.audio-label {
+    font-size: 10px;
+    color: rgba(255,255,255,0.5);
+    margin-bottom: 2px;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+}
+
+.audio-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    margin-left: 6px;
+    flex-shrink: 0;
+}
+
+.audio-action-btn {
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    border: 1px solid rgba(255,255,255,0.1);
+    background: rgba(255,255,255,0.06);
+    color: #ccc;
+    font-size: 12px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.15s;
+    padding: 0;
+    line-height: 1;
+}
+
+.audio-action-btn:hover {
+    background: rgba(108,92,231,0.25);
+    border-color: rgba(108,92,231,0.5);
+    color: #fff;
+}
+
+.audio-action-btn:active {
+    transform: scale(0.88);
+}
+
+/* На узких экранах прячем кнопки в один ряд */
+@media (max-width: 480px) {
+    .audio-track-name { max-width: 130px; font-size: 11px; }
+    .audio-actions { flex-direction: row; gap: 2px; }
+    .audio-action-btn { width: 24px; height: 24px; font-size: 11px; }
+    .audio-container { min-width: 180px; }
+}
+
     </style>
 </head>
 <body>
@@ -2113,47 +2177,22 @@ max-height: var(--vh, 90vh);
             <button class="mic-btn" id="micBtn" title="Записать аудио (до 10 сек)">🎤</button>
             <button class="send-btn" id="sendBtn">➤</button>
         </div>
+        
         <div class="emoji-panel" id="emojiPanel"></div>
+
         <div class="attach-menu" id="attachMenu">
-
-
-<div class="attach-menu" id="attachMenu">
-    <div class="attach-menu-item image" data-action="image">
-        <div class="icon">🖼️</div>
-        <div class="text">
-            <div class="title">Изображения</div>
-            <div class="subtitle">До 20 шт, каждая до 25 МБ</div>
-        </div>
-    </div>
-    <div class="attach-menu-item audio" data-action="audio">
-        <div class="icon">🎵</div>
-        <div class="text">
-            <div class="title">Аудиофайл</div>
-            <div class="subtitle">MP3, OGG, WAV, M4A… до 25 МБ</div>
-        </div>
-    </div>
-    <div class="attach-menu-item file" data-action="file">
-        <div class="icon">📄</div>
-        <div class="text">
-            <div class="title">Любой файл</div>
-            <div class="subtitle">ZIP, MP4, PDF… до 25 МБ</div>
-        </div>
-    </div>
-    <div class="attach-menu-item doc" data-action="document">
-        <div class="icon">📚</div>
-        <div class="text">
-            <div class="title">Документы</div>
-            <div class="subtitle">PDF, DOCX, XLSX, TXT</div>
-        </div>
-    </div>
-</div>
-
-
             <div class="attach-menu-item image" data-action="image">
                 <div class="icon">🖼️</div>
                 <div class="text">
                     <div class="title">Изображения</div>
                     <div class="subtitle">До 20 шт, каждая до 25 МБ</div>
+                </div>
+            </div>
+            <div class="attach-menu-item audio" data-action="audio">
+                <div class="icon">🎵</div>
+                <div class="text">
+                    <div class="title">Аудиофайл</div>
+                    <div class="subtitle">MP3, OGG, WAV, M4A… до 25 МБ</div>
                 </div>
             </div>
             <div class="attach-menu-item file" data-action="file">
@@ -4366,6 +4405,7 @@ async function deleteAttachment(chatFile, attachName) {
 
 
 
+
 async function loadAttachmentsIn(root) {
     const placeholders = root.querySelectorAll('[data-attach]:not([data-loaded])');
     if (placeholders.length === 0) return;
@@ -4386,8 +4426,9 @@ async function loadAttachmentsIn(root) {
                     const msgId = el.dataset.msgid || '';
                     const duration = parseFloat(el.dataset.duration) || 0;
                     const mime = el.dataset.audiomime || '';
+                    const trackName = el.dataset.audioname || '';
                     const wrapper = document.createElement('div');
-                    wrapper.innerHTML = createAudioPlayerHTML(msgId, url, duration, mime);
+                    wrapper.innerHTML = createAudioPlayerHTML(msgId, url, duration, mime, trackName);
                     el.replaceWith(wrapper.firstElementChild);
                 } else if (isFile) {
                     const fileName = el.dataset.filename || 'file';
@@ -4407,13 +4448,14 @@ async function loadAttachmentsIn(root) {
 
 
 
-
-
                     
 
 // ===================================================================
 //  СООБЩЕНИЯ (шифрование payload)
 // ===================================================================
+
+
+
 
 async function encryptMessage(msg) {
     const payload = { username: msg.username, text: msg.text || '' };
@@ -4424,11 +4466,17 @@ async function encryptMessage(msg) {
         payload.comments = msg.comments;
     }
     if (msg.image) payload.image = msg.image;
+
+
+
     if (msg.audio) {
-        payload.audio = msg.audio;
-        payload.audioDuration = msg.audioDuration || 0;
-        payload.audioMime = msg.audioMime || 'audio/webm';
-    }
+    payload.audio = msg.audio;
+    payload.audioDuration = msg.audioDuration || 0;
+    payload.audioMime = msg.audioMime || 'audio/webm';
+    if (msg.audioName) payload.audioName = msg.audioName;  // 🆕
+}
+
+
     if (msg.file) {
         payload.file = msg.file;
         payload.fileName = msg.fileName || 'file.bin';
@@ -4461,11 +4509,19 @@ async function decryptMessage(encMsg) {
             msg.comments = payload.comments;
         }
         if (payload.image) msg.image = payload.image;
+
+
+
+
         if (payload.audio) {
-            msg.audio = payload.audio;
-            msg.audioDuration = payload.audioDuration || 0;
-            msg.audioMime = payload.audioMime || 'audio/webm';
-        }
+    msg.audio = payload.audio;
+    msg.audioDuration = payload.audioDuration || 0;
+    msg.audioMime = payload.audioMime || 'audio/webm';
+    msg.audioName = payload.audioName || '';  // 🆕
+}
+
+
+
         if (payload.file) {
             msg.file = payload.file;
             msg.fileName = payload.fileName || 'file.bin';
@@ -4974,6 +5030,10 @@ if (hasAudio) {
 
         // 🆕 Отправка аудиофайла
         
+
+
+
+
 if (hasAudioFile) {
     const ext = (audioFile.name.split('.').pop() || 'mp3')
         .toLowerCase().replace(/[^a-z0-9]/g, '') || 'mp3';
@@ -4989,6 +5049,7 @@ if (hasAudioFile) {
     plainMsg.audio = attachName;
     plainMsg.audioDuration = audioFile.duration || 0;
     plainMsg.audioMime = audioFile.mime || guessMimeFromName(audioFile.name);
+    plainMsg.audioName = audioFile.name;  // 🆕 публикуем название
 }
 
 
@@ -5518,32 +5579,60 @@ function getAudioDuration(file) {
 const audioPlayers = {};
 
 
-function createAudioPlayerHTML(msgId, audioSrc, duration, mime) {
+
+
+
+function createAudioPlayerHTML(msgId, audioSrc, duration, mime, trackName) {
     const safeDuration = duration || 0;
     const displayTime = formatAudioTime(safeDuration);
     const isVoice = (mime || '').includes('webm') || (mime || '').includes('opus');
-    const icon = isVoice ? '🎤' : '🎵'; // 🆕
+    const icon = isVoice ? '🎤' : '🎵';
+    
+    // 🆕 Название трека (только для не-голосовых)
+    const displayName = (!isVoice && trackName) ? trackName : '';
+    const nameHtml = displayName
+        ? `<div class="audio-track-name" title="${escapeHtml(displayName)}">${escapeHtml(displayName)}</div>`
+        : '';
+    
+    // 🆕 Кнопки «Скачать» и «Поделиться»
+    const escapedName = (trackName || (isVoice ? 'voice.webm' : 'audio.mp3'))
+        .replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    const actionsHtml = `
+        <div class="audio-actions">
+            <button class="audio-action-btn" 
+                    onclick="event.stopPropagation(); downloadAttachedFile('${audioSrc}', '${escapedName}')"
+                    title="Скачать">⬇</button>
+            <button class="audio-action-btn"
+                    onclick="event.stopPropagation(); shareAudioToChat('${audioSrc}', '${escapedName}')"
+                    title="Поделиться">↗</button>
+        </div>
+    `;
     
     let waveBars = '';
     for (let i = 0; i < 24; i++) {
         const h = 4 + Math.floor(Math.random() * 14);
         waveBars += `<span style="height:${h}px"></span>`;
     }
+    
     return `
         <div class="audio-container" data-audio-id="${msgId}">
             <button class="audio-play-btn" onclick="toggleAudioPlayback(${msgId})" title="${icon} Воспроизвести">▶</button>
             <div class="audio-info">
-                <div style="font-size:11px;color:rgba(255,255,255,0.5);margin-bottom:2px;">${icon}</div>
+                <div class="audio-label">${icon}${displayName ? '' : ' ' + (isVoice ? 'Голосовое' : 'Аудио')}</div>
+                ${nameHtml}
                 <div class="audio-wave" id="wave-${msgId}">${waveBars}</div>
                 <div class="audio-progress" id="progress-${msgId}" onclick="seekAudio(event, ${msgId})">
                     <div class="audio-progress-fill" id="progress-fill-${msgId}"></div>
                 </div>
             </div>
             <span class="audio-time" id="time-${msgId}">${displayTime}</span>
+            ${actionsHtml}
             <audio id="audio-${msgId}" src="${audioSrc}" preload="metadata" style="display:none"></audio>
         </div>
     `;
 }
+
+
 
 
 function initAudioPlayers() {
@@ -5676,6 +5765,9 @@ function openAttachedFile(url) {
     window.open(url, '_blank', 'noopener,noreferrer');
 }
 
+
+
+
 async function shareFileToChat(url, fileName) {
     try {
         const res = await fetch(url);
@@ -5684,6 +5776,19 @@ async function shareFileToChat(url, fileName) {
     } catch (e) {
         console.error(e);
         showToast('❌ Не удалось подготовить файл', 2000);
+    }
+}
+
+
+
+async function shareAudioToChat(url, fileName) {
+    try {
+        const res = await fetch(url);
+        const blob = await res.blob();
+        openShareToChatModal(blob, fileName, null);
+    } catch (e) {
+        console.error(e);
+        showToast('❌ Не удалось подготовить аудио', 2000);
     }
 }
 
@@ -5730,22 +5835,30 @@ if (msg.image) {
 
 
 
-    
-
     // ═══ Аудио ═══
-    if (msg.audio) {
-        if (isAttachmentRef(msg.audio)) {
-            const isVoice = (msg.audioMime || '').includes('webm') || (msg.audioMime || '').includes('opus');
-            const icon = isVoice ? '🎤' : '🎵';
-            content += `<div class="audio-container attach-placeholder" 
-                             data-attach="${msg.audio}" 
-                             data-msgid="${msg.id}" 
-                             data-duration="${msg.audioDuration || 0}"
-                             data-audiomime="${escapeHtml(msg.audioMime || '')}">⏳ ${icon} аудио</div>`;
-        } else {
-            content += createAudioPlayerHTML(msg.id, msg.audio, msg.audioDuration, msg.audioMime);
-        }
+if (msg.audio) {
+    if (isAttachmentRef(msg.audio)) {
+        const isVoice = (msg.audioMime || '').includes('webm') 
+                     || (msg.audioMime || '').includes('opus');
+        const icon = isVoice ? '🎤' : '🎵';
+        const trackLabel = msg.audioName 
+            ? escapeHtml(msg.audioName) 
+            : (isVoice ? 'Голосовое' : 'Аудио');
+        content += `<div class="audio-container attach-placeholder" 
+                         data-attach="${msg.audio}" 
+                         data-msgid="${msg.id}" 
+                         data-duration="${msg.audioDuration || 0}"
+                         data-audiomime="${escapeHtml(msg.audioMime || '')}"
+                         data-audioname="${escapeHtml(msg.audioName || '')}">⏳ ${icon} ${trackLabel}</div>`;
+    } else {
+        content += createAudioPlayerHTML(
+            msg.id, msg.audio, msg.audioDuration, msg.audioMime, msg.audioName
+        );
     }
+}
+
+
+
 
     // ═══ Файл ═══
     if (msg.file) {
@@ -7731,6 +7844,11 @@ function lockChatUI(reason) {
     hideScrollDownBtn();
 }
 
+
+
+
+
+
 function backToChats() {
     markChatAsRead();
     if (audioRecorder.isRecording) audioRecorder.cancel();
@@ -7745,6 +7863,7 @@ function backToChats() {
     state._lastMetaVersion = null;
     state._metaEtag = null;
     state._lastCommitSha = null;
+    state._metaEtagsByFile = {};          // 🆕 Сброс кэша ETag всех чатов
     state.chatFile = null; state.chatName = null;
     state.chatPassword = ''; state.salt = null;
     state._chatEntered = false;
@@ -7758,6 +7877,8 @@ function backToChats() {
 
     showChatsScreen();
 }
+
+
 
 // ===================================================================
 //  АВТОЗАПУСК
@@ -8896,8 +9017,6 @@ function scrollToMessage(msgId) {
 
 
 
-
-
 // Свайп вправо по сообщению → ответ
 
 
@@ -8993,99 +9112,27 @@ function scrollToMessage(msgId) {
          
 
 
-// === ПЕРЕХВАТ ОТПРАВКИ: добавляем replyTo в sendMessage ===
-const _origSendMessage = window.sendMessage;
-window.sendMessage = async function(...args) {
-    const replySnapshot = _replyTo;
-    if (replySnapshot) cancelReply();
-    
-    // Передаём reply через глобальную переменную — модифицируем внутри
-    if (replySnapshot) window._pendingReply = replySnapshot;
-    try {
-        return await _origSendMessage.apply(this, args);
-    } finally {
-        window._pendingReply = null;
-    }
-};
-
-// === ПАТЧ: добавляем reply в plainMsg ===
-const _origEncryptMessage = window.encryptMessage;
-window.encryptMessage = async function(msg) {
-    const payload = { username: msg.username, text: msg.text || '' };
-    if (msg.replyTo) payload.replyTo = msg.replyTo;
-    if (msg.reactions && Object.keys(msg.reactions).length > 0) payload.reactions = msg.reactions;
-    if (msg.image) payload.image = msg.image;
-    if (msg.audio) {
-        payload.audio = msg.audio;
-        payload.audioDuration = msg.audioDuration || 0;
-        payload.audioMime = msg.audioMime || 'audio/webm';
-    }
-    if (msg.file) {
-        payload.file = msg.file;
-        payload.fileName = msg.fileName || 'file.bin';
-        payload.fileMime = msg.fileMime || 'application/octet-stream';
-        payload.fileSize = msg.fileSize || 0;
-    }
-    if (msg.batchId) {
-        payload.batchId = msg.batchId;
-        payload.batchIndex = msg.batchIndex;
-        payload.batchTotal = msg.batchTotal;
-    }
-    const encrypted = await encryptObject(payload, CRYPTO._key);
-    return { id: msg.id, time: msg.time, iv: encrypted.iv, data: encrypted.data };
-};
 
 
 
 
 
 
-// === ПАТЧ: расшифровка replyTo ===
-const _origDecryptMessage = window.decryptMessage;
-window.decryptMessage = async function(encMsg) {
-    const msg = await _origDecryptMessage(encMsg);
-    if (msg) {
-        try {
-            const payload = await decryptObject(encMsg.iv, encMsg.data, CRYPTO._key);
-            if (payload.replyTo) msg.replyTo = payload.replyTo;
-        } catch (e) {}
-    }
-    return msg;
-};
-
-
-
-
-// === ПАТЧ: отображение цитаты в buildMessageHTML ===
-const _origBuildMessageHTML = window.buildMessageHTML;
-window.buildMessageHTML = function(msg, opts = {}) {
-    let html = _origBuildMessageHTML(msg, opts);
-    if (msg.replyTo) {
-        const rq = `<div class="reply-quote" onclick="event.stopPropagation(); scrollToMessage(${msg.replyTo.id})">
-            <div style="flex:1;min-width:0;">
-                <span class="rq-name">↩ ${msg.replyTo.username === state.username ? 'Вы' : escapeHtml(msg.replyTo.username)}</span>
-                <div class="rq-text">${escapeHtml(msg.replyTo.previewText || '')}</div>
-            </div>
-        </div>`;
-        html = html.replace('<div class="message">', '<div class="message">' + rq);
-    }
-    return html;
-};
-
-// В sendMessage передаём reply
-setTimeout(() => {
-    const orig = window.sendMessage;
-    // не нужно, уже обёрнуто выше
-}, 0);
 
 
 
 
 
-// === Финальная привязка: reply ИЛИ комментарий к фото ===
+
+
+
+
+// ═══════════════════════════════════════════════════════════════
+//  ОТПРАВКА: комментарий к фото / ответ на сообщение / обычное
+// ═══════════════════════════════════════════════════════════════
 const _origSendMessageFinal = sendMessage;
 window.sendMessage = async function(text, imageBlob, audioData, fileAttachment, audioFile) {
-    // 🆕 Если активен режим комментария — отправляем именно комментарий
+    // 🆕 Режим комментария к фото
     if (typeof _commentToMsgId !== 'undefined' && _commentToMsgId &&
         text && text.trim() && !imageBlob && !audioData && !fileAttachment && !audioFile) {
         const msgId = _commentToMsgId;
@@ -9096,10 +9143,11 @@ window.sendMessage = async function(text, imageBlob, audioData, fileAttachment, 
         return;
     }
 
-    const replySnapshot = window._pendingReply || _replyTo;
-    if (_replyTo && !window._pendingReply) cancelReply();
-
+    // ↩ Режим ответа (reply)
+    const replySnapshot = _replyTo;
+    if (replySnapshot) cancelReply();
     window._currentReplyTo = replySnapshot;
+
     try {
         return await _origSendMessageFinal.call(this, text, imageBlob, audioData, fileAttachment, audioFile);
     } finally {
@@ -9107,29 +9155,29 @@ window.sendMessage = async function(text, imageBlob, audioData, fileAttachment, 
     }
 };
 
-
-
-
-
-
-// Перехватываем создание plainMsg: вставим replyTo в момент, когда он формируется
-// Проще: мутируем глобально через переопределение Object.assign на plainMsg
-// Ещё проще — перехватим saveFile не будем, а перезапишем createMsg
-// Прагматичный путь: добавляем replyTo прямо в plainMsg через хак на Date.now()
-// Но чище — перезаписать функцию шифрования:
-const _encMsgFinal = window.encryptMessage;
-window.encryptMessage = async function(msg) {
+// Патч encryptMessage — добавляем replyTo и audioName к payload
+const _encMsgFinal = encryptMessage;
+encryptMessage = async function(msg) {
     if (window._currentReplyTo && !msg.replyTo) {
         msg.replyTo = window._currentReplyTo;
     }
     return _encMsgFinal.call(this, msg);
 };
 
+// Патч decryptMessage — вытаскиваем replyTo из payload
+const _decMsgFinal = decryptMessage;
+decryptMessage = async function(encMsg) {
+    const msg = await _decMsgFinal.call(this, encMsg);
+    if (msg && !msg.replyTo) {
+        try {
+            const payload = await decryptObject(encMsg.iv, encMsg.data, CRYPTO._key);
+            if (payload.replyTo) msg.replyTo = payload.replyTo;
+        } catch (e) { /* игнорируем */ }
+    }
+    return msg;
+};
+
 console.log('↩ Система ответов активна (свайп вправо)');
-
-
-
-
 
 
 
