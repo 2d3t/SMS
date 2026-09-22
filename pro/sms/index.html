@@ -5582,15 +5582,21 @@ const audioPlayers = {};
 
 
 
+
 function createAudioPlayerHTML(msgId, audioSrc, duration, mime, trackName) {
     const safeDuration = duration || 0;
     const displayTime = formatAudioTime(safeDuration);
-    const isVoice = (mime || '').includes('webm') || (mime || '').includes('opus');
+
+    // 🆕 Логика: есть trackName → это аудиофайл, нет trackName → голосовое
+    const hasTrackName = !!(trackName && trackName.trim());
+    const isVoice = !hasTrackName;   // если нет имени → это голосовое
     const icon = isVoice ? '🎤' : '🎵';
-    
-    // 🆕 Название трека (только для не-голосовых)
-    const displayName = (!isVoice && trackName) ? trackName : '';
-    const nameHtml = displayName
+
+    // Название трека показываем только если оно есть
+    const displayName = hasTrackName ? trackName : '';
+
+
+const nameHtml = displayName
         ? `<div class="audio-track-name" title="${escapeHtml(displayName)}">${escapeHtml(displayName)}</div>`
         : '';
     
@@ -5836,14 +5842,17 @@ if (msg.image) {
 
 
     // ═══ Аудио ═══
+
 if (msg.audio) {
     if (isAttachmentRef(msg.audio)) {
-        const isVoice = (msg.audioMime || '').includes('webm') 
-                     || (msg.audioMime || '').includes('opus');
+        // 🆕 Есть audioName → аудиофайл, нет → голосовое
+        const hasName = !!(msg.audioName && msg.audioName.trim());
+        const isVoice = !hasName;
         const icon = isVoice ? '🎤' : '🎵';
-        const trackLabel = msg.audioName 
+        const trackLabel = hasName 
             ? escapeHtml(msg.audioName) 
-            : (isVoice ? 'Голосовое' : 'Аудио');
+            : 'Голосовое';
+
         content += `<div class="audio-container attach-placeholder" 
                          data-attach="${msg.audio}" 
                          data-msgid="${msg.id}" 
