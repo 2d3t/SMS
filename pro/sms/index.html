@@ -5872,11 +5872,10 @@ function buildMessageHTML(msg, opts = {}) {
         }
     }
 
-    // ═══ Картинка ═══
-
+   // ═══ Медиа: фото / аудио / файл — все поддерживают комментарии ═══
+let hasMedia = false;
 
 // ═══ Картинка ═══
-let hasMedia = false;
 if (msg.image) {
     hasMedia = true;
     if (isAttachmentRef(msg.image)) {
@@ -5886,13 +5885,10 @@ if (msg.image) {
     }
 }
 
-
-
-    // ═══ Аудио ═══
-
+// ═══ Аудио ═══
 if (msg.audio) {
+    hasMedia = true;  // 🆕 Теперь аудио тоже считается медиа
     if (isAttachmentRef(msg.audio)) {
-        // 🆕 Есть audioName → аудиофайл, нет → голосовое
         const hasName = !!(msg.audioName && msg.audioName.trim());
         const isVoice = !hasName;
         const icon = isVoice ? '🎤' : '🎵';
@@ -5913,17 +5909,16 @@ if (msg.audio) {
     }
 }
 
-
-
-
-    // ═══ Файл ═══
-    if (msg.file) {
-        if (isAttachmentRef(msg.file)) {
-            content += `<div class="file-attach-placeholder" data-attach="${msg.file}" data-filename="${escapeHtml(msg.fileName || 'file')}" data-filesize="${msg.fileSize || 0}" data-filemime="${escapeHtml(msg.fileMime || '')}" data-msgid="${msg.id}">⏳ ${escapeHtml(msg.fileName || 'file')}</div>`;
-        } else {
-            content += `<div class="file-attach-placeholder">${escapeHtml(msg.fileName || 'file')}</div>`;
-        }
+// ═══ Файл ═══
+if (msg.file) {
+    hasMedia = true;  // 🆕 Теперь файлы тоже считаются медиа
+    if (isAttachmentRef(msg.file)) {
+        content += `<div class="file-attach-placeholder" data-attach="${msg.file}" data-filename="${escapeHtml(msg.fileName || 'file')}" data-filesize="${msg.fileSize || 0}" data-filemime="${escapeHtml(msg.fileMime || '')}" data-msgid="${msg.id}">⏳ ${escapeHtml(msg.fileName || 'file')}</div>`;
+    } else {
+        content += `<div class="file-attach-placeholder">${escapeHtml(msg.fileName || 'file')}</div>`;
     }
+}
+
 
     // ═══ Батч-группировка фото ═══
     const isBatch = !!msg.batchId;
@@ -5952,23 +5947,40 @@ if (msg.audio) {
 // ═══ Кнопка «Комментировать» + список комментариев ═══
 let commentBar = '';
 let commentsBlock = '';
+
 if (hasMedia) {
     const count = msg.comments?.length || 0;
     const badge = count > 0 ? `<span class="icb-count">${count}</span>` : '';
+    
+    // 🆕 Контекстная иконка и подпись
+    let commentIcon = '💬';
+    let commentLabel = 'Комментировать';
+    if (msg.image) {
+        commentIcon = '💬';
+        commentLabel = 'К фото';
+    } else if (msg.audio) {
+    const hasName = !!(msg.audioName && msg.audioName.trim());
+    commentIcon = hasName ? '🎵' : '🎤';
+    commentLabel = hasName ? 'К аудио' : 'К голосовому';
+}
+else if (msg.file) {
+        commentIcon = '📎';
+        commentLabel = 'К файлу';
+    }
+    
     commentBar = `
         <div class="image-comment-bar">
             <button class="image-comment-btn"
                     onclick="event.stopPropagation(); startComment(${msg.id})"
                     title="Оставить комментарий">
-                <span>💬</span>
-                <span>Комментировать</span>
+                <span>${commentIcon}</span>
+                <span>${commentLabel}</span>
                 ${badge}
             </button>
         </div>
     `;
     commentsBlock = buildCommentsHTML(msg);
 }
-
 
     return `
         <div class="message-wrapper ${isOwn ? 'own' : 'other'}${isUnread ? ' unread' : ''}${batchClass}" data-msg-id="${msg.id}" ${isBatch ? `data-batch="${msg.batchId}"` : ''}>
@@ -8536,10 +8548,18 @@ function startComment(msgId) {
     if (typeof cancelReply === 'function') cancelReply();
 
     const bar = $('commentPreviewBar');
-    let label = 'Фото';
-    if (msg.file) label = msg.fileName || 'Файл';
-    else if (msg.audio) label = 'Аудио';
-
+let label = 'Фото';
+if (msg.file) {
+    label = msg.fileName || 'Файл';
+} else if (msg.audio) {
+    // 🆕 Показываем название трека, если есть
+    const hasName = !!(msg.audioName && msg.audioName.trim());
+    if (hasName) {
+        label = msg.audioName;
+    } else {
+        label = '🎤 Голосовое';
+    }
+}
     $('commentPreviewTitle').textContent = `💬 Комментарий к: ${label}`;
     $('commentPreviewText').textContent = msg.comments?.length
         ? `Уже есть ${msg.comments.length} коммент.`
@@ -9047,10 +9067,20 @@ function startReply(msgId) {
         cancelComment();
     }
 
+
+
+
     let previewText = msg.text || '';
-    if (msg.image) previewText = '📷 Изображение';
-    else if (msg.audio) previewText = '🎤 Голосовое';
-    else if (msg.file) previewText = '📎 ' + (msg.fileName || 'Файл');
+if (msg.image) {
+    previewText = '📷 Изображение';
+} else if (msg.audio) {
+    const hasName = !!(msg.audioName && msg.audioName.trim());
+    previewText = hasName ? `🎵 ${msg.audioName}` : '🎤 Голосовое';
+} else if (msg.file) {
+    previewText = '📎 ' + (msg.fileName || 'Файл');
+}
+
+
 
     _replyTo = {
         id: msg.id,
