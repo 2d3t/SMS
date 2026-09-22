@@ -2436,7 +2436,12 @@ const CONFIG = {
 
     // ═══ Лимиты GitHub Contents API ═══
     // Мягкий лимит на прямую загрузку через base64 в JSON
-    softLimitBytes: 1 * 1024 * 1024,        // 1 МБ — рекомендуемый максимум
+    
+softLimitBytes: 1 * 1024 * 1024,
+chunkSizeBytes: 900 * 1024,        // 🆕 размер чанка (до base64-раздутия)
+maxChunksPerFile: 30,              // 🆕 защита от бесконечной загрузки
+autoCompressTargetBytes: 950 * 1024, // 🆕 цель сжатия
+// 1 МБ — рекомендуемый максимум
     hardLimitBytes: 25 * 1024 * 1024,       // 25 МБ — абсолютный максимум для Contents API
     warnLimitBytes: 900 * 1024,             // 900 КБ — начинаем предупреждать
     maxAttachmentSize: 25 * 1024 * 1024,
@@ -3929,6 +3934,10 @@ async function decryptAttachment(combinedArrayBuffer, key) {
     return crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, cipher);
 }
 
+
+
+
+
 function uploadAttachment(chatFile, attachName, cipherArrayBuffer, ivBase64, opts = {}) {
     const ivBytes = new Uint8Array(base64ToArrayBuffer(ivBase64));
     const combined = new Uint8Array(4 + ivBytes.length + cipherArrayBuffer.byteLength);
@@ -3992,23 +4001,93 @@ function uploadAttachment(chatFile, attachName, cipherArrayBuffer, ivBase64, opt
     });
 }
 
+
+
+/**
+ * 🆕 Умная загрузка: если файл влезает в 1 МБ — грузит напрямую,
+ * иначе — чанками.
+ */
+async function uploadAttachmentAuto(chatFile, attachName, plainBuffer, mime, displayName) {
+    const size = plainBuffer.byteLength;
+
+    // Маленький файл → обычная загрузка
+    if (size <= CONFIG.autoCompressTargetBytes) {
+        const enc = await encryptAttachment(plainBuffer, CRYPTO._key);
+        await uploadAttachment(chatFile, attachName, enc.cipher, enc.iv, { displayName });
+        return { mode: 'direct', size };
+    }
+
+    // Большой файл → чанки
+    const baseName = attachName.replace(/\.[^.]+$/, '');  // без расширения
+    const result = await uploadFileAsChunks(chatFile, baseName, plainBuffer, mime, (i, total, uploaded, totalBytes) => {
+        const pct = ((i / total) * 100).toFixed(0);
+        showToast(`📦 Часть ${i + 1}/${total} (${pct}%)`, 800);
+    });
+
+    // Сохраняем метаданные чанков (зашифрованно)
+    const meta = {
+        chunkNames: result.chunkNames,
+        totalChunks: result.totalChunks,
+        totalSize: result.totalSize,
+        mime: mime,
+    };
+    const metaBuffer = new TextEncoder().encode(JSON.stringify(meta)).buffer;
+    const metaEnc = await encryptAttachment(metaBuffer, CRYPTO._key);
+    await uploadAttachment(chatFile, `${attachName}.__chunkmeta.json`, metaEnc.cipher, metaEnc.iv, {
+        displayName: `📋 метаданные`
+    });
+
+    return { mode: 'chunks', size, chunks: result.totalChunks };
+}
+
+
 async function loadAttachment(chatFile, attachName) {
     if (_attachmentCache.has(attachName)) return _attachmentCache.get(attachName);
     if (_pendingAttachmentLoads.has(attachName)) return _pendingAttachmentLoads.get(attachName);
 
     const promise = (async () => {
-        const path = getAttachmentPath(chatFile, attachName);
-        const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${path}`;
-        const res = await fetch(url, { headers: getHeaders(state.token), cache: 'force-cache' });
-        if (!res.ok) throw new Error(`attachment: ${res.status}`);
-        const data = await res.json();
-        const binary = base64ToArrayBuffer((data.content || '').replace(/\n/g, ''));
-        const plain = await decryptAttachment(binary, CRYPTO._key);
-        const blob = new Blob([plain], { type: guessMimeFromName(attachName) });
-        const blobUrl = URL.createObjectURL(blob);
-        _attachmentCache.set(attachName, blobUrl);
+        // 🆕 Проверяем, не «шапка» ли это чанк-файла
+        // Формат метаданных: <base>.__chunkmeta.json
+        const metaPath = getAttachmentPath(chatFile, `${attachName}.__chunkmeta.json`);
+
+        // Пробуем сначала как обычный файл
+        try {
+            const path = getAttachmentPath(chatFile, attachName);
+            const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${path}`;
+            const res = await fetch(url, { headers: getHeaders(state.token), cache: 'force-cache' });
+            if (res.ok) {
+                const data = await res.json();
+                const binary = base64ToArrayBuffer((data.content || '').replace(/\n/g, ''));
+                const plain = await decryptAttachment(binary, CRYPTO._key);
+                const blob = new Blob([plain], { type: guessMimeFromName(attachName) });
+                const blobUrl = URL.createObjectURL(blob);
+                _attachmentCache.set(attachName, blobUrl);
+                _pendingAttachmentLoads.delete(attachName);
+                return blobUrl;
+            }
+        } catch (e) { /* продолжаем — попробуем чанки */ }
+
+        // 🆕 Пытаемся прочитать метаданные чанков
+        try {
+            const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${metaPath}`;
+            const res = await fetch(url, { headers: getHeaders(state.token), cache: 'force-cache' });
+            if (res.ok) {
+                const data = await res.json();
+                const binary = base64ToArrayBuffer((data.content || '').replace(/\n/g, ''));
+                const plain = await decryptAttachment(binary, CRYPTO._key);
+                const meta = JSON.parse(new TextDecoder().decode(plain));
+
+                const combined = await downloadFileFromChunks(chatFile, meta.chunkNames);
+                const blob = new Blob([combined], { type: meta.mime || guessMimeFromName(attachName) });
+                const blobUrl = URL.createObjectURL(blob);
+                _attachmentCache.set(attachName, blobUrl);
+                _pendingAttachmentLoads.delete(attachName);
+                return blobUrl;
+            }
+        } catch (e) { /* ничего не нашли */ }
+
         _pendingAttachmentLoads.delete(attachName);
-        return blobUrl;
+        throw new Error('attachment not found');
     })();
 
     _pendingAttachmentLoads.set(attachName, promise);
@@ -4016,20 +4095,29 @@ async function loadAttachment(chatFile, attachName) {
     catch (e) { _pendingAttachmentLoads.delete(attachName); throw e; }
 }
 
-async function deleteAttachment(chatFile, attachName) {
-    if (!attachName || !isAttachmentRef(attachName)) return { ok: true, skipped: true };
-    const path = getAttachmentPath(chatFile, attachName);
+
+
+
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🆕 ЧИСТОЕ УДАЛЕНИЕ (обычный файл / все чанки + метаданные)
+// ═══════════════════════════════════════════════════════════════
+
+async function deleteSingleFile(chatFile, fileName) {
+    const path = getAttachmentPath(chatFile, fileName);
     const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${path}`;
 
     let sha;
     try {
         const res = await fetch(url, { headers: getHeaders(state.token), cache: 'no-store' });
         if (res.status === 404) return { ok: true, skipped: true };
+        if (res.status === 401) throw new Error('401');
+        if (res.status === 403) throw new Error('403');
         if (!res.ok) throw new Error(`get sha: ${res.status}`);
         const data = await res.json();
         sha = data.sha;
     } catch (e) {
-        console.warn('deleteAttachment: не удалось получить sha', attachName, e.message);
         return { ok: false, error: e.message };
     }
 
@@ -4037,25 +4125,92 @@ async function deleteAttachment(chatFile, attachName) {
         const res = await fetch(url, {
             method: 'DELETE',
             headers: getHeaders(state.token),
-            body: JSON.stringify({ message: `🗑️ Удаление вложения ${attachName}`, sha: sha }),
+            body: JSON.stringify({
+                message: `🗑️ Удаление ${fileName}`,
+                sha: sha,
+            }),
             cache: 'no-store',
         });
-        if (res.status === 401) throw new Error('401');
-        if (res.status === 403) throw new Error('403');
         if (res.status === 404) return { ok: true, skipped: true };
         if (!res.ok) {
             const err = await res.json().catch(() => ({}));
             throw new Error(err.message || `delete: ${res.status}`);
         }
+        return { ok: true };
+    } catch (e) {
+        return { ok: false, error: e.message };
+    }
+}
+
+/**
+ * Чистое удаление вложения.
+ * - обычный файл → удаляет сам файл
+ * - чанк-файл → удаляет все .partN + __chunkmeta.json
+ */
+async function deleteAttachment(chatFile, attachName) {
+    if (!attachName || !isAttachmentRef(attachName)) {
+        return { ok: true, skipped: true };
+    }
+
+    const deleted = [];
+    const failed = [];
+
+    // ═══ 1. Пробуем удалить как обычный файл ═══
+    const directResult = await deleteSingleFile(chatFile, attachName);
+    if (directResult.ok && !directResult.skipped) {
+        deleted.push(attachName);
         if (_attachmentCache.has(attachName)) {
             try { URL.revokeObjectURL(_attachmentCache.get(attachName)); } catch (e) {}
             _attachmentCache.delete(attachName);
         }
-        return { ok: true };
-    } catch (e) {
-        console.warn('deleteAttachment failed:', attachName, e.message);
-        return { ok: false, error: e.message };
+        return { ok: true, deleted, failed };
     }
+
+    // ═══ 2. Ищем метаданные чанков ═══
+    const metaName = `${attachName}.__chunkmeta.json`;
+    const metaUrl = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${getAttachmentPath(chatFile, metaName)}`;
+
+    let meta = null;
+    try {
+        const res = await fetch(metaUrl, { headers: getHeaders(state.token), cache: 'no-store' });
+        if (res.ok) {
+            const data = await res.json();
+            const binary = base64ToArrayBuffer((data.content || '').replace(/\n/g, ''));
+            const plain = await decryptAttachment(binary, CRYPTO._key);
+            meta = JSON.parse(new TextDecoder().decode(plain));
+        }
+    } catch (e) {
+        console.warn('Не удалось прочитать метаданные чанков:', e.message);
+    }
+
+    if (!meta || !Array.isArray(meta.chunkNames)) {
+        return { ok: true, skipped: true, deleted, failed };
+    }
+
+    // ═══ 3. Удаляем все части ═══
+    for (const partName of meta.chunkNames) {
+        const r = await deleteSingleFile(chatFile, partName);
+        if (r.ok) {
+            if (!r.skipped) deleted.push(partName);
+        } else {
+            failed.push({ name: partName, error: r.error });
+        }
+    }
+
+    // ═══ 4. Удаляем метаданные (только если все части удалены) ═══
+    if (failed.length === 0) {
+        const metaDel = await deleteSingleFile(chatFile, metaName);
+        if (metaDel.ok && !metaDel.skipped) deleted.push(metaName);
+        else if (!metaDel.ok) failed.push({ name: metaName, error: metaDel.error });
+    }
+
+    // ═══ 5. Чистим кэш ═══
+    if (_attachmentCache.has(attachName)) {
+        try { URL.revokeObjectURL(_attachmentCache.get(attachName)); } catch (e) {}
+        _attachmentCache.delete(attachName);
+    }
+
+    return { ok: failed.length === 0, deleted, failed };
 }
 
 
@@ -4462,6 +4617,113 @@ async function handleMicClick() {
 // ===================================================================
 
 
+// ═══════════════════════════════════════════════════════════════
+//  🆕 СЖАТИЕ ПОД 1 МБ + ЧАНКИ
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Умное сжатие изображения до целевого размера.
+ * Пробует несколько уровней качества и разрешения.
+ */
+async function compressImageToTarget(file, targetBytes = CONFIG.autoCompressTargetBytes) {
+    // Сначала пробуем стандартное сжатие
+    let blob = await compressImage(file);
+    if (blob.size <= targetBytes) {
+        return { blob, method: 'compressed', attempts: 1 };
+    }
+
+    // Итеративно ужимаем
+    const attempts = [
+        { maxW: 1600, maxH: 1600, q: 0.75 },
+        { maxW: 1400, maxH: 1400, q: 0.65 },
+        { maxW: 1200, maxH: 1200, q: 0.55 },
+        { maxW: 1000, maxH: 1000, q: 0.45 },
+        { maxW: 800,  maxH: 800,  q: 0.4  },
+        { maxW: 640,  maxH: 640,  q: 0.35 },
+    ];
+
+    for (let i = 0; i < attempts.length; i++) {
+        const a = attempts[i];
+        blob = await compressImage(file, a.maxW, a.maxH, a.q);
+        if (blob.size <= targetBytes) {
+            return { blob, method: 'compressed', attempts: i + 2 };
+        }
+    }
+
+    // Не влезло даже в 640×640 @ 0.35 — вернём последнее, пойдёт в чанки
+    return { blob, method: 'compressed-max', attempts: attempts.length + 1 };
+}
+
+/**
+ * Разбивает ArrayBuffer на чанки по chunkSize байт.
+ */
+function splitIntoChunks(buffer, chunkSize) {
+    const chunks = [];
+    for (let offset = 0; offset < buffer.byteLength; offset += chunkSize) {
+        chunks.push(buffer.slice(offset, Math.min(offset + chunkSize, buffer.byteLength)));
+    }
+    return chunks;
+}
+
+/**
+ * Загружает файл через чанки.
+ * @returns {{chunkNames: string[], totalChunks: number, totalSize: number}}
+ */
+async function uploadFileAsChunks(chatFile, baseName, arrayBuffer, mime, onProgress) {
+    const chunks = splitIntoChunks(arrayBuffer, CONFIG.chunkSizeBytes);
+
+    if (chunks.length > CONFIG.maxChunksPerFile) {
+        throw new Error(`Слишком много чанков (${chunks.length}). Максимум ${CONFIG.maxChunksPerFile}`);
+    }
+
+    const chunkNames = [];
+    const totalBytes = arrayBuffer.byteLength;
+    let uploadedBytes = 0;
+
+    for (let i = 0; i < chunks.length; i++) {
+        if (BatchUploadIndicator.isCancelled?.()) throw new Error('ABORTED');
+
+        const chunk = chunks[i];
+        const chunkName = `${baseName}.part${i}`;
+        const enc = await encryptAttachment(chunk, CRYPTO._key);
+
+        if (onProgress) onProgress(i, chunks.length, uploadedBytes, totalBytes);
+
+        await uploadAttachment(chatFile, chunkName, enc.cipher, enc.iv, {
+            displayName: `📦 часть ${i + 1}/${chunks.length}`
+        });
+
+        chunkNames.push(chunkName);
+        uploadedBytes += chunk.byteLength;
+    }
+
+    return { chunkNames, totalChunks: chunks.length, totalSize: totalBytes, mime };
+}
+
+/**
+ * Скачивает и собирает файл из чанков.
+ */
+async function downloadFileFromChunks(chatFile, chunkNames) {
+    const buffers = [];
+    for (const name of chunkNames) {
+        const url = await loadAttachment(chatFile, name);
+        const res = await fetch(url);
+        const buf = await res.arrayBuffer();
+        buffers.push(new Uint8Array(buf));
+    }
+
+    const totalLen = buffers.reduce((s, b) => s + b.length, 0);
+    const combined = new Uint8Array(totalLen);
+    let offset = 0;
+    for (const b of buffers) {
+        combined.set(b, offset);
+        offset += b.length;
+    }
+    return combined.buffer;
+}
+
+
+
 async function sendMessage(text, imageBlob = null, audioData = null, fileAttachment = null, audioFile = null) {
     if (!state.isAuthorized || !state.chatFile) { showToast('❌ Нет доступа', 2000); soundManager.play('error'); return; }
     if (!navigator.onLine || !networkState.isOnline) { showToast('📵 Нет подключения', 2500); soundManager.play('error'); return; }
@@ -4507,57 +4769,77 @@ async function sendMessage(text, imageBlob = null, audioData = null, fileAttachm
             time: new Date().toISOString()
         };
 
-        if (hasImage) {
-            const attachName = generateAttachmentName('img', 'jpg');
-            const buf = await imageBlob.arrayBuffer();
-            const enc = await encryptAttachment(buf, CRYPTO._key);
-            await uploadAttachment(state.chatFile, attachName, enc.cipher, enc.iv, {
-                displayName: `📷 Фото (${formatFileSize(imageBlob.size)})`
-            });
-            plainMsg.image = attachName;
-        }
 
-        if (hasAudio) {
-            const attachName = generateAttachmentName('aud', 'webm');
-            const b64 = audioData.data.includes(',') ? audioData.data.split(',')[1] : audioData.data;
-            const buf = base64ToArrayBuffer(b64);
-            const enc = await encryptAttachment(buf, CRYPTO._key);
-            await uploadAttachment(state.chatFile, attachName, enc.cipher, enc.iv, {
-                displayName: `🎤 Голосовое (${formatFileSize(buf.byteLength)})`
-            });
-            plainMsg.audio = attachName;
-            plainMsg.audioDuration = audioData.duration || 0;
-            plainMsg.audioMime = audioData.mime || 'audio/webm';
-        }
+
+
+        if (hasImage) {
+    const attachName = generateAttachmentName('img', 'jpg');
+    const buf = await imageBlob.arrayBuffer();
+    await uploadAttachmentAuto(state.chatFile, attachName, buf, 'image/jpeg', `📷 Фото (${formatFileSize(imageBlob.size)})`);
+    plainMsg.image = attachName;
+}
+
+
+
+
+if (hasAudio) {
+    const attachName = generateAttachmentName('aud', 'webm');
+    const b64 = audioData.data.includes(',') ? audioData.data.split(',')[1] : audioData.data;
+    const buf = base64ToArrayBuffer(b64);
+    await uploadAttachmentAuto(
+        state.chatFile,
+        attachName,
+        buf,
+        audioData.mime || 'audio/webm',
+        `🎤 Голосовое (${formatFileSize(buf.byteLength)})`
+    );
+    plainMsg.audio = attachName;
+    plainMsg.audioDuration = audioData.duration || 0;
+    plainMsg.audioMime = audioData.mime || 'audio/webm';
+}
+
+
 
         // 🆕 Отправка аудиофайла
-        if (hasAudioFile) {
-            const ext = (audioFile.name.split('.').pop() || 'mp3')
-                .toLowerCase().replace(/[^a-z0-9]/g, '') || 'mp3';
-            const attachName = generateAttachmentName('aud', ext);
-            const buf = await audioFile.blob.arrayBuffer();
-            const enc = await encryptAttachment(buf, CRYPTO._key);
-            await uploadAttachment(state.chatFile, attachName, enc.cipher, enc.iv, {
-                displayName: `🎵 ${audioFile.name}`
-            });
-            plainMsg.audio = attachName;
-            plainMsg.audioDuration = audioFile.duration || 0;
-            plainMsg.audioMime = audioFile.mime || guessMimeFromName(audioFile.name);
-        }
+        
+if (hasAudioFile) {
+    const ext = (audioFile.name.split('.').pop() || 'mp3')
+        .toLowerCase().replace(/[^a-z0-9]/g, '') || 'mp3';
+    const attachName = generateAttachmentName('aud', ext);
+    const buf = await audioFile.blob.arrayBuffer();
+    await uploadAttachmentAuto(
+        state.chatFile,
+        attachName,
+        buf,
+        audioFile.mime || guessMimeFromName(audioFile.name),
+        `🎵 ${audioFile.name}`
+    );
+    plainMsg.audio = attachName;
+    plainMsg.audioDuration = audioFile.duration || 0;
+    plainMsg.audioMime = audioFile.mime || guessMimeFromName(audioFile.name);
+}
 
-        if (hasFile) {
-            const ext = (fileAttachment.name.split('.').pop() || 'bin').toLowerCase().replace(/[^a-z0-9]/g, '') || 'bin';
-            const attachName = generateAttachmentName('file', ext);
-            const buf = await fileAttachment.blob.arrayBuffer();
-            const enc = await encryptAttachment(buf, CRYPTO._key);
-            await uploadAttachment(state.chatFile, attachName, enc.cipher, enc.iv, {
-                displayName: fileAttachment.name
-            });
-            plainMsg.file = attachName;
-            plainMsg.fileName = fileAttachment.name;
-            plainMsg.fileMime = fileAttachment.mime || 'application/octet-stream';
-            plainMsg.fileSize = fileAttachment.blob.size;
-        }
+
+
+if (hasFile) {
+    const ext = (fileAttachment.name.split('.').pop() || 'bin').toLowerCase().replace(/[^a-z0-9]/g, '') || 'bin';
+    const attachName = generateAttachmentName('file', ext);
+    const buf = await fileAttachment.blob.arrayBuffer();
+    await uploadAttachmentAuto(
+        state.chatFile,
+        attachName,
+        buf,
+        fileAttachment.mime || 'application/octet-stream',
+        fileAttachment.name
+    );
+    plainMsg.file = attachName;
+    plainMsg.fileName = fileAttachment.name;
+    plainMsg.fileMime = fileAttachment.mime || 'application/octet-stream';
+    plainMsg.fileSize = fileAttachment.blob.size;
+}
+
+        
+
 
         state._lastSentMessageId = messageId;
 
@@ -4623,6 +4905,7 @@ async function handleMultipleImageUpload(files) {
         return;
     }
 
+    // ═══ 1. Фильтрация ═══
     const valid = [];
     let totalSize = 0;
     let skipped = 0;
@@ -4651,21 +4934,21 @@ async function handleMultipleImageUpload(files) {
     micBtn.disabled = true;
 
     try {
-        const encrypted = [];
+        // ═══ 2. Сжатие под 1 МБ (если влезет) ═══
+        const prepared = [];
         for (let i = 0; i < valid.length; i++) {
             if (BatchUploadIndicator.isCancelled()) throw new Error('ABORTED');
             const file = valid[i];
             updateBatchUploadIndicator(i, valid.length, `Обработка ${i + 1} из ${valid.length}…`);
             try {
-                const compressed = await compressImage(file);
+                const { blob: compressed } = await compressImageToTarget(file);
                 const attachName = generateAttachmentName('img', 'jpg');
                 const buf = await compressed.arrayBuffer();
-                const enc = await encryptAttachment(buf, CRYPTO._key);
-                encrypted.push({
+                prepared.push({
                     attachName,
-                    cipher: enc.cipher,
-                    iv: enc.iv,
+                    buf,                        // 🆕 сырой буфер — шифруем внутри uploadAttachmentAuto
                     size: compressed.size,
+                    mime: 'image/jpeg',
                 });
             } catch (e) {
                 console.warn('Ошибка обработки', file.name, e);
@@ -4673,23 +4956,30 @@ async function handleMultipleImageUpload(files) {
             }
         }
 
-        if (encrypted.length === 0) {
+        if (prepared.length === 0) {
             hideBatchUploadIndicator();
             showToast('❌ Не удалось обработать фото', 2500);
             soundManager.play('error');
             return;
         }
 
-        for (let i = 0; i < encrypted.length; i++) {
+        // ═══ 3. Загрузка (авто: сжатие или чанки) ═══
+        for (let i = 0; i < prepared.length; i++) {
             if (BatchUploadIndicator.isCancelled()) throw new Error('ABORTED');
-            const item = encrypted[i];
-            updateBatchUploadIndicator(i, encrypted.length,
-                `Загрузка ${i + 1} из ${encrypted.length}…`);
-            await uploadAttachment(state.chatFile, item.attachName, item.cipher, item.iv, {
-                displayName: `📷 Фото ${i + 1}/${encrypted.length} (${formatFileSize(item.size)})`
-            });
+            const item = prepared[i];
+            updateBatchUploadIndicator(i, prepared.length,
+                `Загрузка ${i + 1} из ${prepared.length}…`);
+
+            await uploadAttachmentAuto(
+                state.chatFile,
+                item.attachName,
+                item.buf,
+                item.mime,
+                `📷 Фото ${i + 1}/${prepared.length} (${formatFileSize(item.size)})`
+            );
         }
 
+        // ═══ 4. Читаем файл чата ═══
         const path = getChatPath(state.chatFile);
         const result = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
         let fileContent, sha;
@@ -4710,12 +5000,13 @@ async function handleMultipleImageUpload(files) {
             }
         }
 
+        // ═══ 5. Создаём сообщения ═══
         const batchId = 'batch_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
         const baseTime = Date.now();
         const newPlainMessages = [];
 
-        for (let i = 0; i < encrypted.length; i++) {
-            const item = encrypted[i];
+        for (let i = 0; i < prepared.length; i++) {
+            const item = prepared[i];
             const messageId = baseTime + i;
             const plainMsg = {
                 id: messageId,
@@ -4725,7 +5016,7 @@ async function handleMultipleImageUpload(files) {
                 image: item.attachName,
                 batchId,
                 batchIndex: i,
-                batchTotal: encrypted.length,
+                batchTotal: prepared.length,
             };
             const encMsg = await encryptMessage(plainMsg);
             fileContent.messages.push(encMsg);
@@ -4764,8 +5055,8 @@ async function handleMultipleImageUpload(files) {
         soundManager.play('send');
 
         const msg = skipped > 0
-            ? `✅ Отправлено ${encrypted.length} из ${files.length} (${skipped} пропущено)`
-            : `✅ Отправлено ${encrypted.length} фото`;
+            ? `✅ Отправлено ${prepared.length} из ${files.length} (${skipped} пропущено)`
+            : `✅ Отправлено ${prepared.length} фото`;
         showToast(msg, 2500);
     } catch (error) {
         console.error('Batch upload error:', error);
@@ -4785,6 +5076,12 @@ async function handleMultipleImageUpload(files) {
         if (state.isAuthorized && state.chatFile) messageInput.focus();
     }
 }
+
+
+
+
+            
+           
 
 // ===================================================================
 //  УДАЛЕНИЕ СООБЩЕНИЯ
@@ -4811,10 +5108,38 @@ async function deleteMessage(messageId) {
         if (plain.audio && isAttachmentRef(plain.audio)) attToDelete.push(plain.audio);
         if (plain.file && isAttachmentRef(plain.file)) attToDelete.push(plain.file);
 
-        if (attToDelete.length > 0) {
-            showToast('🗑️ Удаление вложения...', 1500);
-            await Promise.allSettled(attToDelete.map(name => deleteAttachment(state.chatFile, name)));
+       
+
+if (attToDelete.length > 0) {
+    showToast(`🗑️ Удаление ${attToDelete.length} вложени${attToDelete.length === 1 ? 'я' : 'й'}...`, 2000);
+
+    const results = await Promise.allSettled(
+        attToDelete.map(name => deleteAttachment(state.chatFile, name))
+    );
+
+    let totalDeleted = 0, totalFailed = 0;
+    const failedNames = [];
+
+    for (const r of results) {
+        if (r.status === 'fulfilled' && r.value) {
+            totalDeleted += (r.value.deleted || []).length;
+            if (r.value.failed && r.value.failed.length > 0) {
+                totalFailed += r.value.failed.length;
+                r.value.failed.forEach(f => failedNames.push(f.name));
+            }
+        } else {
+            totalFailed++;
         }
+    }
+
+    if (totalFailed === 0) {
+        showToast(`✅ Удалено файлов: ${totalDeleted}`, 1500);
+    } else {
+        showToast(`⚠️ Удалено: ${totalDeleted}, не удалось: ${totalFailed}`, 3000);
+        console.warn('Не удалось удалить:', failedNames);
+    }
+}
+ 
 
         encMessages.splice(idx, 1);
         fileContent.messages = encMessages;
@@ -4853,6 +5178,11 @@ async function deleteMessage(messageId) {
 // ===================================================================
 //  ЗАГРУЗКА ФОТО (одиночная)
 // ===================================================================
+
+
+
+
+
 async function handleFileUpload(file) {
     if (!file) return;
     if (!state.isAuthorized || !state.chatFile) {
@@ -4868,23 +5198,33 @@ async function handleFileUpload(file) {
         return;
     }
 
-    // ═══ Проверка размера с предупреждением ═══
-    const confirmed = await confirmLargeFile(file.size, file.name || 'image.jpg');
-    if (!confirmed) return;
-
     try {
         showToast('⏳ Обработка...', 1500);
-        const compressedBlob = await compressImage(file);
-        if (compressedBlob.size > CONFIG.hardLimitBytes) {
-            showToast(`❌ Даже после сжатия файл ${formatFileSize(compressedBlob.size)} слишком большой`, 3500);
-            return;
+
+        // 🆕 Итеративное сжатие под 950 КБ
+        const { blob: compressedBlob, method } = await compressImageToTarget(file);
+        const finalSize = compressedBlob.size;
+        const origSize = file.size;
+
+        if (method === 'compressed' && finalSize <= CONFIG.autoCompressTargetBytes) {
+            const ratio = ((1 - finalSize / origSize) * 100).toFixed(0);
+            showToast(`✅ Сжато: ${formatFileSize(origSize)} → ${formatFileSize(finalSize)} (−${ratio}%)`, 2000);
+        } else {
+            showToast(`⚠️ Сжато до ${formatFileSize(finalSize)}, будет разбито на чанки`, 2500);
         }
+
         await sendMessage('', compressedBlob);
     } catch (error) {
         console.error(error);
         showToast('❌ Ошибка обработки', 3000);
     }
 }
+
+
+
+
+
+
 
 async function handleAnyFileUpload(file) {
     if (!file) return;
@@ -6203,8 +6543,12 @@ async function confirmShareToChat() {
         return;
     }
 
+
     await doShareToChat(targetFile, password, blob, fileName, mime);
 }
+
+
+
 
 async function doShareToChat(targetFile, targetPassword, blob, fileName, mime) {
     const isImage = mime.startsWith('image/');
@@ -6238,7 +6582,6 @@ async function doShareToChat(targetFile, targetPassword, blob, fileName, mime) {
             : (fileName.split('.').pop() || 'bin').toLowerCase().replace(/[^a-z0-9]/g, '') || 'bin';
         const attachName = generateAttachmentName(isImage ? 'img' : 'file', ext);
         const buf = await blob.arrayBuffer();
-        const enc = await encryptAttachment(buf, targetKey);
 
         const saveState = {
             chatFile: state.chatFile,
@@ -6251,9 +6594,14 @@ async function doShareToChat(targetFile, targetPassword, blob, fileName, mime) {
         CRYPTO._key = targetKey;
 
         try {
-            await uploadAttachment(targetFile, attachName, enc.cipher, enc.iv, {
-                displayName: isImage ? `📷 ${fileName}` : `📎 ${fileName}`,
-            });
+            // 🆕 Авто-режим: сжатие для маленьких, чанки для больших
+            await uploadAttachmentAuto(
+                targetFile,
+                attachName,
+                buf,
+                mime,
+                isImage ? `📷 ${fileName}` : `📎 ${fileName}`
+            );
         } finally {
             state.chatFile = saveState.chatFile;
             state.chatPassword = saveState.chatPassword;
@@ -6328,6 +6676,8 @@ async function doShareToChat(targetFile, targetPassword, blob, fileName, mime) {
         soundManager.play('error');
     }
 }
+
+
 
 // ===================================================================
 //  ЭМОДЗИ
