@@ -732,6 +732,9 @@ body.player-active .gallery-actions {
             transition: all 0.2s; position: relative;
         }
         .input-bar .send-btn:active { transform: scale(0.85); }
+
+
+
         .input-bar .send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
         .input-bar .send-btn.clicked { animation: clickFeedback 0.15s ease; }
         @keyframes clickFeedback {
@@ -988,12 +991,38 @@ body.player-active .gallery-actions {
             0% { transform: scale(0.4); opacity: 0; }
             100% { transform: scale(1); opacity: 1; }
         }
-        .chat-name-row {
-            display: flex; align-items: center; gap: 6px;
-            min-width: 0;
-        }
-        .chat-name-row .chat-name { flex: 1; min-width: 0; }
+        
+.chat-name-row {
+    display: flex; align-items: center; gap: 6px;
+    min-width: 0;
+}
+.chat-name-row .chat-name { flex: 1; min-width: 0; }
 
+/* 🆕 Значок «играет музыка в этом чате» */
+.chat-playing-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, #6c5ce7, #00b894);
+    color: #fff;
+    font-size: 11px;
+    flex-shrink: 0;
+    box-shadow: 0 0 10px rgba(108,92,231,0.6);
+    animation: chatPlayingPulse 1.6s ease-in-out infinite;
+    margin-left: 4px;
+}
+.chat-playing-icon::before {
+    content: '♪';
+    font-weight: 900;
+    line-height: 1;
+}
+@keyframes chatPlayingPulse {
+    0%, 100% { transform: scale(1); box-shadow: 0 0 10px rgba(108,92,231,0.6); }
+    50%      { transform: scale(1.12); box-shadow: 0 0 16px rgba(0,184,148,0.8); }
+}
         .unread-divider {
             align-self: center;
             display: flex; align-items: center; gap: 10px;
@@ -1767,30 +1796,7 @@ body.player-active .gallery-actions {
 
 
 
-/* ═══ Крутящееся кольцо вокруг кнопки отправки, пока она disabled ═══ */
-.input-bar .send-btn {
-    position: relative;
-    overflow: visible;
-}
-.input-bar .send-btn:disabled {
-    opacity: 1;                       /* перебиваем существующее opacity: 0.4 */
-    background: linear-gradient(135deg, #4a4a6e, #2f4a5a);
-    cursor: not-allowed;
-}
-.input-bar .send-btn:disabled::before {
-    content: '';
-    position: absolute;
-    inset: -3px;                      /* кольцо чуть больше кнопки */
-    border-radius: 50%;
-    border: 2px solid transparent;
-    border-top-color: #6c5ce7;
-    border-right-color: #00b894;
-    animation: sendSpin 0.9s linear infinite;
-    pointer-events: none;
-}
-@keyframes sendSpin {
-    to { transform: rotate(360deg); }
-}
+
 
 /* ═══ Модалка подтверждения (крупные файлы) ═══ */
 #confirmModal .form-modal-content {
@@ -2196,6 +2202,24 @@ body.player-active .gallery-actions { bottom: 56px; }
 #globalPlayerBar .gp-btn-main:hover {
     background: linear-gradient(135deg, #7a6cf0, #00cfa4);
 }
+
+/* 🆕 Кнопка смены порядка */
+#globalPlayerBar .gp-btn-order {
+    color: #a78bfa;
+    font-size: 16px;
+    font-weight: 700;
+}
+#globalPlayerBar .gp-btn-order:hover {
+    background: rgba(108,92,231,0.15);
+    color: #fff;
+}
+#globalPlayerBar .gp-btn-order.active {
+    background: linear-gradient(135deg, rgba(108,92,231,0.3), rgba(0,184,148,0.2));
+    color: #fff;
+    box-shadow: inset 0 0 0 1px rgba(108,92,231,0.5);
+}
+
+
 #globalPlayerBar .gp-btn-close {
     color: #888;
     font-size: 14px;
@@ -2224,6 +2248,137 @@ body.player-active .gallery-actions { bottom: 56px; }
 /* Отступ снизу у мессенджера, чтобы плеер не перекрывал ввод */
 body.player-active .input-bar { padding-bottom: 68px; }
 body.player-active .messages-container { padding-bottom: 68px; }
+
+
+/* ═══ Оптимистичная отправка ═══ */
+.message-wrapper.pending .message {
+    opacity: 0.75;
+    transition: opacity 0.3s ease;
+}
+.message-wrapper.failed .message {
+    box-shadow: 0 0 0 1.5px rgba(255, 107, 107, 0.7);
+    opacity: 1;
+}
+.retry-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin-top: 6px;
+    padding: 4px 10px;
+    background: rgba(255, 107, 107, 0.15);
+    border: 1px solid rgba(255, 107, 107, 0.35);
+    border-radius: 14px;
+    color: #ff8a8a;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+    font-family: inherit;
+}
+.retry-btn:hover { background: rgba(255, 107, 107, 0.25); color: #fff; }
+.retry-btn:active { transform: scale(0.94); }
+
+/* ═══ Кнопка отправки всегда активна (оптимистичный UI) ═══ */
+.input-bar .send-btn:disabled {
+    opacity: 1 !important;
+    background: linear-gradient(135deg, #6c5ce7, #00b894) !important;
+    cursor: pointer !important;
+    pointer-events: auto !important;
+}
+.input-bar .send-btn:disabled::before {
+    display: none !important;
+}
+
+
+/* ═══ Бейдж очереди на кнопке отправки ═══ */
+.input-bar .send-btn {
+    position: relative;
+}
+.send-queue-badge {
+    position: absolute;
+    top: -4px;
+    right: -4px;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 5px;
+    background: linear-gradient(135deg, #ff9f43, #feca57);
+    color: #1a1a2e;
+    font-size: 10px;
+    font-weight: 800;
+    border-radius: 9px;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.4);
+    animation: popIn 0.25s ease;
+    border: 2px solid #0a0a0f;
+    line-height: 1;
+    pointer-events: none;
+}
+.send-queue-badge.show {
+    display: flex;
+}
+
+/* ═══ Статус сообщения (галочки) ═══ */
+.msg-status {
+    display: inline-block;
+    font-size: 11px;
+    line-height: 1;
+    margin-left: 5px;
+    font-weight: 700;
+    transition: opacity 0.2s ease, color 0.2s ease;
+    vertical-align: middle;
+    position: relative;
+    top: -1px;
+}
+/* ⏳ — в процессе отправки */
+.msg-status.sending {
+    color: rgba(255,255,255,0.55);
+    animation: statusPulse 1.2s ease-in-out infinite;
+}
+/* ✓ — успешно отправлено */
+.msg-status.sent {
+    color: #00e0b8;
+    text-shadow: 0 0 6px rgba(0,224,184,0.6);
+}
+/* ⚠ — ошибка */
+.msg-status.failed {
+    color: #ff8a8a;
+    cursor: pointer;
+    padding: 0 3px;
+}
+.msg-status.failed:hover { color: #fff; }
+
+@keyframes statusPulse {
+    0%, 100% { opacity: 0.45; }
+    50%      { opacity: 1; }
+}
+
+/* ═══ Кнопка отмены pending-сообщения ═══ */
+.cancel-pending-btn {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    border: none;
+    background: rgba(255,255,255,0.15);
+    color: #fff;
+    font-size: 10px;
+    cursor: pointer;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    line-height: 1;
+    z-index: 5;
+}
+.message-wrapper.pending:hover .cancel-pending-btn,
+.message-wrapper.pending:active .cancel-pending-btn {
+    display: flex;
+}
+.cancel-pending-btn:active { transform: scale(0.85); }
 
     </style>
 </head>
@@ -2311,14 +2466,16 @@ body.player-active .messages-container { padding-bottom: 68px; }
     </div>
 
     <div class="messages-container" id="messagesContainer">
-        <div class="messages-inner" id="messagesInner">
-            <div class="skeleton other"></div>
-            <div class="skeleton own"></div>
-            <div class="skeleton other"></div>
-        </div>
+    <div class="messages-inner" id="messagesInner">
+        <div class="skeleton other"></div>
+        <div class="skeleton own"></div>
+        <div class="skeleton other"></div>
     </div>
+</div>
 
-    <div class="input-bar" id="inputBar">
+
+
+<div class="input-bar" id="inputBar">
         <button class="close-panel-btn" id="closePanelBtn" title="Скрыть панель">✕</button>
         <textarea id="messageInput" rows="1" placeholder="Сообщение..." maxlength="50000"></textarea>
         <div class="recording-indicator" id="recordingIndicator">
@@ -2330,7 +2487,10 @@ body.player-active .messages-container { padding-bottom: 68px; }
             <button class="emoji-btn" id="emojiBtn" title="Эмодзи">😊</button>
             <button class="file-btn" id="fileBtn" title="Прикрепить">📎</button>
             <button class="mic-btn" id="micBtn" title="Записать аудио (до 10 сек)">🎤</button>
-            <button class="send-btn" id="sendBtn">➤</button>
+            <button class="send-btn" id="sendBtn">
+    ➤
+    <span class="send-queue-badge" id="sendQueueBadge">0</span>
+</button>
         </div>
         
         <div class="emoji-panel" id="emojiPanel"></div>
@@ -5298,11 +5458,14 @@ if (hasFile) {
         scrollState.isAtBottom = true;
 
         appendMessages([plainMsg]);
-        scrollToBottom(true);
-        markChatAsRead();
-        soundManager.play('click');
-        soundManager.play('send');
-        showToast('✅ Отправлено!', 1000);
+// 🆕 При работе очереди — не показываем тост и не дёргаем скролл
+if (!window._suppressSendSideEffects) {
+    scrollToBottom(true);
+    markChatAsRead();
+    soundManager.play('click');
+    soundManager.play('send');
+    showToast('✅ Отправлено!', 1000);
+}
     } catch (error) {
         console.error('Ошибка:', error);
         if (error.message === 'ABORTED') {
@@ -6149,8 +6312,8 @@ ${content}
 ${commentBar}
 ${commentsBlock}
 ${buildReactionsHTML(msg)}
-<span class="time">${fullTime}</span>
 
+<span class="time">${fullTime}${msg._status === 'sending' ? `<span class="msg-status sending" data-status-for="${msg.id}">⏳</span>` : msg._status === 'sent' ? `<span class="msg-status sent" data-status-for="${msg.id}">✓</span>` : msg._status === 'failed' ? `<span class="msg-status failed" data-status-for="${msg.id}">⚠</span>` : ''}</span>
 
 
             </div>
@@ -6210,10 +6373,21 @@ function renderHistory() {
         }
         const msgDate = formatDate(msg.time);
         if (msgDate !== lastDate) { html += `<div class="message system">${msgDate}</div>`; lastDate = msgDate; }
-        const isUnread = firstUnreadIdx >= 0 && i >= firstUnreadIdx && msg.username !== state.username;
-        html += buildMessageHTML(msg, { isUnread });
-    }
 
+    const isUnread = firstUnreadIdx >= 0 && i >= firstUnreadIdx && msg.username !== state.username;
+    let msgHtml = buildMessageHTML(msg, { isUnread });
+    // 🆕 Восстанавливаем pending-класс для неотправленных
+    if (msg._tempId) {
+        msgHtml = msgHtml.replace(
+            `data-msg-id="${msg.id}"`,
+            `data-msg-id="${msg.id}" data-temp-id="${msg._tempId}"`
+        ).replace(
+            /class="message-wrapper ([^"]*)"/,
+            'class="message-wrapper $1 pending"'
+        );
+    }
+    html += msgHtml;
+}
     messagesInner.innerHTML = html;
     messagesInner.dataset.lastDate = lastDate;
     loadAttachmentsIn(messagesInner);
@@ -6229,6 +6403,21 @@ function renderMessages(messages) {
 }
 
 function appendMessages(newMsgs) {
+    // 🆕 Если сейчас работает очередь — не рисуем.
+    // DOM уже отрисован оптимистично через appendOptimisticMessage.
+    if (window._suppressSendSideEffects) {
+        // Всё равно добавляем в историю, чтобы state не разъехался
+        if (newMsgs && newMsgs.length > 0) {
+            for (const m of newMsgs) {
+                // Только если такого ещё нет
+                if (!historyState.allMessages.some(x => x.id === m.id)) {
+                    historyState.allMessages.push(m);
+                }
+            }
+        }
+        return;
+    }
+
     if (!newMsgs || newMsgs.length === 0) return;
 
     const divider = messagesInner.querySelector('.unread-divider');
@@ -6242,10 +6431,21 @@ function appendMessages(newMsgs) {
     let html = '';
     let lastDate = messagesInner.dataset.lastDate || '';
     for (const msg of newMsgs) {
-        const msgDate = formatDate(msg.time);
-        if (msgDate !== lastDate) { html += `<div class="message system">${msgDate}</div>`; lastDate = msgDate; }
-        html += buildMessageHTML(msg, { isUnread: markUnread });
+    const msgDate = formatDate(msg.time);
+    if (msgDate !== lastDate) { html += `<div class="message system">${msgDate}</div>`; lastDate = msgDate; }
+    let msgHtml = buildMessageHTML(msg, { isUnread: markUnread });
+    // 🆕 Если это pending — добавим классы
+    if (msg._tempId) {
+        msgHtml = msgHtml.replace(
+            `data-msg-id="${msg.id}"`,
+            `data-msg-id="${msg.id}" data-temp-id="${msg._tempId}"`
+        ).replace(
+            /class="message-wrapper ([^"]*)"/,
+            'class="message-wrapper $1 pending"'
+        );
     }
+    html += msgHtml;
+}
     messagesInner.dataset.lastDate = lastDate;
     messagesInner.insertAdjacentHTML('beforeend', html);
     loadAttachmentsIn(messagesInner);
@@ -7551,7 +7751,7 @@ function showChatsScreen() {
     chatScreen.style.display = 'none';
     chatsScreen.style.display = 'flex';
     $('chatsUserLabel').textContent = state.username;
-    renderChatsList();
+    renderChatsList();   // 🆕 renderChatsList сам добавит значок ♪ если что-то играет
     setTimeout(refreshUnreadBadges, 100);
     scrollDownBtn.classList.remove('show');
     floatingKeyboardBtn.classList.remove('show');
@@ -7589,28 +7789,42 @@ function renderChatsList() {
         `;
         return;
     }
-    const autorunFile = getAutorunChat();
-    container.innerHTML = state.chats.map(c => {
-        const hasUnread = c.hasUnread;
-        const count = c.unreadCount || 0;
-        const badge = hasUnread
-            ? (count > 0
-                ? `<span class="unread-badge">${count > 99 ? '99+' : count}</span>`
-                : `<span class="unread-badge" style="background:#00b894;">•</span>`)
-            : '';
-        const isAutorun = autorunFile === c.file;
-        return `
-        <div class="chat-list-item ${hasUnread ? 'has-unread' : ''}" data-file="${c.file}">
-            <div style="display:flex;align-items:center;gap:12px;flex:1;min-width:0;">
-                <div class="chat-avatar ${hasUnread ? 'has-unread' : ''}">${(c.name || c.file).charAt(0).toUpperCase()}</div>
-                <div style="min-width:0;flex:1;">
-                    <div class="chat-name-row">
-                        <div class="chat-name">${escapeHtml(c.name || c.file)}</div>
-                        ${badge}
-                    </div>
-                    <div class="chat-file">${escapeHtml(c.file)}</div>
+    
+const autorunFile = getAutorunChat();
+
+// 🆕 Какой чат сейчас играет?
+const playingChatFile = GlobalPlayer.currentChatFile
+    && GlobalPlayer.getCurrentMsgId()
+    && !GlobalPlayer.audioEl.paused
+    ? GlobalPlayer.currentChatFile
+    : null;
+
+container.innerHTML = state.chats.map(c => {
+    const hasUnread = c.hasUnread;
+    const count = c.unreadCount || 0;
+    const badge = hasUnread
+        ? (count > 0
+            ? `<span class="unread-badge">${count > 99 ? '99+' : count}</span>`
+            : `<span class="unread-badge" style="background:#00b894;">•</span>`)
+        : '';
+    const isAutorun = autorunFile === c.file;
+    // 🆕 Показываем значок ♪ у играющего чата
+    const isPlaying = playingChatFile === c.file;
+    const playingIcon = isPlaying ? `<span class="chat-playing-icon" title="Сейчас играет"></span>` : '';
+    return `
+    <div class="chat-list-item ${hasUnread ? 'has-unread' : ''}" data-file="${c.file}">
+        <div style="display:flex;align-items:center;gap:12px;flex:1;min-width:0;">
+            <div class="chat-avatar ${hasUnread ? 'has-unread' : ''}">${(c.name || c.file).charAt(0).toUpperCase()}</div>
+            <div style="min-width:0;flex:1;">
+                <div class="chat-name-row">
+                    <div class="chat-name">${escapeHtml(c.name || c.file)}</div>
+                    ${playingIcon}
+                    ${badge}
                 </div>
+                <div class="chat-file">${escapeHtml(c.file)}</div>
             </div>
+        </div>
+
             <button class="share-btn" data-file="${c.file}" title="Поделиться чатом">💾</button>
             <button class="rename-btn" data-file="${c.file}" title="Переименовать">✏️</button>
             <button class="autorun-btn ${isAutorun ? 'active' : ''}"
@@ -7752,6 +7966,11 @@ async function confirmCreateChat() {
 //  ВХОД В ЧАТ
 // ===================================================================
 function openChatFlow(file) {
+    // 🆕 Проверим pending/failed для текущего чата
+    if (state.chatFile && state.chatFile !== file && SendQueue.hasPending()) {
+        if (!confirm('Есть неотправленные сообщения в текущем чате. Перейти и отменить их?')) return;
+        SendQueue.clearAll();
+    }
     const chat = state.chats.find(c => c.file === file);
     const name = chat ? chat.name : file;
     if (state.savedPasswords[file]) {
@@ -7824,11 +8043,13 @@ async function enterChat(file, name, password) {
             const saltBytes = generateSalt();
             state.salt = arrayBufferToBase64(saltBytes);
             CRYPTO._key = await deriveKey(password, state.salt);
-            state.messages = [];
-            state.sha = null;
-            state._lastCommitSha = null;
-            state.lastMessageCount = 0;
-            renderMessages([]);
+            const pendingFromHistory = historyState.allMessages.filter(m => m._tempId);
+state.messages = pendingFromHistory.slice();
+state.sha = null;
+state._lastCommitSha = null;
+state.lastMessageCount = 0;
+historyState.allMessages = pendingFromHistory.slice();
+renderHistory();
             startPolling();
 
 syncPlayerWithCurrentChat();
@@ -7870,8 +8091,16 @@ syncPlayerWithCurrentChat();
             }
         } catch (e) { /* ok */ }
 
-        historyState.allMessages = decrypted.slice();
-        renderHistory();
+        // 🆕 Сохраняем pending-сообщения (они ещё не в GitHub)
+const pendingFromHistory = historyState.allMessages.filter(m => m._tempId);
+historyState.allMessages = decrypted.slice();
+// Возвращаем pending-сообщения в конец (они самые свежие)
+pendingFromHistory.forEach(pm => {
+    if (!historyState.allMessages.some(m => m._tempId === pm._tempId)) {
+        historyState.allMessages.push(pm);
+    }
+});
+renderHistory();
         
 startPolling();
 syncPlayerWithCurrentChat();   // 🆕 ДОБАВИТЬ
@@ -8027,6 +8256,10 @@ async function login() {
 }
 
 function logout() {
+    if (SendQueue.hasPending()) {
+        if (!confirm('Есть неотправленные сообщения. Выйти и отменить их?')) return;
+        SendQueue.clearAll();
+    }
     if (audioRecorder.isRecording) audioRecorder.cancel();
     markChatAsRead();
     stopPolling();
@@ -8095,12 +8328,17 @@ function lockChatUI(reason) {
 
 
 
-
-
-
 function backToChats() {
+    // 🆕 Если есть неотправленные — спросим
+    if (SendQueue.hasPending()) {
+        if (!confirm('Есть неотправленные сообщения. Выйти из чата и отменить их?')) return;
+        SendQueue.clearAll();
+    }
     markChatAsRead();
     if (audioRecorder.isRecording) audioRecorder.cancel();
+
+
+
     Object.keys(audioPlayers).forEach(id => {
         try { audioPlayers[id].audio.pause(); } catch (e) {}
         delete audioPlayers[id];
@@ -9589,20 +9827,23 @@ const GlobalPlayer = (() => {
     audio.preload = 'metadata';
 
     
-
 let queue = [];
 let currentIndex = -1;
 let currentChatFile = null;
-let currentMsgId = null;      // 🆕 ДОБАВИТЬ
+let currentMsgId = null;
 let isSeeking = false;
 let _savePositionTimer = null;
+let orderDown = false;   // 🆕 false = сверху вниз (старые→новые), true = снизу вверх
+let currentMsgIdForOrder = null;  // 🆕 запоминаем, откуда начали
+
 
     const el = {
-        bar: null, title: null, sub: null,
-        playBtn: null, prevBtn: null, nextBtn: null,
-        closeBtn: null, progressFill: null, progressBar: null,
-        timeCurrent: null, timeTotal: null, thumb: null,
-    };
+    bar: null, title: null, sub: null,
+    playBtn: null, prevBtn: null, nextBtn: null,
+    closeBtn: null, progressFill: null, progressBar: null,
+    timeCurrent: null, timeTotal: null, thumb: null,
+    orderBtn: null,   // 🆕
+};
 
     // ─── Создание DOM мини-плеера ───
     function buildUI() {
@@ -9623,11 +9864,12 @@ let _savePositionTimer = null;
                 </div>
             </div>
             <div class="gp-controls">
-                <button class="gp-btn" id="gpPrev" title="Предыдущий">⏮</button>
-                <button class="gp-btn gp-btn-main" id="gpPlay" title="Пауза">⏸</button>
-                <button class="gp-btn" id="gpNext" title="Следующий">⏭</button>
-                <button class="gp-btn gp-btn-close" id="gpClose" title="Закрыть">✕</button>
-            </div>
+    <button class="gp-btn gp-btn-order" id="gpOrder" title="Порядок: вниз к новым (нажмите для ⬆)">⬇</button>
+    <button class="gp-btn" id="gpPrev" title="Предыдущий">⏮</button>
+    <button class="gp-btn gp-btn-main" id="gpPlay" title="Пауза">⏸</button>
+    <button class="gp-btn" id="gpNext" title="Следующий">⏭</button>
+    <button class="gp-btn gp-btn-close" id="gpClose" title="Закрыть">✕</button>
+</div>
         `;
         document.body.appendChild(bar);
 
@@ -9645,9 +9887,14 @@ let _savePositionTimer = null;
         el.thumb = bar.querySelector('#gpThumb');
 
         el.playBtn.addEventListener('click', toggle);
-        el.prevBtn.addEventListener('click', prev);
-        el.nextBtn.addEventListener('click', next);
-        el.closeBtn.addEventListener('click', stop);
+el.prevBtn.addEventListener('click', prev);
+el.nextBtn.addEventListener('click', next);
+el.closeBtn.addEventListener('click', stop);
+
+// 🆕 Кнопка смены порядка воспроизведения
+const orderBtn = bar.querySelector('#gpOrder');
+el.orderBtn = orderBtn;
+orderBtn.addEventListener('click', toggleOrder);
 
         el.progressBar.addEventListener('click', (e) => {
             if (!audio.duration || !isFinite(audio.duration)) return;
@@ -9714,12 +9961,17 @@ let _savePositionTimer = null;
         el.timeCurrent.textContent = formatAudioTime(audio.currentTime);
     }
 
-
 function renderPlayState(playing) {
     if (!el.playBtn) return;
     el.playBtn.textContent = playing ? '⏸' : '▶';
 
+    // 🆕 Обновляем значок ♪ на карточке чата в списке
+    if (state.currentScreen === 'chats') {
+        renderChatsList();
+    }
+
     // 🆕 Гасим .playing у ВСЕХ инлайн-плееров
+
     document.querySelectorAll('.audio-wave.playing').forEach(wave => {
         const container = wave.closest('.audio-container');
         if (!container) return;
@@ -9743,15 +9995,18 @@ function renderPlayState(playing) {
     }
 
     // 🆕 Страховка: сброс через audioPlayers (если DOM перестроен)
-    Object.keys(audioPlayers).forEach(id => {
-        const p = audioPlayers[id];
-        if (!p) return;
-        const isCurrent = String(id) === String(currentMsgId);
-        if (!isCurrent) {
-            if (p.waveEl) p.waveEl.classList.remove('playing');
-            if (p.btn) p.btn.textContent = '▶';
-        }
-    });
+Object.keys(audioPlayers).forEach(id => {
+    const p = audioPlayers[id];
+    if (!p) return;
+    const isCurrent = String(id) === String(currentMsgId);
+    if (!isCurrent) {
+        // 🆕 Явно сбрасываем isPlaying, чтобы клик по этому
+        // сообщению снова запускал воспроизведение
+        p.isPlaying = false;
+        if (p.waveEl) p.waveEl.classList.remove('playing');
+        if (p.btn) p.btn.textContent = '▶';
+    }
+});
 }
 
 
@@ -9835,18 +10090,61 @@ function hide() {
 }
 
     function playQueue(newQueue, startIndex, chatFile) {
-        buildUI();
-        queue = Array.isArray(newQueue) ? newQueue.slice() : [];
-        currentChatFile = chatFile || null;
-        if (queue.length === 0) return false;
+    buildUI();
+    queue = Array.isArray(newQueue) ? newQueue.slice() : [];
+    currentChatFile = chatFile || null;
+    if (queue.length === 0) return false;
 
-        // Если открыт тот же чат и играет тот же трек — просто toggle
-        if (currentIndex >= 0 && queue[startIndex] && queue[startIndex].id === currentMsgId
-            && currentChatFile === chatFile) {
-            return toggle();
-        }
-        return playTrack(startIndex);
+    // 🆕 Запоминаем трек, с которого начали — чтобы при смене порядка
+    // остаться на том же месте
+    currentMsgIdForOrder = queue[startIndex]?.id;
+
+    // Если открыт тот же чат и играет тот же трек — просто toggle
+    if (currentIndex >= 0 && queue[startIndex] && queue[startIndex].id === currentMsgId
+        && currentChatFile === chatFile) {
+        return toggle();
     }
+    return playTrack(startIndex);
+}
+
+/**
+ * 🆕 Переключает порядок воспроизведения:
+ * ⬆ (по умолчанию) — от старых к новым (как сейчас)
+ * ⬇ — от новых к старым (обратный)
+ *
+ * Сохраняет текущий играющий трек и меняет prev/next местами.
+ */
+function toggleOrder() {
+    if (queue.length < 2) {
+        showToast('Нужно хотя бы 2 трека', 1500);
+        return;
+    }
+
+    // Запоминаем текущий трек
+    const playingTrack = queue[currentIndex];
+    if (!playingTrack) return;
+
+    // Разворачиваем очередь
+    orderDown = !orderDown;
+    queue.reverse();
+
+    // Находим новый индекс играющего трека
+    const newIdx = queue.findIndex(t => t.id === playingTrack.id);
+    if (newIdx >= 0) currentIndex = newIdx;
+
+    // Обновляем кнопку
+if (el.orderBtn) {
+    // ⬇ = прямой порядок (старые→новые), ⬆ = обратный (новые→старые)
+    el.orderBtn.textContent = orderDown ? '⬆' : '⬇';
+    el.orderBtn.title = orderDown
+        ? 'Порядок: вверх к старым (нажмите для ⬇)'
+        : 'Порядок: вниз к новым (нажмите для ⬆)';
+    el.orderBtn.classList.toggle('active', orderDown);
+}
+
+renderMeta();
+showToast(orderDown ? '⬆ К старым' : '⬇ К новым', 1500);
+}
 
     function toggle() {
         if (currentIndex < 0) return false;
@@ -9875,22 +10173,44 @@ function hide() {
     }
 
     function stop() {
-        audio.pause();
-        audio.currentTime = 0;
-        audio.removeAttribute('src');
-        audio.load();
-        queue = [];
-        currentIndex = -1;
-        currentMsgId = null;
-        currentChatFile = null;
-        renderPlayState(false);
-        hide();
-        // Сбрасываем инлайн-кнопки
-        document.querySelectorAll('.audio-wave.playing').forEach(w => w.classList.remove('playing'));
-        document.querySelectorAll('.audio-play-btn').forEach(b => {
-            if (b.closest('.audio-container')) b.textContent = '▶';
-        });
+audio.pause();
+audio.currentTime = 0;
+audio.removeAttribute('src');
+audio.load();
+queue = [];
+currentIndex = -1;
+currentMsgId = null;
+currentChatFile = null;
+orderDown = false;              // 🆕 сброс порядка
+currentMsgIdForOrder = null;    // 🆕
+if (el.orderBtn) {              // 🆕
+    el.orderBtn.textContent = '⬇';
+    el.orderBtn.title = 'Порядок: вниз к новым (нажмите для ⬆)';
+    el.orderBtn.classList.remove('active');
+}
+    renderPlayState(false);
+    hide();
+    // Сбрасываем инлайн-кнопки
+    document.querySelectorAll('.audio-wave.playing').forEach(w => w.classList.remove('playing'));
+    document.querySelectorAll('.audio-play-btn').forEach(b => {
+        if (b.closest('.audio-container')) b.textContent = '▶';
+    });
+    // 🆕 Сбрасываем isPlaying у всех инлайн-плееров,
+    // чтобы клик по тому же голосовому работал с нуля
+    Object.keys(audioPlayers).forEach(id => {
+        const p = audioPlayers[id];
+        if (p) {
+            p.isPlaying = false;
+            if (p.waveEl) p.waveEl.classList.remove('playing');
+            if (p.btn) p.btn.textContent = '▶';
+        }
+    });
+
+    // 🆕 Убираем значок ♪ из списка чатов (если он открыт)
+    if (state.currentScreen === 'chats') {
+        renderChatsList();
     }
+}
 
     function isPlayingMsg(msgId) {
         return String(currentMsgId) === String(msgId) && !audio.paused;
@@ -9937,21 +10257,20 @@ async function playAudioFromMessage(msgId) {
     const startIndex = queue.findIndex(x => String(x.id) === String(msgId));
     if (startIndex === -1) return;
 
-    // Предзагружаем только нужный + следующий (чтобы быстро)
-    const load = async (idx) => {
-        if (idx < 0 || idx >= queue.length) return;
-        if (queue[idx].src) return;
-        try {
-            const url = await loadAttachment(state.chatFile, queue[idx]._msg.audio);
-            queue[idx].src = url;
-        } catch (e) {
-            console.warn('failed to load audio', queue[idx].id, e);
-            queue[idx].src = null;
-        }
-    };
+    // 🆕 ВСЕГДА пересоздаём src, чтобы не хватать мёртвый blob:URL
+const load = async (idx) => {
+    if (idx < 0 || idx >= queue.length) return;
+    try {
+        const url = await loadAttachment(state.chatFile, queue[idx]._msg.audio);
+        queue[idx].src = url;
+    } catch (e) {
+        console.warn('failed to load audio', queue[idx].id, e);
+        queue[idx].src = null;
+    }
+};
 
-    // Грузим все сразу — параллельно (blob:URL дешёвый после кэша)
-    await Promise.all(queue.map((_, i) => load(i)));
+// Грузим все сразу — параллельно (blob:URL дешёвый после кэша)
+await Promise.all(queue.map((_, i) => load(i)));
 
     const playable = queue.filter(x => x.src);
     if (playable.length === 0) {
@@ -9981,23 +10300,736 @@ window.toggleAudioPlayback = function(msgId) {
 
 // ═══ Восстановление позиции после перезахода в чат ═══
 // (если играет трек из ЭТОГО ЖЕ чата — оставляем, иначе продолжаем играть чужой)
+
 function syncPlayerWithCurrentChat() {
     // Если ничего не играет — нечего синхронизировать
-    if (!GlobalPlayer.getCurrentMsgId()) return;
+    const cur = GlobalPlayer.getCurrentMsgId();
+    if (!cur) return;
     // Если играет трек из другого чата — не трогаем, пусть играет
     if (GlobalPlayer.currentChatFile && GlobalPlayer.currentChatFile !== state.chatFile) {
         return;
     }
-    // Если играет трек из этого чата — просто обновим инлайн-кнопки
-    const cur = GlobalPlayer.getCurrentMsgId();
-    if (cur && audioPlayers[cur]) {
-        GlobalPlayer.toggle(); // toggle чтобы синхронизировать состояние
-        GlobalPlayer.toggle();
+
+    // 🆕 Пытаемся синхронизировать несколько раз с нарастающей задержкой —
+    // ждём пока loadAttachmentsIn создаст <audio> плееры в DOM.
+    let attempts = 0;
+    const maxAttempts = 20;
+
+    const trySync = () => {
+        attempts++;
+
+        // Пересобираем audioPlayers из DOM
+        if (document.querySelector('.audio-container[data-audio-id]')
+            && Object.keys(audioPlayers).length === 0) {
+            initAudioPlayers();
+        }
+
+        syncInlineAudioStates();
+
+        // 🆕 Ищем играющий элемент в DOM
+        let playingEl = messagesInner.querySelector(
+            `.audio-container[data-audio-id="${cur}"]`
+        );
+
+        // 🆕 ЕСЛИ НЕ НАШЛИ — подгружаем старые сообщения, пока не найдём
+        if (!playingEl && attempts <= 3) {
+            // Ищем сообщение в полной истории
+            const idxInHistory = historyState.allMessages.findIndex(
+                m => String(m.id) === String(cur)
+            );
+            // Если оно есть в истории, но не в DOM — значит оно выше границы рендера
+            if (idxInHistory >= 0) {
+                // Нужно "домотать" историю до этого индекса
+                // Рендерим историю целиком от нужной точки до конца
+                const all = historyState.allMessages;
+                const start = Math.max(0, Math.min(idxInHistory, all.length - CONFIG.renderInitial));
+
+                historyState.startIndex = start;
+                historyState.renderedCount = all.length - start;
+
+                // Перерисовываем
+                let html = '';
+                if (start > 0) {
+                    html += `<div class="history-sentinel" id="historySentinel">↑ Потяните вверх, чтобы загрузить ещё</div>`;
+                }
+                let lastDate = '';
+                for (let i = start; i < all.length; i++) {
+                    const msg = all[i];
+                    const msgDate = formatDate(msg.time);
+                    if (msgDate !== lastDate) {
+                        html += `<div class="message system">${msgDate}</div>`;
+                        lastDate = msgDate;
+                    }
+                    html += buildMessageHTML(msg);
+                }
+                messagesInner.innerHTML = html;
+                messagesInner.dataset.lastDate = lastDate;
+                loadAttachmentsIn(messagesInner);
+            }
+        }
+
+        // Проверяем ещё раз после подгрузки
+        playingEl = messagesInner.querySelector(
+            `.audio-container[data-audio-id="${cur}"]`
+        );
+
+        if (playingEl) {
+            // Плеер найден — синхронизируем состояние
+            const p = audioPlayers[cur];
+            if (p) {
+                const isActuallyPlaying = !GlobalPlayer.audioEl.paused;
+                p.isPlaying = isActuallyPlaying;
+                if (p.btn) p.btn.textContent = isActuallyPlaying ? '⏸' : '▶';
+                if (p.waveEl) p.waveEl.classList.toggle('playing', isActuallyPlaying);
+            }
+
+            // Прокручиваем к играющему сообщению
+            playingEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            const wrapper = playingEl.closest('.message-wrapper');
+            if (wrapper) {
+                wrapper.classList.add('highlight-flash');
+                setTimeout(() => wrapper.classList.remove('highlight-flash'), 1300);
+            }
+            return; // успех
+        }
+
+        // Ещё не готово — пробуем снова
+        if (attempts < maxAttempts) {
+            setTimeout(trySync, 300);
+        }
+    };
+
+    // Даём DOM немного времени на первый рендер, потом начинаем попытки
+    setTimeout(trySync, 200);
+}
+
+// 🆕 Приводим все инлайн-плееры к актуальному состоянию
+function syncInlineAudioStates() {
+    const playingId = GlobalPlayer.getCurrentMsgId();
+    const isActuallyPlaying = playingId && !GlobalPlayer.audioEl.paused;
+
+    Object.keys(audioPlayers).forEach(id => {
+        const p = audioPlayers[id];
+        if (!p) return;
+        const isCurrent = String(id) === String(playingId);
+
+        if (isCurrent && isActuallyPlaying) {
+            // этот играет — показываем «пауза» и анимацию
+            p.isPlaying = true;
+            if (p.btn) p.btn.textContent = '⏸';
+            if (p.waveEl) p.waveEl.classList.add('playing');
+        } else {
+            // остальные — сбрасываем
+            p.isPlaying = false;
+            if (p.btn) p.btn.textContent = '▶';
+            if (p.waveEl) p.waveEl.classList.remove('playing');
+        }
+    });
+}
+console.log('🎵 Глобальный плеер активен — музыка играет между чатами');
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🚀 ОЧЕРЕДЬ ОТПРАВКИ
+//  Сообщения показываются мгновенно, уходят в GitHub по одному.
+// ═══════════════════════════════════════════════════════════════
+const SendQueue = (() => {
+    // Активные задачи (в очереди или в полёте)
+    const tasks = [];
+
+    // 🆕 Глушилка побочек старой sendMessage (appendMessages + state.messages.push).
+    // Пока true — все вызовы appendMessages/state.messages.push игнорируются.
+    // Нужна чтобы оптимистичный UI не дублировался с реальным.
+    window._suppressSendSideEffects = false;
+    // Провалившиеся задачи (для повтора)
+    const failedTasks = new Map();  // tempId -> task
+    let isRunning = false;
+    let _consecutiveFails = 0;
+    let _lastSendTime = 0;
+    const MIN_INTERVAL_MS = 250;  // защита от rate-limit GitHub
+
+    // ═══ Публичное API ═══
+    function enqueue(task) {
+        tasks.push(task);
+        _updatePendingBadge();
+        if (!isRunning) _run();
+    }
+
+    function isPending(tempId) {
+        return tasks.some(t => t.tempId === tempId);
+    }
+
+    function getTask(tempId) {
+        return tasks.find(t => t.tempId === tempId)
+            || failedTasks.get(tempId)
+            || null;
+    }
+
+    function clearAll() {
+        for (let i = tasks.length - 1; i >= 0; i--) {
+            if (tasks[i].status !== 'sending') {
+                _cleanupTask(tasks[i]);
+                tasks.splice(i, 1);
+            }
+        }
+        failedTasks.clear();
+        _updatePendingBadge();
+    }
+
+    function hasPending() {
+    return tasks.length > 0 || failedTasks.size > 0;
+}
+
+    function cancelTask(tempId) {
+        const idx = tasks.findIndex(t => t.tempId === tempId);
+        if (idx >= 0 && tasks[idx].status !== 'sending') {
+            _cleanupTask(tasks[idx]);
+            tasks.splice(idx, 1);
+            _updatePendingBadge();
+            return true;
+        }
+        if (failedTasks.has(tempId)) {
+            const t = failedTasks.get(tempId);
+            _cleanupTask(t);
+            failedTasks.delete(tempId);
+            _updatePendingBadge();
+            return true;
+        }
+        return false;
+    }
+
+    function _restore(task) {
+        failedTasks.delete(task.tempId);
+        if (tasks.some(t => t.tempId === task.tempId)) return;
+        tasks.unshift(task);  // в начало — повторится первым
+    }
+
+    // ═══ Внутреннее ═══
+    async function _run() {
+        if (isRunning) return;
+        isRunning = true;
+
+        while (tasks.length > 0) {
+            // Защита от rate-limit
+            const now = Date.now();
+            if (now - _lastSendTime < MIN_INTERVAL_MS) {
+                await new Promise(r => setTimeout(r, MIN_INTERVAL_MS - (now - _lastSendTime)));
+            }
+            _lastSendTime = Date.now();
+
+            // Если сеть пропала — ждём
+            if (!navigator.onLine || !networkState.isOnline) {
+                await new Promise(r => setTimeout(r, 3000));
+                if (!navigator.onLine || !networkState.isOnline) continue;
+            }
+
+            const task = tasks[0];
+            task.status = 'sending';
+            _updatePendingBadge();
+
+            try {
+                await _sendOne(task);
+                _cleanupTask(task);
+                tasks.shift();
+                _consecutiveFails = 0;
+            } catch (e) {
+                console.error('SendQueue error:', e);
+                task.status = 'failed';
+                task.error = e.message || 'Неизвестная ошибка';
+                _markFailed(task);
+
+                // Ошибка авторизации — стоп всей очереди
+                if (e.message && (e.message.includes('401') || e.message.includes('403'))) {
+                    showToast('🔒 Сессия истекла — отправка остановлена', 3000);
+                    lockChatUI('Сессия истекла');
+                    isRunning = false;
+                    _updatePendingBadge();
+                    return;
+                }
+
+                // Сохраняем в failedTasks для повтора
+                failedTasks.set(task.tempId, task);
+                tasks.shift();
+                _consecutiveFails++;
+
+                // 3 подряд — пауза
+                if (_consecutiveFails >= 3) {
+                    showToast('⚠️ Проблемы с сетью — очередь приостановлена', 3000);
+                    isRunning = false;
+                    _updatePendingBadge();
+                    setTimeout(() => {
+                        if (!isRunning && tasks.length > 0 && networkState.isOnline) {
+                            _consecutiveFails = 0;
+                            _run();
+                        }
+                    }, 10000);
+                    return;
+                }
+                continue;
+            }
+        }
+
+        isRunning = false;
+        _updatePendingBadge();
+    }
+
+    async function _sendOne(task) {
+    const { args, ctx } = task;
+
+    // Сохраняем контекст текущего чата и подменяем на снимок задачи
+    const originalState = {
+        chatFile: state.chatFile,
+        chatPassword: state.chatPassword,
+        salt: state.salt,
+        chatName: state.chatName,
+        key: CRYPTO._key,
+    };
+
+    if (ctx && ctx.chatFile) {
+        state.chatFile = ctx.chatFile;
+        state.chatPassword = ctx.chatPassword;
+        state.salt = ctx.salt;
+        state.chatName = ctx.chatName;
+        CRYPTO._key = ctx.key;
+    }
+
+    // 🆕 Включаем глушилку — старая sendMessage не должна рисовать DOM
+    window._suppressSendSideEffects = true;
+
+    try {
+        // Комментарий к фото — отдельный путь (без DOM-дублей)
+        if (args._isComment && args.commentMsgId) {
+            await submitComment(args.commentMsgId, args.text);
+            return;
+        }
+
+        const replySnapshot = task.plainMsg.replyTo;
+        window._currentReplyTo = replySnapshot || null;
+
+        let capturedRealMsg = null;
+
+        try {
+            // Перехватываем push в state.messages, чтобы вытащить B
+            const origPush = state.messages.push.bind(state.messages);
+            state.messages.push = function(...items) {
+                capturedRealMsg = items[items.length - 1];
+                // Вызываем оригинал — но! состояние потом всё равно почистим
+                return origPush(...items);
+            };
+
+            try {
+                await _origSendMessageFinal.call(null,
+                    args.text,
+                    args.imageBlob,
+                    args.audioData,
+                    args.fileAttachment,
+                    args.audioFile
+                );
+            } finally {
+                state.messages.push = origPush;
+            }
+        } finally {
+            window._currentReplyTo = null;
+        }
+
+        // 🆕 НЕ удаляем B из state.messages вручную!
+// Это сделает _markSent (он удалит A по _tempId).
+// В state.messages останется только B — то, что нам нужно.
+
+task.status = 'sent';
+task.realMsg = capturedRealMsg;
+_markSent(task, capturedRealMsg || task.plainMsg);
+    } finally {
+        // 🆕 Выключаем глушилку
+        window._suppressSendSideEffects = false;
+
+        // Восстанавливаем контекст
+        state.chatFile = originalState.chatFile;
+        state.chatPassword = originalState.chatPassword;
+        state.salt = originalState.salt;
+        state.chatName = originalState.chatName;
+        CRYPTO._key = originalState.key;
     }
 }
 
-console.log('🎵 Глобальный плеер активен — музыка играет между чатами');
+    function _cleanupTask(task) {
+        if (task.localUrls && task.localUrls.length > 0) {
+            setTimeout(() => {
+                task.localUrls.forEach(u => { try { URL.revokeObjectURL(u); } catch (e) {} });
+            }, 5000);
+        }
+    }
 
+    function _updatePendingBadge() {
+        const waiting = tasks.filter(t => t.status === 'pending' || t.status === 'sending').length;
+        const failed = failedTasks.size;
+
+
+    // Бейдж на кнопке отправки
+    const badge = document.getElementById('sendQueueBadge');
+    if (badge) {
+        if (waiting > 0) {
+            badge.textContent = waiting > 9 ? '9+' : waiting;
+            badge.classList.add('show');
+        } else {
+            badge.classList.remove('show');
+        }
+    }
+}  // ← вот эта скобка закрывает _updatePendingBadge
+
+return {
+    enqueue, isPending, getTask, clearAll, hasPending,
+
+        cancelTask, _restore,
+        _kick() { if (!isRunning) _run(); },
+        get _isRunning() { return isRunning; },
+    };
+})();
+// ═══ Хелперы для DOM-статусов ═══
+
+function appendOptimisticMessage(plainMsg) {
+    const wrapper = document.createElement('div');
+    wrapper.innerHTML = buildMessageHTML(plainMsg).trim();
+    const node = wrapper.firstElementChild;
+    node.classList.add('pending');
+    node.dataset.tempId = plainMsg._tempId;
+
+    const divider = messagesInner.querySelector('.unread-divider');
+    if (divider) divider.remove();
+
+    messagesInner.appendChild(node);
+
+    // Мгновенный локальный превью картинки
+    if (plainMsg._localImageUrl) {
+        const cont = node.querySelector('.image-container');
+        if (cont) {
+            cont.classList.remove('attach-placeholder');
+            cont.innerHTML = `<img src="${plainMsg._localImageUrl}" alt="Изображение" onclick="openImageModal('${plainMsg._localImageUrl}')">`;
+        }
+    }
+    // Мгновенный превью аудио
+    if (plainMsg._localAudioUrl) {
+        const cont = node.querySelector('.audio-container');
+        if (cont) {
+            // Перерисовываем плеер с локальным blob:URL
+            const newPlayer = document.createElement('div');
+            newPlayer.innerHTML = createAudioPlayerHTML(
+                plainMsg.id,
+                plainMsg._localAudioUrl,
+                plainMsg.audioDuration,
+                plainMsg.audioMime,
+                plainMsg.audioName
+            );
+            cont.replaceWith(newPlayer.firstElementChild);
+        }
+    }
+    // Мгновенный превью файла
+    if (plainMsg._localFileUrl) {
+        const cont = node.querySelector('.file-attach-placeholder');
+        if (cont) {
+            const card = document.createElement('div');
+            card.innerHTML = createFileCardHTML(
+                plainMsg.file,
+                plainMsg._localFileUrl,
+                plainMsg.fileName,
+                plainMsg.fileSize
+            );
+            cont.replaceWith(card.firstElementChild);
+        }
+    }
+    // 🆕 Кнопка отмены для текстовых сообщений (пока не отправлено)
+    if (!plainMsg._localImageUrl && !plainMsg._localAudioUrl && !plainMsg._localFileUrl) {
+        const msgBox = node.querySelector('.message');
+        if (msgBox) {
+            const cancelBtn = document.createElement('button');
+            cancelBtn.className = 'cancel-pending-btn';
+            cancelBtn.textContent = '✕';
+            cancelBtn.title = 'Отменить отправку';
+            cancelBtn.onclick = (e) => {
+                e.stopPropagation();
+                if (SendQueue.cancelTask(plainMsg._tempId)) {
+                    node.remove();
+                    const idx = historyState.allMessages.findIndex(m => m._tempId === plainMsg._tempId);
+                    if (idx >= 0) historyState.allMessages.splice(idx, 1);
+                    const sIdx = state.messages.findIndex(m => m._tempId === plainMsg._tempId);
+                    if (sIdx >= 0) state.messages.splice(sIdx, 1);
+                    showToast('⏹️ Отправка отменена', 1200);
+                }
+            };
+            msgBox.appendChild(cancelBtn);
+        }
+    }
+
+    requestAnimationFrame(() => {
+        if (scrollState.isAtBottom) scrollToBottom(true);
+    });
+    return node;
+}
+
+function _markSent(task, realPlainMsg) {
+    const node = messagesInner.querySelector(`.message-wrapper[data-temp-id="${task.tempId}"]`);
+    if (node) {
+        node.classList.remove('pending', 'failed', 'queued');
+        node.dataset.msgId = realPlainMsg.id;
+        delete node.dataset.tempId;
+        const retry = node.querySelector('.retry-btn');
+        if (retry) retry.remove();
+
+        // 🆕 Меняем ⏳ на ✓
+        const status = node.querySelector('.msg-status');
+        if (status) {
+            status.className = 'msg-status sent';
+            status.textContent = '✓';
+            setTimeout(() => { status.style.opacity = '0'; }, 3500);
+        }
+    }
+
+    // 🆕 Удаляем временный объект A из historyState.allMessages.
+    // Реальный B уже там (его добавила старая sendMessage через глушилку).
+    const idxA = historyState.allMessages.findIndex(m => m._tempId === task.tempId);
+    if (idxA >= 0) historyState.allMessages.splice(idxA, 1);
+
+    // 🆕 Если B почему-то не попал в историю — добавляем его вручную
+    if (realPlainMsg && !historyState.allMessages.some(m => m.id === realPlainMsg.id)) {
+        historyState.allMessages.push(realPlainMsg);
+    }
+
+    // 🆕 Тоже самое для state.messages: удаляем A, добавляем B (если не добавился)
+    const idxA2 = state.messages.findIndex(m => m._tempId === task.tempId);
+    if (idxA2 >= 0) state.messages.splice(idxA2, 1);
+
+    if (realPlainMsg && !state.messages.some(m => m.id === realPlainMsg.id)) {
+        state.messages.push(realPlainMsg);
+    }
+}
+
+function _markFailed(task) {
+    const node = messagesInner.querySelector(`.message-wrapper[data-temp-id="${task.tempId}"]`);
+    if (!node) return;
+    node.classList.remove('pending', 'queued');
+    node.classList.add('failed');
+
+    // 🆕 Меняем ⏳ на ⚠
+    const status = node.querySelector('.msg-status');
+    if (status) {
+        status.className = 'msg-status failed';
+        status.textContent = '⚠';
+        status.title = 'Нажмите, чтобы повторить';
+        status.onclick = (e) => {
+            e.stopPropagation();
+            retryTask(task.tempId);
+        };
+    }
+
+    if (!node.querySelector('.retry-btn')) {
+        const msgBox = node.querySelector('.message');
+        const btn = document.createElement('button');
+        btn.className = 'retry-btn';
+        btn.textContent = '🔄 Повторить';
+        btn.onclick = (e) => {
+            e.stopPropagation();
+            retryTask(task.tempId);
+        };
+        msgBox.appendChild(btn);
+    }
+}
+
+function retryTask(tempId) {
+    const task = SendQueue.getTask(tempId);
+    if (!task) { showToast('❌ Нечего повторять', 1500); return; }
+    if (task.status === 'sending') return;
+
+    // Сбрасываем статус
+    task.status = 'pending';
+    task.attempts = (task.attempts || 1) + 1;
+
+    // Возвращаем задачу в основную очередь (в начало)
+    SendQueue._restore(task);
+
+    const node = messagesInner.querySelector(`.message-wrapper[data-temp-id="${tempId}"]`);
+if (node) {
+    node.classList.remove('failed');
+    node.classList.add('pending');
+    const retry = node.querySelector('.retry-btn');
+    if (retry) retry.remove();
+
+    // 🆕 Возвращаем ⏳
+    const status = node.querySelector('.msg-status');
+    if (status) {
+        status.className = 'msg-status sending';
+        status.textContent = '⏳';
+        status.title = '';
+        status.onclick = null;
+    }
+}
+
+    // Пинаем очередь
+    SendQueue._kick();
+}
+
+// ═══ Публичная точка входа: оптимистичная отправка с очередью ═══
+
+async function sendMessageOptimistic(text, imageBlob, audioData, fileAttachment, audioFile, opts = {}) {
+    if (!state.isAuthorized || !state.chatFile) {
+        showToast('❌ Нет доступа', 2000);
+        return;
+    }
+    if (!navigator.onLine || !networkState.isOnline) {
+        showToast('📵 Нет подключения — сообщение встанет в очередь', 2000);
+    }
+
+    const tempId = 'tmp_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+    const realId = Date.now();
+
+    const plainMsg = {
+        id: realId,
+        _tempId: tempId,
+        username: state.username,
+        text: (text || '').trim(),
+        time: new Date().toISOString(),
+        _status: 'sending',  // 🆕
+    };
+
+    const localUrls = [];
+
+    // Мгновенные превью
+    if (imageBlob instanceof Blob) {
+        const u = URL.createObjectURL(imageBlob);
+        localUrls.push(u);
+        plainMsg.image = u;
+        plainMsg._localImageUrl = u;
+    }
+    if (audioData) {
+    // data:URL → blob:URL для мгновенного превью
+    try {
+        const b64 = audioData.data.includes(',') ? audioData.data.split(',')[1] : audioData.data;
+        const buf = base64ToArrayBuffer(b64);
+        const blob = new Blob([buf], { type: audioData.mime || 'audio/webm' });
+        const u = URL.createObjectURL(blob);
+        localUrls.push(u);
+        plainMsg.audio = u;
+        plainMsg._localAudioUrl = u;
+    } catch (e) {
+        plainMsg.audio = audioData.data;
+    }
+    plainMsg.audioDuration = audioData.duration || 0;
+    plainMsg.audioMime = audioData.mime || 'audio/webm';
+    plainMsg._localAudio = true;
+}
+    if (audioFile && audioFile.blob) {
+        const u = URL.createObjectURL(audioFile.blob);
+        localUrls.push(u);
+        plainMsg.audio = u;
+        plainMsg._localAudioUrl = u;
+        plainMsg.audioName = audioFile.name;
+        plainMsg.audioDuration = audioFile.duration || 0;
+        plainMsg.audioMime = audioFile.mime || 'audio/mpeg';
+    }
+    if (fileAttachment && fileAttachment.blob) {
+        const u = URL.createObjectURL(fileAttachment.blob);
+        localUrls.push(u);
+        plainMsg.file = u;
+        plainMsg._localFileUrl = u;
+        plainMsg.fileName = fileAttachment.name;
+        plainMsg.fileMime = fileAttachment.mime;
+        plainMsg.fileSize = fileAttachment.blob.size;
+    }
+    if (window._currentReplyTo) {
+        plainMsg.replyTo = { ...window._currentReplyTo };
+    }
+
+    // 1. Мгновенно показываем в чате
+    appendOptimisticMessage(plainMsg);
+    historyState.allMessages.push(plainMsg);
+    state.messages.push(plainMsg);
+    markChatAsRead();
+    soundManager.play('click');
+    if (navigator.vibrate) navigator.vibrate(10);
+
+    // 2. Очищаем поле ввода сразу
+    messageInput.value = '';
+    messageInput.style.height = 'auto';
+    if (window._currentReplyTo) cancelReply();
+
+
+    // 3. Ставим в очередь
+    SendQueue.enqueue({
+        tempId,
+        args: {
+            text,
+            imageBlob,
+            audioData,
+            fileAttachment,
+            audioFile,
+            _isComment: !!opts._isComment,
+            commentMsgId: opts.commentMsgId,
+        },
+        plainMsg,
+        localUrls,
+        attempts: 1,
+        status: 'pending',
+        // 🆕 Снимок контекста чата — защита от переключения чата
+        ctx: {
+            chatFile: state.chatFile,
+            chatPassword: state.chatPassword,
+            salt: state.salt,
+            chatName: state.chatName,
+            key: CRYPTO._key,
+        },
+    });
+
+    return true;
+}
+// ═══ Перехват sendMessage ═══
+window.sendMessage = function(text, imageBlob, audioData, fileAttachment, audioFile) {
+    // Особый случай: комментарий к фото
+    if (typeof _commentToMsgId !== 'undefined' && _commentToMsgId && text && text.trim()
+        && !imageBlob && !audioData && !fileAttachment && !audioFile) {
+        const msgId = _commentToMsgId;
+        cancelComment();
+        messageInput.value = '';
+        messageInput.style.height = 'auto';
+        // Комментарии тоже через очередь — на случай параллельной отправки
+        return sendMessageOptimistic(text, null, null, null, null, {
+            _isComment: true,
+            commentMsgId: msgId,
+        });
+    }
+
+    return sendMessageOptimistic(text, imageBlob, audioData, fileAttachment, audioFile);
+};
+
+// ═══ Не блокируем кнопки ═══
+// ═══ Кнопки всегда активны — оптимистичный UI ═══
+// Патчим .disabled через Proxy на самом sendBtn
+// (работает надёжнее defineProperty на HTMLButtonElement)
+
+try {
+    Object.defineProperty(sendBtn, 'disabled', {
+
+
+        configurable: true,
+        get() { return false; },
+        set() { /* игнорируем попытки выключить */ },
+    });
+    Object.defineProperty(micBtn, 'disabled', {
+        configurable: true,
+        get() { return false; },
+        set() { /* игнорируем */ },
+    });
+} catch (e) {
+    console.warn('Не удалось перехватить disabled:', e);
+    // Fallback: просто не позволяем кнопке быть disabled
+    new MutationObserver(() => {
+        if (sendBtn.disabled) sendBtn.disabled = false;
+        if (micBtn.disabled) micBtn.disabled = false;
+    }).observe(sendBtn, { attributes: true, attributeFilter: ['disabled'] });
+    new MutationObserver(() => {
+        if (micBtn.disabled) micBtn.disabled = false;
+    }).observe(micBtn, { attributes: true, attributeFilter: ['disabled'] });
+}
+console.log('🚀 Очередь отправки активна');
+console.log('📋 Статусы: ⏳ отправка / ✓ доставлено / ⚠ ошибка');
 </script>
 </body>
 </html>
