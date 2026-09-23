@@ -9702,18 +9702,46 @@ let _savePositionTimer = null;
         el.timeCurrent.textContent = formatAudioTime(audio.currentTime);
     }
 
-    function renderPlayState(playing) {
-        if (!el.playBtn) return;
-        el.playBtn.textContent = playing ? '⏸' : '▶';
-        // Синхронизация с инлайн-кнопками в сообщениях
-        if (currentMsgId && audioPlayers[currentMsgId]) {
-            const p = audioPlayers[currentMsgId];
-            if (p && p.waveEl) {
-                p.waveEl.classList.toggle('playing', playing);
-                if (p.btn) p.btn.textContent = playing ? '⏸' : '▶';
-            }
+
+function renderPlayState(playing) {
+    if (!el.playBtn) return;
+    el.playBtn.textContent = playing ? '⏸' : '▶';
+
+    // 🆕 Гасим .playing у ВСЕХ инлайн-плееров
+    document.querySelectorAll('.audio-wave.playing').forEach(wave => {
+        const container = wave.closest('.audio-container');
+        if (!container) return;
+        const id = container.dataset.audioId;
+        if (String(id) !== String(currentMsgId)) {
+            wave.classList.remove('playing');
+            const btn = container.querySelector('.audio-play-btn');
+            if (btn) btn.textContent = '▶';
+        }
+    });
+
+    // 🆕 Включаем .playing ТОЛЬКО у текущего (если играет)
+    if (currentMsgId) {
+        const container = document.querySelector(`.audio-container[data-audio-id="${currentMsgId}"]`);
+        if (container) {
+            const wave = document.getElementById(`wave-${currentMsgId}`);
+            const btn = container.querySelector('.audio-play-btn');
+            if (wave) wave.classList.toggle('playing', playing);
+            if (btn) btn.textContent = playing ? '⏸' : '▶';
         }
     }
+
+    // 🆕 Страховка: сброс через audioPlayers (если DOM перестроен)
+    Object.keys(audioPlayers).forEach(id => {
+        const p = audioPlayers[id];
+        if (!p) return;
+        const isCurrent = String(id) === String(currentMsgId);
+        if (!isCurrent) {
+            if (p.waveEl) p.waveEl.classList.remove('playing');
+            if (p.btn) p.btn.textContent = '▶';
+        }
+    });
+}
+
 
     function renderMeta() {
         const track = queue[currentIndex];
