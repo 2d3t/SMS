@@ -1,5 +1,5 @@
 // sw.js - Универсальный кеш + уведомления
-const CACHE_NAME = 'sms-pwa-v29';
+const CACHE_NAME = 'sms-pwa-v30';
 
 const FILES_TO_CACHE = [
     '/SMS/pro/sms/index.html',
