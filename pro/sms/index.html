@@ -2582,8 +2582,10 @@ max-height: var(--vh, 90vh);
 <div class="image-modal" id="searchModal">
     <div class="form-modal-content" style="max-width:500px;max-height:85vh;display:flex;flex-direction:column;">
         <h2>🔍 Поиск в чате</h2>
-        <input type="text" id="searchInput" placeholder="Введите текст или имя отправителя..." 
-               style="width:100%;padding:12px 14px;background:rgba(255,255,255,0.06);
+        
+<input type="text" id="searchInput" placeholder="Текст, автор или название трека..." 
+
+style="width:100%;padding:12px 14px;background:rgba(255,255,255,0.06);
                       border:1px solid rgba(255,255,255,0.1);border-radius:12px;
                       color:#fff;font-size:15px;outline:none;margin-bottom:12px;">
         <div id="searchResults" style="flex:1;overflow-y:auto;max-height:55vh;padding-right:4px;">
@@ -9320,17 +9322,22 @@ console.log('↩ Система ответов активна (свайп впр
             results.innerHTML = '<div style="text-align:center;color:#666;font-size:13px;padding:20px;">Минимум 2 символа…</div>';
             return;
         }
-        const q = query.toLowerCase();
-        const matches = [];
-        for (const msg of historyState.allMessages) {
-            const text = (msg.text || '').toLowerCase();
-            const author = (msg.username || '').toLowerCase();
-            const fname = (msg.fileName || '').toLowerCase();
-            if (text.includes(q) || author.includes(q) || fname.includes(q)) {
-                matches.push(msg);
-            }
-        }
-        matches.reverse();
+        
+
+
+const q = query.toLowerCase();
+const matches = [];
+for (const msg of historyState.allMessages) {
+    const text = (msg.text || '').toLowerCase();
+    const author = (msg.username || '').toLowerCase();
+    const fileName = (msg.fileName || '').toLowerCase();
+    const audioName = (msg.audioName || '').toLowerCase(); // 🆕 Ищем по названию трека
+
+    if (text.includes(q) || author.includes(q) || fileName.includes(q) || audioName.includes(q)) {
+        matches.push(msg);
+    }
+}
+matches.reverse();
 
         if (matches.length === 0) {
             results.innerHTML = '<div style="text-align:center;color:#666;font-size:13px;padding:20px;">🔍 Ничего не найдено</div>';
@@ -9339,15 +9346,25 @@ console.log('↩ Система ответов активна (свайп впр
 
         results.innerHTML = `<div class="search-counter">Найдено: <strong style="color:#a78bfa">${matches.length}</strong> из ${historyState.allMessages.length}</div>` +
             matches.slice(0, 100).map(m => {
-                let icon = '💬', preview = m.text || '';
-                if (m.image) { icon = '📷'; preview = preview || 'Изображение'; }
-                else if (m.audio) { icon = '🎤'; preview = preview || 'Голосовое'; }
-                else if (m.file) { icon = '📎'; preview = preview || (m.fileName || 'Файл'); }
+    let icon = '💬', preview = m.text || '';
+    const hasAudioName = !!(m.audioName && m.audioName.trim());
 
-                const safePreview = highlightMatch(escapeHtml(preview), query);
-                const isOwn = m.username === state.username;
-                const author = isOwn ? 'Вы' : escapeHtml(m.username || 'Аноним');
-                const time = formatFullTime(m.time);
+    if (m.image) {
+        icon = '📷';
+        preview = preview || 'Изображение';
+    } else if (m.audio) {
+        // 🆕 Различаем голосовые и музыкальные файлы
+        icon = hasAudioName ? '🎵' : '🎤';
+        preview = hasAudioName ? m.audioName : 'Голосовое сообщение';
+    } else if (m.file) {
+        icon = '📎';
+        preview = preview || (m.fileName || 'Файл');
+    }
+
+    const safePreview = highlightMatch(escapeHtml(preview), query);
+    const isOwn = m.username === state.username;
+    const author = isOwn ? 'Вы' : escapeHtml(m.username || 'Аноним');
+    const time = formatFullTime(m.time);
 
                 return `<div class="search-result-item" data-msg-id="${m.id}">
                     <span class="sr-icon">${icon}</span>
