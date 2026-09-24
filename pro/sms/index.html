@@ -233,16 +233,7 @@
             background: rgba(255,107,107,0.1); color: #ff6b6b;
             border: 1px solid rgba(255,107,107,0.2);
         }
-/* ═══ Нерасшифрованные сообщения ═══ */
-.message-wrapper .message[data-decryption-error="true"] {
-    opacity: 0.75;
-    border-left: 3px solid #ff6b6b;
-    background: rgba(255,107,107,0.06);
-}
-.message-wrapper .message[data-decryption-error="true"] .text {
-    color: #ff6b6b;
-    font-style: italic;
-}
+
         .message .image-container {
     margin: 6px 0 4px; border-radius: 12px;
     overflow: hidden; cursor: pointer; position: relative;
@@ -6398,7 +6389,7 @@ else if (msg.file) {
 
     return `
         <div class="message-wrapper ${isOwn ? 'own' : 'other'}${isUnread ? ' unread' : ''}${batchClass}${opts.noFade ? ' no-fade' : ''}" data-msg-id="${msg.id}" ${isBatch ? `data-batch="${msg.batchId}"` : ''}>
-            <div class="message" ${msg._decryptionError ? 'data-decryption-error="true"' : ''}>
+            <div class="message">
                 ${isFirstInBatch ? `<div class="batch-label">📷 ${msg.batchTotal} фото</div>` : ''}
                 ${(!isBatch || isFirstInBatch) ? `<span class="sender">${isOwn ? 'Вы' : escapeHtml(senderName)}</span>` : ''}
                
@@ -8520,35 +8511,15 @@ setTimeout(() => {
 
         state.salt = content.salt;
         const encMessages = Array.isArray(content.messages) ? content.messages : [];
-        // ═══ ИЗМЕНЕНИЕ: мягкая расшифровка — пропускаем битые сообщения ═══
-const decrypted = [];
-let decryptionErrors = 0;
-
-for (const encMsg of encMessages) {
-    try {
-        const msg = await decryptMessage(encMsg);
-        if (msg) {
-            decrypted.push(msg);
-        } else {
-            throw new Error('decrypt returned null');
+        let decrypted;
+        try {
+            decrypted = await loadAndDecrypt(content.salt, encMessages);
+        } catch (e) {
+            throw new Error('Неверный пароль чата');
         }
-    } catch (e) {
-        console.warn(`⚠️ Не удалось расшифровать сообщение ${encMsg.id}:`, e);
-        decryptionErrors++;
-        decrypted.push({
-            id: encMsg.id,
-            time: encMsg.time,
-            username: 'Система',
-            text: '[Сообщение не может быть расшифровано]',
-            _decryptionError: true,
-        });
-    }
-}
-
-// Блокируем вход ТОЛЬКО если вообще ни одно сообщение не расшифровалось
-if (encMessages.length > 0 && decryptionErrors === encMessages.length) {
-    throw new Error('Неверный пароль чата');
-}
+        if (encMessages.length > 0 && decrypted.length === 0) {
+            throw new Error('Неверный пароль чата');
+        }
 
         state.messages = decrypted;
         state.sha = result.sha;
