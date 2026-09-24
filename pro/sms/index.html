@@ -183,11 +183,13 @@
         .exit-btn:active { background: rgba(255,255,255,0.12); transform: scale(0.9); }
 
         .messages-container {
-            flex: 1 1 auto; overflow-y: auto; overflow-x: hidden;
-            padding: 16px 14px 8px; display: block;
-            -webkit-overflow-scrolling: touch;
-            overscroll-behavior: contain; min-height: 0; max-height: 100%;
-        }
+    flex: 1 1 auto; overflow-y: auto; overflow-x: hidden;
+    padding: 16px 14px 8px; display: block;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain; min-height: 0; max-height: 100%;
+    /* 🆕 Отключаем автоматический скролл-анкор браузера — будем управлять сами */
+    overflow-anchor: none;
+}
         .messages-container > .messages-inner {
             display: flex; flex-direction: column; gap: 6px;
             width: 100%; min-height: 100%; justify-content: flex-end;
@@ -216,6 +218,8 @@
         }
 
         @keyframes fadeIn { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
+/* 🆕 Сообщения подгружаемые сверху — без анимации (плавность скролла) */
+.message-wrapper.no-fade { animation: none; }
         .message .sender { font-size: 12px; font-weight: 600; color: #6c5ce7; margin-bottom: 3px; display: block; }
         .message-wrapper.own .sender { color: #a78bfa; }
         .message .text { font-size: 15px; line-height: 1.45; white-space: pre-wrap; }
@@ -231,14 +235,27 @@
         }
 
         .message .image-container {
-            margin: 6px 0 4px; border-radius: 12px;
-            overflow: hidden; cursor: pointer; position: relative;
-            background: rgba(0,0,0,0.2); max-width: 100%;
-        }
+    margin: 6px 0 4px; border-radius: 12px;
+    overflow: hidden; cursor: pointer; position: relative;
+    background: rgba(0,0,0,0.2); max-width: 100%;
+    /* 🆕 Фиксируем высоту — картинка займёт ровно это место */
+    height: 220px;
+    min-height: 220px;
+    max-height: 220px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    /* 🆕 Не даём содержимому влиять на внешний layout */
+    contain: layout paint;
+}
         .message .image-container img {
-            display: block; width: 100%; max-height: 300px;
-            object-fit: contain; border-radius: 12px; transition: transform 0.2s;
-        }
+    display: block;
+    width: 100%;
+    height: 100%;        /* 🆕 вместо max-height */
+    object-fit: contain;
+    border-radius: 12px;
+    transition: transform 0.2s;
+}
         .message .image-container img:active { transform: scale(0.98); }
 
         .message .audio-container {
@@ -283,12 +300,46 @@
         }
 
         .attach-placeholder {
-            min-height: 120px;
-            display: flex; align-items: center; justify-content: center;
-            color: #555; font-size: 13px;
-            background: rgba(0,0,0,0.15); border-radius: 12px;
-            padding: 20px;
-        }
+    min-height: 120px;
+    height: 200px;              /* 🆕 фикс. высота, чтобы при подгрузке не «дёргалось» */
+    max-height: 300px;
+    display: flex; align-items: center; justify-content: center;
+    color: #555; font-size: 13px;
+    background: rgba(0,0,0,0.15); border-radius: 12px;
+    padding: 20px;
+    overflow: hidden;
+}
+/* 🆕 Плейсхолдер для аудио — фиксированная высота */
+.audio-container.attach-placeholder {
+    height: 56px;
+    min-height: 56px;
+    max-height: 56px;
+    padding: 6px 14px 6px 6px;
+}
+/* 🆕 Плейсхолдер для файла — фиксированная высота */
+.file-attach-placeholder {
+    height: 62px;                /* 🆕 */
+    min-height: 62px;
+    max-height: 62px;
+    box-sizing: border-box;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 14px;
+    color: #666;
+    font-size: 13px;
+    background: rgba(0,0,0,0.2);
+    border-radius: 12px;
+    margin: 6px 0;
+    text-align: center;
+    overflow: hidden;
+}
+/* 🆕 Картинка в плейсхолдере — фикс. высота */
+.image-container.attach-placeholder {
+    height: 220px;               /* 🆕 средний размер, чтобы не дёргалось */
+    min-height: 220px;
+    max-height: 220px;
+}
         .attach-error {
             padding: 12px; color: #ff6b6b; font-size: 13px;
             text-align: center;
@@ -959,7 +1010,59 @@ body.player-active .gallery-actions {
         }
         .scroll-badge.show { display: flex; }
 
-        .chat-list-item.has-unread {
+        /* ═══ 🆕 Индикатор «сейчас играет» в списке чатов ═══ */
+.chat-list-item.is-playing {
+    border-color: rgba(254,202,87,0.45);
+    background: linear-gradient(90deg, rgba(254,202,87,0.06), rgba(254,202,87,0.02));
+    position: relative;
+}
+.chat-list-item.is-playing::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 3px;
+    border-radius: 3px 0 0 3px;
+    background: linear-gradient(180deg, #feca57, #ff9f43);
+    animation: playingBar 1.5s ease-in-out infinite;
+}
+@keyframes playingBar {
+    0%, 100% { opacity: 0.6; }
+    50%      { opacity: 1; }
+}
+
+.chat-playing-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, rgba(254,202,87,0.25), rgba(255,159,67,0.2));
+    border: 1px solid rgba(254,202,87,0.5);
+    color: #feca57;
+    font-size: 11px;
+    flex-shrink: 0;
+    margin-left: 6px;
+    animation: playingPulse 1.4s ease-in-out infinite;
+    cursor: pointer;
+    user-select: none;
+    transition: transform 0.15s;
+}
+.chat-playing-badge:active {
+    transform: scale(0.85);
+}
+.chat-playing-badge.paused {
+    animation: none;
+    background: linear-gradient(135deg, rgba(136,136,136,0.25), rgba(100,100,100,0.2));
+    border-color: rgba(136,136,136,0.5);
+    color: #888;
+}
+@keyframes playingPulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(254,202,87,0.4); }
+    50%      { box-shadow: 0 0 0 6px rgba(254,202,87,0); }
+}.chat-list-item.has-unread {
             border-color: rgba(108,92,231,0.45);
             background: rgba(108,92,231,0.08);
         }
@@ -3789,7 +3892,8 @@ function applyImport() {
 // ===================================================================
 const SCROLL_THRESHOLD = 80;
 const SCROLL_BTN_SHOW = 150;
-const SCROLL_TOP_TRIGGER = 80;
+const SCROLL_TOP_TRIGGER = 800;  // 🆕 было 80 — теперь грузим сильно заранее
+const SCROLL_PRELOAD_EXTRA = 400; // 🆕 если до края осталось столько — тоже грузим
 let scrollState = { isAtBottom: true, unreadCount: 0 };
 
 function isNearBottom() {
@@ -3813,20 +3917,17 @@ function updateScrollBadge() {
 }
 function scrollToBottom(force = false) {
     if (!force && !scrollState.isAtBottom) return;
-    requestAnimationFrame(() => {
-        void messagesContainer.scrollHeight;
-        requestAnimationFrame(() => {
-            messagesContainer.scrollTop = messagesContainer.scrollHeight;
-            scrollState.unreadCount = 0;
-            scrollState.isAtBottom = true;
-            updateScrollBadge();
-            updateScrollButton();
-            setTimeout(() => {
-                if (scrollState.isAtBottom) messagesContainer.scrollTop = messagesContainer.scrollHeight;
-                updateScrollButton();
-            }, 50);
-        });
-    });
+
+    // 🆕 Не крутим вниз, если прямо сейчас идёт подгрузка старой истории
+    if (_loadingOlder) return;
+
+    // Просто один раз — без двойных rAF, без setTimeout-дожима
+    // Двойные догоны дают микро-дёргания.
+    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    scrollState.unreadCount = 0;
+    scrollState.isAtBottom = true;
+    updateScrollBadge();
+    updateScrollButton();
 }
 function scrollToBottomNow() {
     messagesContainer.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'smooth' });
@@ -3849,6 +3950,9 @@ messagesContainer.addEventListener('scroll', () => {
         scrollState.isAtBottom = isNearBottom();
         if (scrollState.isAtBottom) { scrollState.unreadCount = 0; updateScrollBadge(); }
         updateScrollButton();
+
+        // 🆕 Грузим ЗАРАНЕЕ — за 800px до края, а не когда уже упёрлись
+        //    К моменту, когда пользователь дойдёт до верха — сообщения УЖЕ в DOM
         if (messagesContainer.scrollTop < SCROLL_TOP_TRIGGER && !_loadingOlder) {
             loadOlderMessages();
         }
@@ -5891,16 +5995,27 @@ function initAudioPlayers() {
         const timeEl = document.getElementById(`time-${msgId}`);
         const waveEl = document.getElementById(`wave-${msgId}`);
         audioPlayers[msgId] = { audio, btn, progressFill, timeEl, waveEl, isPlaying: false };
+
+        // Локальные обработчики (для случая когда трек не в глобальном плеере)
         audio.addEventListener('timeupdate', () => {
+            // 🆕 Если этот трек играет в ГЛОБАЛЬНОМ плеере — не перебиваем его таймером инлайна
+            if (typeof GlobalPlayer !== 'undefined'
+                && String(GlobalPlayer.getCurrentMsgId()) === String(msgId)) return;
             if (audio.duration && isFinite(audio.duration)) {
                 progressFill.style.width = (audio.currentTime / audio.duration) * 100 + '%';
                 timeEl.textContent = formatAudioTime(Math.max(0, audio.duration - audio.currentTime));
             }
         });
         audio.addEventListener('loadedmetadata', () => {
+            // 🆕 Если это трек из глобального — не перебиваем длительность
+            if (typeof GlobalPlayer !== 'undefined'
+                && String(GlobalPlayer.getCurrentMsgId()) === String(msgId)) return;
             if (audio.duration && isFinite(audio.duration)) timeEl.textContent = formatAudioTime(audio.duration);
         });
         audio.addEventListener('ended', () => {
+            // 🆕 Если это трек из глобального — пусть глобальный сам решает
+            if (typeof GlobalPlayer !== 'undefined'
+                && String(GlobalPlayer.getCurrentMsgId()) === String(msgId)) return;
             btn.textContent = '▶';
             audio.currentTime = 0;
             progressFill.style.width = '0%';
@@ -5909,11 +6024,30 @@ function initAudioPlayers() {
             audioPlayers[msgId].isPlaying = false;
         });
         audio.addEventListener('error', () => {
+            // 🆕 Если это трек из глобального — игнорируем ошибку инлайна
+            if (typeof GlobalPlayer !== 'undefined'
+                && String(GlobalPlayer.getCurrentMsgId()) === String(msgId)) return;
             timeEl.textContent = 'ошибка'; btn.textContent = '⚠'; btn.disabled = true;
         });
     });
+
+    // 🆕 После инициализации — синхронизируем с глобальным плеером
+    syncInlineWithGlobal();
 }
 function toggleAudioPlayback(msgId) {
+    // 🆕 Если этот трек играет (или на паузе) в ГЛОБАЛЬНОМ плеере — управляем им
+    if (typeof GlobalPlayer !== 'undefined') {
+        const globalMsgId = GlobalPlayer.getCurrentMsgId();
+        if (String(globalMsgId) === String(msgId)) {
+            // Просто toggle глобального
+            GlobalPlayer.toggle();
+            // Мгновенно синхронизируем инлайн (не ждём setInterval)
+            syncInlineWithGlobal();
+            return;
+        }
+    }
+
+    // Старая логика — для случая когда трек играет ЛОКАЛЬНО (не через глобальный)
     const player = audioPlayers[msgId];
     if (!player) return;
     Object.keys(audioPlayers).forEach(id => {
@@ -5945,6 +6079,24 @@ function toggleAudioPlayback(msgId) {
     }
 }
 function seekAudio(event, msgId) {
+    // 🆕 Если трек играет в глобальном плеере — seek применяем к нему
+    if (typeof GlobalPlayer !== 'undefined'
+        && String(GlobalPlayer.getCurrentMsgId()) === String(msgId)) {
+        const audio = GlobalPlayer.audioEl;
+        if (!audio || !isFinite(audio.duration)) return;
+        const rect = event.currentTarget.getBoundingClientRect();
+        const pct = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+        audio.currentTime = pct * audio.duration;
+        // Мгновенно обновим UI инлайна
+        const p = audioPlayers[msgId];
+        if (p) {
+            p.progressFill.style.width = (pct * 100) + '%';
+            p.timeEl.textContent = formatAudioTime(Math.max(0, audio.duration - audio.currentTime));
+        }
+        return;
+    }
+
+    // Старая логика для локального воспроизведения
     const player = audioPlayers[msgId];
     if (!player || !player.audio.duration) return;
     const rect = event.currentTarget.getBoundingClientRect();
@@ -6178,7 +6330,7 @@ else if (msg.file) {
 }
 
     return `
-        <div class="message-wrapper ${isOwn ? 'own' : 'other'}${isUnread ? ' unread' : ''}${batchClass}" data-msg-id="${msg.id}" ${isBatch ? `data-batch="${msg.batchId}"` : ''}>
+        <div class="message-wrapper ${isOwn ? 'own' : 'other'}${isUnread ? ' unread' : ''}${batchClass}${opts.noFade ? ' no-fade' : ''}" data-msg-id="${msg.id}" ${isBatch ? `data-batch="${msg.batchId}"` : ''}>
             <div class="message">
                 ${isFirstInBatch ? `<div class="batch-label">📷 ${msg.batchTotal} фото</div>` : ''}
                 ${(!isBatch || isFirstInBatch) ? `<span class="sender">${isOwn ? 'Вы' : escapeHtml(senderName)}</span>` : ''}
@@ -6293,19 +6445,100 @@ function appendMessages(newMsgs) {
     trimDomTop();
 }
 
+// ═══════════════════════════════════════════════════════════════
+//  🆕 УМНЫЙ TRIM: не режем то, что пользователь может читать
+//  Запускаем только когда пользователь внизу и DOM реально переполнен
+// ═══════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════
+//  🆕 TRIM ПОЛНОСТЬЮ ОТКЛЮЧЁН
+//  Современный браузер спокойно тянет 300-500 DOM-нод.
+//  Все манипуляции с DOM во время скролла = источник дёргания.
+//  Память и так чистится через clearAttachmentCache при выходе.
+// ═══════════════════════════════════════════════════════════════
+
 function trimDomTop() {
-    const wrappers = messagesInner.querySelectorAll('.message-wrapper');
-    if (wrappers.length <= CONFIG.maxDomNodes) return;
-    const toRemove = wrappers.length - CONFIG.maxDomNodes;
-    for (let i = 0; i < toRemove; i++) {
-        const imgs = wrappers[i].querySelectorAll('img[src^="blob:"]');
-        imgs.forEach(im => { try { URL.revokeObjectURL(im.src); } catch (e) {} });
-        wrappers[i].remove();
-        historyState.startIndex++;
+    // NO-OP. Оставляем функцию для совместимости с вызовами.
+    return;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  🆕 ПЛАВНАЯ ПОДГРУЗКА СТАРЫХ СООБЩЕНИЙ
+//  Сохраняет позицию через ResizeObserver, а не через пересчёт scrollTop.
+//  Работает даже если картинки грузятся асинхронно и меняют высоту.
+// ═══════════════════════════════════════════════════════════════
+
+let _scrollPreserver = null;   // активный "замораживатель" позиции
+
+/**
+ * «Приколачивает» позицию к текущему первому видимому сообщению.
+ * Пока активен — любые изменения высоты сверху компенсируются автопрокруткой.
+ * @param {HTMLElement} anchorEl — элемент, к которому привязываемся
+ * @param {number} offsetTop — насколько этот элемент был от верха контейнера
+ */
+function startScrollPreserve(anchorEl, offsetTop) {
+    // Если уже есть активный — останавливаем
+    stopScrollPreserve();
+
+    if (!anchorEl || !anchorEl.isConnected) {
+        // Фолбэк: просто запомним scrollTop
+        _scrollPreserver = {
+            anchorEl: null,
+            offsetTop: offsetTop,
+            rafId: null,
+            ro: null,
+            active: true,
+        };
+        return;
     }
-    if (historyState.startIndex > 0 && !$('historySentinel')) {
-        messagesInner.insertAdjacentHTML('afterbegin',
-            `<div class="history-sentinel" id="historySentinel">↑ Потяните вверх, чтобы загрузить ещё</div>`);
+
+    const container = messagesContainer;
+
+    const keepPosition = () => {
+        if (!_scrollPreserver || !_scrollPreserver.active) return;
+        if (!anchorEl.isConnected) {
+            stopScrollPreserve();
+            return;
+        }
+        const newTop = anchorEl.offsetTop;
+        const diff = newTop - offsetTop;
+        if (Math.abs(diff) > 0.5) {
+            // Прокручиваем так, чтобы anchor вернулся на ту же визуальную позицию
+            container.scrollTop += diff;
+            _scrollPreserver.offsetTop = anchorEl.offsetTop;
+        }
+    };
+
+    // ResizeObserver на контейнер — ловит любое изменение высоты
+    const ro = new ResizeObserver(() => {
+        if (!_scrollPreserver || !_scrollPreserver.active) return;
+        // Двойной rAF, чтобы дать браузеру применить layout
+        requestAnimationFrame(() => {
+            requestAnimationFrame(keepPosition);
+        });
+    });
+    ro.observe(messagesInner);
+
+    _scrollPreserver = {
+        anchorEl,
+        offsetTop: anchorEl.offsetTop,
+        rafId: null,
+        ro,
+        active: true,
+    };
+
+    // Первичная коррекция
+    keepPosition();
+}
+
+function stopScrollPreserve() {
+    if (_scrollPreserver) {
+        _scrollPreserver.active = false;
+        if (_scrollPreserver.rafId) cancelAnimationFrame(_scrollPreserver.rafId);
+        if (_scrollPreserver.ro) {
+            try { _scrollPreserver.ro.disconnect(); } catch (e) {}
+        }
+        _scrollPreserver = null;
     }
 }
 
@@ -6314,9 +6547,32 @@ async function loadOlderMessages() {
     if (historyState.startIndex <= 0) return;
     _loadingOlder = true;
 
-    const prevScrollHeight = messagesContainer.scrollHeight;
-    const prevScrollTop = messagesContainer.scrollTop;
+    // ═══ 1. Находим «якорь» — первое видимое сейчас сообщение ═══
+    //    К нему будем привязывать позицию скролла
+    const containerRect = messagesContainer.getBoundingClientRect();
+    const allWrappers = messagesInner.querySelectorAll('.message-wrapper, .message.system, .history-sentinel');
+    let anchorEl = null;
+    let anchorOffset = 0;
 
+    for (const el of allWrappers) {
+        const r = el.getBoundingClientRect();
+        if (r.bottom >= containerRect.top) {
+            anchorEl = el;
+            anchorOffset = el.offsetTop;
+            break;
+        }
+    }
+
+    // Фолбэк — если ничего не нашли, запоминаем scrollTop
+    if (!anchorEl) {
+        anchorEl = null;
+        anchorOffset = messagesContainer.scrollTop;
+    }
+
+    // ═══ 2. Стартуем «замораживатель» позиции ДО вставки ═══
+    startScrollPreserve(anchorEl, anchorOffset);
+
+    // ═══ 3. Вставляем новые сообщения ═══
     const more = Math.min(CONFIG.renderPageSize, historyState.startIndex);
     const newStart = historyState.startIndex - more;
 
@@ -6326,7 +6582,8 @@ async function loadOlderMessages() {
         const msg = historyState.allMessages[i];
         const msgDate = formatDate(msg.time);
         if (msgDate !== lastDate) { html += `<div class="message system">${msgDate}</div>`; lastDate = msgDate; }
-        html += buildMessageHTML(msg);
+        // 🆕 noFade: не анимируем появление — важно для плавности
+html += buildMessageHTML(msg, { noFade: true });
     }
 
     const sentinel = $('historySentinel');
@@ -6336,17 +6593,23 @@ async function loadOlderMessages() {
     historyState.startIndex = newStart;
     historyState.renderedCount += more;
 
+    // ═══ 4. Загружаем вложения — ResizeObserver сам удержит позицию ═══
     await loadAttachmentsIn(messagesInner);
 
-    requestAnimationFrame(() => {
-        const newScrollHeight = messagesContainer.scrollHeight;
-        messagesContainer.scrollTop = prevScrollTop + (newScrollHeight - prevScrollHeight);
+    // ═══ 5. Финальная коррекция — даём вложениям время догрузиться ═══
+    //    (картинки могут прийти с задержкой и изменить высоту)
+    await new Promise(r => setTimeout(r, 50));
+
+    // ═══ 6. Останавливаем «замораживатель» через 400 мс после подгрузки ═══
+    //    Это время ловит все асинхронные изменения (img.onload и т.п.)
+    setTimeout(() => {
+        stopScrollPreserve();
         if (historyState.startIndex === 0) {
             const s = $('historySentinel');
             if (s) s.outerHTML = '<div class="history-start">— Начало истории —</div>';
         }
         _loadingOlder = false;
-    });
+    }, 400);
 }
 
 // ===================================================================
@@ -6494,9 +6757,33 @@ let singleTapTimer = null;
         if (idx < total - 1) { const im = new Image(); im.src = galleryState.images[idx + 1]; }
     }
     async function navigateGallery(direction) {
-        if (galleryBusy) return false;
-        const newIndex = galleryState.currentIndex + direction;
-        if (newIndex < 0 || newIndex >= galleryState.images.length) return false;
+    if (galleryBusy) return false;
+    const newIndex = galleryState.currentIndex + direction;
+    if (newIndex < 0 || newIndex >= galleryState.images.length) {
+        // 🆕 Уперлись в границу окна — пытаемся подгрузить ещё
+        if (direction < 0) {
+            // Листаем влево — подгружаем более старые
+            const loaded = await preloadOlderImages(10);
+            if (loaded > 0) {
+                const keepMsgId = (galleryState._windowMsgIds || [])[galleryState.currentIndex];
+                rebuildGalleryWindow(keepMsgId);
+                // После rebuild текущий индекс мог сместиться вправо
+                // (добавились новые слева) — пересчитываем
+                const newIdx2 = galleryState.currentIndex + direction;
+                if (newIdx2 < 0 || newIdx2 >= galleryState.images.length) return false;
+                return navigateGalleryInternal(direction);
+            }
+        }
+        return false;
+    }
+    return navigateGalleryInternal(direction);
+}
+
+// 🆕 Внутренняя навигация — оригинальная логика без проверок границ
+async function navigateGalleryInternal(direction) {
+    if (galleryBusy) return false;
+    const newIndex = galleryState.currentIndex + direction;
+    if (newIndex < 0 || newIndex >= galleryState.images.length) return false;
 
         galleryBusy = true;
         const nextSrc = galleryState.images[newIndex];
@@ -6526,29 +6813,51 @@ let singleTapTimer = null;
         active.classList.add('smooth');
         buffer.classList.add('smooth');
         applySlideTransform(active, { tx: outX, ty: 0, sc: 1, opacity: 0 });
-        applySlideTransform(buffer, { tx: 0, ty: 0, sc: 1, opacity: 1 });
+        applySlideTransform(buffer, { tx: 0, ty: 0, sc: 1, opacity: 1 });    setTimeout(async () => {
+        active.classList.remove('smooth');
+        buffer.classList.remove('smooth');
+        active.style.visibility = 'hidden';
+        active.style.opacity = '';
+        active.style.setProperty('--tx', '0px');
+        active.style.setProperty('--ty', '0px');
+        active.style.setProperty('--sc', '1');
+        buffer.style.opacity = '';
+        buffer.style.setProperty('--tx', '0px');
+        buffer.style.setProperty('--ty', '0px');
+        buffer.style.setProperty('--sc', '1');
+        activeIsA = !activeIsA;
+        updateGalleryUI();
+        preloadNeighbors();
+        galleryBusy = false;
+        hideGalleryActions();
 
-        setTimeout(() => {
-            active.classList.remove('smooth');
-            buffer.classList.remove('smooth');
-            active.style.visibility = 'hidden';
-            active.style.opacity = '';
-            active.style.setProperty('--tx', '0px');
-            active.style.setProperty('--ty', '0px');
-            active.style.setProperty('--sc', '1');
-            buffer.style.opacity = '';
-            buffer.style.setProperty('--tx', '0px');
-            buffer.style.setProperty('--ty', '0px');
-            buffer.style.setProperty('--sc', '1');
-            activeIsA = !activeIsA;
-            updateGalleryUI();
-            preloadNeighbors();
-            galleryBusy = false;
-            hideGalleryActions();
-        }, GALLERY_ANIM_MS + 20);
+        // 🆕 Бесшовная подгрузка: если подошли близко к левому краю окна
+        const curIdx = galleryState.currentIndex;
+        const total = galleryState.images.length;
+        const BUFFER = 3;
 
-        return true;
-    }
+        // Близко к левому краю → грузим старые
+        if (curIdx <= BUFFER && galleryState.allImageMsgIds.length > total) {
+            const loaded = await preloadOlderImages(10);
+            if (loaded > 0 && galleryState.isOpen) {
+                const keepMsgId = (galleryState._windowMsgIds || [])[curIdx];
+                // rebuild сдвинет индекс вправо на количество добавленных слева
+                rebuildGalleryWindow(keepMsgId);
+            }
+        }
+
+        // Близко к правому краю → грузим новые (на всякий)
+        if (curIdx >= total - BUFFER - 1 && galleryState.allImageMsgIds.length > total) {
+            const loaded = await preloadNewerImages(10);
+            if (loaded > 0 && galleryState.isOpen) {
+                const keepMsgId = (galleryState._windowMsgIds || [])[curIdx];
+                rebuildGalleryWindow(keepMsgId);
+            }
+        }
+    }, GALLERY_ANIM_MS + 20);
+
+    return true;
+}
 
 
 function onTouchStart(e) {
@@ -6847,21 +7156,215 @@ function updateGalleryUI() {
         dots.innerHTML = '';
     }
 }
-function openGallery(imageUrl) {
-    const imgs = Array.from(
-        messagesInner.querySelectorAll('.message .image-container img')
-    ).map(img => img.getAttribute('src')).filter(Boolean);
-    galleryState.images = imgs.length > 0 ? imgs : [imageUrl];
-    galleryState.currentIndex = Math.max(0, galleryState.images.indexOf(imageUrl));
-    if (galleryState.currentIndex === -1) galleryState.currentIndex = 0;
+// ═══════════════════════════════════════════════════════════════
+//  🆕 ГАЛЕРЕЯ С ПОДГРУЗКОЙ СТАРЫХ ФОТО
+// ═══════════════════════════════════════════════════════════════
+
+// Расширенное состояние галереи
+galleryState.allImageMsgIds = [];   // id всех сообщений с картинками (от старых к новым)
+galleryState.loadedSrcs = {};        // msgId → blob:URL
+galleryState.loadingSet = new Set(); // msgId которые сейчас грузятся
+galleryState.viewOffset = 0;         // индекс начала окна в allImageMsgIds
+
+// Собираем ВСЕ id сообщений с фото из полной истории
+function collectAllImageMsgIds() {
+    const ids = [];
+    for (const msg of historyState.allMessages) {
+        if (msg.image && isAttachmentRef(msg.image)) {
+            ids.push({ msgId: msg.id, attachName: msg.image });
+        } else if (msg.image && (msg.image.startsWith('blob:') || msg.image.startsWith('data:'))) {
+            ids.push({ msgId: msg.id, attachName: null, inlineSrc: msg.image });
+        }
+    }
+    return ids;
+}
+
+// Строим "окно" src для показа в галерее. Гарантирует что индекс msgId в окне корректен
+function buildGalleryWindow(anchorMsgId) {
+    const all = galleryState.allImageMsgIds;
+    if (all.length === 0) return;
+
+    // Уже загруженные blob:URL
+    const srcs = [];
+    const indicesMap = [];  // индекс в окне → msgId
+
+    for (let i = 0; i < all.length; i++) {
+        const item = all[i];
+        const src = item.inlineSrc || galleryState.loadedSrcs[item.msgId];
+        if (src) {
+            srcs.push(src);
+            indicesMap.push(item.msgId);
+        }
+    }
+    galleryState.images = srcs;
+    galleryState._windowMsgIds = indicesMap;
+}
+
+// Найти индекс картинки в окне по msgId
+function findGalleryIndexByMsgId(msgId) {
+    const map = galleryState._windowMsgIds || [];
+    return map.indexOf(msgId);
+}
+
+// Загрузить blob:URL для конкретного сообщения
+async function ensureImageLoaded(item) {
+    if (!item) return null;
+    if (item.inlineSrc) return item.inlineSrc;
+    if (galleryState.loadedSrcs[item.msgId]) return galleryState.loadedSrcs[item.msgId];
+    if (galleryState.loadingSet.has(item.msgId)) return null;
+
+    galleryState.loadingSet.add(item.msgId);
+    try {
+        const url = await loadAttachment(state.chatFile, item.attachName);
+        galleryState.loadedSrcs[item.msgId] = url;
+        return url;
+    } catch (e) {
+        console.warn('gallery load fail', item.msgId, e);
+        return null;
+    } finally {
+        galleryState.loadingSet.delete(item.msgId);
+    }
+}
+
+// 🆕 Подгрузить более старые фото в фоне (без отрисовки в DOM)
+// Возвращает количество новых загруженных фото
+async function preloadOlderImages(howMany = 10) {
+    const all = galleryState.allImageMsgIds;
+    if (!all || all.length === 0) return 0;
+
+    // Находим index самого первого загруженного в окне
+    const firstLoadedIdx = all.findIndex(x =>
+        x.inlineSrc || galleryState.loadedSrcs[x.msgId]
+    );
+    if (firstLoadedIdx <= 0) return 0;
+
+    // Сколько хотим загрузить
+    const want = Math.min(howMany, firstLoadedIdx);
+    const start = firstLoadedIdx - want;
+
+    let loaded = 0;
+    // Грузим по 3 параллельно
+    const batchSize = 3;
+    for (let i = start; i < firstLoadedIdx; i += batchSize) {
+        const batch = [];
+        for (let j = i; j < Math.min(i + batchSize, firstLoadedIdx); j++) {
+            batch.push(ensureImageLoaded(all[j]).then(url => { if (url) loaded++; }));
+        }
+        await Promise.all(batch);
+    }
+    return loaded;
+}
+
+// 🆕 Подгрузить более новые фото (на случай если DOM обрезал низ — маловероятно, но пусть будет)
+async function preloadNewerImages(howMany = 10) {
+    const all = galleryState.allImageMsgIds;
+    if (!all || all.length === 0) return 0;
+
+    // Находим index последнего загруженного
+    let lastLoadedIdx = -1;
+    for (let i = all.length - 1; i >= 0; i--) {
+        if (all[i].inlineSrc || galleryState.loadedSrcs[all[i].msgId]) {
+            lastLoadedIdx = i;
+            break;
+        }
+    }
+    if (lastLoadedIdx === -1 || lastLoadedIdx >= all.length - 1) return 0;
+
+    const end = Math.min(lastLoadedIdx + howMany, all.length - 1);
+    let loaded = 0;
+    const batchSize = 3;
+    for (let i = lastLoadedIdx + 1; i <= end; i += batchSize) {
+        const batch = [];
+        for (let j = i; j <= Math.min(i + batchSize - 1, end); j++) {
+            batch.push(ensureImageLoaded(all[j]).then(url => { if (url) loaded++; }));
+        }
+        await Promise.all(batch);
+    }
+    return loaded;
+}
+
+// 🆕 Перестроить окно галереи с сохранением текущего фото
+function rebuildGalleryWindow(keepMsgId) {
+    const all = galleryState.allImageMsgIds;
+    const oldSrcs = galleryState.images.slice();
+    const oldIndex = galleryState.currentIndex;
+    const oldCurrentSrc = oldSrcs[oldIndex];
+
+    buildGalleryWindow(keepMsgId);
+
+    // Найти новый индекс
+    let newIndex = -1;
+    if (keepMsgId != null) {
+        newIndex = findGalleryIndexByMsgId(keepMsgId);
+    }
+    // Fallback: по src
+    if (newIndex === -1 && oldCurrentSrc) {
+        newIndex = galleryState.images.indexOf(oldCurrentSrc);
+    }
+    if (newIndex === -1) newIndex = Math.min(oldIndex, galleryState.images.length - 1);
+    if (newIndex < 0) newIndex = 0;
+
+    galleryState.currentIndex = newIndex;
+    updateGalleryUI();
+    return newIndex;
+}
+
+
+async function openGallery(imageUrl) {
+    // 1. Собираем полный список фото из historyState
+    galleryState.allImageMsgIds = collectAllImageMsgIds();
+
+    // 2. Находим msgId текущей картинки — по blob:URL ищем в DOM
+    //    (у нас imageUrl — это blob:URL, а не id сообщения)
+    let anchorMsgId = null;
+
+    // 2а. Прямой поиск в DOM: находим .image-container img с этим src
+    const domImg = messagesInner.querySelector(`.image-container img[src="${imageUrl}"]`);
+    if (domImg) {
+        const wrapper = domImg.closest('.message-wrapper');
+        if (wrapper) anchorMsgId = parseInt(wrapper.dataset.msgId);
+    }
+
+    // 2б. Если не нашли в DOM — ищем по загруженным src
+    if (!anchorMsgId) {
+        for (const [id, src] of Object.entries(galleryState.loadedSrcs)) {
+            if (src === imageUrl) { anchorMsgId = parseInt(id); break; }
+        }
+    }
+
+    // 2в. Если нашли msgId — подгружаем все фото из этого чата (параллельно)
+    if (anchorMsgId) {
+        // Убедимся, что фото этого сообщения есть в loadedSrcs
+        const item = galleryState.allImageMsgIds.find(x => x.msgId === anchorMsgId);
+        if (item && !galleryState.loadedSrcs[anchorMsgId] && !item.inlineSrc) {
+            galleryState.loadedSrcs[anchorMsgId] = imageUrl;
+        }
+    }
+
+    // 3. Строим окно с уже загруженными фото
+    buildGalleryWindow(anchorMsgId);
+
+    // 4. Если очередь пуста — fallback на single
+    if (galleryState.images.length === 0) {
+        galleryState.images = [imageUrl];
+        galleryState._windowMsgIds = [anchorMsgId];
+    }
+
+    // 5. Индекс
+    let idx = anchorMsgId ? findGalleryIndexByMsgId(anchorMsgId) : -1;
+    if (idx === -1) idx = galleryState.images.indexOf(imageUrl);
+    if (idx === -1) idx = 0;
+    galleryState.currentIndex = idx;
+
+    // 6. Открываем
     imageModal.classList.add('active');
     document.body.style.overflow = 'hidden';
     galleryState.isOpen = true;
     if (window._updateGallerySizes) window._updateGallerySizes();
-    // 🆕 Применяем текущую ориентацию экрана
-    
+
     updateGalleryUI();
     hideGalleryActions();
+
     const src = galleryState.images[galleryState.currentIndex];
     const pre = new Image();
     const init = () => { ImageZoom.open(); };
@@ -6869,6 +7372,16 @@ function openGallery(imageUrl) {
     pre.onerror = init;
     pre.src = src;
     if (pre.complete && pre.naturalWidth) init();
+
+    // 7. 🆕 В фоне подгружаем более старые фото (чтобы можно было листать влево)
+    //    и более новые (на всякий)
+    setTimeout(async () => {
+        if (!galleryState.isOpen) return;
+        const loadedOld = await preloadOlderImages(15);
+        if (loadedOld > 0 && galleryState.isOpen) {
+            rebuildGalleryWindow(anchorMsgId);
+        }
+    }, 200);
 }
 function openImageModal(imageUrl) { openGallery(imageUrl); }
 
@@ -6878,6 +7391,12 @@ function closeImageModal() {
     galleryState.isOpen = false;
     galleryState.images = [];
     galleryState.currentIndex = 0;
+    // 🆕 Сброс очереди и кэша картинок
+    galleryState.allImageMsgIds = [];
+    galleryState._windowMsgIds = [];
+    galleryState.loadedSrcs = {};
+    galleryState.loadingSet.clear();
+    galleryState.viewOffset = 0;
     ImageZoom.close();
     hideGalleryActions();
     imageModal.classList.remove('active', 'has-gallery', 'single-image');
@@ -7524,16 +8043,25 @@ async function pollUpdates() {
         }
 
         scrollState.isAtBottom = wasAtBottom;
-        appendMessages(newPlainMessages);
+appendMessages(newPlainMessages);
 
-        if (wasAtBottom) {
-            scrollToBottom(true);
-            markChatAsRead();
-        } else {
-            scrollState.unreadCount += addedCount;
-            updateScrollBadge();
-            updateScrollButton();
-        }
+// 🆕 Более надёжная проверка «пользователь действительно внизу»
+//    заново считаем diff — за время appendMessages DOM мог измениться
+const stillAtBottom = (() => {
+    const diff = messagesContainer.scrollHeight
+        - messagesContainer.scrollTop
+        - messagesContainer.clientHeight;
+    return diff < 120;
+})();
+
+if (wasAtBottom && stillAtBottom) {
+    scrollToBottom(true);
+    markChatAsRead();
+} else {
+    scrollState.unreadCount += addedCount;
+    updateScrollBadge();
+    updateScrollButton();
+}
         if (!hasOwnMessage) soundManager.play('receive');
         else state._lastSentMessageId = null;
     } catch (error) {
@@ -7631,48 +8159,62 @@ function renderChatsList() {
         return;
     }
     const autorunFile = getAutorunChat();
-    container.innerHTML = state.chats.map(c => {
-        const hasUnread = c.hasUnread;
-        const count = c.unreadCount || 0;
-        const badge = hasUnread
-            ? (count > 0
-                ? `<span class="unread-badge">${count > 99 ? '99+' : count}</span>`
-                : `<span class="unread-badge" style="background:#00b894;">•</span>`)
-            : '';
-        const isAutorun = autorunFile === c.file;
-        return `
-        <div class="chat-list-item ${hasUnread ? 'has-unread' : ''}" data-file="${c.file}">
-            <div style="display:flex;align-items:center;gap:12px;flex:1;min-width:0;">
-                <div class="chat-avatar ${hasUnread ? 'has-unread' : ''}">${(c.name || c.file).charAt(0).toUpperCase()}</div>
-                <div style="min-width:0;flex:1;">
-                    <div class="chat-name-row">
-                        <div class="chat-name">${escapeHtml(c.name || c.file)}</div>
-                        ${badge}
-                    </div>
-                    <div class="chat-file">${escapeHtml(c.file)}</div>
+// 🆕 Текущий играющий чат
+const playingChatFile = (typeof GlobalPlayer !== 'undefined' && GlobalPlayer.currentChatFile)
+    ? GlobalPlayer.currentChatFile
+    : null;
+const playingPaused = (typeof GlobalPlayer !== 'undefined' && GlobalPlayer.audioEl)
+    ? GlobalPlayer.audioEl.paused
+    : true;
+
+container.innerHTML = state.chats.map(c => {
+    const hasUnread = c.hasUnread;
+    const count = c.unreadCount || 0;
+    const badge = hasUnread
+        ? (count > 0
+            ? `<span class="unread-badge">${count > 99 ? '99+' : count}</span>`
+            : `<span class="unread-badge" style="background:#00b894;">•</span>`)
+        : '';
+    const isAutorun = autorunFile === c.file;
+    // 🆕 Играет ли музыка из этого чата?
+    const isPlaying = playingChatFile === c.file;
+    return `
+    <div class="chat-list-item ${hasUnread ? 'has-unread' : ''} ${isPlaying ? 'is-playing' : ''}" data-file="${c.file}">
+        <div style="display:flex;align-items:center;gap:12px;flex:1;min-width:0;">
+            <div class="chat-avatar ${hasUnread ? 'has-unread' : ''}">${(c.name || c.file).charAt(0).toUpperCase()}</div>
+            <div style="min-width:0;flex:1;">
+                <div class="chat-name-row">
+                    <div class="chat-name">${escapeHtml(c.name || c.file)}</div>
+                    ${badge}
+                    ${isPlaying ? `<span class="chat-playing-badge ${playingPaused ? 'paused' : ''}"
+                                        data-play-chat="${c.file}"
+                                        title="${playingPaused ? 'Пауза' : 'Играет сейчас'}">${playingPaused ? '⏸' : '♫'}</span>` : ''}
                 </div>
+                <div class="chat-file">${escapeHtml(c.file)}</div>
             </div>
-            <button class="share-btn" data-file="${c.file}" title="Поделиться чатом">💾</button>
-            <button class="rename-btn" data-file="${c.file}" title="Переименовать">✏️</button>
-            <button class="autorun-btn ${isAutorun ? 'active' : ''}"
-                    data-file="${c.file}"
-                    title="${isAutorun ? 'Отключить автовход' : 'Открывать этот чат при запуске'}">
-                ${isAutorun ? '⚡' : '☆'}
-            </button>
-            <button class="chat-delete-btn" data-file="${c.file}" title="Убрать из списка">✕</button>
         </div>
-        `;
-    }).join('');
+        <button class="share-btn" data-file="${c.file}" title="Поделиться чатом">💾</button>
+        <button class="rename-btn" data-file="${c.file}" title="Переименовать">✏️</button>
+        <button class="autorun-btn ${isAutorun ? 'active' : ''}"
+                data-file="${c.file}"
+                title="${isAutorun ? 'Отключить автовход' : 'Открывать этот чат при запуске'}">
+            ${isAutorun ? '⚡' : '☆'}
+        </button>
+        <button class="chat-delete-btn" data-file="${c.file}" title="Убрать из списка">✕</button>
+    </div>
+    `;
+}).join('');
 
     container.querySelectorAll('.chat-list-item').forEach(el => {
-        el.addEventListener('click', (e) => {
-            if (e.target.closest('.chat-delete-btn')) return;
-            if (e.target.closest('.autorun-btn')) return;
-            if (e.target.closest('.rename-btn')) return;
-            if (e.target.closest('.share-btn')) return;
-            openChatFlow(el.dataset.file);
-        });
+    el.addEventListener('click', (e) => {
+        if (e.target.closest('.chat-delete-btn')) return;
+        if (e.target.closest('.autorun-btn')) return;
+        if (e.target.closest('.rename-btn')) return;
+        if (e.target.closest('.share-btn')) return;
+        if (e.target.closest('.chat-playing-badge')) return;  // 🆕
+        openChatFlow(el.dataset.file);
     });
+});
     container.querySelectorAll('.chat-delete-btn').forEach(el => {
         el.addEventListener('click', (e) => { e.stopPropagation(); removeChatFromList(el.dataset.file); });
     });
@@ -7684,6 +8226,18 @@ function renderChatsList() {
     });
     container.querySelectorAll('.share-btn').forEach(el => {
         el.addEventListener('click', (e) => { e.stopPropagation(); openShareChatModal(el.dataset.file); });
+    });
+
+    // 🆕 Клик по бейджу «играет» — пауза/воспроизведение
+    container.querySelectorAll('.chat-playing-badge').forEach(el => {
+        el.addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (typeof GlobalPlayer !== 'undefined') {
+                GlobalPlayer.toggle();
+                // Перерисуем список через мгновение — обновится иконка ▶/⏸
+                setTimeout(() => renderChatsList(), 100);
+            }
+        });
     });
 }
 
@@ -7872,7 +8426,10 @@ async function enterChat(file, name, password) {
             renderMessages([]);
             startPolling();
 
-syncPlayerWithCurrentChat();
+// 🆕 На всякий случай сбросим инлайн-плееры
+setTimeout(() => {
+    if (typeof syncInlineWithGlobal === 'function') syncInlineWithGlobal();
+}, 200);
 
             state._chatEntered = true;
             setTimeout(() => { if (state.chatFile === file) markChatAsRead(); }, 1500);
@@ -7915,7 +8472,10 @@ syncPlayerWithCurrentChat();
         renderHistory();
         
 startPolling();
-syncPlayerWithCurrentChat();   // 🆕 ДОБАВИТЬ
+// 🆕 Синхронизируем инлайн-плеер с глобальным (если музыка играет)
+setTimeout(() => {
+    if (typeof syncInlineWithGlobal === 'function') syncInlineWithGlobal();
+}, 200);
 
 
 
@@ -8709,7 +9269,32 @@ setInterval(() => {
     if (state.currentScreen === 'chats' && state.isAuthorized) {
         refreshUnreadBadges();
     }
-}, 3000);
+}, 3000);// ═══════════════════════════════════════════════════════════════
+//  🆕 Живое обновление бейджа «играет» в списке чатов
+// ═══════════════════════════════════════════════════════════════
+let _lastPlayingState = {
+    chatFile: null,
+    paused: null,
+};
+
+setInterval(() => {
+    if (state.currentScreen !== 'chats') return;
+    if (typeof GlobalPlayer === 'undefined') return;
+
+    const curChat = GlobalPlayer.currentChatFile;
+    const isPaused = GlobalPlayer.audioEl ? GlobalPlayer.audioEl.paused : true;
+
+    // Изменился ли чат-источник или состояние паузы?
+    const changed =
+        _lastPlayingState.chatFile !== curChat ||
+        _lastPlayingState.paused !== isPaused;
+
+    if (changed) {
+        _lastPlayingState.chatFile = curChat;
+        _lastPlayingState.paused = isPaused;
+        renderChatsList();
+    }
+}, 800);
 
 setInterval(() => {
     const inChat = chatScreen.style.display === 'flex' && state.isAuthorized && state.chatFile;
@@ -10070,7 +10655,219 @@ function syncPlayerWithCurrentChat() {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════
+//  🆕 СИНХРОНИЗАЦИЯ ИНЛАЙН-ПЛЕЕРА С ГЛОБАЛЬНЫМ
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Приводит все инлайн-плееры в соответствие с состоянием Глобального плеера.
+ *  - Текущий (играющий/на паузе) трек → ⏸/▶, волны, прогресс, время
+ *  - Остальные → ▶, волны выкл, прогресс 0
+ */
+function syncInlineWithGlobal() {
+    if (typeof GlobalPlayer === 'undefined') return;
+
+    const globalMsgId = GlobalPlayer.getCurrentMsgId();
+    const globalAudio = GlobalPlayer.audioEl;
+    const isGlobalPaused = globalAudio ? globalAudio.paused : true;
+    const globalCurTime = globalAudio ? (globalAudio.currentTime || 0) : 0;
+    const globalDuration = globalAudio && isFinite(globalAudio.duration)
+        ? globalAudio.duration
+        : 0;
+
+    Object.keys(audioPlayers).forEach(id => {
+        const p = audioPlayers[id];
+        if (!p) return;
+
+        const isCurrent = String(id) === String(globalMsgId);
+
+        if (isCurrent) {
+            // ═══ ЭТО текущий трек глобального плеера ═══
+            // Иконка кнопки
+            p.btn.textContent = isGlobalPaused ? '▶' : '⏸';
+
+            // Волны
+            if (isGlobalPaused) {
+                p.waveEl.classList.remove('playing');
+            } else {
+                p.waveEl.classList.add('playing');
+            }
+
+            // Прогресс и время
+            if (globalDuration > 0) {
+                const pct = (globalCurTime / globalDuration) * 100;
+                p.progressFill.style.width = pct + '%';
+                p.timeEl.textContent = formatAudioTime(
+                    Math.max(0, globalDuration - globalCurTime)
+                );
+            }
+
+            // Синхронизируем и локальный audio, чтобы кнопка seek работала правильно
+            // (инлайн-аудио не играет, но его currentTime полезен для seekAudio)
+            if (p.audio) {
+                try {
+                    if (Math.abs((p.audio.currentTime || 0) - globalCurTime) > 0.5) {
+                        p.audio.currentTime = globalCurTime;
+                    }
+                } catch (e) { /* ignore */ }
+            }
+
+            p.isPlaying = !isGlobalPaused;
+        } else {
+            // ═══ ЭТО не текущий трек — сбрасываем ═══
+            // Не трогаем сообщения, которые сейчас playing через ЛОКАЛЬНЫЙ audio
+            // (проверка: p.audio.paused === false и это не глобальный трек)
+            const localPlaying = p.audio && !p.audio.paused;
+
+            if (!localPlaying) {
+                p.btn.textContent = '▶';
+                p.waveEl.classList.remove('playing');
+                p.progressFill.style.width = '0%';
+                if (p.audio && isFinite(p.audio.duration)) {
+                    p.timeEl.textContent = formatAudioTime(p.audio.duration);
+                }
+                p.isPlaying = false;
+            }
+        }
+    });
+}
+
+// ═══ Слушатели глобального плеера → мгновенная синхронизация ═══
+(function attachGlobalPlayerSyncListeners() {
+    if (typeof GlobalPlayer === 'undefined') return;
+    const audio = GlobalPlayer.audioEl;
+    if (!audio) {
+        // Ждём пока плеер построится (buildUI вызывается при первом playQueue)
+        const waitTimer = setInterval(() => {
+            if (GlobalPlayer.audioEl) {
+                clearInterval(waitTimer);
+                attachGlobalPlayerSyncListeners();
+            }
+        }, 300);
+        return;
+    }
+
+    // Убираем старые слушатели, если функция вызвана повторно
+    if (audio._syncHandlers) {
+        audio.removeEventListener('play', audio._syncHandlers.play);
+        audio.removeEventListener('pause', audio._syncHandlers.pause);
+        audio.removeEventListener('timeupdate', audio._syncHandlers.timeupdate);
+        audio.removeEventListener('ended', audio._syncHandlers.ended);
+    }
+
+    const handlers = {
+        play: () => syncInlineWithGlobal(),
+        pause: () => syncInlineWithGlobal(),
+        timeupdate: () => {
+            // Быстрое обновление прогресса для ТЕКУЩЕГО инлайн-плеера
+            const globalMsgId = GlobalPlayer.getCurrentMsgId();
+            if (!globalMsgId) return;
+            const p = audioPlayers[globalMsgId];
+            if (!p) return;
+            const dur = audio.duration;
+            if (!isFinite(dur) || dur <= 0) return;
+            const pct = (audio.currentTime / dur) * 100;
+            p.progressFill.style.width = pct + '%';
+            p.timeEl.textContent = formatAudioTime(Math.max(0, dur - audio.currentTime));
+        },
+        ended: () => {
+            // После окончания трека — глобальный сам переключит, синхронизация придёт через play/pause
+            setTimeout(() => syncInlineWithGlobal(), 50);
+        },
+    };
+
+    audio.addEventListener('play', handlers.play);
+    audio.addEventListener('pause', handlers.pause);
+    audio.addEventListener('timeupdate', handlers.timeupdate);
+    audio.addEventListener('ended', handlers.ended);
+    audio._syncHandlers = handlers;
+})();
+
+// ═══ Также синхронизируем при перестройке DOM (после renderHistory / appendMessages) ═══
+// Патчим initAudioPlayers так, чтобы после создания всех плееров вызывалась синхронизация
+// (это уже добавлено в конце initAudioPlayers — syncInlineWithGlobal())
+// Но для случая когда initAudioPlayers вызывается с задержкой — ставим ещё один страховочный таймер:
+setInterval(() => {
+    // Если глобальный что-то играет, а в UI это не отражено — синхронизируем
+    if (typeof GlobalPlayer === 'undefined') return;
+    const globalMsgId = GlobalPlayer.getCurrentMsgId();
+    if (!globalMsgId) return;
+    const p = audioPlayers[globalMsgId];
+    if (!p) return;
+
+    const audio = GlobalPlayer.audioEl;
+    if (!audio) return;
+
+    const shouldPlay = !audio.paused;
+    const uiPlaying = p.waveEl.classList.contains('playing');
+
+    if (shouldPlay !== uiPlaying) {
+        syncInlineWithGlobal();
+    }
+}, 500);
+
+// ═══════════════════════════════════════════════════════════════
+//  🆕 ПРЕДЗАГРУЗКА ИСТОРИИ ЧЕРЕЗ INTERSECTION OBSERVER
+//  Грузим за 1500px до появления sentinel'а — пользователь не замечает
+// ═══════════════════════════════════════════════════════════════
+let _historyObserver = null;
+
+function initHistoryObserver() {
+    if (_historyObserver) {
+        _historyObserver.disconnect();
+        _historyObserver = null;
+    }
+    if (typeof IntersectionObserver === 'undefined') return;
+
+    _historyObserver = new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+            if (!entry.isIntersecting) continue;
+            if (entry.target.id !== 'historySentinel') continue;
+            if (_loadingOlder) continue;
+            if (historyState.startIndex <= 0) continue;
+            // Sentinel приблизился — грузим!
+            loadOlderMessages();
+        }
+    }, {
+        root: messagesContainer,
+        // 🆕 Грузим, когда sentinel ещё за 1500px до видимой области
+        rootMargin: '1500px 0px 0px 0px',
+        threshold: 0,
+    });
+
+    // Наблюдаем за sentinel'ом, если он существует
+    observeHistorySentinel();
+}
+
+function observeHistorySentinel() {
+    if (!_historyObserver) return;
+    const sentinel = $('historySentinel');
+    if (sentinel) {
+        _historyObserver.observe(sentinel);
+    }
+}
+
+// Патчим loadOlderMessages и renderHistory чтобы переподписываться
+// на новый sentinel после каждого цикла
+const _origLoadOlder = loadOlderMessages;
+loadOlderMessages = async function(...args) {
+    const result = await _origLoadOlder.apply(this, args);
+    // После подгрузки sentinel остался тот же, но на всякий случай перепроверим
+    setTimeout(observeHistorySentinel, 300);
+    return result;
+};
+
+// Запускаем observer когда открыт чат
+const _origEnterChat = enterChat;
+enterChat = async function(...args) {
+    const r = await _origEnterChat.apply(this, args);
+    setTimeout(initHistoryObserver, 500);
+    return r;
+};
+
 console.log('🎵 Глобальный плеер активен — музыка играет между чатами');
+console.log('🔗 Инлайн-плееры синхронизируются с глобальным');
+console.log('📜 История чата: предзагрузка за 1500px до края');
 
 </script>
 </body>
