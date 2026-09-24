@@ -3172,8 +3172,30 @@ function resetHistoryState() {
     _loadingOlder = false;
 }
 function clearAttachmentCache() {
-    _attachmentCache.forEach(url => { try { URL.revokeObjectURL(url); } catch (e) {} });
-    _attachmentCache.clear();
+    // 🆕 Защищаем blob:URL, которые сейчас в очереди GlobalPlayer,
+    //     чтобы музыка из другого чата не обрывалась при переходе
+    const protectedUrls = new Set();
+    if (typeof GlobalPlayer !== 'undefined' && GlobalPlayer.queue) {
+        for (const track of GlobalPlayer.queue) {
+            if (track.src) protectedUrls.add(track.src);
+        }
+    }
+    // Защищаем src текущего играющего трека
+    if (typeof GlobalPlayer !== 'undefined' && GlobalPlayer.audioEl && GlobalPlayer.audioEl.src) {
+        protectedUrls.add(GlobalPlayer.audioEl.src);
+    }
+
+    _attachmentCache.forEach((url, name) => {
+        if (protectedUrls.has(url)) return;
+        try { URL.revokeObjectURL(url); } catch (e) {}
+    });
+
+    // Удаляем из кэша только незащищённые
+    for (const name of Array.from(_attachmentCache.keys())) {
+        const url = _attachmentCache.get(name);
+        if (protectedUrls.has(url)) continue;
+        _attachmentCache.delete(name);
+    }
     _pendingAttachmentLoads.clear();
 }
 
@@ -3896,6 +3918,40 @@ const SCROLL_TOP_TRIGGER = 800;  // 🆕 было 80 — теперь грузи
 const SCROLL_PRELOAD_EXTRA = 400; // 🆕 если до края осталось столько — тоже грузим
 let scrollState = { isAtBottom: true, unreadCount: 0 };
 
+// ═══════════════════════════════════════════════════════════════
+//  🆕 ОТСЛЕЖИВАНИЕ ЖЕСТА СКРОЛЛА
+//  Пока палец на экране — НЕ трогаем DOM (не вставляем старые сообщения)
+//  Всё откладываем до touchend
+// ═══════════════════════════════════════════════════════════════
+let _isUserScrolling = false;
+let _pendingLoadOlder = false;
+let _scrollIdleTimer = null;
+
+function markScrollStart() {
+    _isUserScrolling = true;
+    if (_scrollIdleTimer) { clearTimeout(_scrollIdleTimer); _scrollIdleTimer = null; }
+}
+
+function markScrollEnd() {
+    if (_scrollIdleTimer) clearTimeout(_scrollIdleTimer);
+    _scrollIdleTimer = setTimeout(() => {
+        _isUserScrolling = false;
+        _scrollIdleTimer = null;
+        if (_pendingLoadOlder && !_loadingOlder && historyState.startIndex > 0) {
+            _pendingLoadOlder = false;
+            loadOlderMessages();
+        }
+    }, 120);
+}
+
+messagesContainer.addEventListener('touchstart', markScrollStart, { passive: true });
+messagesContainer.addEventListener('touchend',   markScrollEnd,   { passive: true });
+messagesContainer.addEventListener('touchcancel', markScrollEnd,  { passive: true });
+messagesContainer.addEventListener('wheel', () => {
+    markScrollStart();
+    markScrollEnd();
+}, { passive: true });
+
 function isNearBottom() {
     const diff = messagesContainer.scrollHeight - messagesContainer.scrollTop - messagesContainer.clientHeight;
     return diff <= SCROLL_THRESHOLD;
@@ -3916,10 +3972,10 @@ function updateScrollBadge() {
     } else scrollBadge.classList.remove('show');
 }
 function scrollToBottom(force = false) {
-    // ⛔ НИКОГДА не крутим вниз, пока грузится старая история
-    if (_loadingOlder) return;
-    // ⛔ Не крутим вниз, если пользователь не у самого низа (без force)
     if (!force && !scrollState.isAtBottom) return;
+    if (_loadingOlder) return;
+    if (_isUserScrolling) return;              // палец на экране
+    if (_scrollPreserver && _scrollPreserver.active) return;  // 🆕 идёт удержание позиции
 
     messagesContainer.scrollTop = messagesContainer.scrollHeight;
     scrollState.unreadCount = 0;
@@ -3927,19 +3983,13 @@ function scrollToBottom(force = false) {
     updateScrollBadge();
     updateScrollButton();
 }
-
 function scrollToBottomNow() {
-    if (_loadingOlder) return;   // 🆕
     messagesContainer.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'smooth' });
     scrollState.unreadCount = 0;
     updateScrollBadge();
     scrollState.isAtBottom = true;
     setTimeout(updateScrollButton, 300);
 }
-
-
-
-
 function hideScrollDownBtn() {
     scrollDownBtn.classList.remove('show');
     scrollState.unreadCount = 0;
@@ -3948,8 +3998,6 @@ function hideScrollDownBtn() {
 
 let _scrollRaf = null;
 messagesContainer.addEventListener('scroll', () => {
-    // 🆕 Если идёт подгрузка — игнорируем ВСЁ, кроме флага "пользователь внизу"
-    if (_loadingOlder) return;
     if (_scrollRaf) return;
     _scrollRaf = requestAnimationFrame(() => {
         _scrollRaf = null;
@@ -3958,7 +4006,13 @@ messagesContainer.addEventListener('scroll', () => {
         updateScrollButton();
 
         if (messagesContainer.scrollTop < SCROLL_TOP_TRIGGER && !_loadingOlder) {
-            loadOlderMessages();
+            if (_isUserScrolling) {
+                // 🆕 Палец на экране — только копим запрос
+                _pendingLoadOlder = true;
+            } else {
+                // Жест закончился — грузим сразу
+                loadOlderMessages();
+            }
         }
     });
 }, { passive: true });
@@ -6443,19 +6497,12 @@ function appendMessages(newMsgs) {
         if (msgDate !== lastDate) { html += `<div class="message system">${msgDate}</div>`; lastDate = msgDate; }
         html += buildMessageHTML(msg, { isUnread: markUnread });
     }
-
     messagesInner.dataset.lastDate = lastDate;
     messagesInner.insertAdjacentHTML('beforeend', html);
-
-    // Грузим вложения только для вновь добавленных сообщений
-    const wrappers = messagesInner.querySelectorAll('.message-wrapper');
-    const startIdx = Math.max(0, wrappers.length - newMsgs.length);
-    for (let i = startIdx; i < wrappers.length; i++) {
-        loadAttachmentsIn(wrappers[i]);
-    }
-
+    loadAttachmentsIn(messagesInner);
     trimDomTop();
 }
+
 // ═══════════════════════════════════════════════════════════════
 //  🆕 УМНЫЙ TRIM: не режем то, что пользователь может читать
 //  Запускаем только когда пользователь внизу и DOM реально переполнен
@@ -6486,97 +6533,62 @@ let _scrollPreserver = null;   // активный "замораживатель
  * Пока активен — любые изменения высоты сверху компенсируются автопрокруткой.
  * @param {HTMLElement} anchorEl — элемент, к которому привязываемся
  * @param {number} offsetTop — насколько этот элемент был от верха контейнера
- */async function loadOlderMessages() {
-    if (_loadingOlder) return;
-    if (historyState.startIndex <= 0) return;
-    _loadingOlder = true;
+ */
+function startScrollPreserve(anchorEl, offsetTop) {
+    // Если уже есть активный — останавливаем
+    stopScrollPreserve();
+
+    if (!anchorEl || !anchorEl.isConnected) {
+        // Фолбэк: просто запомним scrollTop
+        _scrollPreserver = {
+            anchorEl: null,
+            offsetTop: offsetTop,
+            rafId: null,
+            ro: null,
+            active: true,
+        };
+        return;
+    }
 
     const container = messagesContainer;
-    const prevScrollHeight = container.scrollHeight;
-    const prevScrollTop = container.scrollTop;
 
-    // Находим первый видимый wrapper как якорь
-    const containerTop = container.getBoundingClientRect().top;
-    let anchorEl = null;
-    let anchorOffset = 0;
-    for (const el of messagesInner.querySelectorAll('.message-wrapper, .message.system, .history-sentinel')) {
-        const r = el.getBoundingClientRect();
-        if (r.bottom >= containerTop) {
-            anchorEl = el;
-            anchorOffset = r.top - containerTop;
-            break;
+    const keepPosition = () => {
+        if (!_scrollPreserver || !_scrollPreserver.active) return;
+        if (!anchorEl.isConnected) {
+            stopScrollPreserve();
+            return;
         }
-    }
-
-    // Вставляем
-    const more = Math.min(CONFIG.renderPageSize, historyState.startIndex);
-    const newStart = historyState.startIndex - more;
-    let html = '';
-    let lastDate = '';
-    for (let i = newStart; i < historyState.startIndex; i++) {
-        const msg = historyState.allMessages[i];
-        const msgDate = formatDate(msg.time);
-        if (msgDate !== lastDate) { html += `<div class="message system">${msgDate}</div>`; lastDate = msgDate; }
-        html += buildMessageHTML(msg, { noFade: true });
-    }
-    const sentinel = $('historySentinel');
-    if (sentinel) sentinel.insertAdjacentHTML('afterend', html);
-    else messagesInner.insertAdjacentHTML('afterbegin', html);
-    historyState.startIndex = newStart;
-    historyState.renderedCount += more;
-
-    // 🆕 Компенсируем СРАЗУ, до загрузки вложений
-    const newScrollHeight = container.scrollHeight;
-    container.scrollTop = prevScrollTop + (newScrollHeight - prevScrollHeight);
-
-    // 🆕 Второй компенсатор — через rAF, ловит синхронный layout
-    requestAnimationFrame(() => {
-        if (anchorEl && anchorEl.isConnected) {
-            const r = anchorEl.getBoundingClientRect();
-            const delta = r.top - container.getBoundingClientRect().top - anchorOffset;
-            if (Math.abs(delta) > 0.5) container.scrollTop += delta;
+        const newTop = anchorEl.offsetTop;
+        const diff = newTop - offsetTop;
+        if (Math.abs(diff) > 0.5) {
+            // Прокручиваем так, чтобы anchor вернулся на ту же визуальную позицию
+            container.scrollTop += diff;
+            _scrollPreserver.offsetTop = anchorEl.offsetTop;
         }
-    });
-
-    // Грузим вложения новых сообщений (не трогая существующие)
-    const newWrappers = [];
-    let count = 0;
-    for (let i = messagesInner.children.length - 1; i >= 0 && count < more + 2; i--) {
-        const child = messagesInner.children[i];
-        if (child.classList.contains('message-wrapper') || child.classList.contains('message')) {
-            newWrappers.push(child);
-            count++;
-        }
-    }
-    newWrappers.reverse();
-
-    // Обёртка для loadAttachmentsIn — она ищет [data-attach]
-    for (const w of newWrappers) {
-        await loadAttachmentsIn(w);
-    }
-
-
-    // 🆕 Финальный компенсатор — ловит асинхронную догрузку картинок
-    //    Работает не дольше 1.5 сек, потом сам выключается
-    const keepAliveUntil = Date.now() + 1500;
-    const keepAlive = () => {
-        if (!anchorEl || !anchorEl.isConnected) return;
-        if (Date.now() > keepAliveUntil) return;
-        const r = anchorEl.getBoundingClientRect();
-        const delta = r.top - container.getBoundingClientRect().top - anchorOffset;
-        if (Math.abs(delta) > 0.5) container.scrollTop += delta;
-        requestAnimationFrame(keepAlive);
     };
-    requestAnimationFrame(keepAlive);
 
-    if (historyState.startIndex === 0) {
-        const s = $('historySentinel');
-        if (s) s.outerHTML = '<div class="history-start">— Начало истории —</div>';
-    }
+    // ResizeObserver на контейнер — ловит любое изменение высоты
+    const ro = new ResizeObserver(() => {
+        if (!_scrollPreserver || !_scrollPreserver.active) return;
+        // Двойной rAF, чтобы дать браузеру применить layout
+        requestAnimationFrame(() => {
+            requestAnimationFrame(keepPosition);
+        });
+    });
+    ro.observe(messagesInner);
 
-    // 🆕 Разрешаем новые подгрузки через 400мс — чтобы не было цепочки
-    setTimeout(() => { _loadingOlder = false; }, 400);
+    _scrollPreserver = {
+        anchorEl,
+        offsetTop: anchorEl.offsetTop,
+        rafId: null,
+        ro,
+        active: true,
+    };
+
+    // Первичная коррекция
+    keepPosition();
 }
+
 function stopScrollPreserve() {
     if (_scrollPreserver) {
         _scrollPreserver.active = false;
@@ -6588,10 +6600,83 @@ function stopScrollPreserve() {
     }
 }
 
+async function loadOlderMessages() {
+    if (_loadingOlder) return;
+    if (historyState.startIndex <= 0) return;
 
-    
+    // 🆕 Если палец на экране — откладываем до touchend
+    if (_isUserScrolling) {
+        _pendingLoadOlder = true;
+        return;
+    }
 
-    
+    _loadingOlder = true;
+    _pendingLoadOlder = false;
+
+    // ═══ 1. Находим «якорь» — первое видимое сейчас сообщение ═══
+    //    К нему будем привязывать позицию скролла
+    const containerRect = messagesContainer.getBoundingClientRect();
+    const allWrappers = messagesInner.querySelectorAll('.message-wrapper, .message.system, .history-sentinel');
+    let anchorEl = null;
+    let anchorOffset = 0;
+
+    for (const el of allWrappers) {
+        const r = el.getBoundingClientRect();
+        if (r.bottom >= containerRect.top) {
+            anchorEl = el;
+            anchorOffset = el.offsetTop;
+            break;
+        }
+    }
+
+    // Фолбэк — если ничего не нашли, запоминаем scrollTop
+    if (!anchorEl) {
+        anchorEl = null;
+        anchorOffset = messagesContainer.scrollTop;
+    }
+
+    // ═══ 2. Стартуем «замораживатель» позиции ДО вставки ═══
+    startScrollPreserve(anchorEl, anchorOffset);
+
+    // ═══ 3. Вставляем новые сообщения ═══
+    const more = Math.min(CONFIG.renderPageSize, historyState.startIndex);
+    const newStart = historyState.startIndex - more;
+
+    let html = '';
+    let lastDate = '';
+    for (let i = newStart; i < historyState.startIndex; i++) {
+        const msg = historyState.allMessages[i];
+        const msgDate = formatDate(msg.time);
+        if (msgDate !== lastDate) { html += `<div class="message system">${msgDate}</div>`; lastDate = msgDate; }
+        // 🆕 noFade: не анимируем появление — важно для плавности
+html += buildMessageHTML(msg, { noFade: true });
+    }
+
+    const sentinel = $('historySentinel');
+    if (sentinel) sentinel.insertAdjacentHTML('afterend', html);
+    else messagesInner.insertAdjacentHTML('afterbegin', html);
+
+    historyState.startIndex = newStart;
+    historyState.renderedCount += more;
+
+    // ═══ 4. Загружаем вложения — ResizeObserver сам удержит позицию ═══
+    await loadAttachmentsIn(messagesInner);
+
+    // ═══ 5. Финальная коррекция — даём вложениям время догрузиться ═══
+    //    (картинки могут прийти с задержкой и изменить высоту)
+    await new Promise(r => setTimeout(r, 50));
+
+    // ═══ 6. Останавливаем «замораживатель» через 400 мс после подгрузки ═══
+    //    Это время ловит все асинхронные изменения (img.onload и т.п.)
+    setTimeout(() => {
+        stopScrollPreserve();
+        if (historyState.startIndex === 0) {
+            const s = $('historySentinel');
+            if (s) s.outerHTML = '<div class="history-start">— Начало истории —</div>';
+        }
+        _loadingOlder = false;
+    }, 400);
+}
 
 // ===================================================================
 //  ГАЛЕРЕЯ
@@ -8035,8 +8120,7 @@ const stillAtBottom = (() => {
     return diff < 120;
 })();
 
- 
-if (wasAtBottom && stillAtBottom && !_loadingOlder) {
+if (wasAtBottom && stillAtBottom) {
     scrollToBottom(true);
     markChatAsRead();
 } else {
@@ -8370,8 +8454,10 @@ async function enterChat(file, name, password) {
     await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
 
     stopPolling();
-    clearAttachmentCache();
-    resetHistoryState();
+// 🆕 НЕ рвём blob:URL, которые сейчас играют в GlobalPlayer
+//     — иначе музыка из другого чата оборвётся при переключении
+clearAttachmentCache();
+resetHistoryState();
 
     state.messages = []; state.sha = null; state.lastMessageCount = 0;
     state._lastCommitSha = null;
@@ -10802,15 +10888,20 @@ function initHistoryObserver() {
     if (typeof IntersectionObserver === 'undefined') return;
 
     _historyObserver = new IntersectionObserver((entries) => {
-        for (const entry of entries) {
-            if (!entry.isIntersecting) continue;
-            if (entry.target.id !== 'historySentinel') continue;
-            if (_loadingOlder) continue;
-            if (historyState.startIndex <= 0) continue;
-            // Sentinel приблизился — грузим!
-            loadOlderMessages();
+    for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        if (entry.target.id !== 'historySentinel') continue;
+        if (_loadingOlder) continue;
+        if (historyState.startIndex <= 0) continue;
+
+        // 🆕 Пока палец на экране — откладываем
+        if (_isUserScrolling) {
+            _pendingLoadOlder = true;
+            continue;
         }
-    }, {
+        loadOlderMessages();
+    }
+}, {
         root: messagesContainer,
         // 🆕 Грузим, когда sentinel ещё за 1500px до видимой области
         rootMargin: '1500px 0px 0px 0px',
