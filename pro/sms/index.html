@@ -4705,6 +4705,10 @@ async function encryptMessage(msg) {
         payload.batchIndex = msg.batchIndex;
         payload.batchTotal = msg.batchTotal;
     }
+    // ✅ ДОБАВЛЕНО: replyTo (цитата ответа)
+    if (msg.replyTo) {
+        payload.replyTo = msg.replyTo;
+    }
     const encrypted = await encryptObject(payload, CRYPTO._key);
     return { id: msg.id, time: msg.time, iv: encrypted.iv, data: encrypted.data };
 }
@@ -4749,6 +4753,10 @@ async function decryptMessage(encMsg) {
             msg.batchId = payload.batchId;
             msg.batchIndex = payload.batchIndex;
             msg.batchTotal = payload.batchTotal;
+        }
+        // ✅ ДОБАВЛЕНО: replyTo (цитата ответа)
+        if (payload.replyTo) {
+            msg.replyTo = payload.replyTo;
         }
         return msg;
     } catch (e) {
@@ -5217,16 +5225,21 @@ async function sendMessage(text, imageBlob = null, audioData = null, fileAttachm
         }
 
         const messageId = Date.now();
-        const plainMsg = {
-            id: messageId, username: state.username,
-            text: hasText ? text.trim() : '',
-            time: new Date().toISOString()
-        };
+const plainMsg = {
+    id: messageId, username: state.username,
+    text: hasText ? text.trim() : '',
+    time: new Date().toISOString()
+};
+
+// ✅ ДОБАВЛЕНО: пробрасываем replyTo в plainMsg
+if (window._currentReplyTo) {
+    plainMsg.replyTo = window._currentReplyTo;
+}
 
 
 
 
-        if (hasImage) {
+if (hasImage) {
     const attachName = generateAttachmentName('img', 'jpg');
     const buf = await imageBlob.arrayBuffer();
     await uploadAttachmentAuto(state.chatFile, attachName, buf, 'image/jpeg', `📷 Фото (${formatFileSize(imageBlob.size)})`);
@@ -9448,28 +9461,6 @@ window.sendMessage = async function(text, imageBlob, audioData, fileAttachment, 
     } finally {
         window._currentReplyTo = null;
     }
-};
-
-// Патч encryptMessage — добавляем replyTo и audioName к payload
-const _encMsgFinal = encryptMessage;
-encryptMessage = async function(msg) {
-    if (window._currentReplyTo && !msg.replyTo) {
-        msg.replyTo = window._currentReplyTo;
-    }
-    return _encMsgFinal.call(this, msg);
-};
-
-// Патч decryptMessage — вытаскиваем replyTo из payload
-const _decMsgFinal = decryptMessage;
-decryptMessage = async function(encMsg) {
-    const msg = await _decMsgFinal.call(this, encMsg);
-    if (msg && !msg.replyTo) {
-        try {
-            const payload = await decryptObject(encMsg.iv, encMsg.data, CRYPTO._key);
-            if (payload.replyTo) msg.replyTo = payload.replyTo;
-        } catch (e) { /* игнорируем */ }
-    }
-    return msg;
 };
 
 console.log('↩ Система ответов активна (свайп вправо)');
