@@ -2196,6 +2196,34 @@ body.player-active .gallery-actions { bottom: 56px; }
 #globalPlayerBar .gp-btn-main:hover {
     background: linear-gradient(135deg, #7a6cf0, #00cfa4);
 }
+
+
+
+#globalPlayerBar .gp-btn-dir {
+    color: #888;
+    font-size: 15px;
+    position: relative;
+}
+#globalPlayerBar .gp-btn-dir:hover {
+    color: #a78bfa;
+    background: rgba(108,92,231,0.12);
+}
+#globalPlayerBar .gp-btn-dir.reverse {
+    color: #feca57;
+    background: linear-gradient(135deg, rgba(254,202,87,0.18), rgba(255,159,67,0.12));
+    box-shadow: 0 0 10px rgba(254,202,87,0.25);
+}
+#globalPlayerBar .gp-btn-dir.reverse::after {
+    content: '';
+    position: absolute;
+    bottom: 2px; left: 50%;
+    transform: translateX(-50%);
+    width: 4px; height: 4px;
+    border-radius: 50%;
+    background: #feca57;
+    box-shadow: 0 0 6px rgba(254,202,87,0.8);
+}
+
 #globalPlayerBar .gp-btn-close {
     color: #888;
     font-size: 14px;
@@ -9595,12 +9623,13 @@ let currentIndex = -1;
 let currentChatFile = null;
 let currentMsgId = null;      // 🆕 ДОБАВИТЬ
 let isSeeking = false;
+let direction = 1; // 1 = вперёд, -1 = назад
 let _savePositionTimer = null;
 
     const el = {
         bar: null, title: null, sub: null,
         playBtn: null, prevBtn: null, nextBtn: null,
-        closeBtn: null, progressFill: null, progressBar: null,
+        closeBtn: null, dirBtn: null, progressFill: null, progressBar: null,
         timeCurrent: null, timeTotal: null, thumb: null,
     };
 
@@ -9626,7 +9655,8 @@ let _savePositionTimer = null;
                 <button class="gp-btn" id="gpPrev" title="Предыдущий">⏮</button>
                 <button class="gp-btn gp-btn-main" id="gpPlay" title="Пауза">⏸</button>
                 <button class="gp-btn" id="gpNext" title="Следующий">⏭</button>
-                <button class="gp-btn gp-btn-close" id="gpClose" title="Закрыть">✕</button>
+                <button class="gp-btn gp-btn-dir" id="gpDir" title="Направление: вперёд">🔀</button>
+<button class="gp-btn gp-btn-close" id="gpClose" title="Закрыть">✕</button>
             </div>
         `;
         document.body.appendChild(bar);
@@ -9638,6 +9668,7 @@ let _savePositionTimer = null;
         el.prevBtn = bar.querySelector('#gpPrev');
         el.nextBtn = bar.querySelector('#gpNext');
         el.closeBtn = bar.querySelector('#gpClose');
+el.dirBtn = bar.querySelector('#gpDir');
         el.progressFill = bar.querySelector('#gpProgressFill');
         el.progressBar = bar.querySelector('#gpProgress');
         el.timeCurrent = bar.querySelector('#gpTimeCur');
@@ -9648,6 +9679,7 @@ let _savePositionTimer = null;
         el.prevBtn.addEventListener('click', prev);
         el.nextBtn.addEventListener('click', next);
         el.closeBtn.addEventListener('click', stop);
+el.dirBtn.addEventListener('click', toggleDirection);
 
         el.progressBar.addEventListener('click', (e) => {
             if (!audio.duration || !isFinite(audio.duration)) return;
@@ -9696,7 +9728,24 @@ let _savePositionTimer = null;
         });
     }
 
-    function updateProgressFromPointer(e) {
+    function toggleDirection() {
+    direction = -direction;
+    const btn = el.dirBtn;
+    if (!btn) return;
+    if (direction === -1) {
+        btn.classList.add('reverse');
+        btn.title = 'Направление: назад (⏪ к началу)';
+        showToast('🔀 Направление: ⏪ назад', 1500);
+    } else {
+        btn.classList.remove('reverse');
+        btn.title = 'Направление: вперёд (⏩ к концу)';
+        showToast('🔀 Направление: ⏩ вперёд', 1500);
+    }
+    renderMeta();
+}
+
+
+function updateProgressFromPointer(e) {
         if (!audio.duration || !isFinite(audio.duration)) return;
         const rect = el.progressBar.getBoundingClientRect();
         const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
@@ -9756,19 +9805,43 @@ function renderPlayState(playing) {
 
 
     function renderMeta() {
-        const track = queue[currentIndex];
-        if (!track) {
-            el.title.textContent = '—';
-            el.sub.textContent = '';
-            return;
-        }
-        el.title.textContent = track.name || 'Аудио';
-        el.thumb.textContent = track.name && !/голосов/i.test(track.name) ? '🎵' : '🎤';
-        el.prevBtn.disabled = currentIndex <= 0;
-        el.nextBtn.disabled = currentIndex >= queue.length - 1;
-        el.prevBtn.style.opacity = el.prevBtn.disabled ? '0.3' : '1';
-        el.nextBtn.style.opacity = el.nextBtn.disabled ? '0.3' : '1';
+    const track = queue[currentIndex];
+    if (!track) {
+        el.title.textContent = '—';
+        el.sub.textContent = '';
+        return;
     }
+    el.title.textContent = track.name || 'Аудио';
+    el.thumb.textContent = track.name && !/голосов/i.test(track.name) ? '🎵' : '🎤';
+
+    const isReverse = direction === -1;
+
+    // В reverse режиме "next" ведёт к началу плейлиста
+    const nextDisabled = isReverse
+        ? currentIndex <= 0
+        : currentIndex >= queue.length - 1;
+    const prevDisabled = isReverse
+        ? currentIndex >= queue.length - 1
+        : currentIndex <= 0;
+
+    el.nextBtn.disabled = nextDisabled;
+    el.prevBtn.disabled = prevDisabled;
+    el.nextBtn.style.opacity = nextDisabled ? '0.3' : '1';
+    el.prevBtn.style.opacity = prevDisabled ? '0.3' : '1';
+
+    // Меняем иконки и подсказки в reverse — визуальная подсказка
+    if (isReverse) {
+        el.nextBtn.textContent = '⏮';
+        el.prevBtn.textContent = '⏭';
+        el.nextBtn.title = 'Предыдущий (в обратном направлении)';
+        el.prevBtn.title = 'Следующий (в обратном направлении)';
+    } else {
+        el.nextBtn.textContent = '⏭';
+        el.prevBtn.textContent = '⏮';
+        el.nextBtn.title = 'Следующий';
+        el.prevBtn.title = 'Предыдущий';
+    }
+}
 
     
 // ─── Управление ───
@@ -9860,25 +9933,35 @@ function hide() {
     }
 
     function next(autoplay = true) {
-        if (currentIndex + 1 >= queue.length) return false;
-        return playTrack(currentIndex + 1);
-    }
+    const target = currentIndex + direction;
+    if (target < 0 || target >= queue.length) return false;
+    return playTrack(target);
+}
 
     function prev() {
-        if (currentIndex <= 0) return false;
-        // Если трек играет больше 3 секунд — сначала в начало
-        if (audio.currentTime > 3) {
-            audio.currentTime = 0;
-            return true;
-        }
-        return playTrack(currentIndex - 1);
+    // Если трек играет больше 3 секунд — сначала в начало
+    if (audio.currentTime > 3) {
+        audio.currentTime = 0;
+        return true;
     }
+    const target = currentIndex - direction;
+    if (target < 0 || target >= queue.length) return false;
+    return playTrack(target);
+}
 
     function stop() {
-        audio.pause();
-        audio.currentTime = 0;
-        audio.removeAttribute('src');
-        audio.load();
+    // Сбрасываем направление
+    if (direction === -1) {
+        direction = 1;
+        if (el.dirBtn) {
+            el.dirBtn.classList.remove('reverse');
+            el.dirBtn.title = 'Направление: вперёд';
+        }
+    }
+    audio.pause();
+    audio.currentTime = 0;
+    audio.removeAttribute('src');
+    audio.load();
         queue = [];
         currentIndex = -1;
         currentMsgId = null;
