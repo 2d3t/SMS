@@ -6511,8 +6511,58 @@ async function loadOlderMessages() {
 // ===================================================================
 //  ГАЛЕРЕЯ
 // ===================================================================
-const galleryState = { images: [], currentIndex: 0, isOpen: false };
+const galleryState = {
+    images: [],          // [{ msgId, src|null, _msg }] — полный список
+    currentIndex: 0,
+    isOpen: false,
+    _loadingMore: false,
+};
 const GALLERY_ANIM_MS = 500;
+
+// Строим список ВСЕХ изображений из истории (не из DOM!)
+function buildGalleryListFromHistory() {
+    const list = [];
+    for (const msg of historyState.allMessages) {
+        if (!msg.image) continue;
+        let src = null;
+        if (typeof msg.image === 'string' && msg.image.startsWith('blob:')) {
+            src = msg.image;
+        } else if (!isAttachmentRef(msg.image)) {
+            src = msg.image;
+        }
+        list.push({ msgId: msg.id, _msg: msg, src });
+    }
+    return list;
+}
+
+// Ленивая загрузка src для конкретного элемента галереи
+async function ensureGalleryItemLoaded(item) {
+    if (!item || item.src) return item.src;
+    const attachName = item._msg.image;
+    if (!attachName || !isAttachmentRef(attachName)) return null;
+    try {
+        const url = await loadAttachment(state.chatFile, attachName);
+        item.src = url;
+        return url;
+    } catch (e) {
+        console.warn('gallery: не удалось загрузить', attachName, e);
+        return null;
+    }
+}
+
+// Подгружает src для диапазона вокруг индекса
+async function preloadGalleryRange(centerIdx) {
+    const list = galleryState.images;
+    const radius = 3;
+    const start = Math.max(0, centerIdx - radius);
+    const end = Math.min(list.length - 1, centerIdx + radius);
+    const tasks = [];
+    for (let i = start; i <= end; i++) {
+        if (list[i].src) continue;
+        tasks.push(ensureGalleryItemLoaded(list[i]));
+    }
+    if (tasks.length) await Promise.allSettled(tasks);
+}
 
 const galleryActionsEl = document.getElementById('galleryActions');
 function showGalleryActions() {
@@ -6646,29 +6696,38 @@ let singleTapTimer = null;
         });
     }
     function preloadNeighbors() {
-        if (!galleryState.isOpen || galleryState.images.length <= 1) return;
-        const idx = galleryState.currentIndex;
-        const total = galleryState.images.length;
-        if (idx > 0) { const im = new Image(); im.src = galleryState.images[idx - 1]; }
-        if (idx < total - 1) { const im = new Image(); im.src = galleryState.images[idx + 1]; }
+    if (!galleryState.isOpen || galleryState.images.length <= 1) return;
+    preloadGalleryRange(galleryState.currentIndex);
+}
+async function navigateGallery(direction) {
+    if (galleryBusy) return false;
+    const newIndex = galleryState.currentIndex + direction;
+    if (newIndex < 0 || newIndex >= galleryState.images.length) return false;
+
+    galleryBusy = true;
+
+    // 🆕 Обеспечиваем загрузку целевого элемента (может быть ещё не загружен)
+    const targetItem = galleryState.images[newIndex];
+    if (!targetItem.src) {
+        const url = await ensureGalleryItemLoaded(targetItem);
+        if (!url) {
+            galleryBusy = false;
+            showToast('⚠️ Не удалось загрузить фото', 1800);
+            return false;
+        }
     }
-    async function navigateGallery(direction) {
-        if (galleryBusy) return false;
-        const newIndex = galleryState.currentIndex + direction;
-        if (newIndex < 0 || newIndex >= galleryState.images.length) return false;
 
-        galleryBusy = true;
-        const nextSrc = galleryState.images[newIndex];
-        galleryState.currentIndex = newIndex;
+    galleryState.currentIndex = newIndex;
+    const nextSrc = targetItem.src;
 
-        const w = window.innerWidth;
-        const outX = -direction * w;
-        const inX = direction * w;
+    const w = window.innerWidth;
+    const outX = -direction * w;
+    const inX = direction * w;
 
-        const active = getActive();
-        const buffer = getBuffer();
+    const active = getActive();
+    const buffer = getBuffer();
 
-        await preloadImage(nextSrc);
+    await preloadImage(nextSrc);
         buffer.src = nextSrc;
         buffer.style.setProperty('--tx', `${inX}px`);
         buffer.style.setProperty('--ty', '0px');
@@ -6698,16 +6757,35 @@ let singleTapTimer = null;
             buffer.style.opacity = '';
             buffer.style.setProperty('--tx', '0px');
             buffer.style.setProperty('--ty', '0px');
-            buffer.style.setProperty('--sc', '1');
-            activeIsA = !activeIsA;
-            updateGalleryUI();
-            preloadNeighbors();
-            galleryBusy = false;
-            hideGalleryActions();
-        }, GALLERY_ANIM_MS + 20);
+            buffer.style.setProperty('--sc', '1');        activeIsA = !activeIsA;
+        updateGalleryUI();
+        preloadNeighbors();
+        galleryBusy = false;
+        hideGalleryActions();
+    }, GALLERY_ANIM_MS + 20);
 
-        return true;
+    // 🆕 Автоподгрузка истории, если пользователь листает к началу
+    if (newIndex < 5 && historyState.startIndex > 0 && !galleryState._loadingMore) {
+        galleryState._loadingMore = true;
+        const currentMsgId = galleryState.images[galleryState.currentIndex]?.msgId;
+        try {
+            await loadOlderMessages();
+            // Пересобираем список галереи
+            const newList = buildGalleryListFromHistory();
+            galleryState.images = newList;
+            const newIdx = newList.findIndex(x => x.msgId === currentMsgId);
+            if (newIdx >= 0) galleryState.currentIndex = newIdx;
+            updateGalleryUI();
+            preloadGalleryRange(galleryState.currentIndex);
+        } catch (e) {
+            console.warn('gallery: автоподгрузка не удалась', e);
+        } finally {
+            galleryState._loadingMore = false;
+        }
     }
+
+    return true;
+}
 
 
 function onTouchStart(e) {
@@ -6948,16 +7026,16 @@ function onTouchStart(e) {
             el.style.setProperty('--sc', '1');
         });
     }
-    return {
-        open() {
-            slideA = document.getElementById('modalImage');
-            slideB = document.getElementById('modalImageNext');
-            activeIsA = true;
-            slideB.style.visibility = 'hidden';
-            slideA.style.visibility = 'visible';
-            slideA.src = galleryState.images[galleryState.currentIndex];
-            slideA.style.setProperty('--tx', '0px');
-            slideA.style.setProperty('--ty', '0px');
+    return {    open() {
+slideA = document.getElementById('modalImage');
+slideB = document.getElementById('modalImageNext');
+activeIsA = true;
+slideB.style.visibility = 'hidden';
+slideA.style.visibility = 'visible';
+const item = galleryState.images[galleryState.currentIndex];
+slideA.src = item ? (item.src || '') : '';
+slideA.style.setProperty('--tx', '0px');
+        slideA.style.setProperty('--ty', '0px');
             slideA.style.setProperty('--sc', '1');
             slideA.style.opacity = '';
             galleryBusy = false;
@@ -7006,28 +7084,61 @@ function updateGalleryUI() {
         dots.innerHTML = '';
     }
 }
-function openGallery(imageUrl) {
-    const imgs = Array.from(
-        messagesInner.querySelectorAll('.message .image-container img')
-    ).map(img => img.getAttribute('src')).filter(Boolean);
-    galleryState.images = imgs.length > 0 ? imgs : [imageUrl];
-    galleryState.currentIndex = Math.max(0, galleryState.images.indexOf(imageUrl));
-    if (galleryState.currentIndex === -1) galleryState.currentIndex = 0;
+async function openGallery(clickedSrc) {
+    // 1. Строим список из ПОЛНОЙ истории
+    const list = buildGalleryListFromHistory();
+    if (list.length === 0) return;
+
+    // 2. Ищем индекс кликнутого — сначала по src
+    let idx = list.findIndex(it => it.src === clickedSrc);
+
+    // 3. Если не нашли — по DOM-элементу
+    if (idx === -1) {
+        const clickedImg = Array.from(
+            messagesInner.querySelectorAll('.message .image-container img')
+        ).find(img => img.getAttribute('src') === clickedSrc);
+        if (clickedImg) {
+            const wrapper = clickedImg.closest('.message-wrapper');
+            const domId = wrapper ? parseInt(wrapper.dataset.msgId) : null;
+            if (domId) idx = list.findIndex(it => it.msgId === domId);
+        }
+    }
+    if (idx === -1) idx = 0;
+
+    galleryState.images = list;
+    galleryState.currentIndex = idx;
+    galleryState.isOpen = true;
     imageModal.classList.add('active');
     document.body.style.overflow = 'hidden';
-    galleryState.isOpen = true;
-    if (window._updateGallerySizes) window._updateGallerySizes();
-    // 🆕 Применяем текущую ориентацию экрана
-    
+
     updateGalleryUI();
     hideGalleryActions();
-    const src = galleryState.images[galleryState.currentIndex];
-    const pre = new Image();
-    const init = () => { ImageZoom.open(); };
-    pre.onload = init;
-    pre.onerror = init;
-    pre.src = src;
-    if (pre.complete && pre.naturalWidth) init();
+
+    // 4. Гарантируем загрузку текущего и соседей
+    await preloadGalleryRange(idx);
+
+    // 5. Если текущий так и не загрузился — не открываем
+    if (!galleryState.images[idx].src) {
+        showToast('⚠️ Не удалось загрузить изображение', 1800);
+        closeImageModal();
+        return;
+    }
+
+    // 🆕 Сначала подгружаем картинку в <img>, потом открываем галерею
+    const initialSrc = galleryState.images[idx].src;
+    await new Promise((resolve) => {
+        const testImg = new Image();
+        testImg.onload = resolve;
+        testImg.onerror = resolve;
+        testImg.src = initialSrc;
+        if (testImg.complete && testImg.naturalWidth > 0) resolve();
+    });
+
+    // 🆕 Теперь применяем размеры viewport
+    if (window._updateGallerySizes) window._updateGallerySizes();
+
+    // 🆕 И открываем зум уже с готовой картинкой
+    ImageZoom.open();
 }
 function openImageModal(imageUrl) { openGallery(imageUrl); }
 
@@ -7037,6 +7148,7 @@ function closeImageModal() {
     galleryState.isOpen = false;
     galleryState.images = [];
     galleryState.currentIndex = 0;
+    galleryState._loadingMore = false;
     ImageZoom.close();
     hideGalleryActions();
     imageModal.classList.remove('active', 'has-gallery', 'single-image');
@@ -8659,9 +8771,10 @@ document.addEventListener('keydown', (e) => {
     const shareBtn = $('galleryShareBtn');
 
     function getCurrentSrc() {
-        if (!galleryState.isOpen || galleryState.images.length === 0) return null;
-        return galleryState.images[galleryState.currentIndex];
-    }
+    if (!galleryState.isOpen || galleryState.images.length === 0) return null;
+    const item = galleryState.images[galleryState.currentIndex];
+    return item ? item.src : null;
+}
 
     downloadBtn.addEventListener('click', (e) => {
         e.stopPropagation();
@@ -8788,11 +8901,12 @@ function setupLongPressShare() {
         longPressFired = false;
 
         pressTimer = setTimeout(async () => {
-            longPressFired = true;
-            if (navigator.vibrate) navigator.vibrate(30);
-            const src = galleryState.images[galleryState.currentIndex];
-            if (src) await systemShareImage(src);
-        }, LONG_PRESS_MS);
+    longPressFired = true;
+    if (navigator.vibrate) navigator.vibrate(30);
+    const item = galleryState.images[galleryState.currentIndex];
+    const src = item ? item.src : null;
+    if (src) await systemShareImage(src);
+}, LONG_PRESS_MS);
     }
 
     function onMove(e) {
