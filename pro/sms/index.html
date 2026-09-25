@@ -123,14 +123,18 @@
             font-weight: 700; color: #fff; flex-shrink: 0;
         }
 /* ═══ 🖼️ Аватарки чатов (только локально) ═══ */
-.chat-avatar,
+/* Аватарка в списке чатов — НЕ кликабельна */
+.chat-avatar {
+    overflow: hidden;
+    position: relative;
+}
+/* Аватарка в шапке открытого чата — кликабельна */
 .chat-header .avatar {
     cursor: pointer;
     overflow: hidden;
     transition: transform 0.15s, box-shadow 0.2s;
     position: relative;
 }
-.chat-avatar:active,
 .chat-header .avatar:active {
     transform: scale(0.92);
 }
@@ -11419,16 +11423,7 @@ avatarFileInput.addEventListener('change', (e) => {
     e.target.value = '';
 });
 
-// ═══ Делегирование кликов по аватаркам в СПИСКЕ ЧАТОВ ═══
-document.getElementById('chatsList').addEventListener('click', (e) => {
-    const avatar = e.target.closest('.chat-avatar');
-    if (!avatar) return;
-    const item = avatar.closest('.chat-list-item');
-    if (!item) return;
-    e.stopPropagation();
-    e.preventDefault();
-    pickAvatarForChat(item.dataset.file);
-});
+
 
 // ═══ Клик по аватарке в ШАПКЕ ЧАТА ═══
 userAvatar.addEventListener('click', (e) => {
@@ -11461,18 +11456,8 @@ userAvatar.addEventListener('click', (e) => {
         if (timer) { clearTimeout(timer); timer = null; }
     }
 
-    // Список чатов
-    const chatsListEl = document.getElementById('chatsList');
-    chatsListEl.addEventListener('touchstart', (e) => {
-        const av = e.target.closest('.chat-avatar');
-        if (!av) return;
-        const item = av.closest('.chat-list-item');
-        if (item) start(item.dataset.file);
-    }, { passive: true });
-    chatsListEl.addEventListener('touchend', cancel);
-    chatsListEl.addEventListener('touchmove', cancel);
-    chatsListEl.addEventListener('touchcancel', cancel);
-
+    
+// Список чатов: аватарки не кликабельны (только в открытом чате)
     // Шапка чата
     userAvatar.addEventListener('touchstart', (e) => {
         if (state.chatFile) start(state.chatFile);
@@ -11481,24 +11466,18 @@ userAvatar.addEventListener('click', (e) => {
     userAvatar.addEventListener('touchmove', cancel);
     userAvatar.addEventListener('touchcancel', cancel);
 
-    // Не даём лонг-тапу открыть чат/модалку по touchend
-    chatsListEl.addEventListener('click', (e) => {
-        if (longPressFired) {
-            e.stopPropagation();
-            e.preventDefault();
-            longPressFired = false;
-        }
-    }, true);
-    userAvatar.addEventListener('click', (e) => {
-        if (longPressFired) {
-            e.stopPropagation();
-            e.preventDefault();
-            longPressFired = false;
-        }
-    }, true);
+    // Не даём лонг-тапу по аватарке в шапке открыть лишнее
+userAvatar.addEventListener('click', (e) => {
+    if (longPressFired) {
+        e.stopPropagation();
+        e.preventDefault();
+        longPressFired = false;
+    }
+}, true);
 })();
 
-// ═══ Патч renderChatsList — навешиваем data-атрибут и аватарки ═══
+
+// ═══ Патч renderChatsList — просто грузим аватарки в список (без кликов) ═══
 const _origRenderChatsListForAvatar = renderChatsList;
 renderChatsList = function() {
     _origRenderChatsListForAvatar.apply(this, arguments);
@@ -11506,12 +11485,10 @@ renderChatsList = function() {
         const file = item.dataset.file;
         const avatar = item.querySelector('.chat-avatar');
         if (avatar && file) {
-            avatar.dataset.avatarFile = file;
             applyAvatarToElement(avatar, file);
         }
     });
 };
-
 // ═══ Патч enterChat — аватарка в шапке открытого чата ═══
 const _origEnterChatForAvatar = enterChat;
 enterChat = async function(file, name, password) {
