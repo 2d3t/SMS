@@ -5345,10 +5345,223 @@ async function downloadFileFromChunks(chatFile, chunkNames) {
 }
 
 
+// ═══════════════════════════════════════════════════════════════
+//  🆕 ОЧЕРЕДЬ ОТПРАВКИ СООБЩЕНИЙ
+//  Решает проблему 409 CONFLICT при быстрой отправке подряд
+// ═══════════════════════════════════════════════════════════════
 
+const SendQueue = (() => {
+    const queue = [];           // массив задач
+    let isProcessing = false;
+    let _stats = {
+        total: 0,
+        completed: 0,
+        failed: 0,
+    };
 
+    // Индикатор в UI
+    let _indicatorEl = null;
 
-async function sendMessage(text, imageBlob = null, audioData = null, fileAttachment = null, audioFile = null) {
+    function ensureIndicator() {
+        if (_indicatorEl) return;
+        _indicatorEl = document.createElement('div');
+        _indicatorEl.id = 'sendQueueIndicator';
+        _indicatorEl.style.cssText = `
+            position: fixed;
+            bottom: 90px;
+            left: 50%;
+            transform: translateX(-50%) translateY(20px);
+            background: rgba(26, 26, 46, 0.95);
+            backdrop-filter: blur(20px);
+            border: 1px solid rgba(108, 92, 231, 0.4);
+            border-radius: 14px;
+            padding: 10px 16px;
+            color: #fff;
+            font-size: 13px;
+            font-family: inherit;
+            z-index: 2600;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            display: none;
+            align-items: center;
+            gap: 10px;
+            opacity: 0;
+            transition: opacity 0.25s, transform 0.25s;
+            pointer-events: none;
+            max-width: 90vw;
+        `;
+        _indicatorEl.innerHTML = `
+            <div style="
+                width: 22px;height:22px;border-radius:50%;
+                border: 2px solid rgba(108,92,231,0.25);
+                border-top-color: #6c5ce7;
+                animation: sendQueueSpin 0.9s linear infinite;
+                flex-shrink: 0;
+            "></div>
+            <div style="min-width:0;">
+                <div id="sendQueueTitle" style="font-weight:600;margin-bottom:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+                    Отправка…
+                </div>
+                <div id="sendQueueSub" style="font-size:11px;color:#888;">
+                    …
+                </div>
+            </div>
+            <button id="sendQueueCancel" style="
+                background: rgba(255,107,107,0.15);
+                border: 1px solid rgba(255,107,107,0.3);
+                color: #ff6b6b;
+                width: 26px;height:26px;border-radius:50%;
+                cursor:pointer;font-size:12px;
+                display:flex;align-items:center;justify-content:center;
+                flex-shrink:0;padding:0;
+            " title="Очистить очередь">✕</button>
+        `;
+        document.body.appendChild(_indicatorEl);
+
+        // Стиль анимации (добавим один раз)
+        if (!document.getElementById('sendQueueStyles')) {
+            const style = document.createElement('style');
+            style.id = 'sendQueueStyles';
+            style.textContent = `
+                @keyframes sendQueueSpin { to { transform: rotate(360deg); } }
+                #sendQueueIndicator.show {
+                    display: flex !important;
+                    opacity: 1;
+                    transform: translateX(-50%) translateY(0);
+                }
+            `;
+            document.head.appendChild(style);
+        }
+
+        _indicatorEl.querySelector('#sendQueueCancel').addEventListener('click', (e) => {
+            e.stopPropagation();
+            cancelAll();
+        });
+    }
+
+    function showIndicator() {
+        ensureIndicator();
+        _indicatorEl.classList.add('show');
+    }
+
+    function hideIndicator() {
+        if (!_indicatorEl) return;
+        _indicatorEl.classList.remove('show');
+    }
+
+    function updateIndicator() {
+        if (!_indicatorEl) return;
+        const title = _indicatorEl.querySelector('#sendQueueTitle');
+        const sub = _indicatorEl.querySelector('#sendQueueSub');
+        const remaining = queue.length + (isProcessing ? 1 : 0);
+
+        if (remaining === 0) {
+            title.textContent = '✅ Готово';
+            sub.textContent = `Отправлено: ${_stats.completed}` + (_stats.failed ? ` · Ошибок: ${_stats.failed}` : '');
+        } else {
+            title.textContent = `📤 Отправка (${_stats.completed + 1} из ${_stats.total})`;
+            sub.textContent = `В очереди: ${queue.length}`;
+        }
+    }
+
+    // ─── Внутренняя обработка ───
+    async function processNext() {
+        if (isProcessing) return;
+        if (queue.length === 0) {
+            // Все задачи выполнены — прячем через паузу
+            setTimeout(() => {
+                if (queue.length === 0 && !isProcessing) {
+                    hideIndicator();
+                    // Сброс статистики
+                    _stats = { total: 0, completed: 0, failed: 0 };
+                    // Разблокировка UI
+                    state.isSending = false;
+                    if (state.isAuthorized) {
+                        sendBtn.disabled = false;
+                        micBtn.disabled = false;
+                    }
+                }
+            }, 1200);
+            return;
+        }
+
+        isProcessing = true;
+        const task = queue.shift();
+        updateIndicator();
+
+        try {
+            // Вызываем ОРИГИНАЛЬНУЮ sendMessage (сохранённую в _origSendMessage)
+            
+// Устанавливаем replyTo перед вызовом
+window._currentReplyTo = task._replyTo;
+try {
+    await _origSendMessage(
+        task.text,
+        task.imageBlob,
+        task.audioData,
+        task.fileAttachment,
+        task.audioFile
+    );
+} finally {
+    window._currentReplyTo = null;
+}
+
+            _stats.completed++;
+        } catch (e) {
+            console.error('Send queue task failed:', e);
+            _stats.failed++;
+        } finally {
+            isProcessing = false;
+            updateIndicator();
+            // Небольшая пауза между задачами — даём GitHub время
+            setTimeout(() => processNext(), 100);
+        }
+    }
+
+    // ─── Публичный API ───
+    function enqueue(task) {
+        // Помечаем, что это часть очереди (для оптимизации UI)
+        task._fromQueue = true;
+        queue.push(task);
+
+        if (_stats.total === 0) {
+            _stats.total = 1;
+            _stats.completed = 0;
+            _stats.failed = 0;
+        } else {
+            _stats.total++;
+        }
+
+        showIndicator();
+        updateIndicator();
+        processNext();
+
+        return queue.length;
+    }
+
+    function cancelAll() {
+        const count = queue.length;
+        queue.length = 0;
+        if (count > 0) {
+            showToast(`⏹️ Отменено ${count} сообщени${count === 1 ? 'е' : 'й'} из очереди`, 2000);
+        }
+        updateIndicator();
+    }
+
+    function getLength() { return queue.length; }
+    function isBusy() { return isProcessing || queue.length > 0; }
+
+    return {
+        enqueue,
+        cancelAll,
+        getLength,
+        isBusy,
+        get stats() { return { ..._stats }; },
+    };
+})();
+
+// 🆕 Переименовали: теперь это «внутренняя» функция, которую вызывает очередь
+async function _origSendMessage(text, imageBlob = null, audioData = null, fileAttachment = null, audioFile = null) {
+
     if (!state.isAuthorized || !state.chatFile) { showToast('❌ Нет доступа', 2000); soundManager.play('error'); return; }
     if (!navigator.onLine || !networkState.isOnline) { showToast('📵 Нет подключения', 2500); soundManager.play('error'); return; }
     const hasText = text && text.trim();
@@ -5361,10 +5574,11 @@ async function sendMessage(text, imageBlob = null, audioData = null, fileAttachm
     if (_emojiPanelOpen) toggleEmojiPanel(false);
     if (_attachMenuOpen) toggleAttachMenu(false);
 
-    state.isSending = true;
-    sendBtn.disabled = true;
-    micBtn.disabled = true;
-
+    // 🆕 Блокируем UI на всё время работы очереди
+// 🆕 Блокируем UI на всё время работы очереди
+state.isSending = true;
+sendBtn.disabled = true;
+micBtn.disabled = true;
     try {
         const path = getChatPath(state.chatFile);
         const result = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
@@ -5393,11 +5607,9 @@ const plainMsg = {
     time: new Date().toISOString()
 };
 
-// ✅ ДОБАВЛЕНО: пробрасываем replyTo в plainMsg
-if (window._currentReplyTo) {
-    plainMsg.replyTo = window._currentReplyTo;
-}
 
+// 🆕 replyTo теперь берётся из аргумента функции
+// (обёртка sendMessage передаёт его через замыкание)
 
 
 
@@ -5519,14 +5731,69 @@ if (hasFile) {
         }
         state._lastSentMessageId = null;
     } finally {
+    // 🆕 НЕ разблокируем UI, если в очереди ещё есть задачи
+    if (!SendQueue.isBusy()) {
         state.isSending = false;
         sendBtn.disabled = !state.isAuthorized;
         micBtn.disabled = !state.isAuthorized;
-        if (state.isAuthorized && state.chatFile) messageInput.focus();
     }
+    if (state.isAuthorized && state.chatFile) messageInput.focus();
+}
 }
 
+// ═══════════════════════════════════════════════════════════════
+//  🆕 ПУБЛИЧНАЯ sendMessage — ставит задачу в очередь
+// ═══════════════════════════════════════════════════════════════
+async function sendMessage(text, imageBlob = null, audioData = null, fileAttachment = null, audioFile = null) {
+    if (!state.isAuthorized || !state.chatFile) {
+        showToast('❌ Нет доступа', 2000);
+        soundManager.play('error');
+        return;
+    }
 
+    const hasText = text && text.trim();
+    const hasImage = imageBlob instanceof Blob;
+    const hasAudio = audioData !== null;
+    const hasFile = fileAttachment && fileAttachment.blob instanceof Blob;
+    const hasAudioFile = audioFile && audioFile.blob instanceof Blob;
+
+    if (!hasText && !hasImage && !hasAudio && !hasFile && !hasAudioFile) return;
+
+    // 🆕 Если это ответ/комментарий — оборачиваем в задачу с контекстом
+    const task = {
+        text: hasText ? text : '',
+        imageBlob,
+        audioData,
+        fileAttachment,
+        audioFile,
+        _replyTo: window._currentReplyTo || null,
+        _commentToMsgId: (typeof _commentToMsgId !== 'undefined' ? _commentToMsgId : null),
+    };
+
+    // Очищаем глобальные переменные СРАЗУ, чтобы следующий вызов не подхватил старое
+    window._currentReplyTo = null;
+
+    // 🆕 Если очередь пуста и ничего не обрабатывается — можно сразу
+    SendQueue.enqueue(task);
+
+    // Немедленный визуальный отклик
+    sendBtn.classList.add('clicked');
+    setTimeout(() => sendBtn.classList.remove('clicked'), 200);
+
+    // Очищаем input сразу — пользователь может писать следующее
+    messageInput.value = '';
+    messageInput.style.height = 'auto';
+
+    // Закрываем панели
+    if (typeof _emojiPanelOpen !== 'undefined' && _emojiPanelOpen) toggleEmojiPanel(false);
+    if (typeof _attachMenuOpen !== 'undefined' && _attachMenuOpen) toggleAttachMenu(false);
+    if (typeof cancelReply === 'function') cancelReply();
+    if (typeof cancelComment === 'function' && typeof _commentToMsgId !== 'undefined' && _commentToMsgId) {
+        cancelComment();
+    }
+
+    soundManager.play('click');
+}
 // ===================================================================
 //  МНОЖЕСТВЕННАЯ ОТПРАВКА ФОТО (batch)
 // ===================================================================
