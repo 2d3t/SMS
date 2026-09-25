@@ -2401,6 +2401,111 @@ body.player-active .gallery-actions { bottom: 56px; }
 body.player-active .input-bar { padding-bottom: 68px; }
 body.player-active .messages-container { padding-bottom: 68px; }
 
+/* ═══ Редактирование сообщений ═══ */
+.edit-menu {
+    position: fixed;
+    z-index: 4000;
+    background: #1a1a2e;
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 14px;
+    padding: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.65);
+    backdrop-filter: blur(20px);
+    animation: editMenuPop 0.18s ease-out;
+    min-width: 180px;
+}
+@keyframes editMenuPop {
+    from { opacity: 0; transform: scale(0.92); }
+    to   { opacity: 1; transform: scale(1); }
+}
+.edit-menu-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    border-radius: 10px;
+    cursor: pointer;
+    color: #e0e0e0;
+    font-size: 14px;
+    font-weight: 500;
+    transition: background 0.15s;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+}
+.edit-menu-item:hover {
+    background: rgba(108,92,231,0.2);
+}
+.edit-menu-item:active {
+    background: rgba(108,92,231,0.35);
+    transform: scale(0.97);
+}
+.edit-menu-item.danger {
+    color: #ff6b6b;
+}
+.edit-menu-item.danger:hover {
+    background: rgba(255,107,107,0.15);
+}
+.edit-menu-item .emi-icon {
+    font-size: 18px;
+    width: 24px;
+    text-align: center;
+    flex-shrink: 0;
+}
+
+/* Метка «изменено» */
+.message .edited-mark {
+    font-size: 10px;
+    color: rgba(255,255,255,0.4);
+    font-style: italic;
+    margin-left: 4px;
+}
+
+/* Индикация «сообщение редактируется» — лёгкая подсветка */
+.message-wrapper.editing .message {
+    box-shadow: 0 0 0 2px rgba(0,184,148,0.5);
+}
+
+/* Модалка редактирования */
+#editMessageModal .form-modal-content {
+    max-width: 480px;
+}
+#editMessageModal textarea {
+    width: 100%;
+    padding: 12px 14px;
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 12px;
+    color: #fff;
+    font-size: 15px;
+    font-family: inherit;
+    resize: vertical;
+    min-height: 100px;
+    max-height: 300px;
+    outline: none;
+    margin-bottom: 14px;
+    line-height: 1.5;
+}
+#editMessageModal textarea:focus {
+    border-color: #6c5ce7;
+    box-shadow: 0 0 0 3px rgba(108,92,231,0.15);
+}
+.edit-original-preview {
+    padding: 10px 12px;
+    background: rgba(255,255,255,0.03);
+    border-left: 3px solid #555;
+    border-radius: 8px;
+    font-size: 13px;
+    color: #888;
+    margin-bottom: 14px;
+    max-height: 100px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    line-height: 1.4;
+}
     </style>
 </head>
 <body>
@@ -2923,6 +3028,20 @@ style="width:100%;padding:12px 14px;background:rgba(255,255,255,0.06);
         </div>
         <div class="modal-actions" style="margin-top:12px;">
             <button class="btn btn-secondary" id="cancelSearchBtn">Закрыть</button>
+        </div>
+    </div>
+</div>
+<!-- ═══════════ МОДАЛКА РЕДАКТИРОВАНИЯ СООБЩЕНИЯ ═══════════ -->
+<div class="image-modal" id="editMessageModal">
+    <div class="form-modal-content">
+        <h2>✏️ Редактирование</h2>
+        <label>Исходный текст</label>
+        <div class="edit-original-preview" id="editOriginalPreview">—</div>
+        <label>Новый текст</label>
+        <textarea id="editMessageInput" placeholder="Введите новый текст..."></textarea>
+        <div class="modal-actions">
+            <button class="btn btn-secondary" id="cancelEditMessageBtn">Отмена</button>
+            <button class="btn" id="confirmEditMessageBtn">Сохранить</button>
         </div>
     </div>
 </div>
@@ -5536,26 +5655,17 @@ const SendQueue = (() => {
         isProcessing = true;
         const task = queue.shift();
         updateIndicator();
-
-        try {
-            // Вызываем ОРИГИНАЛЬНУЮ sendMessage (сохранённую в _origSendMessage)
-            
-// Устанавливаем replyTo перед вызовом
-window._currentReplyTo = task._replyTo;
 try {
     await _origSendMessage(
         task.text,
         task.imageBlob,
         task.audioData,
         task.fileAttachment,
-        task.audioFile
+        task.audioFile,
+        task._replyTo
     );
-} finally {
-    window._currentReplyTo = null;
-}
-
-            _stats.completed++;
-        } catch (e) {
+    _stats.completed++;
+} catch (e) {
             console.error('Send queue task failed:', e);
             _stats.failed++;
         } finally {
@@ -5609,7 +5719,7 @@ try {
 })();
 
 // 🆕 Переименовали: теперь это «внутренняя» функция, которую вызывает очередь
-async function _origSendMessage(text, imageBlob = null, audioData = null, fileAttachment = null, audioFile = null) {
+async function _origSendMessage(text, imageBlob = null, audioData = null, fileAttachment = null, audioFile = null, replyContext = null) {
 
     if (!state.isAuthorized || !state.chatFile) { showToast('❌ Нет доступа', 2000); soundManager.play('error'); return; }
     if (!navigator.onLine || !networkState.isOnline) { showToast('📵 Нет подключения', 2500); soundManager.play('error'); return; }
@@ -5649,17 +5759,29 @@ micBtn.disabled = true;
             }
         }
 
-        const messageId = Date.now();
+        
+const messageId = Date.now();
 const plainMsg = {
     id: messageId, username: state.username,
     text: hasText ? text.trim() : '',
     time: new Date().toISOString()
 };
 
+// 🆕 Прикрепляем цитату ответа — берём из параметра, а не из глобальной
+if (replyContext) {
+    const replied = historyState.allMessages.find(m => m.id === replyContext.id)
+        || state.messages.find(m => m.id === replyContext.id);
 
-// 🆕 replyTo теперь берётся из аргумента функции
-// (обёртка sendMessage передаёт его через замыкание)
-
+    plainMsg.replyTo = {
+        id: replyContext.id,
+        username: replyContext.username,
+        previewText: replyContext.previewText || '',
+        hasImage: replied?.image ? true : undefined,
+        hasAudio: replied?.audio ? true : undefined,
+        hasFile: replied?.file ? true : undefined,
+        fileName: replied?.fileName || undefined,
+    };
+}
 
 
 if (hasImage) {
@@ -5793,7 +5915,7 @@ if (hasFile) {
 // ═══════════════════════════════════════════════════════════════
 //  🆕 ПУБЛИЧНАЯ sendMessage — ставит задачу в очередь
 // ═══════════════════════════════════════════════════════════════
-async function sendMessage(text, imageBlob = null, audioData = null, fileAttachment = null, audioFile = null) {
+async function sendMessage(text, imageBlob = null, audioData = null, fileAttachment = null, audioFile = null, replyContext = null) {
     if (!state.isAuthorized || !state.chatFile) {
         showToast('❌ Нет доступа', 2000);
         soundManager.play('error');
@@ -5810,17 +5932,14 @@ async function sendMessage(text, imageBlob = null, audioData = null, fileAttachm
 
     // 🆕 Если это ответ/комментарий — оборачиваем в задачу с контекстом
     const task = {
-        text: hasText ? text : '',
-        imageBlob,
-        audioData,
-        fileAttachment,
-        audioFile,
-        _replyTo: window._currentReplyTo || null,
-        _commentToMsgId: (typeof _commentToMsgId !== 'undefined' ? _commentToMsgId : null),
-    };
-
-    // Очищаем глобальные переменные СРАЗУ, чтобы следующий вызов не подхватил старое
-    window._currentReplyTo = null;
+    text: hasText ? text : '',
+    imageBlob,
+    audioData,
+    fileAttachment,
+    audioFile,
+    _replyTo: replyContext,
+    _commentToMsgId: (typeof _commentToMsgId !== 'undefined' ? _commentToMsgId : null),
+};
 
     // 🆕 Если очередь пуста и ничего не обрабатывается — можно сразу
     SendQueue.enqueue(task);
@@ -6716,7 +6835,7 @@ ${content}
 ${commentBar}
 ${commentsBlock}
 ${buildReactionsHTML(msg)}
-<span class="time">${fullTime}</span>
+<span class="time">${msg.edited ? '<span class="edited-mark">(изменено)</span> ' : ''}${fullTime}</span>
 
 
 
@@ -10420,16 +10539,14 @@ window.sendMessage = async function(text, imageBlob, audioData, fileAttachment, 
         return;
     }
 
-    // ↩ Режим ответа (reply)
+    // ↩ Режим ответа (reply) — передаём контекст через параметр
     const replySnapshot = _replyTo;
     if (replySnapshot) cancelReply();
-    window._currentReplyTo = replySnapshot;
 
-    try {
-        return await _origSendMessageFinal.call(this, text, imageBlob, audioData, fileAttachment, audioFile);
-    } finally {
-        window._currentReplyTo = null;
-    }
+    return await _origSendMessageFinal.call(
+        this, text, imageBlob, audioData, fileAttachment, audioFile,
+        replySnapshot
+    );
 };
 
 console.log('↩ Система ответов активна (свайп вправо)');
@@ -11530,6 +11647,474 @@ logout = function() {
 loadAvatars();
 console.log('🖼️ Личные аватарки чатов активны — клик по аватарке, лонг-тап для удаления');
 
+// ═══════════════════════════════════════════════════════════════
+//  ✏️ РЕДАКТИРОВАНИЕ СООБЩЕНИЙ
+// ═══════════════════════════════════════════════════════════════
+
+let _editMenuEl = null;
+let _editingMessageId = null;
+
+/**
+ * Показывает контекстное меню при долгом нажатии
+ */
+function showMessageMenu(x, y, msgId, isOwn) {
+    closeMessageMenu();
+
+    const menu = document.createElement('div');
+    menu.className = 'edit-menu';
+
+    let itemsHtml = '';
+
+    if (isOwn) {
+        itemsHtml += `
+            <div class="edit-menu-item" data-action="edit">
+                <span class="emi-icon">✏️</span>
+                <span>Редактировать</span>
+            </div>
+        `;
+    }
+
+    itemsHtml += `
+        <div class="edit-menu-item" data-action="reply">
+            <span class="emi-icon">↩</span>
+            <span>Ответить</span>
+        </div>
+        <div class="edit-menu-item" data-action="copy">
+            <span class="emi-icon">📋</span>
+            <span>Копировать текст</span>
+        </div>
+    `;
+
+    if (isOwn) {
+        itemsHtml += `
+            <div class="edit-menu-item danger" data-action="delete">
+                <span class="emi-icon">🗑️</span>
+                <span>Удалить</span>
+            </div>
+        `;
+    }
+
+    menu.innerHTML = itemsHtml;
+    document.body.appendChild(menu);
+
+    // Позиционирование
+    const rect = menu.getBoundingClientRect();
+    const margin = 10;
+    let left = x - rect.width / 2;
+    let top = y - rect.height - 10;
+
+    left = Math.max(margin, Math.min(left, window.innerWidth - rect.width - margin));
+    if (top < margin) top = y + 20;
+    top = Math.max(margin, Math.min(top, window.innerHeight - rect.height - margin));
+
+    menu.style.left = left + 'px';
+    menu.style.top = top + 'px';
+
+    menu.querySelectorAll('.edit-menu-item').forEach(el => {
+        el.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const action = el.dataset.action;
+            closeMessageMenu();
+            handleMessageAction(action, msgId);
+        });
+    });
+
+    _editMenuEl = menu;
+
+    // Закрытие по клику вне
+    setTimeout(() => {
+        document.addEventListener('click', closeMessageMenuOnOutside);
+        document.addEventListener('scroll', closeMessageMenu, true);
+    }, 0);
+
+    if (navigator.vibrate) navigator.vibrate(15);
+}
+
+function closeMessageMenuOnOutside(e) {
+    if (_editMenuEl && !_editMenuEl.contains(e.target)) {
+        closeMessageMenu();
+    }
+}
+
+function closeMessageMenu() {
+    if (_editMenuEl) {
+        _editMenuEl.remove();
+        _editMenuEl = null;
+        document.removeEventListener('click', closeMessageMenuOnOutside);
+        document.removeEventListener('scroll', closeMessageMenu, true);
+    }
+}
+
+function handleMessageAction(action, msgId) {
+    const msg = historyState.allMessages.find(m => m.id === msgId);
+    if (!msg) return;
+
+    if (action === 'edit') {
+        openEditMessageModal(msgId);
+    } else if (action === 'reply') {
+        startReply(msgId);
+    } else if (action === 'copy') {
+        copyMessageText(msg);
+    } else if (action === 'delete') {
+        deleteMessage(msgId);
+    }
+}
+
+async function copyMessageText(msg) {
+    let text = msg.text || '';
+    if (!text && msg.image) text = '[Изображение]';
+    if (!text && msg.audio) text = '[Аудио]';
+    if (!text && msg.file) text = '[Файл: ' + (msg.fileName || 'файл') + ']';
+
+    try {
+        await navigator.clipboard.writeText(text);
+        showToast('📋 Скопировано', 1200);
+        soundManager.play('click');
+    } catch (e) {
+        showToast('❌ Не удалось скопировать', 2000);
+    }
+}
+
+/**
+ * Открывает модалку редактирования
+ */
+function openEditMessageModal(msgId) {
+    const msg = historyState.allMessages.find(m => m.id === msgId);
+    if (!msg) { showToast('❌ Сообщение не найдено', 1500); return; }
+    if (msg.username !== state.username) {
+        showToast('❌ Только свои сообщения', 1500); return;
+    }
+
+    _editingMessageId = msgId;
+
+    $('editOriginalPreview').textContent = msg.text || '(без текста)';
+    $('editMessageInput').value = msg.text || '';
+
+    $('editMessageModal').classList.add('active');
+
+    // Подсветка сообщения
+    const wrapper = messagesInner.querySelector(`.message-wrapper[data-msg-id="${msgId}"]`);
+    if (wrapper) wrapper.classList.add('editing');
+
+    setTimeout(() => {
+        const inp = $('editMessageInput');
+        inp.focus();
+        inp.setSelectionRange(inp.value.length, inp.value.length);
+    }, 100);
+}
+
+function closeEditMessageModal() {
+    if (_editingMessageId) {
+        const wrapper = messagesInner.querySelector(`.message-wrapper[data-msg-id="${_editingMessageId}"]`);
+        if (wrapper) wrapper.classList.remove('editing');
+    }
+    _editingMessageId = null;
+    $('editMessageModal').classList.remove('active');
+}
+
+/**
+ * Сохраняет отредактированное сообщение на GitHub
+ */
+async function confirmEditMessage() {
+    if (!_editingMessageId) return;
+    if (!state.isAuthorized || !state.chatFile) {
+        showToast('❌ Нет доступа', 2000);
+        return;
+    }
+    if (!navigator.onLine || !networkState.isOnline) {
+        showToast('📵 Нет подключения', 2500);
+        return;
+    }
+
+    const msgId = _editingMessageId;
+    const msg = historyState.allMessages.find(m => m.id === msgId);
+    if (!msg) { closeEditMessageModal(); return; }
+
+    const newText = $('editMessageInput').value.trim();
+    const oldText = (msg.text || '').trim();
+
+    if (newText === oldText) {
+        closeEditMessageModal();
+        showToast('ℹ️ Текст не изменён', 1200);
+        return;
+    }
+
+    if (newText.length > 50000) {
+        showToast('❌ Максимум 50000 символов', 2000);
+        return;
+    }
+
+    const btn = $('confirmEditMessageBtn');
+    btn.disabled = true;
+    btn.textContent = '⏳ Сохранение...';
+
+    try {
+        const path = getChatPath(state.chatFile);
+        const result = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
+        if (!result.exists) throw new Error('chat not found');
+
+        const fileContent = result.content;
+        if (fileContent.v !== CRYPTO.VERSION) throw new Error('version mismatch');
+
+        if (fileContent.salt !== state.salt) {
+            state.salt = fileContent.salt;
+            CRYPTO._key = await deriveKey(state.chatPassword, state.salt);
+        }
+
+        const idx = fileContent.messages.findIndex(m => m.id === msgId);
+        if (idx === -1) throw new Error('message not found');
+
+        // Расшифровываем, меняем текст, шифруем обратно
+        const plain = await decryptMessage(fileContent.messages[idx]);
+        if (!plain) throw new Error('decrypt failed');
+        if (plain.username !== state.username) throw new Error('not your message');
+
+        plain.text = newText;
+        plain.edited = true;
+        plain.editedAt = new Date().toISOString();
+
+        const reEncrypted = await encryptMessage(plain);
+        fileContent.messages[idx] = { ...fileContent.messages[idx], ...reEncrypted };
+
+        const saved = await saveFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path, fileContent, result.sha);
+
+        // Обновляем метаданные
+        const newVersion = Date.now();
+        await updateMeta(state.chatFile, newVersion, fileContent.messages.length);
+        state._lastMetaVersion = newVersion;
+        state._metaEtag = null;
+        state._metaEtagsByFile[state.chatFile] = null;
+
+        // Обновляем локальное состояние
+        msg.text = newText;
+        msg.edited = true;
+        msg.editedAt = plain.editedAt;
+
+        state.sha = saved.blobSha;
+        state._lastCommitSha = saved.commitSha;
+        state.lastMessageCount = fileContent.messages.length;
+        state._lastActivityAt = Date.now();
+
+        // Перерисовываем конкретное сообщение
+        updateMessageInDOM(msgId, msg);
+
+        closeEditMessageModal();
+        showToast('✅ Сообщение изменено', 1500);
+        soundManager.play('send');
+
+    } catch (e) {
+        console.error('edit message error:', e);
+        soundManager.play('error');
+        const isNetworkError = !navigator.onLine || e.name === 'AbortError'
+            || e.message.includes('Failed to fetch');
+        if (isNetworkError) {
+            networkState.isOnline = false;
+            showToast('📵 Соединение потеряно', 2500);
+        } else {
+            showToast('❌ Ошибка: ' + e.message, 3000);
+        }
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Сохранить';
+    }
+}
+
+/**
+ * Обновляет одно сообщение в DOM без перерисовки всей истории
+ */
+function updateMessageInDOM(msgId, msg) {
+    const wrapper = messagesInner.querySelector(`.message-wrapper[data-msg-id="${msgId}"]`);
+    if (!wrapper) return;
+
+    const msgEl = wrapper.querySelector('.message');
+    if (!msgEl) return;
+
+    const oldTextEl = msgEl.querySelector('.text');
+    const oldEditedMark = msgEl.querySelector('.edited-mark');
+
+    // Если было вложение, но текст теперь пустой — оставляем вложение
+    // Если было эмодзи-только — пересчитываем
+    const hasAttachments = !!(msg.image || msg.audio || msg.file);
+    const emojiInfo = hasAttachments ? null : analyzeEmojiOnly(msg.text || '');
+
+    let newHtml = '';
+    if (msg.text && msg.text.trim()) {
+        if (emojiInfo) {
+            const sizeClass = `emoji-${Math.min(emojiInfo.count, 3)}`;
+            newHtml = `<span class="text emoji-only ${sizeClass}">${escapeHtml(msg.text.trim())}</span>`;
+        } else {
+            newHtml = `<span class="text">${renderTextWithLinks(msg.text)}</span>`;
+        }
+    }
+
+    // Заменяем текст
+    if (oldTextEl) {
+        if (newHtml) {
+            const temp = document.createElement('div');
+            temp.innerHTML = newHtml;
+            oldTextEl.replaceWith(temp.firstElementChild);
+        } else {
+            oldTextEl.remove();
+        }
+    } else if (newHtml) {
+        // Текста раньше не было — вставляем после sender/reply
+        const sender = msgEl.querySelector('.sender');
+        const replyQuote = msgEl.querySelector('.reply-quote');
+        const anchor = replyQuote || sender;
+        if (anchor) anchor.insertAdjacentHTML('afterend', newHtml);
+        else msgEl.insertAdjacentHTML('afterbegin', newHtml);
+    }
+
+    // Обновляем метку "изменено"
+    const timeEl = msgEl.querySelector('.time');
+    if (oldEditedMark) oldEditedMark.remove();
+
+    if (msg.edited && timeEl) {
+        timeEl.insertAdjacentHTML('beforebegin', '<span class="edited-mark">(изменено)</span>');
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ОБРАБОТЧИК ДОЛГОГО НАЖАТИЯ НА СООБЩЕНИЕ
+// ═══════════════════════════════════════════════════════════════
+
+(function initLongPressOnMessages() {
+    const LONG_PRESS_MS = 500;
+    let pressTimer = null;
+    let startX = 0, startY = 0;
+    let targetWrapper = null;
+    let longPressFired = false;
+    let scrollDetected = false;
+
+    function cancelPress() {
+        if (pressTimer) {
+            clearTimeout(pressTimer);
+            pressTimer = null;
+        }
+        targetWrapper = null;
+        scrollDetected = false;
+    }
+
+    function onStart(e) {
+        // Игнорируем клики по интерактивным элементам
+        if (e.target.closest('a, button, audio, .image-container img, .reaction-chip, .audio-play-btn, .file-action-btn, .reply-quote, .image-comment-btn, .comment-item, .link-button')) {
+            return;
+        }
+
+        const touch = e.touches ? e.touches[0] : e;
+        const wrapper = e.target.closest('.message-wrapper');
+        if (!wrapper) return;
+
+        // Игнорируем системные сообщения (нет data-msg-id)
+        if (!wrapper.dataset.msgId) return;
+
+        startX = touch.clientX;
+        startY = touch.clientY;
+        targetWrapper = wrapper;
+        longPressFired = false;
+        scrollDetected = false;
+
+        pressTimer = setTimeout(() => {
+            if (scrollDetected || !targetWrapper) return;
+            longPressFired = true;
+            const msgId = parseInt(targetWrapper.dataset.msgId);
+            if (!msgId) return;
+
+            const msg = historyState.allMessages.find(m => m.id === msgId);
+            if (!msg) return;
+
+            const isOwn = msg.username === state.username && state.isAuthorized;
+
+            const rect = targetWrapper.getBoundingClientRect();
+            showMessageMenu(
+                rect.left + rect.width / 2,
+                rect.top,
+                msgId,
+                isOwn
+            );
+        }, LONG_PRESS_MS);
+    }
+
+    function onMove(e) {
+        if (!pressTimer) return;
+        const touch = e.touches ? e.touches[0] : e;
+        const dx = touch.clientX - startX;
+        const dy = touch.clientY - startY;
+        if (Math.hypot(dx, dy) > 10) {
+            scrollDetected = true;
+            cancelPress();
+        }
+    }
+
+    function onEnd(e) {
+        if (longPressFired) {
+            // Гасим клик после долгого нажатия
+            e.preventDefault?.();
+            e.stopPropagation?.();
+            longPressFired = false;
+        }
+        cancelPress();
+    }
+
+    messagesInner.addEventListener('touchstart', onStart, { passive: true });
+    messagesInner.addEventListener('touchmove',  onMove,  { passive: true });
+    messagesInner.addEventListener('touchend',   onEnd);
+    messagesInner.addEventListener('touchcancel', onEnd);
+
+    // Для десктопа — ПКМ / долгий клик мышью
+    messagesInner.addEventListener('mousedown', (e) => {
+        if (e.button !== 0) return;
+        onStart(e);
+    });
+    messagesInner.addEventListener('mousemove', onMove);
+    messagesInner.addEventListener('mouseup', onEnd);
+    messagesInner.addEventListener('mouseleave', onEnd);
+
+    // ПКМ — как альтернатива на десктопе
+    messagesInner.addEventListener('contextmenu', (e) => {
+        const wrapper = e.target.closest('.message-wrapper');
+        if (!wrapper || !wrapper.dataset.msgId) return;
+        if (e.target.closest('a, button, audio, input, textarea')) return;
+        e.preventDefault();
+        const msgId = parseInt(wrapper.dataset.msgId);
+        const msg = historyState.allMessages.find(m => m.id === msgId);
+        if (!msg) return;
+        const isOwn = msg.username === state.username && state.isAuthorized;
+        showMessageMenu(e.clientX, e.clientY, msgId, isOwn);
+    });
+})();
+
+// ═══════════════════════════════════════════════════════════════
+//  ОБРАБОТЧИКИ МОДАЛКИ РЕДАКТИРОВАНИЯ
+// ═══════════════════════════════════════════════════════════════
+
+$('cancelEditMessageBtn').addEventListener('click', closeEditMessageModal);
+$('confirmEditMessageBtn').addEventListener('click', confirmEditMessage);
+
+$('editMessageInput').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        confirmEditMessage();
+    }
+    if (e.key === 'Escape') {
+        e.preventDefault();
+        closeEditMessageModal();
+    }
+});
+
+// Закрытие по клику на фон
+$('editMessageModal').addEventListener('click', (e) => {
+    if (e.target === $('editMessageModal')) closeEditMessageModal();
+});
+
+// Обновляем Escape-обработчик
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && $('editMessageModal').classList.contains('active')) {
+        closeEditMessageModal();
+    }
+});
+
+console.log('✏️ Редактирование сообщений: долгое нажатие → меню');
 
 console.log('🎵 Глобальный плеер активен — музыка играет между чатами');
 console.log('🔗 Инлайн-плееры синхронизируются с глобальным');
