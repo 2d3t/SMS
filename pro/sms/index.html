@@ -122,6 +122,47 @@
             display: flex; align-items: center; justify-content: center;
             font-weight: 700; color: #fff; flex-shrink: 0;
         }
+/* ═══ 🖼️ Аватарки чатов (только локально) ═══ */
+.chat-avatar,
+.chat-header .avatar {
+    cursor: pointer;
+    overflow: hidden;
+    transition: transform 0.15s, box-shadow 0.2s;
+    position: relative;
+}
+.chat-avatar:active,
+.chat-header .avatar:active {
+    transform: scale(0.92);
+}
+.chat-avatar img,
+.chat-header .avatar img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    border-radius: 50%;
+    display: block;
+    pointer-events: none;
+}
+.chat-avatar.has-custom-avatar:hover,
+.chat-header .avatar.has-custom-avatar:hover {
+    box-shadow: 0 0 0 2px rgba(108,92,231,0.6);
+}
+.chat-avatar.uploading,
+.chat-header .avatar.uploading {
+    opacity: 0.6;
+    pointer-events: none;
+}
+.chat-avatar.uploading::after,
+.chat-header .avatar.uploading::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: 50%;
+    border: 2px solid transparent;
+    border-top-color: #fff;
+    animation: avatarSpin 0.7s linear infinite;
+}
+@keyframes avatarSpin { to { transform: rotate(360deg); } }
         .chat-name {
             font-size: 15px; font-weight: 600; color: #fff;
             white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
@@ -2884,6 +2925,9 @@ style="width:100%;padding:12px 14px;background:rgba(255,255,255,0.06);
 
 <div class="toast" id="toast"></div>
 
+<!-- 🖼️ Скрытый input для выбора личной аватарки чата -->
+<input type="file" id="avatarFileInput" accept="image/*" style="display:none">
+
 <script>
 // ===================================================================
 //  КОНФИГУРАЦИЯ
@@ -3248,6 +3292,7 @@ const modalImageNext = $('modalImageNext');
 const closeModalBtn = $('closeModalBtn');
 const scrollDownBtn = $('scrollDownBtn');
 const scrollBadge = $('scrollBadge');
+const avatarFileInput = $('avatarFileInput');
 
 // ===================================================================
 //  УТИЛИТЫ ЧАТОВ
@@ -11204,6 +11249,310 @@ enterChat = async function(...args) {
     setTimeout(initHistoryObserver, 500);
     return r;
 };
+
+// ═══════════════════════════════════════════════════════════════
+//  🖼️ ЛИЧНЫЕ АВАТАРКИ ЧАТОВ (localStorage, каждый видит только своё)
+// ═══════════════════════════════════════════════════════════════
+
+const AVATAR_STORAGE_KEY = 'chathub_avatars';
+const AVATAR_MAX_SIZE = 300 * 1024;     // ~300 КБ в base64
+const AVATAR_DIMENSION = 256;           // 256×256 квадрат
+
+let _avatars = {};
+let _avatarTargetFile = null;
+
+function loadAvatars() {
+    try {
+        const raw = localStorage.getItem(AVATAR_STORAGE_KEY);
+        _avatars = raw ? JSON.parse(raw) : {};
+    } catch (e) { _avatars = {}; }
+}
+function saveAvatars() {
+    try {
+        localStorage.setItem(AVATAR_STORAGE_KEY, JSON.stringify(_avatars));
+    } catch (e) {
+        if (e.name === 'QuotaExceededError') {
+            showToast('⚠️ Хранилище переполнено', 3000);
+        }
+    }
+}
+
+function getChatAvatar(chatFile) {
+    if (!chatFile) return null;
+    return _avatars[chatFile] || null;
+}
+
+/**
+ * Применяет аватарку к элементу (или возвращает букву-фолбэк).
+ * ВАЖНО: не ломает классы has-unread, uploading — сохраняем их.
+ */
+function applyAvatarToElement(el, chatFile) {
+    if (!el || !chatFile) return;
+
+    // Сохраняем служебные классы, которые могли стоять
+    const keepClasses = [];
+    if (el.classList.contains('has-unread')) keepClasses.push('has-unread');
+    if (el.classList.contains('uploading')) keepClasses.push('uploading');
+
+    const dataUrl = getChatAvatar(chatFile);
+    const chat = state.chats.find(c => c.file === chatFile);
+    const letter = (chat?.name || chatFile).charAt(0).toUpperCase();
+
+    // Очищаем содержимое и пересобираем
+    el.innerHTML = '';
+    el.classList.remove('has-custom-avatar');
+    keepClasses.forEach(c => el.classList.add(c));
+
+    if (dataUrl) {
+        const img = document.createElement('img');
+        img.src = dataUrl;
+        img.alt = 'Аватар';
+        el.appendChild(img);
+        el.classList.add('has-custom-avatar');
+    } else {
+        el.textContent = letter;
+    }
+}
+
+function refreshAllAvatarsForChat(chatFile) {
+    // В списке чатов
+    document.querySelectorAll(`.chat-avatar[data-avatar-file="${chatFile}"]`).forEach(el => {
+        applyAvatarToElement(el, chatFile);
+    });
+    // В шапке открытого чата
+    if (state.chatFile === chatFile) {
+        applyAvatarToElement(userAvatar, chatFile);
+    }
+}
+
+function pickAvatarForChat(chatFile) {
+    if (!chatFile) return;
+    _avatarTargetFile = chatFile;
+    avatarFileInput.value = '';
+    avatarFileInput.click();
+}
+
+async function handleAvatarFileSelected(file) {
+    if (!file || !_avatarTargetFile) return;
+    const chatFile = _avatarTargetFile;
+    _avatarTargetFile = null;
+
+    if (!file.type.startsWith('image/')) {
+        showToast('❌ Только изображения', 2000);
+        return;
+    }
+    if (file.size > CONFIG.maxImageSize) {
+        showToast(`❌ Максимум ${formatFileSize(CONFIG.maxImageSize)}`, 2500);
+        return;
+    }
+
+    // Визуальная блокировка — сразу все места, где показана эта аватарка
+    const els = document.querySelectorAll(
+        `.chat-avatar[data-avatar-file="${chatFile}"], ` +
+        (state.chatFile === chatFile ? '#userAvatar' : '.nothing')
+    );
+    els.forEach(el => el.classList.add('uploading'));
+
+    try {
+        const dataUrl = await makeAvatarDataUrl(file);
+        _avatars[chatFile] = dataUrl;
+        saveAvatars();
+        refreshAllAvatarsForChat(chatFile);
+        showToast('✅ Аватарка обновлена', 1500);
+        soundManager.play('click');
+    } catch (e) {
+        console.error('avatar error:', e);
+        showToast('❌ ' + (e.message || 'Ошибка'), 2500);
+        soundManager.play('error');
+    } finally {
+        els.forEach(el => el.classList.remove('uploading'));
+    }
+}
+
+/**
+ * Кроп-центр → квадрат → resize → JPEG → data:URL
+ */
+function makeAvatarDataUrl(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onerror = () => reject(new Error('Не удалось прочитать файл'));
+        reader.onload = (e) => {
+            const img = new Image();
+            img.onerror = () => reject(new Error('Невалидное изображение'));
+            img.onload = () => {
+                const side = Math.min(img.width, img.height);
+                const sx = (img.width - side) / 2;
+                const sy = (img.height - side) / 2;
+
+                const canvas = document.createElement('canvas');
+                canvas.width = AVATAR_DIMENSION;
+                canvas.height = AVATAR_DIMENSION;
+                const ctx = canvas.getContext('2d');
+                ctx.imageSmoothingEnabled = true;
+                ctx.imageSmoothingQuality = 'high';
+                ctx.drawImage(img, sx, sy, side, side, 0, 0, AVATAR_DIMENSION, AVATAR_DIMENSION);
+
+                let dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+                if (dataUrl.length > AVATAR_MAX_SIZE) dataUrl = canvas.toDataURL('image/jpeg', 0.7);
+                if (dataUrl.length > AVATAR_MAX_SIZE) dataUrl = canvas.toDataURL('image/jpeg', 0.55);
+                resolve(dataUrl);
+            };
+            img.src = e.target.result;
+        };
+        reader.readAsDataURL(file);
+    });
+}
+
+function removeChatAvatar(chatFile) {
+    if (!_avatars[chatFile]) return;
+    delete _avatars[chatFile];
+    saveAvatars();
+    refreshAllAvatarsForChat(chatFile);
+    showToast('🗑️ Аватарка удалена', 1200);
+    soundManager.play('delete');
+}
+
+// ═══ Обработчик выбора файла ═══
+avatarFileInput.addEventListener('change', (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (file) handleAvatarFileSelected(file);
+    e.target.value = '';
+});
+
+// ═══ Делегирование кликов по аватаркам в СПИСКЕ ЧАТОВ ═══
+document.getElementById('chatsList').addEventListener('click', (e) => {
+    const avatar = e.target.closest('.chat-avatar');
+    if (!avatar) return;
+    const item = avatar.closest('.chat-list-item');
+    if (!item) return;
+    e.stopPropagation();
+    e.preventDefault();
+    pickAvatarForChat(item.dataset.file);
+});
+
+// ═══ Клик по аватарке в ШАПКЕ ЧАТА ═══
+userAvatar.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (!state.chatFile) return;
+    pickAvatarForChat(state.chatFile);
+});
+
+// ═══ Лонг-тап → удалить аватарку ═══
+(function setupAvatarLongPress() {
+    let timer = null;
+    let longPressFired = false;
+    const LONG_PRESS = 600;
+
+    function start(chatFile) {
+        longPressFired = false;
+        timer = setTimeout(() => {
+            longPressFired = true;
+            if (navigator.vibrate) navigator.vibrate(30);
+            if (getChatAvatar(chatFile)) {
+                if (confirm('Удалить аватарку этого чата?')) {
+                    removeChatAvatar(chatFile);
+                }
+            } else {
+                showToast('ℹ️ Аватарки нет', 1200);
+            }
+        }, LONG_PRESS);
+    }
+    function cancel() {
+        if (timer) { clearTimeout(timer); timer = null; }
+    }
+
+    // Список чатов
+    const chatsListEl = document.getElementById('chatsList');
+    chatsListEl.addEventListener('touchstart', (e) => {
+        const av = e.target.closest('.chat-avatar');
+        if (!av) return;
+        const item = av.closest('.chat-list-item');
+        if (item) start(item.dataset.file);
+    }, { passive: true });
+    chatsListEl.addEventListener('touchend', cancel);
+    chatsListEl.addEventListener('touchmove', cancel);
+    chatsListEl.addEventListener('touchcancel', cancel);
+
+    // Шапка чата
+    userAvatar.addEventListener('touchstart', (e) => {
+        if (state.chatFile) start(state.chatFile);
+    }, { passive: true });
+    userAvatar.addEventListener('touchend', cancel);
+    userAvatar.addEventListener('touchmove', cancel);
+    userAvatar.addEventListener('touchcancel', cancel);
+
+    // Не даём лонг-тапу открыть чат/модалку по touchend
+    chatsListEl.addEventListener('click', (e) => {
+        if (longPressFired) {
+            e.stopPropagation();
+            e.preventDefault();
+            longPressFired = false;
+        }
+    }, true);
+    userAvatar.addEventListener('click', (e) => {
+        if (longPressFired) {
+            e.stopPropagation();
+            e.preventDefault();
+            longPressFired = false;
+        }
+    }, true);
+})();
+
+// ═══ Патч renderChatsList — навешиваем data-атрибут и аватарки ═══
+const _origRenderChatsListForAvatar = renderChatsList;
+renderChatsList = function() {
+    _origRenderChatsListForAvatar.apply(this, arguments);
+    document.querySelectorAll('#chatsList .chat-list-item').forEach(item => {
+        const file = item.dataset.file;
+        const avatar = item.querySelector('.chat-avatar');
+        if (avatar && file) {
+            avatar.dataset.avatarFile = file;
+            applyAvatarToElement(avatar, file);
+        }
+    });
+};
+
+// ═══ Патч enterChat — аватарка в шапке открытого чата ═══
+const _origEnterChatForAvatar = enterChat;
+enterChat = async function(file, name, password) {
+    const r = await _origEnterChatForAvatar.apply(this, arguments);
+    if (state.chatFile === file) {
+        applyAvatarToElement(userAvatar, file);
+    }
+    return r;
+};
+
+// ═══ Патч backToChats — сброс аватарки шапки ═══
+const _origBackToChatsForAvatar = backToChats;
+backToChats = function() {
+    _origBackToChatsForAvatar.apply(this, arguments);
+    userAvatar.classList.remove('has-custom-avatar');
+    userAvatar.textContent = '?';
+};
+
+// ═══ Патч confirmRenameChat — обновление буквы-фолбэка ═══
+const _origConfirmRenameForAvatar = confirmRenameChat;
+confirmRenameChat = function() {
+    const file = _pendingRenameFile;
+    _origConfirmRenameForAvatar.apply(this, arguments);
+    if (file && !getChatAvatar(file)) {
+        const el = document.querySelector(`.chat-avatar[data-avatar-file="${file}"]`);
+        if (el) applyAvatarToElement(el, file);
+    }
+};
+
+// ═══ Патч logout — чистим кэш аватарок (в памяти) ═══
+// (в localStorage они остаются — это профиль пользователя)
+const _origLogoutForAvatar = logout;
+logout = function() {
+    _avatars = {};        // in-memory сброс; в localStorage остаётся
+    _origLogoutForAvatar.apply(this, arguments);
+};
+
+// ═══ Инициализация ═══
+loadAvatars();
+console.log('🖼️ Личные аватарки чатов активны — клик по аватарке, лонг-тап для удаления');
+
 
 console.log('🎵 Глобальный плеер активен — музыка играет между чатами');
 console.log('🔗 Инлайн-плееры синхронизируются с глобальным');
