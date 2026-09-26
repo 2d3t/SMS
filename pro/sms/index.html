@@ -8316,8 +8316,6 @@ function closeImageModal() {
     window._updateGallerySizes = applySizes;
 })();
 
-
-
 async function handleVideoFileUpload(file) {
     if (!file) return;
     if (!state.isAuthorized || !state.chatFile) {
@@ -8336,8 +8334,12 @@ async function handleVideoFileUpload(file) {
         return;
     }
 
-    if (file.size > VIDEO_CONFIG.fileMaxSize) {
-        showToast(`❌ Максимум ${formatFileSize(VIDEO_CONFIG.fileMaxSize)}`, 3000);
+    // ═══ 🆕 РАСШИРЕННЫЙ ЛИМИТ НА ВХОДЕ ═══
+    // Разрешаем выбрать "большое" видео — оно сожмётся.
+    // Жёсткий потолок — 500 МБ (защита от совсем тяжёлых файлов).
+    const INPUT_HARD_LIMIT = 500 * 1024 * 1024;   // 500 МБ
+    if (file.size > INPUT_HARD_LIMIT) {
+        showToast(`❌ Файл слишком большой (${formatFileSize(file.size)}). Максимум ${formatFileSize(INPUT_HARD_LIMIT)}`, 3500);
         return;
     }
     if (file.size === 0) {
@@ -8347,52 +8349,63 @@ async function handleVideoFileUpload(file) {
 
     let finalBlob = file;
     let finalMime = file.type || guessMimeFromName(file.name) || 'video/mp4';
-    let finalExt = (file.name.split('.').pop() || 'mp4').toLowerCase().replace(/[^a-z0-9]/g, '') || 'mp4';
+    let finalExt = (file.name.split('.').pop() || 'mp4')
+        .toLowerCase().replace(/[^a-z0-9]/g, '') || 'mp4';
 
-    // ═══════════════════════════════════════════════════════════════
-    //  🆕 АВТО-СЖАТИЕ ВИДЕО
-    //  Если файл > 950 КБ — пытаемся перекодировать
-    // ═══════════════════════════════════════════════════════════════
+    // ═══ АВТОСЖАТИЕ ═══
     if (file.size > CONFIG.autoCompressTargetBytes) {
-        showToast(`⏳ Сжимаем видео (${formatFileSize(file.size)})…`, 3000);
+        const durationSec = await getVideoDuration(file).catch(() => 0);
+        const hint = durationSec > 0 ? ` (${Math.round(durationSec)} с)` : '';
+        showToast(`⏳ Сжимаем видео ${formatFileSize(file.size)}${hint}…`, 3000);
 
-        // Показываем оверлей прогресса
         UploadProgress.open(`🎬 ${file.name}`, file.size);
-        
         try {
             const result = await compressVideoFile(file, CONFIG.autoCompressTargetBytes);
-            
             if (result && result.blob && result.blob.size > 0 && result.blob.size < file.size) {
-                const saved = file.size - result.blob.size;
-                const ratio = ((saved / file.size) * 100).toFixed(0);
+                const ratio = ((1 - result.blob.size / file.size) * 100).toFixed(0);
                 finalBlob = result.blob;
                 finalMime = result.mime;
-                finalExt = 'webm';   // MediaRecorder выдаёт webm
-                
-                UploadProgress.finish(`Сжато: ${formatFileSize(file.size)} → ${formatFileSize(finalBlob.size)}`);
+                finalExt = 'webm';
+                UploadProgress.finish(
+                    `Сжато: ${formatFileSize(file.size)} → ${formatFileSize(finalBlob.size)} (−${ratio}%)`
+                );
                 showToast(`✅ Видео сжато на ${ratio}% (${formatFileSize(finalBlob.size)})`, 2500);
             } else {
                 UploadProgress.close();
-                showToast(`ℹ️ Сжатие не удалось — отправляем как есть`, 2500);
+                // 🆕 Если сжать не удалось — но файл всё ещё влезает в hardLimit (25 МБ),
+                //     отправляем как есть. Если больше — ругаемся.
+                if (file.size > CONFIG.hardLimitBytes) {
+                    showToast(`❌ Не удалось сжать, а файл больше ${formatFileSize(CONFIG.hardLimitBytes)}`, 4000);
+                    return;
+                }
+                showToast(`ℹ️ Сжатие не удалось — отправляем как есть (${formatFileSize(file.size)})`, 3000);
             }
         } catch (e) {
             console.warn('Compress failed:', e);
             UploadProgress.close();
+            if (file.size > CONFIG.hardLimitBytes) {
+                showToast(`❌ Не удалось сжать, а файл больше ${formatFileSize(CONFIG.hardLimitBytes)}`, 4000);
+                return;
+            }
             showToast(`ℹ️ Сжатие не удалось — отправляем как есть`, 2500);
         }
     }
 
-    // Получаем длительность
-    let duration = 0;
-    try {
-        duration = await getVideoDuration(finalBlob);
-    } catch (e) {}
+    // ═══ ФИНАЛЬНАЯ ПРОВЕРКА после сжатия ═══
+    // uploadAttachmentAuto сам разберётся: < 1 МБ → напрямую, иначе → чанки.
+    // Но всё же проверим, что не больше жёсткого лимита GitHub.
+    if (finalBlob.size > CONFIG.hardLimitBytes) {
+        showToast(`❌ Даже после сжатия файл больше ${formatFileSize(CONFIG.hardLimitBytes)}`, 4000);
+        return;
+    }
 
-    // Отправляем
+    // ═══ Отправка ═══
+    let duration = 0;
+    try { duration = await getVideoDuration(finalBlob); } catch (e) {}
+
     try {
         const buf = await finalBlob.arrayBuffer();
         const attachName = generateAttachmentName('video', finalExt);
-
         await uploadAttachmentAuto(
             state.chatFile,
             attachName,
@@ -8413,8 +8426,6 @@ async function handleVideoFileUpload(file) {
         showToast('❌ Ошибка отправки: ' + e.message, 3000);
     }
 }
-
-
     
 
 // ===================================================================
