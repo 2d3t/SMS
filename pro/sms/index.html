@@ -2777,29 +2777,7 @@ body.player-active .messages-container { padding-bottom: 68px; }
 #videoModal .vm-topbar > * {
     pointer-events: auto;
 }
-#videoModal .vm-share {
-    width: 48px;
-    height: 48px;
-    border-radius: 50%;
-    background: rgba(255,255,255,0.18);
-    border: 2px solid rgba(255,255,255,0.35);
-    color: #fff;
-    font-size: 22px;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    backdrop-filter: blur(10px);
-    -webkit-backdrop-filter: blur(10px);
-    transition: all 0.15s;
-    box-shadow: 0 4px 20px rgba(0,0,0,0.5);
-    flex-shrink: 0;
-}
-#videoModal .vm-share:hover {
-    background: rgba(0,184,148,0.35);
-    border-color: rgba(0,184,148,0.6);
-}
-#videoModal .vm-share:active { transform: scale(0.9); }
+
 #videoModal .vm-close {
     width: 48px;
     height: 48px;
@@ -2894,12 +2872,11 @@ body.player-active .messages-container { padding-bottom: 68px; }
 
 @media (max-width: 480px) {
     #videoModal .vm-close,
-#videoModal .vm-fullscreen,
-#videoModal .vm-share {
-    width: 42px;
-    height: 42px;
-    font-size: 20px;
-}
+    #videoModal .vm-fullscreen {
+        width: 42px;
+        height: 42px;
+        font-size: 20px;
+    }
     #videoModal .vm-topbar { top: 12px; left: 12px; right: 12px; }
     #videoModal .vm-hint { font-size: 11px; padding: 6px 12px; bottom: 14px; }
 }
@@ -3475,16 +3452,15 @@ style="width:100%;padding:12px 14px;background:rgba(255,255,255,0.06);
 </div>
 <!-- ═══════════ МОДАЛКА ПРОСМОТРА ВИДЕО ═══════════ -->
 <!-- ═══════════ МОДАЛКА ПРОСМОТРА ВИДЕО ═══════════ -->
-
 <div id="videoModal">
     <div class="vm-topbar">
         <button class="vm-fullscreen" id="videoFullscreenBtn" title="На весь экран / Выйти">⛶</button>
-        <button class="vm-share" id="videoShareBtn" title="Поделиться">↗</button>
         <button class="vm-close" id="videoModalClose" title="Закрыть (Esc)">✕</button>
     </div>
     <video id="videoModalPlayer" controls playsinline webkit-playsinline></video>
     <div class="vm-hint" id="vmHint">Двойной тап — на весь экран · Крестик сверху — закрыть</div>
 </div>
+
 
 <div class="toast" id="toast"></div>
 
@@ -7138,16 +7114,7 @@ function createFileCardHTML(attachName, url, fileName, fileSize) {
 function downloadAttachedFile(url, fileName) {
     const a = document.createElement('a');
     a.href = url;
-
-    // 🆕 На Android подменяем .webm → .mp4 —
-    // многие плееры смотрят на содержимое, а не на расширение,
-    // и после подмены webm-видео открывается в галерее
-    let outName = fileName || 'file';
-    if (/\.webm$/i.test(outName) && /Android/i.test(navigator.userAgent)) {
-        outName = outName.replace(/\.webm$/i, '.mp4');
-    }
-    a.download = outName;
-
+    a.download = fileName || 'file';
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -7173,6 +7140,7 @@ async function shareFileToChat(url, fileName) {
 }
 
 
+
 async function shareAudioToChat(url, fileName) {
     try {
         const res = await fetch(url);
@@ -7184,17 +7152,7 @@ async function shareAudioToChat(url, fileName) {
     }
 }
 
-// 🆕 Поделиться видео
-async function shareVideoToChat(url, fileName) {
-    try {
-        const res = await fetch(url);
-        const blob = await res.blob();
-        openShareToChatModal(blob, fileName, null, { isVideo: true });
-    } catch (e) {
-        console.error(e);
-        showToast('❌ Не удалось подготовить видео', 2000);
-    }
-}
+
 
 
 // ===================================================================
@@ -7224,8 +7182,13 @@ function buildMessageHTML(msg, opts = {}) {
         }
     }
 
-   // ═══ Медиа: фото / аудио / файл — все поддерживают комментарии ═══
+   // ═══ Медиа: фото / аудио / файл / видео — все поддерживают комментарии ═══
 let hasMedia = false;
+
+// ═══ Видео-кружочек и видеофайл тоже медиа ═══
+if (msg.video || msg.videoNote) {
+    hasMedia = true;
+}
 
 // ═══ Картинка ═══
 if (msg.image) {
@@ -8564,6 +8527,7 @@ function closeImageModal() {
 
     window._updateGallerySizes = applySizes;
 })();
+
 async function handleVideoFileUpload(file) {
     if (!file) return;
     if (!state.isAuthorized || !state.chatFile) {
@@ -8582,7 +8546,10 @@ async function handleVideoFileUpload(file) {
         return;
     }
 
-    const INPUT_HARD_LIMIT = 500 * 1024 * 1024;
+    // ═══ 🆕 РАСШИРЕННЫЙ ЛИМИТ НА ВХОДЕ ═══
+    // Разрешаем выбрать "большое" видео — оно сожмётся.
+    // Жёсткий потолок — 500 МБ (защита от совсем тяжёлых файлов).
+    const INPUT_HARD_LIMIT = 500 * 1024 * 1024;   // 500 МБ
     if (file.size > INPUT_HARD_LIMIT) {
         showToast(`❌ Файл слишком большой (${formatFileSize(file.size)}). Максимум ${formatFileSize(INPUT_HARD_LIMIT)}`, 3500);
         return;
@@ -8597,66 +8564,57 @@ async function handleVideoFileUpload(file) {
     let finalExt = (file.name.split('.').pop() || 'mp4')
         .toLowerCase().replace(/[^a-z0-9]/g, '') || 'mp4';
 
-    // 🆕 НЕ сжимаем, если файл уже маленький и это MP4/MOV
-    const isSmallEnough = file.size <= CONFIG.autoCompressTargetBytes;
-    const isAlreadyMp4Family = /\.(mp4|m4v|mov)$/i.test(file.name) &&
-        (file.type === 'video/mp4' || file.type === 'video/quicktime' || file.type === '');
+    // ═══ АВТОСЖАТИЕ ═══
+if (file.size > CONFIG.autoCompressTargetBytes) {
+    const durationSec = await getVideoDuration(file).catch(() => 0);
+    const hint = durationSec > 0 ? ` (${Math.round(durationSec)} с)` : '';
 
-    if (isSmallEnough && isAlreadyMp4Family) {
-        // Отправляем оригинал без сжатия — он уже откроется на телефоне
-        console.log('📹 Маленькое MP4 — отправляем без сжатия');
-        showToast(`📹 Видео ${formatFileSize(file.size)} — без сжатия`, 1500);
-        finalExt = (file.name.split('.').pop() || 'mp4').toLowerCase();
-        finalMime = file.type || 'video/mp4';
-    } else if (file.size > CONFIG.autoCompressTargetBytes) {
-        // ═══ СЖАТИЕ ═══
-        const durationSec = await getVideoDuration(file).catch(() => 0);
+    UploadProgress.open(file.name, file.size, {
+        icon: '🎬',
+        phase: 'compressing',
+        force: true,
+        cancelText: 'Прервать сжатие',
+    });
 
-        UploadProgress.open(file.name, file.size, {
-            icon: '🎬',
-            phase: 'compressing',
-            force: true,
-            cancelText: 'Прервать сжатие',
-        });
-
-        try {
-            const result = await compressVideoFile(file, CONFIG.autoCompressTargetBytes);
-            if (result && result.blob && result.blob.size > 0 && result.blob.size < file.size) {
-                const ratio = ((1 - result.blob.size / file.size) * 100).toFixed(0);
-                finalBlob = result.blob;
-                finalMime = result.mime;
-                finalExt = result.ext || (result.mime.startsWith('video/mp4') ? 'mp4' : 'webm');
-                UploadProgress.finish(
-                    `✅ Сжато: ${formatFileSize(file.size)} → ${formatFileSize(finalBlob.size)} (−${ratio}%)`
-                );
-                showToast(
-                    `✅ Сжато на ${ratio}% (${formatFileSize(finalBlob.size)}, .${finalExt})`,
-                    2500
-                );
-            } else {
-                UploadProgress.close();
-                if (file.size > CONFIG.hardLimitBytes) {
-                    showToast(`❌ Не удалось сжать, а файл больше ${formatFileSize(CONFIG.hardLimitBytes)}`, 4000);
-                    return;
-                }
-                showToast(`ℹ️ Сжатие не удалось — отправляем как есть`, 3000);
-            }
-        } catch (e) {
-            console.warn('Compress failed:', e);
+    try {
+        const result = await compressVideoFile(file, CONFIG.autoCompressTargetBytes);
+        if (result && result.blob && result.blob.size > 0 && result.blob.size < file.size) {
+            const ratio = ((1 - result.blob.size / file.size) * 100).toFixed(0);
+            finalBlob = result.blob;
+            finalMime = result.mime;
+            finalExt = 'webm';
+            UploadProgress.finish(
+                `✅ Сжато: ${formatFileSize(file.size)} → ${formatFileSize(finalBlob.size)} (−${ratio}%)`
+            );
+            showToast(`✅ Видео сжато на ${ratio}% (${formatFileSize(finalBlob.size)})`, 2500);
+        } else {
             UploadProgress.close();
             if (file.size > CONFIG.hardLimitBytes) {
                 showToast(`❌ Не удалось сжать, а файл больше ${formatFileSize(CONFIG.hardLimitBytes)}`, 4000);
                 return;
             }
-            showToast(`ℹ️ Сжатие не удалось — отправляем как есть`, 2500);
+            showToast(`ℹ️ Сжатие не удалось — отправляем как есть (${formatFileSize(file.size)})`, 3000);
         }
+    } catch (e) {
+        console.warn('Compress failed:', e);
+        UploadProgress.close();
+        if (file.size > CONFIG.hardLimitBytes) {
+            showToast(`❌ Не удалось сжать, а файл больше ${formatFileSize(CONFIG.hardLimitBytes)}`, 4000);
+            return;
+        }
+        showToast(`ℹ️ Сжатие не удалось — отправляем как есть`, 2500);
     }
+}
 
+    // ═══ ФИНАЛЬНАЯ ПРОВЕРКА после сжатия ═══
+    // uploadAttachmentAuto сам разберётся: < 1 МБ → напрямую, иначе → чанки.
+    // Но всё же проверим, что не больше жёсткого лимита GitHub.
     if (finalBlob.size > CONFIG.hardLimitBytes) {
         showToast(`❌ Даже после сжатия файл больше ${formatFileSize(CONFIG.hardLimitBytes)}`, 4000);
         return;
     }
 
+    // ═══ Отправка ═══
     let duration = 0;
     try { duration = await getVideoDuration(finalBlob); } catch (e) {}
 
@@ -8683,6 +8641,8 @@ async function handleVideoFileUpload(file) {
         showToast('❌ Ошибка отправки: ' + e.message, 3000);
     }
 }
+    
+
 // ===================================================================
 //  ПОДЕЛИТЬСЯ С ЧАТОМ
 // ===================================================================
@@ -8791,13 +8751,11 @@ async function confirmShareToChat() {
 
 
 
+
 async function doShareToChat(targetFile, targetPassword, blob, fileName, mime, meta = {}) {
     const isImage = mime.startsWith('image/');
     const isAudio = mime.startsWith('audio/') ||
         /\.(mp3|ogg|wav|m4a|aac|flac|opus|webm)$/i.test(fileName);
-    // 🆕 Видео — отдельный тип
-    const isVideo = mime.startsWith('video/') ||
-        /\.(mp4|mov|webm|mkv|avi|m4v|3gp)$/i.test(fileName);
 
     showToast(`📤 Отправка в чат…`, 1500);
 
@@ -8823,16 +8781,10 @@ async function doShareToChat(targetFile, targetPassword, blob, fileName, mime, m
 
         const targetKey = await deriveKey(targetPassword, targetSalt);
 
-        // 🆕 Префикс по типу
-        let prefix = 'file';
-        if (isImage) prefix = 'img';
-        else if (isAudio) prefix = 'aud';
-        else if (isVideo) prefix = 'video';
-
         const ext = isImage
             ? 'jpg'
             : (fileName.split('.').pop() || 'bin').toLowerCase().replace(/[^a-z0-9]/g, '') || 'bin';
-        const attachName = generateAttachmentName(prefix, ext);
+        const attachName = generateAttachmentName(isImage ? 'img' : (isAudio ? 'aud' : 'file'), ext);
         const buf = await blob.arrayBuffer();
 
         const saveState = {
@@ -8846,11 +8798,7 @@ async function doShareToChat(targetFile, targetPassword, blob, fileName, mime, m
         CRYPTO._key = targetKey;
 
         try {
-            let label;
-            if (isImage) label = `📷 ${fileName}`;
-            else if (isAudio) label = `🎵 ${fileName}`;
-            else if (isVideo) label = `🎬 ${fileName}`;
-            else label = `📎 ${fileName}`;
+            const label = isImage ? `📷 ${fileName}` : (isAudio ? `🎵 ${fileName}` : `📎 ${fileName}`);
             await uploadAttachmentAuto(targetFile, attachName, buf, mime, label);
         } finally {
             state.chatFile = saveState.chatFile;
@@ -8866,39 +8814,29 @@ async function doShareToChat(targetFile, targetPassword, blob, fileName, mime, m
             text: '',
             time: new Date().toISOString(),
         };
-
-        // ═══ Заполняем payload ═══
-        const payload = { username: state.username, text: '' };
-
         if (isImage) {
             plainMsg.image = attachName;
-            payload.image = attachName;
         } else if (isAudio) {
             plainMsg.audio = attachName;
             plainMsg.audioName = fileName;
             plainMsg.audioDuration = 0;
             plainMsg.audioMime = mime;
-            payload.audio = attachName;
-            payload.audioName = fileName;
-            payload.audioDuration = 0;
-            payload.audioMime = mime;
-        } else if (isVideo) {
-            // 🆕 Видео как видео, а не как generic file
-            plainMsg.video = attachName;
-            plainMsg.videoName = fileName;
-            plainMsg.videoDuration = 0;
-            plainMsg.videoMime = mime;
-            plainMsg.videoSize = blob.size;
-            payload.video = attachName;
-            payload.videoName = fileName;
-            payload.videoDuration = 0;
-            payload.videoMime = mime;
-            payload.videoSize = blob.size;
         } else {
             plainMsg.file = attachName;
             plainMsg.fileName = fileName;
             plainMsg.fileMime = mime;
             plainMsg.fileSize = blob.size;
+        }
+
+        const payload = { username: state.username, text: '' };
+        if (isImage) {
+            payload.image = attachName;
+        } else if (isAudio) {
+            payload.audio = attachName;
+            payload.audioName = fileName;
+            payload.audioDuration = 0;
+            payload.audioMime = mime;
+        } else {
             payload.file = attachName;
             payload.fileName = fileName;
             payload.fileMime = mime;
@@ -8948,6 +8886,9 @@ async function doShareToChat(targetFile, targetPassword, blob, fileName, mime, m
         soundManager.play('error');
     }
 }
+
+
+
 
 
 // ===================================================================
@@ -12829,39 +12770,7 @@ $('videoFullscreenBtn').addEventListener('click', (e) => {
     e.stopPropagation();
     toggleVideoFullscreen();
 });
-// 🆕 Кнопка «Поделиться» в модалке видео
-$('videoShareBtn').addEventListener('click', async (e) => {
-    e.stopPropagation();
-    const player = $('videoModalPlayer');
-    const src = player && player.src;
-    if (!src) return;
 
-    if (navigator.vibrate) navigator.vibrate(20);
-
-    try {
-        const res = await fetch(src);
-        const blob = await res.blob();
-
-        // Определяем расширение
-        const isMp4 = blob.type.includes('mp4') || src.includes('.mp4');
-        const fileName = 'video_' + Date.now() + (isMp4 ? '.mp4' : '.webm');
-        const file = new File([blob], fileName, { type: blob.type || 'video/mp4' });
-
-        // 1) Системный шаринг с файлом (Telegram, WhatsApp, почта)
-        if (navigator.canShare && navigator.canShare({ files: [file] })) {
-            await navigator.share({ files: [file], title: fileName });
-            return;
-        }
-
-        // 2) Внутренний шаринг в наш чат
-        openShareToChatModal(blob, fileName, null, { isVideo: true });
-
-    } catch (err) {
-        if (err.name === 'AbortError') return;
-        console.error('video share error:', err);
-        showToast('❌ Не удалось поделиться', 2000);
-    }
-});
 // Следим за изменениями fullscreen — обновляем иконку
 
 function updateFullscreenState() {
@@ -12988,7 +12897,7 @@ async function compressVideoFile(file, targetBytes) {
         const url = URL.createObjectURL(file);
         const video = document.createElement('video');
         video.preload = 'auto';
-        video.muted = false;
+        video.muted = false;         // важно: не muted, чтобы звук захватился
         video.playsInline = true;
         video.crossOrigin = 'anonymous';
 
@@ -12999,6 +12908,7 @@ async function compressVideoFile(file, targetBytes) {
             video.load();
         };
 
+        // Жёсткий таймаут — если за 60 сек не справились, отдаём оригинал
         const timeout = setTimeout(() => {
             cleanup();
             resolve(null);
@@ -13010,6 +12920,7 @@ async function compressVideoFile(file, targetBytes) {
                 clearTimeout(timeout); cleanup(); resolve(null); return;
             }
 
+            // Масштабируем под лимиты
             const ratio = Math.min(
                 VIDEO_CONFIG.fileMaxWidth / w,
                 VIDEO_CONFIG.fileMaxHeight / h,
@@ -13020,64 +12931,62 @@ async function compressVideoFile(file, targetBytes) {
             if (w % 2) w++;
             if (h % 2) h++;
 
+            // Проверяем поддержку MediaRecorder
             if (typeof MediaRecorder === 'undefined') {
                 clearTimeout(timeout); cleanup(); resolve(null); return;
             }
 
+            // Создаём canvas для перекодирования видео
             const canvas = document.createElement('canvas');
             canvas.width = w;
             canvas.height = h;
             const ctx = canvas.getContext('2d', { alpha: false });
 
+            // Захват видеопотока с canvas
             const canvasStream = canvas.captureStream(VIDEO_CONFIG.fileFPS);
 
             // ═══ ЗАХВАТ ЗВУКА ═══
+            // Ключевой момент: создаём AudioContext и подключаем к нему video
             let audioCtx = null;
             let audioSource = null;
             try {
                 audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                // Если AudioContext в suspended — резюмируем (iOS)
                 if (audioCtx.state === 'suspended') {
                     await audioCtx.resume();
                 }
+
                 audioSource = audioCtx.createMediaElementSource(video);
                 const dest = audioCtx.createMediaStreamDestination();
+
+                // Подключаем источник к destination (для записи)
                 audioSource.connect(dest);
+                // НЕ подключаем к audioCtx.destination — иначе будет эхо
+
+                // Добавляем аудиотреки в общий поток
                 dest.stream.getAudioTracks().forEach(track => {
                     canvasStream.addTrack(track);
                 });
             } catch (e) {
+                // Может не сработать если CORS или AudioContext ограничен
                 console.warn('Audio capture failed, будет без звука:', e);
             }
 
-            // ═══ 🆕 УМНЫЙ ВЫБОР ФОРМАТА ═══
-            // Приоритет: MP4 (iOS Safari) → WebM (Android/Chrome)
-            let mime = '';
-            const candidates = [
-                'video/mp4;codecs=h264,aac',
-                'video/mp4',
-                'video/webm;codecs=vp9,opus',
-                'video/webm;codecs=vp8,opus',
-                'video/webm',
-            ];
-            for (const c of candidates) {
-                if (MediaRecorder.isTypeSupported(c)) {
-                    mime = c;
-                    break;
-                }
-            }
-            if (!mime) mime = 'video/webm';
-
-            // Расширение по mime
-            const ext = mime.startsWith('video/mp4') ? 'mp4' : 'webm';
-            console.log('📹 Видео будет сжато как .' + ext + ' (mime:', mime + ')');
+            // Выбор mime
+            const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus')
+                ? 'video/webm;codecs=vp8,opus'
+                : (MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
+                    ? 'video/webm;codecs=vp9,opus'
+                    : 'video/webm');
 
             let recorder;
             try {
+                // Адаптивный битрейт в зависимости от целевого размера
                 const targetBitrate = calculateVideoBitrate(video.duration, targetBytes);
                 recorder = new MediaRecorder(canvasStream, {
                     mimeType: mime,
                     videoBitsPerSecond: targetBitrate,
-                    audioBitsPerSecond: 64000,
+                    audioBitsPerSecond: 64000,   // 64 kbps для звука
                 });
             } catch (e) {
                 console.warn('MediaRecorder init failed:', e);
@@ -13101,7 +13010,6 @@ async function compressVideoFile(file, targetBytes) {
                     width: w,
                     height: h,
                     mime,
-                    ext,          // 🆕 возвращаем расширение
                 });
             };
 
@@ -13113,6 +13021,7 @@ async function compressVideoFile(file, targetBytes) {
                 resolve(null);
             };
 
+            // Запускаем воспроизведение и запись
             try {
                 video.currentTime = 0;
                 await video.play();
@@ -13121,44 +13030,48 @@ async function compressVideoFile(file, targetBytes) {
                 clearTimeout(timeout); cleanup(); resolve(null); return;
             }
 
-            recorder.start(250);
+            recorder.start(250);   // чанки по 250 мс
 
-            let frameCount = 0;
-            const totalDuration = video.duration || 0;
-            const compressStartTime = Date.now();
+            // Кадр-за-кадром перерисовываем video в canvas
+let frameCount = 0;
+const totalDuration = video.duration || 0;
+const compressStartTime = Date.now();
 
-            const draw = () => {
-                if (video.ended || video.paused) {
-                    if (recorder.state !== 'inactive') {
-                        setTimeout(() => {
-                            if (recorder.state !== 'inactive') recorder.stop();
-                        }, 150);
-                    }
-                    return;
-                }
-                try {
-                    ctx.drawImage(video, 0, 0, w, h);
-                } catch (e) {
-                    console.warn('drawImage failed:', e);
-                }
-                frameCount++;
+const draw = () => {
+    if (video.ended || video.paused) {
+        if (recorder.state !== 'inactive') {
+            // даём последние чанки собраться
+            setTimeout(() => {
+                if (recorder.state !== 'inactive') recorder.stop();
+            }, 150);
+        }
+        return;
+    }
+    try {
+        ctx.drawImage(video, 0, 0, w, h);
+    } catch (e) {
+        console.warn('drawImage failed:', e);
+    }
+    frameCount++;
 
-                if (totalDuration > 0 && UploadProgress.isVisible()) {
-                    const progress = video.currentTime / totalDuration;
-                    const elapsed = (Date.now() - compressStartTime) / 1000;
-                    const eta = progress > 0.02 ? (elapsed / progress) - elapsed : 0;
+    // 🆕 Обновляем прогресс сжатия по текущей позиции видео
+    if (totalDuration > 0 && UploadProgress.isVisible()) {
+        const progress = video.currentTime / totalDuration;
+        const elapsed = (Date.now() - compressStartTime) / 1000;
+        const eta = progress > 0.02 ? (elapsed / progress) - elapsed : 0;
 
-                    let label = 'Обработка кадров…';
-                    if (eta > 1 && eta < 600) {
-                        label = `Сжатие · осталось ~${Math.ceil(eta)} с`;
-                    }
-                    UploadProgress.setCompressProgress(progress, label);
-                }
+        let label = 'Обработка кадров…';
+        if (eta > 1 && eta < 600) {
+            label = `Сжатие · осталось ~${Math.ceil(eta)} с`;
+        }
+        UploadProgress.setCompressProgress(progress, label);
+    }
 
-                requestAnimationFrame(draw);
-            };
-            draw();
+    requestAnimationFrame(draw);
+};
+draw();
 
+            // Автостоп по достижению длительности
             video.onended = () => {
                 if (recorder.state !== 'inactive') {
                     setTimeout(() => {
@@ -13178,6 +13091,7 @@ async function compressVideoFile(file, targetBytes) {
         video.load();
     });
 }
+
 /**
  * Подбирает битрейт видео, чтобы уложиться в targetBytes
  */
@@ -13471,6 +13385,7 @@ function buildVideoNoteHTML(msgId, src, duration) {
         </div>
     `;
 }
+
 function buildVideoFileHTML(msgId, src, duration, name, size) {
     const durationText = duration > 0 ? formatAudioTime(duration) : '';
     const safeName = escapeHtml(name || 'video');
@@ -13494,14 +13409,10 @@ function buildVideoFileHTML(msgId, src, duration, name, size) {
                     title="Скачать видео">
                 <span>⬇</span><span>Скачать</span>
             </button>
-            <button class="video-action-btn"
-                    onclick="event.stopPropagation(); shareVideoToChat('${src}', '${escapedName}')"
-                    title="Отправить в чат или другое приложение">
-                <span>↗</span><span>Поделиться</span>
-            </button>
         </div>
     `;
 }
+
 // ═══ Открыть видео-кружочек в модалке ═══
 function playVideoNote(msgId, src) {
     openVideoModal(src, 'Видео-кружочек');
@@ -13745,6 +13656,7 @@ console.log('✏️ Редактирование сообщений: долго�
 console.log('🎵 Глобальный плеер активен — музыка играет между чатами');
 console.log('🔗 Инлайн-плееры синхронизируются с глобальным');
 console.log('📜 История чата: предзагрузка за 1500px до края');
+
 
 </script>
 </body>
