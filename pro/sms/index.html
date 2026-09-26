@@ -3233,8 +3233,8 @@ body.player-active .messages-container { padding-bottom: 68px; }
     <div class="form-modal-content" style="max-width: 460px;">
         <h2>📤 Поделиться с чатом</h2>
         <div class="file-preview" style="color:#888;margin-bottom:14px;font-size:12px;">
-            Фото будет отправлено в выбранный чат как новое сообщение.
-        </div>
+    Файл будет отправлен в выбранный чат как новое сообщение.
+</div>
         <div id="shareToChatPreview" style="
             display: flex;
             align-items: center;
@@ -3468,6 +3468,268 @@ style="width:100%;padding:12px 14px;background:rgba(255,255,255,0.06);
 <input type="file" id="avatarFileInput" accept="image/*" style="display:none">
 
 <script>
+// ═══════════════════════════════════════════════════════════════
+//  🎬 КОНВЕРТЕР WebM → MP4
+// ═══════════════════════════════════════════════════════════════
+const VideoConverter = (() => {
+    async function toMp4(webmBlob, opts = {}) {
+        const onProgress = opts.onProgress || (() => {});
+
+        const video = document.createElement('video');
+        video.playsInline = true;
+        video.muted = false;
+        video.preload = 'auto';
+        video.src = URL.createObjectURL(webmBlob);
+
+        await new Promise((resolve, reject) => {
+            video.onloadedmetadata = resolve;
+            video.onerror = () => reject(new Error('Не удалось прочитать видео'));
+            setTimeout(() => reject(new Error('Таймаут метаданных')), 15000);
+        });
+
+        let w = video.videoWidth || 640;
+        let h = video.videoHeight || 480;
+        const maxDim = 1280;
+        if (w > maxDim || h > maxDim) {
+            const r = Math.min(maxDim / w, maxDim / h);
+            w = Math.floor(w * r);
+            h = Math.floor(h * r);
+        }
+        if (w % 2) w++;
+        if (h % 2) h++;
+
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        const videoStream = canvas.captureStream(30);
+
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+        let audioSource = null;
+        try {
+            audioSource = audioCtx.createMediaElementSource(video);
+            const audioDest = audioCtx.createMediaStreamDestination();
+            audioSource.connect(audioDest);
+            audioDest.stream.getAudioTracks().forEach(t => videoStream.addTrack(t));
+        } catch (e) {
+            console.warn('Audio capture не удался:', e);
+        }
+
+        const mimeCandidates = [
+            'video/mp4;codecs=h264,aac',
+            'video/mp4;codecs=avc1,mp4a',
+            'video/mp4',
+            'video/webm;codecs=vp9,opus',
+        ];
+        let mime = mimeCandidates.find(m => MediaRecorder.isTypeSupported(m));
+        if (!mime) throw new Error('Браузер не поддерживает запись');
+
+        const chunks = [];
+        const recorder = new MediaRecorder(videoStream, {
+            mimeType: mime,
+            videoBitsPerSecond: 2500000,
+            audioBitsPerSecond: 128000,
+        });
+        recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+
+        const done = new Promise((resolve) => {
+            recorder.onstop = () => resolve(new Blob(chunks, { type: mime }));
+        });
+
+        recorder.start(100);
+        await video.play();
+
+        const duration = video.duration || 1;
+        const draw = () => {
+            if (video.paused || video.ended) return;
+            ctx.drawImage(video, 0, 0, w, h);
+            onProgress(Math.min(100, (video.currentTime / duration) * 100));
+            requestAnimationFrame(draw);
+        };
+        draw();
+
+        await new Promise((resolve) => {
+            video.onended = () => {
+                setTimeout(() => {
+                    if (recorder.state === 'recording') recorder.stop();
+                    resolve();
+                }, 400);
+            };
+        });
+
+        const outBlob = await done;
+        try { audioSource?.disconnect(); } catch (e) {}
+        try { audioCtx.close(); } catch (e) {}
+        URL.revokeObjectURL(video.src);
+        return outBlob;
+    }
+
+    return { toMp4 };
+})();
+
+// ═══ Кэш MP4 ═══
+const _mp4Cache = new Map();
+const _mp4Pending = new Map();
+async function ensureMp4(videoUrl, onProgress) {
+    if (_mp4Cache.has(videoUrl)) return _mp4Cache.get(videoUrl);
+    if (_mp4Pending.has(videoUrl)) return _mp4Pending.get(videoUrl);
+
+    const job = (async () => {
+        const res = await fetch(videoUrl);
+        const blob = await res.blob();
+        const mime = blob.type || '';
+
+        // 🆕 Двойная проверка: и MIME, и магические байты
+        if (mime.includes('mp4') || mime.includes('quicktime')) {
+            _mp4Cache.set(videoUrl, blob);
+            return blob;
+        }
+
+        // 🆕 Даже если браузер не определил mime — проверим магические байты
+        const head = await blob.slice(0, 12).arrayBuffer();
+        const bytes = new Uint8Array(head);
+        if (bytes[4] === 0x66 && bytes[5] === 0x74 &&
+            bytes[6] === 0x79 && bytes[7] === 0x70) {
+            // Это реально MP4, только браузер не знает
+            const properBlob = new Blob([blob], { type: 'video/mp4' });
+            _mp4Cache.set(videoUrl, properBlob);
+            return properBlob;
+        }
+
+        // Иначе — конвертируем
+        const mp4 = await VideoConverter.toMp4(blob, { onProgress });
+        _mp4Cache.set(videoUrl, mp4);
+        return mp4;
+    })();
+
+    _mp4Pending.set(videoUrl, job);
+    try {
+        const r = await job;
+        _mp4Pending.delete(videoUrl);
+        return r;
+    } catch (e) {
+        _mp4Pending.delete(videoUrl);
+        throw e;
+    }
+}
+// ═══ Обёртка с прогресс-оверлеем ═══
+// ═══ Обёртка с прогресс-оверлеем ═══
+async function getVideoAsMp4(videoUrl, displayName = 'video') {
+    // 🆕 Сначала — «умная» проверка: реально ли это MP4 по содержимому, а не по расширению?
+    try {
+        const head = await fetch(videoUrl);
+        const blob = await head.blob();
+        const realType = blob.type || '';
+
+        // 1. По MIME — если браузер сам говорит, что это mp4/quicktime — вообще не трогаем
+        if (realType.includes('mp4') || realType.includes('quicktime')) {
+            return blob;
+        }
+
+        // 2. 🆕 Проверяем «магические байты» — даже если blob.type пустой, посмотрим на содержимое
+        const isRealMp4 = await looksLikeMp4(blob);
+        if (isRealMp4) {
+            // Если реальный mp4 — не трогаем, вернём с правильным mime
+            return new Blob([blob], { type: 'video/mp4' });
+        }
+
+        // 3. Иначе — это WebM или что-то ещё → конвертируем
+    } catch (e) {
+        console.warn('Проверка blob упала, пробуем конвертировать:', e);
+    }
+
+    // ═══ Конвертация с оверлеем ═══
+    const overlay = document.getElementById('uploadProgressOverlay');
+    const nameEl = document.getElementById('uploadNameText');
+    const iconEl = document.getElementById('uploadIconInline');
+    const fillEl = document.getElementById('uploadProgressFill');
+    const pctEl = document.getElementById('uploadProgressPercent');
+    const bytesEl = document.getElementById('uploadProgressBytes');
+    const phaseEl = document.getElementById('uploadPhaseBadge');
+    const cancelBtn = document.getElementById('uploadCancelBtn');
+
+    iconEl.textContent = '🎬';
+    nameEl.textContent = `Конвертация в MP4: ${displayName}`;
+    fillEl.style.width = '0%';
+    fillEl.classList.remove('compressing');
+    fillEl.style.background = '';
+    pctEl.textContent = '0%';
+    bytesEl.textContent = 'Подготовка…';
+    phaseEl.textContent = '⚙ Сжатие в MP4';
+    phaseEl.className = 'phase-badge compressing';
+    cancelBtn.disabled = true;
+    overlay.classList.add('show');
+
+    const startTime = Date.now();
+    const timer = setInterval(() => {
+        const s = ((Date.now() - startTime) / 1000).toFixed(1);
+        document.getElementById('uploadElapsed').textContent = `⏱ ${s} с`;
+    }, 100);
+
+    try {
+        const mp4 = await ensureMp4(videoUrl, (p) => {
+            fillEl.style.width = p + '%';
+            pctEl.textContent = Math.round(p) + '%';
+            bytesEl.textContent = `Обработано ${Math.round(p)}%`;
+        });
+        fillEl.style.width = '100%';
+        pctEl.textContent = '100%';
+        phaseEl.textContent = '✓ Готово';
+        phaseEl.className = 'phase-badge done';
+        await new Promise(r => setTimeout(r, 500));
+        return mp4;
+    } finally {
+        clearInterval(timer);
+        overlay.classList.remove('show');
+        cancelBtn.disabled = false;
+    }
+}
+
+// 🆕 Проверка «реально ли это MP4» по магическим байтам
+async function looksLikeMp4(blob) {
+    try {
+        // Читаем первые 12 байт — там должен быть ftyp + бренд
+        const head = await blob.slice(0, 12).arrayBuffer();
+        const bytes = new Uint8Array(head);
+
+        // ISO BMFF: байты 4-7 должны быть 'f','t','y','p'
+        if (bytes[4] === 0x66 && bytes[5] === 0x74 &&
+            bytes[6] === 0x79 && bytes[7] === 0x70) {
+            return true;
+        }
+
+        // WebM/MKV: первые 4 байта — 0x1A 0x45 0xDF 0xA3
+        if (bytes[0] === 0x1A && bytes[1] === 0x45 &&
+            bytes[2] === 0xDF && bytes[3] === 0xA3) {
+            return false;
+        }
+
+        // Если ничего не распознали — вернём false (пусть конвертер попробует)
+        return false;
+    } catch (e) {
+        return false;
+    }
+}
+// ═══ Скачать видео в MP4 ═══
+async function downloadVideoAsMp4(videoUrl, displayName) {
+    try {
+        const mp4 = await getVideoAsMp4(videoUrl, displayName);
+        const url = URL.createObjectURL(mp4);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = (displayName || 'video').replace(/\.[^.]+$/, '') + '.mp4';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 2000);
+        showToast('💾 Скачано в MP4', 1500);
+    } catch (e) {
+        console.error(e);
+        showToast('❌ ' + e.message, 3000);
+    }
+}
 // ===================================================================
 //  КОНФИГУРАЦИЯ
 // ===================================================================
@@ -3944,6 +4206,25 @@ function guessMimeFromName(name) {
     };
     return mimeMap[ext] || 'application/octet-stream';
 }
+
+/**
+ * 🆕 Определяет: файл — это видео?
+ * Смотрит сначала на MIME, потом на расширение (с фолбэком).
+ */
+function isVideoFile(fileName, fileMime) {
+    // 1. По MIME
+    if (fileMime && typeof fileMime === 'string') {
+        if (fileMime.startsWith('video/')) return true;
+    }
+    // 2. По расширению
+    if (fileName && typeof fileName === 'string') {
+        const ext = (fileName.split('.').pop() || '').toLowerCase();
+        const videoExts = ['mp4', 'webm', 'mov', 'mkv', 'avi', 'm4v', '3gp', 'ogv'];
+        if (videoExts.includes(ext)) return true;
+    }
+    return false;
+}
+
 
 function isAttachmentRef(value) {
     if (typeof value !== 'string') return false;
@@ -4558,14 +4839,47 @@ function updateScrollBadge() {
 function scrollToBottom(force = false) {
     if (!force && !scrollState.isAtBottom) return;
     if (_loadingOlder) return;
-    if (_isUserScrolling) return;              // палец на экране
-    if (_scrollPreserver && _scrollPreserver.active) return;  // 🆕 идёт удержание позиции
+    if (_isUserScrolling) return;
+    if (_scrollPreserver && _scrollPreserver.active) return;
 
     messagesContainer.scrollTop = messagesContainer.scrollHeight;
     scrollState.unreadCount = 0;
     scrollState.isAtBottom = true;
     updateScrollBadge();
     updateScrollButton();
+
+    // 🆕 «Догоняющий» скролл: вложения (видео/фото) подгружаются асинхронно
+    // и увеличивают высоту контейнера. Через 250мс, 600мс и 1200мс ещё раз
+    // прокрутим вниз — но только если пользователь всё ещё внизу и не трогает скролл.
+    _scheduleBottomCatchup();
+}
+
+// 🆕 Серия отложенных прокруток вниз, чтобы догнать асинхронные вложения
+let _bottomCatchupTimers = [];
+function _scheduleBottomCatchup() {
+    // Сброс старых таймеров
+    _bottomCatchupTimers.forEach(t => clearTimeout(t));
+    _bottomCatchupTimers = [];
+
+    const delays = [250, 600, 1200, 2000];
+    delays.forEach(delay => {
+        const t = setTimeout(() => {
+            // Проверяем: всё ещё внизу? не скроллит ли юзер? не грузится ли история?
+            if (_isUserScrolling) return;
+            if (_loadingOlder) return;
+            if (_scrollPreserver && _scrollPreserver.active) return;
+
+            const diff = messagesContainer.scrollHeight
+                - messagesContainer.scrollTop
+                - messagesContainer.clientHeight;
+
+            // Если мы «отстали» от низа больше чем на 30px — догоняем
+            if (diff > 30) {
+                messagesContainer.scrollTop = messagesContainer.scrollHeight;
+            }
+        }, delay);
+        _bottomCatchupTimers.push(t);
+    });
 }
 function scrollToBottomNow() {
     messagesContainer.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'smooth' });
@@ -5459,7 +5773,21 @@ async function loadAttachmentsIn(root) {
         })());
     });
     await Promise.allSettled(tasks);
-    setTimeout(initAudioPlayers, 0);
+setTimeout(initAudioPlayers, 0);
+
+// 🆕 После того как все вложения превратились в реальные элементы —
+// если юзер был у низа, аккуратно досылаем вниз
+if (scrollState.isAtBottom && !_isUserScrolling
+    && !(_scrollPreserver && _scrollPreserver.active)) {
+    requestAnimationFrame(() => {
+        const diff = messagesContainer.scrollHeight
+            - messagesContainer.scrollTop
+            - messagesContainer.clientHeight;
+        if (diff > 30) {
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        }
+    });
+}
 }
 
 
@@ -7152,9 +7480,47 @@ async function shareAudioToChat(url, fileName) {
     }
 }
 
+// 🆕 Поделиться видео — конвертирует в MP4 и открывает модалку выбора чата
+// 🆕 Поделиться видео — конвертирует в MP4 ТОЛЬКО если ещё не MP4
+async function shareVideoToChat(url, fileName) {
+    try {
+        // 1. Достаём blob
+        const res = await fetch(url);
+        const blob = await res.blob();
 
+        // 2. 🆕 Проверяем: реально ли это MP4 (по mime + магическим байтам)?
+        const mime = blob.type || '';
+        const isMp4ByMime = mime.includes('mp4') || mime.includes('quicktime');
+        const isMp4ByMagic = !isMp4ByMime && await looksLikeMp4(blob);
 
+        let finalBlob = blob;
+        let finalName = fileName || 'video.mp4';
 
+        if (isMp4ByMime || isMp4ByMagic) {
+            // Уже MP4 — не перекодируем, оставляем как есть
+            finalBlob = new Blob([blob], { type: 'video/mp4' });
+            // Нормализуем имя
+            finalName = finalName.replace(/\.[^.]+$/, '') + '.mp4';
+            console.log('🎬 shareVideoToChat: уже MP4, не конвертируем');
+        } else {
+            // WebM → MP4
+            console.log('🎬 shareVideoToChat: конвертируем WebM → MP4');
+            finalBlob = await getVideoAsMp4(url, fileName);
+            finalName = finalName.replace(/\.[^.]+$/, '') + '.mp4';
+        }
+
+        // 3. Открываем модалку «Поделиться с чатом»
+        openShareToChatModal(finalBlob, finalName, null);
+
+        showToast(isMp4ByMime || isMp4ByMagic
+            ? '🎬 Видео готово к отправке (уже MP4)'
+            : '🎬 Видео конвертировано в MP4',
+            1500);
+    } catch (e) {
+        console.error('shareVideoToChat error:', e);
+        showToast('❌ Не удалось подготовить видео: ' + e.message, 3000);
+    }
+}
 // ===================================================================
 //  РЕНДЕРИНГ СООБЩЕНИЙ
 // ===================================================================
@@ -7226,11 +7592,29 @@ if (msg.audio) {
 
 // ═══ Файл ═══
 if (msg.file) {
-    hasMedia = true;  // 🆕 Теперь файлы тоже считаются медиа
-    if (isAttachmentRef(msg.file)) {
-        content += `<div class="file-attach-placeholder" data-attach="${msg.file}" data-filename="${escapeHtml(msg.fileName || 'file')}" data-filesize="${msg.fileSize || 0}" data-filemime="${escapeHtml(msg.fileMime || '')}" data-msgid="${msg.id}">⏳ ${escapeHtml(msg.fileName || 'file')}</div>`;
+    hasMedia = true;
+    // 🆕 Проверяем: это видео?
+    const fileIsVideo = isVideoFile(msg.fileName, msg.fileMime);
+    if (fileIsVideo) {
+        // Рендерим как видео — плейсхолдер, который потом заменится плеером
+        if (isAttachmentRef(msg.file)) {
+            content += `<div class="video-container attach-placeholder"
+                              data-video-attach="${msg.file}"
+                              data-video-msgid="${msg.id}"
+                              data-video-duration="0"
+                              data-video-name="${escapeHtml(msg.fileName || 'video')}"
+                              data-video-size="${msg.fileSize || 0}"
+                              data-video-from-file="1">⏳ Видео</div>`;
+        } else {
+            content += `<div class="video-container attach-placeholder">${escapeHtml(msg.fileName || 'video')}</div>`;
+        }
     } else {
-        content += `<div class="file-attach-placeholder">${escapeHtml(msg.fileName || 'file')}</div>`;
+        // Обычный файл — как раньше
+        if (isAttachmentRef(msg.file)) {
+            content += `<div class="file-attach-placeholder" data-attach="${msg.file}" data-filename="${escapeHtml(msg.fileName || 'file')}" data-filesize="${msg.fileSize || 0}" data-filemime="${escapeHtml(msg.fileMime || '')}" data-msgid="${msg.id}">⏳ ${escapeHtml(msg.fileName || 'file')}</div>`;
+        } else {
+            content += `<div class="file-attach-placeholder">${escapeHtml(msg.fileName || 'file')}</div>`;
+        }
     }
 }
 
@@ -8605,6 +8989,26 @@ if (file.size > CONFIG.autoCompressTargetBytes) {
         showToast(`ℹ️ Сжатие не удалось — отправляем как есть`, 2500);
     }
 }
+// 🆕 Конвертация в MP4, если браузер умеет
+if (!finalMime.includes('mp4') && finalBlob.size < 5 * 1024 * 1024) {
+    try {
+        const mp4 = await VideoConverter.toMp4(finalBlob, {
+            onProgress: (p) => {
+                if (typeof UploadProgress !== 'undefined' && UploadProgress.isVisible()) {
+                    UploadProgress.setCompressProgress(p / 100, `MP4 · ${Math.round(p)}%`);
+                }
+            }
+        });
+        if (mp4 && mp4.size > 0) {
+            finalBlob = mp4;
+            finalMime = 'video/mp4';
+            finalExt = 'mp4';
+            showToast('🎬 Готово в MP4', 1200);
+        }
+    } catch (e) {
+        console.warn('MP4-конвертация не удалась, отправляем оригинал:', e);
+    }
+}
 
     // ═══ ФИНАЛЬНАЯ ПРОВЕРКА после сжатия ═══
     // uploadAttachmentAuto сам разберётся: < 1 МБ → напрямую, иначе → чанки.
@@ -8726,13 +9130,42 @@ function openShareToChatModal(blob, fileName, imageUrl, meta = {}) {
 
 
 
+
 async function confirmShareToChat() {
     if (!_shareToChat.blob || !_shareToChat.selectedFile) return;
     const targetFile = _shareToChat.selectedFile;
-    const blob = _shareToChat.blob;
-    const fileName = _shareToChat.fileName;
-    const mime = _shareToChat.mime;
+    let blob = _shareToChat.blob;
+    let fileName = _shareToChat.fileName;
+    let mime = _shareToChat.mime;
 
+    // 🆕 Проверяем: реально ли это MP4?
+if (mime.startsWith('video/') || /\.(webm|mkv|avi|mov|mp4)$/i.test(fileName)) {
+    try {
+        const url = URL.createObjectURL(blob);
+        const realBlob = await fetch(url).then(r => r.blob());
+        const realMime = realBlob.type || '';
+        const isMp4ByMime = realMime.includes('mp4') || realMime.includes('quicktime');
+        const isMp4ByMagic = !isMp4ByMime && await looksLikeMp4(realBlob);
+        URL.revokeObjectURL(url);
+
+        if (!isMp4ByMime && !isMp4ByMagic) {
+            // Реально WebM — конвертируем
+            const url2 = URL.createObjectURL(blob);
+            blob = await getVideoAsMp4(url2, fileName);
+            URL.revokeObjectURL(url2);
+            mime = 'video/mp4';
+            fileName = fileName.replace(/\.[^.]+$/, '') + '.mp4';
+            showToast('🎬 Подготовлено в MP4', 1200);
+        } else {
+            // Уже MP4 — просто нормализуем
+            blob = new Blob([blob], { type: 'video/mp4' });
+            mime = 'video/mp4';
+            fileName = fileName.replace(/\.[^.]+$/, '') + '.mp4';
+        }
+    } catch (e) {
+        console.warn('Проверка/конвертация упала, шлём как есть:', e);
+    }
+}
     $('shareToChatModal').classList.remove('active');
 
     const password = state.savedPasswords[targetFile];
@@ -10168,9 +10601,31 @@ document.addEventListener('keydown', (e) => {
     btn.addEventListener('touchend',  () => btn.style.transform = 'scale(1)');
 
     btn.addEventListener('click', async () => {
-        const blob = _shareToChat.blob;
-        const fileName = _shareToChat.fileName || 'file.bin';
-        const mime = _shareToChat.mime || 'application/octet-stream';
+        let blob = _shareToChat.blob;
+let fileName = _shareToChat.fileName || 'file.bin';
+let mime = _shareToChat.mime || 'application/octet-stream';
+
+if (!blob) {
+    showToast('❌ Нет файла для отправки', 2000);
+    return;
+}
+
+// 🆕 Если это видео — конвертируем в MP4
+if (mime.startsWith('video/') || /\.(webm|mkv|avi|mov)$/i.test(fileName)) {
+    try {
+        const url = URL.createObjectURL(blob);
+        blob = await getVideoAsMp4(url, fileName);
+        URL.revokeObjectURL(url);
+        mime = 'video/mp4';
+        fileName = fileName.replace(/\.[^.]+$/, '') + '.mp4';
+        showToast('🎬 Готово в MP4', 1200);
+    } catch (e) {
+        console.warn('Конвертация не удалась, шлём как есть:', e);
+    }
+}
+
+document.getElementById('shareToChatModal').classList.remove('active');
+if (navigator.vibrate) navigator.vibrate(20);
 
         if (!blob) {
             showToast('❌ Нет файла для отправки', 2000);
@@ -13385,7 +13840,6 @@ function buildVideoNoteHTML(msgId, src, duration) {
         </div>
     `;
 }
-
 function buildVideoFileHTML(msgId, src, duration, name, size) {
     const durationText = duration > 0 ? formatAudioTime(duration) : '';
     const safeName = escapeHtml(name || 'video');
@@ -13409,10 +13863,19 @@ function buildVideoFileHTML(msgId, src, duration, name, size) {
                     title="Скачать видео">
                 <span>⬇</span><span>Скачать</span>
             </button>
+            <button class="video-action-btn"
+                    onclick="event.stopPropagation(); downloadVideoAsMp4('${src}', '${escapedName}')"
+                    title="Скачать в MP4">
+                <span>🎬</span><span>Скачать MP4</span>
+            </button>
+            <button class="video-action-btn"
+                    onclick="event.stopPropagation(); shareVideoToChat('${src}', '${escapedName}')"
+                    title="Поделиться видео">
+                <span>↗</span><span>Поделиться</span>
+            </button>
         </div>
     `;
 }
-
 // ═══ Открыть видео-кружочек в модалке ═══
 function playVideoNote(msgId, src) {
     openVideoModal(src, 'Видео-кружочек');
