@@ -413,6 +413,105 @@
             max-width: 320px;
             border: 1px solid rgba(255,255,255,0.06);
         }
+
+
+
+
+.invite-card {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 16px;
+    margin: 6px 0 4px;
+    min-width: 240px;
+    max-width: 320px;
+    background: linear-gradient(135deg, rgba(108,92,231,0.18), rgba(0,184,148,0.12));
+    border: 1px solid rgba(108,92,231,0.35);
+    border-radius: 14px;
+    cursor: pointer;
+    transition: all 0.18s ease;
+    position: relative;
+    overflow: hidden;
+    -webkit-tap-highlight-color: transparent;
+}
+.invite-card::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(135deg, transparent 40%, rgba(255,255,255,0.06) 50%, transparent 60%);
+    pointer-events: none;
+}
+.invite-card:hover {
+    background: linear-gradient(135deg, rgba(108,92,231,0.28), rgba(0,184,148,0.18));
+    border-color: rgba(108,92,231,0.55);
+    transform: translateY(-1px);
+    box-shadow: 0 4px 18px rgba(108,92,231,0.25);
+}
+.invite-card:active {
+    transform: scale(0.98);
+}
+.message-wrapper.own .invite-card {
+    background: linear-gradient(135deg, rgba(0,0,0,0.35), rgba(108,92,231,0.2));
+    border-color: rgba(167,139,250,0.5);
+}
+
+.invite-icon {
+    width: 44px;
+    height: 44px;
+    border-radius: 12px;
+    background: linear-gradient(135deg, #6c5ce7, #00b894);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 22px;
+    flex-shrink: 0;
+    box-shadow: 0 4px 12px rgba(108,92,231,0.35);
+}
+
+.invite-body {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.invite-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: #a78bfa;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.invite-name {
+    font-size: 15px;
+    font-weight: 700;
+    color: #fff;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.invite-sub {
+    font-size: 11px;
+    color: rgba(255,255,255,0.55);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.invite-arrow {
+    font-size: 22px;
+    color: rgba(255,255,255,0.5);
+    flex-shrink: 0;
+    transition: transform 0.15s, color 0.15s;
+}
+.invite-card:hover .invite-arrow {
+    transform: translateX(3px);
+    color: #fff;
+}
+
         .message-wrapper.own .file-card {
             background: rgba(0,0,0,0.3);
         }
@@ -2975,7 +3074,9 @@ body.player-active .messages-container { padding-bottom: 68px; }
             <button class="exit-btn" id="backToChatsBtn" title="К списку чатов" style="margin-right:8px;">←</button>
 
 <button class="exit-btn" id="searchChatBtn" title="Поиск" style="margin-right:8px;">🔍</button>
-            <button class="exit-btn" id="forgetBtn" title="Забыть пароль этого чата" style="margin-right:8px;">🔓</button>
+            
+<button class="exit-btn" id="inviteToChatBtn" title="Пригласить в чат" style="margin-right:8px;">💌</button>
+<button class="exit-btn" id="forgetBtn" title="Забыть пароль этого чата" style="margin-right:8px;">🔓</button>
             <button class="exit-btn" id="exitBtn" title="Выйти">✕</button>
         </div>
     </div>
@@ -3121,7 +3222,34 @@ body.player-active .messages-container { padding-bottom: 68px; }
         </div>
     </div>
 </div>
-
+<!-- ═══════════ МОДАЛКА ПОДТВЕРЖДЕНИЯ ПРИГЛАШЕНИЯ ═══════════ -->
+<div class="image-modal" id="inviteConfirmModal">
+    <div class="form-modal-content" style="max-width:380px;text-align:center;">
+        <div style="font-size:56px;margin-bottom:10px;line-height:1;">💌</div>
+        <h2 style="margin-bottom:6px;font-size:18px;">Приглашение в чат</h2>
+        <div id="inviteConfirmName"
+             style="font-size:22px;font-weight:700;color:#fff;margin-bottom:8px;
+                    word-break:break-word;line-height:1.3;">
+            «—»
+        </div>
+        <div id="inviteConfirmFrom"
+             style="font-size:13px;color:#888;margin-bottom:18px;">
+        </div>
+        <div style="background:rgba(108,92,231,0.08);
+                    border:1px solid rgba(108,92,231,0.2);
+                    border-radius:12px;padding:12px 14px;margin-bottom:20px;
+                    text-align:left;font-size:12px;color:#aaa;line-height:1.6;">
+            🆔 ID: <code id="inviteConfirmId"
+                        style="background:rgba(255,255,255,0.08);padding:2px 6px;
+                               border-radius:4px;color:#a78bfa;">—</code><br>
+            🔑 Пароль: <span style="color:#00b894;">сохранится автоматически</span>
+        </div>
+        <div class="modal-actions">
+            <button class="btn btn-secondary" id="cancelInviteConfirmBtn">Отмена</button>
+            <button class="btn" id="confirmInviteConfirmBtn">✅ Добавить</button>
+        </div>
+    </div>
+</div>
 <!-- ═══════════ МОДАЛКА ПРИСОЕДИНЕНИЯ ═══════════ -->
 <div class="image-modal" id="joinChatModal">
     <div class="form-modal-content">
@@ -4232,7 +4360,7 @@ function isAttachmentRef(value) {
     if (value.startsWith('blob:')) return false;
     if (value.startsWith('http://') || value.startsWith('https://')) return false;
     return /^[a-z]+_[a-z0-9]+_[a-f0-9]+\.[a-z0-9]{1,8}$/i.test(value)
-        || /\.(jpg|jpeg|png|gif|webp|bmp|svg|ico|avif|webm|mp3|ogg|wav|m4a|aac|flac|mp4|mov|avi|mkv|pdf|doc|docx|xls|xlsx|ppt|pptx|odt|ods|rtf|html|htm|json|xml|csv|txt|md|yaml|yml|js|mjs|ts|jsx|tsx|css|scss|sass|less|py|rb|go|rs|java|kt|swift|php|c|cpp|h|hpp|cs|sh|bat|ps1|sql|zip|rar|7z|tar|gz|bz2|xz|bin|exe|apk|dmg|iso|db|sqlite|epub|mobi|ttf|otf|woff|woff2|stl|obj)$/i.test(value);
+        || /\.(jpg|jpeg|png|gif|webp|bmp|svg|ico|avif|webm|mp3|ogg|wav|m4a|aac|flac|mp4|mov|avi|mkv|pdf|doc|docx|xls|xlsx|ppt|pptx|odt|ods|rtf|html|htm|json|xml|csv|txt|md|yaml|yml|js|mjs|ts|jsx|tsx|css|scss|sass|less|py|rb|go|rs|java|kt|swift|php|c|cpp|h|hpp|cs|sh|bat|ps1|sql|zip|rar|7z|tar|gz|bz2|xz|bin|exe|apk|dmg|iso|db|sqlite|epub|mobi|ttf|otf|woff|woff2|stl|obj|smschat)$/i.test(value);
 }
 
 function loadChatsList() {
@@ -5762,10 +5890,15 @@ async function loadAttachmentsIn(root) {
                     wrapper.innerHTML = createAudioPlayerHTML(msgId, url, duration, mime, trackName);
                     el.replaceWith(wrapper.firstElementChild);
                 } else if (isFile) {
-                    const fileName = el.dataset.filename || 'file';
-                    const fileSize = parseInt(el.dataset.filesize) || 0;
-                    el.outerHTML = createFileCardHTML(name, url, fileName, fileSize);
-                }
+    const fileName = el.dataset.filename || 'file';
+    const fileSize = parseInt(el.dataset.filesize) || 0;
+
+    if (fileName.toLowerCase().endsWith('.smschat')) {
+        el.outerHTML = createInviteCardHTML(name, url, fileName, fileSize);
+    } else {
+        el.outerHTML = createFileCardHTML(name, url, fileName, fileSize);
+    }
+}
             } catch (e) {
                 console.error('attach load error', name, e);
                 el.innerHTML = `<div class="attach-error">⚠️ не загрузилось</div>`;
@@ -7438,6 +7571,29 @@ function createFileCardHTML(attachName, url, fileName, fileSize) {
         </div>
     `;
 }
+
+function createInviteCardHTML(attachName, url, fileName, fileSize) {
+    // Вытаскиваем имя чата из имени файла (например, "Приглашение в «Семью».smschat")
+    let chatName = fileName.replace(/\.smschat$/i, '');
+    chatName = chatName.replace(/^Приглашение\s*(в\s*)?/i, '').replace(/^«|»$/g, '');
+    if (!chatName) chatName = 'чат';
+
+    const escapedUrl = url.replace(/'/g, "\\'");
+    const escapedName = fileName.replace(/'/g, "\\'");
+
+    return `
+        <div class="invite-card" onclick="event.stopPropagation(); handleInviteClick('${escapedUrl}', '${escapedName}')">
+            <div class="invite-icon">💌</div>
+            <div class="invite-body">
+                <div class="invite-title">Приглашение в чат</div>
+                <div class="invite-name">«${escapeHtml(chatName)}»</div>
+                <div class="invite-sub">Нажмите, чтобы присоединиться</div>
+            </div>
+            <div class="invite-arrow">›</div>
+        </div>
+    `;
+}
+
 
 function downloadAttachedFile(url, fileName) {
     const a = document.createElement('a');
@@ -14120,6 +14276,291 @@ console.log('🎵 Глобальный плеер активен — музык�
 console.log('🔗 Инлайн-плееры синхронизируются с глобальным');
 console.log('📜 История чата: предзагрузка за 1500px до края');
 
+
+// ═══════════════════════════════════════════════════════════════
+//  💌 ПРИГЛАШЕНИЯ В ЧАТ
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Отправляет приглашение в текущий чат через общую модалку шаринга.
+ */
+function inviteToChat() {
+    if (!state.chatFile) return;
+    const password = state.savedPasswords[state.chatFile];
+    if (!password) {
+        showToast('🔐 Сначала сохраните пароль чата (галочка «Запомнить» при входе)', 3500);
+        soundManager.play('error');
+        return;
+    }
+
+    const chat = state.chats.find(c => c.file === state.chatFile);
+    const chatName = chat?.name || state.chatName || state.chatFile;
+
+    // Собираем JSON-приглашение
+    const invite = {
+        app: 'sms-chat',
+        version: 1,
+        type: 'invite',
+        exportedAt: new Date().toISOString(),
+        invitedBy: state.username,
+        chat: {
+            name: chatName,
+            file: state.chatFile,
+            createdAt: chat?.createdAt || null,
+        },
+        password: password,
+    };
+
+    const json = JSON.stringify(invite, null, 2);
+    const blob = new Blob([json], { type: 'application/json' });
+
+    // Безопасное имя файла
+    const safeName = chatName.replace(/[^a-zA-Zа-яА-Я0-9_-]/g, '_').slice(0, 30);
+    const fileName = `Приглашение в «${safeName}».smschat`;
+
+    // Переиспользуем существующую модалку шаринга
+    openShareToChatModal(blob, fileName, null);
+    soundManager.play('click');
+}
+
+/**
+ * Обработка клика по карточке приглашения в сообщении.
+ */
+async function handleInviteClick(url, fileName) {
+    try {
+        showToast('⏳ Загрузка приглашения…', 1200);
+
+        const res = await fetch(url);
+        const blob = await res.blob();
+        const text = await blob.text();
+        const data = JSON.parse(text);
+
+        // ═══ Валидация ═══
+        if (data.app !== 'sms-chat') {
+            showToast('❌ Это не файл SMS Чата', 2500);
+            return;
+        }
+        if (data.type !== 'invite') {
+            showToast('❌ Это не приглашение', 2500);
+            return;
+        }
+        const chatFile = sanitizeChatFile(data.chat?.file);
+        if (!chatFile) {
+            showToast('❌ Повреждённый ID чата', 2500);
+            return;
+        }
+        const password = typeof data.password === 'string' ? data.password : '';
+        if (!password) {
+            showToast('❌ В приглашении нет пароля', 2500);
+            return;
+        }
+        const chatName = String(data.chat?.name || chatFile).slice(0, 40);
+
+        // ═══ Проверяем, есть ли уже такой чат ═══
+        const existing = state.chats.find(c => c.file === chatFile);
+
+        if (existing) {
+            const samePwd = state.savedPasswords[chatFile] === password;
+
+            if (samePwd) {
+                const ok = await showConfirmModal(
+                    '💌 Чат уже есть',
+                    `Чат «${existing.name}» уже есть в списке.\n\nОткрыть его?`,
+                    'Открыть', 'Отмена'
+                );
+                if (ok) {
+                    await enterChat(chatFile, existing.name, password);
+                }
+                return;
+            }
+
+            const ok = await showConfirmModal(
+                '💌 Чат уже есть',
+                `Чат «${existing.name}» уже есть, но с другим паролем.\n\nЗаменить пароль на новый из приглашения?`,
+                'Заменить', 'Отмена'
+            );
+            if (!ok) return;
+
+            state.savedPasswords[chatFile] = password;
+            saveSavedPasswords();
+            await enterChat(chatFile, existing.name, password);
+            showToast('✅ Пароль обновлён', 1500);
+            return;
+        }
+
+        // ═══ Новый чат — спрашиваем подтверждение ═══
+        const confirmed = await showInviteConfirmModal(
+            chatName, chatFile, data.exportedAt, data.invitedBy
+        );
+        if (!confirmed) return;
+
+        // ═══ Добавляем чат ═══
+        state.chats.push({
+            name: chatName,
+            file: chatFile,
+            createdAt: data.chat?.createdAt || new Date().toISOString(),
+        });
+        saveChatsList();
+        state.savedPasswords[chatFile] = password;
+        saveSavedPasswords();
+
+        soundManager.play('send');
+        showToast(`✅ Чат «${chatName}» добавлен`, 2000);
+
+        // Обновляем список чатов (если пользователь сейчас в списке)
+        if (state.currentScreen === 'chats') {
+            renderChatsList();
+            setTimeout(refreshUnreadBadges, 300);
+        } else {
+            // Если в другом чате — предложим сразу зайти
+            const goNow = await showConfirmModal(
+                '💌 Чат добавлен',
+                `«${chatName}» добавлен в список чатов.\n\nОткрыть его сейчас?`,
+                'Открыть', 'Позже'
+            );
+            if (goNow) {
+                await enterChat(chatFile, chatName, password);
+            }
+        }
+    } catch (e) {
+        console.error('handleInviteClick error:', e);
+        showToast('❌ Не удалось обработать приглашение', 2500);
+        soundManager.play('error');
+    }
+}
+
+/**
+ * Красивая модалка подтверждения приглашения.
+ */
+function showInviteConfirmModal(chatName, chatFile, exportedAt, invitedBy) {
+    return new Promise((resolve) => {
+        const modal = $('inviteConfirmModal');
+        $('inviteConfirmName').textContent = `«${chatName}»`;
+        $('inviteConfirmId').textContent = chatFile;
+
+        // Подпись «от кого» + дата
+        const fromEl = $('inviteConfirmFrom');
+        const parts = [];
+        if (invitedBy) parts.push(`от <strong style="color:#a78bfa;">${escapeHtml(invitedBy)}</strong>`);
+        if (exportedAt) {
+            const d = new Date(exportedAt);
+            const when = d.toLocaleString('ru-RU', {
+                day: 'numeric', month: 'short',
+                hour: '2-digit', minute: '2-digit'
+            });
+            parts.push(when);
+        }
+        fromEl.innerHTML = parts.join(' · ');
+
+        modal.classList.add('active');
+
+        const yesBtn = $('confirmInviteConfirmBtn');
+        const noBtn  = $('cancelInviteConfirmBtn');
+
+        const cleanup = () => {
+            modal.classList.remove('active');
+            yesBtn.removeEventListener('click', onYes);
+            noBtn.removeEventListener('click', onNo);
+            modal.removeEventListener('click', onBackdrop);
+        };
+        const onYes = () => { cleanup(); resolve(true); };
+        const onNo  = () => { cleanup(); resolve(false); };
+        const onBackdrop = (e) => { if (e.target === modal) onNo(); };
+
+        yesBtn.addEventListener('click', onYes);
+        noBtn.addEventListener('click', onNo);
+        modal.addEventListener('click', onBackdrop);
+    });
+}
+
+/**
+ * Создаёт HTML карточки приглашения.
+ */
+function createInviteCardHTML(attachName, url, fileName, fileSize) {
+    // Вытаскиваем имя чата из имени файла (например, "Приглашение в «Семью».smschat")
+    let chatName = fileName.replace(/\.smschat$/i, '');
+    chatName = chatName.replace(/^Приглашение\s*(в\s*)?/i, '').replace(/^«|»$/g, '').trim();
+    if (!chatName) chatName = 'чат';
+
+    const escapedUrl = url.replace(/'/g, "\\'");
+    const escapedName = fileName.replace(/'/g, "\\'");
+
+    return `
+        <div class="invite-card" onclick="event.stopPropagation(); handleInviteClick('${escapedUrl}', '${escapedName}')">
+            <div class="invite-icon">💌</div>
+            <div class="invite-body">
+                <div class="invite-title">Приглашение в чат</div>
+                <div class="invite-name">«${escapeHtml(chatName)}»</div>
+                <div class="invite-sub">Нажмите, чтобы присоединиться</div>
+            </div>
+            <div class="invite-arrow">›</div>
+        </div>
+    `;
+}
+
+// ═══ Обработчик кнопки 💌 в шапке чата ═══
+$('inviteToChatBtn').addEventListener('click', inviteToChat);
+
+console.log('💌 Приглашения в чат активны');
+
+// ═══════════════════════════════════════════════════════════════
+//  💌 ПАТЧИ ДЛЯ ПРИГЛАШЕНИЙ
+// ═══════════════════════════════════════════════════════════════
+
+// 1) Патчим isAttachmentRef — добавляем .smschat
+//    НО! Эта функция объявлена как function declaration, поэтому
+//    мы её просто перезаписываем через window, но т.к. она используется
+//    внутри других функций по имени — патч через присваивание не сработает.
+//    Поэтому ЕДИНСТВЕННЫЙ правильный путь — исправить её вручную выше.
+//    См. шаг 7.1 ниже.
+
+// 2) Патчим loadAttachmentsIn — рендерим .smschat как карточку
+const _origLoadAttachmentsInForInvite = loadAttachmentsIn;
+loadAttachmentsIn = async function(root) {
+    // Сначала даём оригиналу обработать всё, кроме файлов .smschat
+    // Но проще: сами находим .smschat и обрабатываем отдельно
+
+    // Временно переименуем data-attach у .smschat-плейсхолдеров,
+    // чтобы оригинал их не трогал
+    const invites = root.querySelectorAll('[data-attach]:not([data-loaded])');
+    const inviteList = [];
+    invites.forEach(el => {
+        const name = el.dataset.attach;
+        const isFile = el.classList.contains('file-attach-placeholder');
+        if (isFile) {
+            const fileName = el.dataset.filename || '';
+            if (fileName.toLowerCase().endsWith('.smschat')) {
+                inviteList.push({ el, name });
+                el.dataset.loaded = '1'; // помечаем, чтобы оригинал пропустил
+            }
+        }
+    });
+
+    // Запускаем оригинал (он обработает всё остальное)
+    await _origLoadAttachmentsInForInvite.call(this, root);
+
+    // Теперь обрабатываем приглашения
+    if (inviteList.length > 0) {
+        const tasks = inviteList.map(async ({ el, name }) => {
+            try {
+                const url = await loadAttachment(state.chatFile, name);
+                const fileName = el.dataset.filename || 'invite.smschat';
+                const fileSize = parseInt(el.dataset.filesize) || 0;
+                el.outerHTML = createInviteCardHTML(name, url, fileName, fileSize);
+            } catch (e) {
+                console.error('invite load error', name, e);
+                el.innerHTML = `<div class="attach-error">⚠️ приглашение не загрузилось</div>`;
+            }
+        });
+        await Promise.allSettled(tasks);
+    }
+};
+
+// 3) Патчим buildMessageHTML — чтобы .smschat не рендерился как file-card
+//    (карточка приглашения подставится при загрузке вложения)
+//    Здесь ничего делать не нужно — плейсхолдер уже есть.
+
+console.log('💌 Патчи для приглашений загружены');
 
 </script>
 </body>
