@@ -14797,6 +14797,671 @@ loadAttachmentsIn = async function(root) {
 
 console.log('💌 Патчи для приглашений загружены');
 
+// ═══════════════════════════════════════════════════════════════
+//  ☑️ ПАКЕТНОЕ УДАЛЕНИЕ СООБЩЕНИЙ (мультивыбор)
+//  Самодостаточный модуль. Вставляется в конец скрипта.
+// ═══════════════════════════════════════════════════════════════
+
+// ─── Состояние режима выбора ───
+let selectionMode = false;
+const selectedIds = new Set();
+let _selectionBarEl = null;
+
+// ─── Стили ───
+(function injectSelectionStyles() {
+    if (document.getElementById('selectionStyles')) return;
+    const style = document.createElement('style');
+    style.id = 'selectionStyles';
+    style.textContent = `
+        #selectionBar {
+            position: fixed;
+            top: 0; left: 0; right: 0;
+            background: linear-gradient(135deg, rgba(26,26,46,0.98), rgba(20,20,35,0.98));
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border-bottom: 1px solid rgba(108,92,231,0.4);
+            padding: 12px 14px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            z-index: 5000;
+            transform: translateY(-100%);
+            transition: transform 0.25s cubic-bezier(0.22, 0.61, 0.36, 1);
+            box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+            padding-top: calc(12px + env(safe-area-inset-top, 0px));
+        }
+        #selectionBar.show { transform: translateY(0); }
+        #selectionBar .sel-close {
+            width: 38px; height: 38px;
+            border-radius: 50%;
+            background: rgba(255,255,255,0.08);
+            border: none; color: #ccc; font-size: 16px;
+            cursor: pointer;
+            display: flex; align-items: center; justify-content: center;
+            flex-shrink: 0; transition: all 0.15s;
+        }
+        #selectionBar .sel-close:active { transform: scale(0.9); background: rgba(255,255,255,0.15); }
+        #selectionBar .sel-counter { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+        #selectionBar .sel-count { font-size: 16px; font-weight: 700; color: #fff; line-height: 1.1; }
+        #selectionBar .sel-hint { font-size: 11px; color: #888; margin-top: 2px; }
+        #selectionBar .sel-btn {
+            height: 38px; padding: 0 14px;
+            border-radius: 19px;
+            border: 1px solid rgba(255,255,255,0.12);
+            background: rgba(255,255,255,0.06);
+            color: #ddd; font-size: 13px; font-weight: 600;
+            cursor: pointer;
+            display: flex; align-items: center; gap: 6px;
+            flex-shrink: 0; transition: all 0.15s;
+            font-family: inherit;
+            -webkit-tap-highlight-color: transparent;
+        }
+        #selectionBar .sel-btn:active { transform: scale(0.94); }
+        #selectionBar .sel-btn:disabled { opacity: 0.35; cursor: not-allowed; transform: none; }
+        #selectionBar .sel-btn-own {
+            background: rgba(108,92,231,0.15);
+            border-color: rgba(108,92,231,0.4);
+            color: #a78bfa;
+        }
+        #selectionBar .sel-btn-own:hover { background: rgba(108,92,231,0.25); }
+        #selectionBar .sel-btn-delete {
+            background: linear-gradient(135deg, rgba(255,107,107,0.25), rgba(238,82,83,0.2));
+            border-color: rgba(255,107,107,0.5);
+            color: #ff6b6b;
+        }
+        #selectionBar .sel-btn-delete:hover { background: linear-gradient(135deg, rgba(255,107,107,0.4), rgba(238,82,83,0.3)); }
+        #selectionBar .sel-btn-delete:not(:disabled) { animation: selDelPulse 2s ease-in-out infinite; }
+        @keyframes selDelPulse {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(255,107,107,0.3); }
+            50%      { box-shadow: 0 0 0 6px rgba(255,107,107,0); }
+        }
+        body.selection-mode .message-wrapper[data-msg-id] {
+            cursor: pointer;
+            transition: transform 0.12s ease, opacity 0.12s ease;
+            position: relative;
+            -webkit-tap-highlight-color: transparent;
+        }
+        body.selection-mode .message-wrapper[data-msg-id]::before {
+            content: '';
+            position: absolute;
+            top: 50%; left: -28px;
+            transform: translateY(-50%);
+            width: 22px; height: 22px;
+            border-radius: 50%;
+            border: 2px solid rgba(255,255,255,0.25);
+            background: rgba(0,0,0,0.2);
+            transition: all 0.15s ease;
+            pointer-events: none;
+        }
+        body.selection-mode .message-wrapper.own[data-msg-id]::before {
+            left: auto; right: -28px;
+        }
+        body.selection-mode .message-wrapper[data-msg-id].selected { transform: scale(0.97); }
+        body.selection-mode .message-wrapper[data-msg-id].selected::before {
+            content: '✓';
+            background: linear-gradient(135deg, #6c5ce7, #00b894);
+            border-color: transparent;
+            color: #fff; font-weight: 700; font-size: 13px;
+            display: flex; align-items: center; justify-content: center;
+            box-shadow: 0 2px 10px rgba(108,92,231,0.5);
+        }
+        body.selection-mode .message-wrapper[data-msg-id].selected .message {
+            box-shadow: 0 0 0 2px rgba(108,92,231,0.6), 0 4px 20px rgba(108,92,231,0.25);
+        }
+        body.selection-mode .message-wrapper.other[data-msg-id]:not(.own) { opacity: 0.55; }
+        body.selection-mode .message-wrapper.other[data-msg-id]:not(.own)::before {
+            border-color: rgba(255,255,255,0.1);
+            background: rgba(0,0,0,0.15);
+        }
+        body.selection-mode .message.system { opacity: 0.35; pointer-events: none; }
+        body.selection-mode .swipe-reply-hint,
+        body.selection-mode .swipe-comment-hint { display: none !important; }
+        body.selection-mode .delete-btn { display: none !important; }
+        body.selection-mode .reaction-add-btn,
+        body.selection-mode .image-comment-btn { pointer-events: none; opacity: 0.5; }
+
+        #batchDeleteOverlay {
+            position: fixed; inset: 0;
+            background: rgba(0,0,0,0.7);
+            backdrop-filter: blur(8px);
+            -webkit-backdrop-filter: blur(8px);
+            z-index: 5500;
+            display: none;
+            align-items: center; justify-content: center;
+            padding: 20px;
+            animation: fadeInModal 0.2s ease;
+        }
+        #batchDeleteOverlay.show { display: flex; }
+        #batchDeleteOverlay .bd-card {
+            background: #1a1a2e;
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 20px;
+            padding: 22px 24px;
+            max-width: 360px; width: 100%;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+            text-align: center;
+            animation: slideUp 0.25s ease;
+        }
+        #batchDeleteOverlay .bd-icon { font-size: 42px; margin-bottom: 8px; line-height: 1; }
+        #batchDeleteOverlay .bd-title { font-size: 16px; font-weight: 700; color: #fff; margin-bottom: 6px; }
+        #batchDeleteOverlay .bd-sub { font-size: 12px; color: #888; margin-bottom: 14px; min-height: 16px; }
+        #batchDeleteOverlay .bd-bar {
+            height: 6px;
+            background: rgba(255,255,255,0.08);
+            border-radius: 3px; overflow: hidden;
+        }
+        #batchDeleteOverlay .bd-fill {
+            height: 100%; width: 0%;
+            background: linear-gradient(90deg, #ff6b6b, #ee5253);
+            border-radius: 3px;
+            transition: width 0.3s ease;
+        }
+        @keyframes selPulse {
+            0%   { background-color: rgba(108,92,231,0.35); }
+            100% { background-color: transparent; }
+        }
+        body.selection-mode .message-wrapper[data-msg-id].pulse {
+            animation: selPulse 0.5s ease-out;
+        }
+        @media (max-width: 480px) {
+            #selectionBar { padding: 10px 10px calc(10px + env(safe-area-inset-top, 0px)); gap: 8px; }
+            #selectionBar .sel-close { width: 34px; height: 34px; font-size: 14px; }
+            #selectionBar .sel-count { font-size: 14px; }
+            #selectionBar .sel-hint { font-size: 10px; }
+            #selectionBar .sel-btn { height: 34px; padding: 0 10px; font-size: 12px; }
+            #selectionBar .sel-btn .sel-btn-label { display: none; }
+            body.selection-mode .message-wrapper[data-msg-id]::before {
+                left: -24px; width: 20px; height: 20px;
+            }
+            body.selection-mode .message-wrapper.own[data-msg-id]::before {
+                left: auto; right: -24px;
+            }
+        }
+    `;
+    document.head.appendChild(style);
+})();
+
+// ─── Панель выбора ───
+function buildSelectionBar() {
+    if (_selectionBarEl) return;
+    const bar = document.createElement('div');
+    bar.id = 'selectionBar';
+    bar.innerHTML = `
+        <button class="sel-close" id="selectionCancelBtn" title="Отменить">✕</button>
+        <div class="sel-counter">
+            <div class="sel-count" id="selectionCount">0 выбрано</div>
+            <div class="sel-hint" id="selectionHint">Тапайте по сообщениям</div>
+        </div>
+        <button class="sel-btn sel-btn-own" id="selectionAllOwnBtn" title="Выбрать все свои сообщения">
+            <span>☑</span><span class="sel-btn-label">Свои</span>
+        </button>
+        <button class="sel-btn sel-btn-delete" id="selectionDeleteBtn" disabled title="Удалить выбранные">
+            <span>🗑</span><span class="sel-btn-label">Удалить</span>
+        </button>
+    `;
+    document.body.appendChild(bar);
+    _selectionBarEl = bar;
+
+    bar.querySelector('#selectionCancelBtn').addEventListener('click', exitSelectionMode);
+    bar.querySelector('#selectionAllOwnBtn').addEventListener('click', selectAllOwn);
+    bar.querySelector('#selectionDeleteBtn').addEventListener('click', confirmBatchDelete);
+}
+
+// ─── Вход в режим выбора ───
+function enterSelectionMode(initialMsgId) {
+    if (selectionMode) return;
+    selectionMode = true;
+    selectedIds.clear();
+
+    document.body.classList.add('selection-mode');
+    buildSelectionBar();
+    void _selectionBarEl.offsetWidth;
+    _selectionBarEl.classList.add('show');
+
+    if (typeof inputBar !== 'undefined') inputBar.classList.add('hidden');
+    if (typeof floatingKeyboardBtn !== 'undefined') floatingKeyboardBtn.classList.remove('show');
+    if (typeof closeReactionPicker === 'function') closeReactionPicker();
+    if (typeof closeMessageMenu === 'function') closeMessageMenu();
+    if (typeof cancelReply === 'function') cancelReply();
+    if (typeof cancelComment === 'function') cancelComment();
+
+    if (initialMsgId) toggleSelection(initialMsgId);
+    if (navigator.vibrate) navigator.vibrate(15);
+    updateSelectionUI();
+}
+
+// ─── Выход ───
+function exitSelectionMode() {
+    if (!selectionMode) return;
+    selectionMode = false;
+    selectedIds.clear();
+
+    document.body.classList.remove('selection-mode');
+    if (_selectionBarEl) _selectionBarEl.classList.remove('show');
+
+    if (typeof showInputBar === 'function' && state.chatFile) showInputBar();
+
+    document.querySelectorAll('.message-wrapper.selected').forEach(el => el.classList.remove('selected'));
+    if (navigator.vibrate) navigator.vibrate(10);
+}
+
+// ─── Тап по сообщению ───
+function toggleSelection(msgId) {
+    const wrapper = messagesInner.querySelector(`.message-wrapper[data-msg-id="${msgId}"]`);
+    if (!wrapper) return;
+    if (!wrapper.classList.contains('own')) {
+        showToast('ℹ️ Только свои сообщения', 1200);
+        return;
+    }
+    if (selectedIds.has(msgId)) {
+        selectedIds.delete(msgId);
+        wrapper.classList.remove('selected');
+    } else {
+        selectedIds.add(msgId);
+        wrapper.classList.add('selected', 'pulse');
+        setTimeout(() => wrapper.classList.remove('pulse'), 500);
+        if (navigator.vibrate) navigator.vibrate(8);
+    }
+    updateSelectionUI();
+}
+
+// ─── Обновление UI ───
+function updateSelectionUI() {
+    if (!_selectionBarEl) return;
+    const count = selectedIds.size;
+    _selectionBarEl.querySelector('#selectionCount').textContent =
+        count === 0 ? '0 выбрано' : `${count} сообщени${count === 1 ? 'е' : count < 5 ? 'я' : 'й'}`;
+
+    const ownCount = historyState.allMessages.filter(m => m.username === state.username).length;
+    const ownBtn = _selectionBarEl.querySelector('#selectionAllOwnBtn');
+    const delBtn = _selectionBarEl.querySelector('#selectionDeleteBtn');
+    const allOwnSelected = ownCount > 0 && count === ownCount;
+
+    if (allOwnSelected) {
+        ownBtn.classList.add('active');
+        ownBtn.style.background = 'linear-gradient(135deg, rgba(108,92,231,0.4), rgba(0,184,148,0.3))';
+        ownBtn.style.color = '#fff';
+    } else {
+        ownBtn.classList.remove('active');
+        ownBtn.style.background = '';
+        ownBtn.style.color = '';
+    }
+    delBtn.disabled = count === 0;
+}
+
+// ─── Выбрать все свои ───
+function selectAllOwn() {
+    const ownMessages = historyState.allMessages.filter(m => m.username === state.username);
+
+    if (selectedIds.size === ownMessages.length && ownMessages.length > 0) {
+        selectedIds.clear();
+        document.querySelectorAll('.message-wrapper.selected').forEach(el => el.classList.remove('selected'));
+        updateSelectionUI();
+        if (navigator.vibrate) navigator.vibrate(10);
+        return;
+    }
+
+    selectedIds.clear();
+    document.querySelectorAll('.message-wrapper.selected').forEach(el => el.classList.remove('selected'));
+
+    document.querySelectorAll('.message-wrapper.own[data-msg-id]').forEach(el => {
+        const id = parseInt(el.dataset.msgId);
+        if (!isNaN(id)) {
+            selectedIds.add(id);
+            el.classList.add('selected');
+        }
+    });
+    updateSelectionUI();
+    if (navigator.vibrate) navigator.vibrate(15);
+    showToast(`☑ Выбрано: ${selectedIds.size}`, 1200);
+}
+
+// ─── Подтверждение удаления ───
+async function confirmBatchDelete() {
+    const count = selectedIds.size;
+    if (count === 0) return;
+
+    const ok = await showConfirmModal(
+        '🗑️ Удалить сообщения?',
+        `Будет удалено ${count} сообщени${count === 1 ? 'е' : count < 5 ? 'я' : 'й'} и все их вложения (фото, аудио, файлы, видео).\n\nДействие необратимо.`,
+        'Удалить', 'Отмена'
+    );
+    if (!ok) return;
+
+    const idsToDelete = Array.from(selectedIds);
+    exitSelectionMode();
+    await performBatchDelete(idsToDelete);
+}
+
+// ─── Пакетное удаление ───
+async function performBatchDelete(messageIds) {
+    if (!state.isAuthorized || !state.chatFile) {
+        showToast('❌ Нет доступа', 2000);
+        return;
+    }
+    if (!navigator.onLine || !networkState.isOnline) {
+        showToast('📵 Нет подключения', 2500);
+        return;
+    }
+
+    const overlay = document.getElementById('batchDeleteOverlay');
+    const subEl = overlay.querySelector('.bd-sub');
+    const fillEl = overlay.querySelector('.bd-fill');
+    const titleEl = overlay.querySelector('.bd-title');
+
+    overlay.classList.add('show');
+    titleEl.textContent = '🗑️ Удаление…';
+    subEl.textContent = 'Читаем сообщения…';
+    fillEl.style.width = '0%';
+
+    try {
+        const path = getChatPath(state.chatFile);
+        const result = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
+        if (!result.exists) throw new Error('Чат не найден');
+
+        const fileContent = result.content;
+        if (fileContent.v !== CRYPTO.VERSION) throw new Error('Формат не поддерживается');
+
+        if (fileContent.salt !== state.salt) {
+            state.salt = fileContent.salt;
+            CRYPTO._key = await deriveKey(state.chatPassword, state.salt);
+        }
+
+        const encMessages = fileContent.messages || [];
+        const idsSet = new Set(messageIds);
+
+        subEl.textContent = 'Анализируем вложения…';
+        const attachmentsToDelete = [];
+        let ownCount = 0, skipped = 0;
+
+        for (let i = 0; i < encMessages.length; i++) {
+            if (!idsSet.has(encMessages[i].id)) continue;
+
+            const plain = await decryptMessage(encMessages[i]);
+            if (!plain) { skipped++; continue; }
+            if (plain.username !== state.username) { skipped++; continue; }
+
+            ownCount++;
+
+            if (plain.image && isAttachmentRef(plain.image)) attachmentsToDelete.push(plain.image);
+            if (plain.audio && isAttachmentRef(plain.audio)) attachmentsToDelete.push(plain.audio);
+            if (plain.file && isAttachmentRef(plain.file)) attachmentsToDelete.push(plain.file);
+            if (plain.video && isAttachmentRef(plain.video)) attachmentsToDelete.push(plain.video);
+            if (plain.videoNote && isAttachmentRef(plain.videoNote)) attachmentsToDelete.push(plain.videoNote);
+        }
+
+        if (ownCount === 0) {
+            overlay.classList.remove('show');
+            showToast('❌ Нечего удалять (только свои сообщения)', 2500);
+            return;
+        }
+
+        const totalAtt = attachmentsToDelete.length;
+        let attDeleted = 0, attFailed = 0;
+        const failedNames = [];
+
+        if (totalAtt > 0) {
+            const BATCH = 3;
+            for (let i = 0; i < attachmentsToDelete.length; i += BATCH) {
+                const batch = attachmentsToDelete.slice(i, i + BATCH);
+                subEl.textContent = `Удаление вложений: ${Math.min(i + batch.length, totalAtt)} / ${totalAtt}`;
+                fillEl.style.width = (10 + (attDeleted / totalAtt) * 40) + '%';
+
+                const results = await Promise.allSettled(
+                    batch.map(name => deleteAttachment(state.chatFile, name))
+                );
+
+                for (const r of results) {
+                    if (r.status === 'fulfilled' && r.value) {
+                        attDeleted += (r.value.deleted || []).length;
+                        if (r.value.failed && r.value.failed.length > 0) {
+                            attFailed += r.value.failed.length;
+                            r.value.failed.forEach(f => failedNames.push(f.name));
+                        }
+                    } else {
+                        attFailed++;
+                    }
+                }
+            }
+        }
+
+        subEl.textContent = 'Обновление файла чата…';
+        fillEl.style.width = '70%';
+
+        fileContent.messages = encMessages.filter(m => !idsSet.has(m.id));
+
+        const saved = await saveFile(
+            state.token, CONFIG.repoOwner, CONFIG.repoName,
+            path, fileContent, result.sha
+        );
+
+        subEl.textContent = 'Обновление метаданных…';
+        fillEl.style.width = '90%';
+
+        const newVersion = Date.now();
+        await updateMeta(state.chatFile, newVersion, fileContent.messages.length);
+
+        state._lastMetaVersion = newVersion;
+        state._metaEtag = null;
+        state._metaEtagsByFile[state.chatFile] = null;
+        state.sha = saved.blobSha;
+        state._lastCommitSha = saved.commitSha;
+        state.lastMessageCount = fileContent.messages.length;
+        state._lastActivityAt = Date.now();
+
+        historyState.allMessages = historyState.allMessages.filter(m => !idsSet.has(m.id));
+        state.messages = state.messages.filter(m => !idsSet.has(m.id));
+
+        messageIds.forEach(id => {
+            const node = messagesInner.querySelector(`.message-wrapper[data-msg-id="${id}"]`);
+            if (node) {
+                node.style.transition = 'opacity 0.2s, transform 0.2s';
+                node.style.opacity = '0';
+                node.style.transform = 'scale(0.85)';
+                setTimeout(() => node.remove(), 200);
+            }
+        });
+
+        if (historyState.allMessages.length <= CONFIG.renderInitial) {
+            setTimeout(() => renderHistory(), 300);
+        }
+
+        fillEl.style.width = '100%';
+
+        setTimeout(() => {
+            overlay.classList.remove('show');
+            fillEl.style.width = '0%';
+
+            let msg = `✅ Удалено: ${ownCount} сообщени${ownCount === 1 ? 'е' : ownCount < 5 ? 'я' : 'й'}`;
+            if (attDeleted > 0) msg += ` · ${attDeleted} файл${attDeleted === 1 ? '' : 'ов'}`;
+            if (attFailed > 0) msg += ` · ⚠️ ошибок: ${attFailed}`;
+
+            showToast(msg, 3000);
+            if (attFailed > 0) console.warn('Не удалось удалить вложения:', failedNames);
+            soundManager.play('delete');
+        }, 300);
+
+    } catch (e) {
+        console.error('batch delete error:', e);
+        overlay.classList.remove('show');
+        fillEl.style.width = '0%';
+        soundManager.play('error');
+
+        const isNetworkError = !navigator.onLine ||
+            e.name === 'AbortError' ||
+            e.message.includes('Failed to fetch') ||
+            e.message.includes('NetworkError');
+
+        if (isNetworkError) {
+            networkState.isOnline = false;
+            showToast('📵 Соединение потеряно', 2500);
+        } else {
+            showToast('❌ Ошибка: ' + e.message, 3000);
+        }
+    }
+}
+
+// ─── Оверлей прогресса удаления ───
+(function buildBatchDeleteOverlay() {
+    if (document.getElementById('batchDeleteOverlay')) return;
+    const overlay = document.createElement('div');
+    overlay.id = 'batchDeleteOverlay';
+    overlay.innerHTML = `
+        <div class="bd-card">
+            <div class="bd-icon">🗑️</div>
+            <div class="bd-title">Удаление…</div>
+            <div class="bd-sub">Подготовка…</div>
+            <div class="bd-bar"><div class="bd-fill"></div></div>
+        </div>
+    `;
+    document.body.appendChild(overlay);
+})();
+
+// ═══════════════════════════════════════════════════════════════
+//  ПЕРЕОПРЕДЕЛЯЕМ showMessageMenu (замена оригинала)
+//  Добавляем пункт "Выбрать несколько" для своих сообщений
+// ═══════════════════════════════════════════════════════════════
+showMessageMenu = function(x, y, msgId, isOwn) {
+    if (typeof _editMenuEl !== 'undefined' && _editMenuEl) return;
+
+    const menu = document.createElement('div');
+    menu.className = 'edit-menu';
+
+    let itemsHtml = '';
+
+    if (isOwn) {
+        itemsHtml += `
+            <div class="edit-menu-item" data-action="select">
+                <span class="emi-icon">☑️</span>
+                <span>Выбрать несколько</span>
+            </div>
+            <div class="edit-menu-item" data-action="edit">
+                <span class="emi-icon">✏️</span>
+                <span>Редактировать</span>
+            </div>
+        `;
+    }
+
+    itemsHtml += `
+        <div class="edit-menu-item" data-action="reply">
+            <span class="emi-icon">↩</span>
+            <span>Ответить</span>
+        </div>
+        <div class="edit-menu-item" data-action="copy">
+            <span class="emi-icon">📋</span>
+            <span>Копировать текст</span>
+        </div>
+    `;
+
+    if (isOwn) {
+        itemsHtml += `
+            <div class="edit-menu-item danger" data-action="delete">
+                <span class="emi-icon">🗑️</span>
+                <span>Удалить</span>
+            </div>
+        `;
+    }
+
+    menu.innerHTML = itemsHtml;
+    document.body.appendChild(menu);
+
+    const rect = menu.getBoundingClientRect();
+    const margin = 10;
+    let left = x - rect.width / 2;
+    let top = y - rect.height - 10;
+    left = Math.max(margin, Math.min(left, window.innerWidth - rect.width - margin));
+    if (top < margin) top = y + 20;
+    top = Math.max(margin, Math.min(top, window.innerHeight - rect.height - margin));
+    menu.style.left = left + 'px';
+    menu.style.top = top + 'px';
+
+    menu.querySelectorAll('.edit-menu-item').forEach(el => {
+        el.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const action = el.dataset.action;
+            if (typeof closeMessageMenu === 'function') closeMessageMenu();
+
+            if (action === 'select') {
+                enterSelectionMode(msgId);
+            } else if (typeof handleMessageAction === 'function') {
+                handleMessageAction(action, msgId);
+            }
+        });
+    });
+
+    _editMenuEl = menu;
+
+    setTimeout(() => {
+        document.addEventListener('click', closeMessageMenuOnOutside);
+        document.addEventListener('scroll', closeMessageMenu, true);
+    }, 0);
+
+    if (navigator.vibrate) navigator.vibrate(15);
+};
+
+// ═══════════════════════════════════════════════════════════════
+//  ПЕРЕХВАТ КЛИКОВ В РЕЖИМЕ ВЫБОРА (capture)
+// ═══════════════════════════════════════════════════════════════
+messagesInner.addEventListener('click', (e) => {
+    if (!selectionMode) return;
+    if (e.target.closest('a, button, audio, video, input, textarea, .reaction-chip, .audio-play-btn, .file-action-btn, .image-comment-btn, .comment-item, .link-button, .reply-quote, .image-container img, .video-container, .video-note-container')) {
+        return;
+    }
+    const wrapper = e.target.closest('.message-wrapper[data-msg-id]');
+    if (!wrapper) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const msgId = parseInt(wrapper.dataset.msgId);
+    if (!isNaN(msgId)) toggleSelection(msgId);
+}, true);
+
+// ═══════════════════════════════════════════════════════════════
+//  🚫 ГЛУШИМ ОРИГИНАЛЬНЫЙ contextmenu (вторая панель!)
+//  Оригинальный initLongPressOnMessages() вешает свой contextmenu,
+//  который рисует ДУБЛЬ меню. Перехватываем в capture-фазе.
+// ═══════════════════════════════════════════════════════════════
+messagesInner.addEventListener('contextmenu', (e) => {
+    const wrapper = e.target.closest('.message-wrapper[data-msg-id]');
+    if (!wrapper) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (selectionMode) return;
+    const msgId = parseInt(wrapper.dataset.msgId);
+    const msg = historyState.allMessages.find(m => m.id === msgId);
+    if (!msg) return;
+    const isOwn = msg.username === state.username && state.isAuthorized;
+    showMessageMenu(e.clientX, e.clientY, msgId, isOwn);
+}, true);
+
+// ═══════════════════════════════════════════════════════════════
+//  ИНТЕГРАЦИЯ
+// ═══════════════════════════════════════════════════════════════
+const _origBackToChatsForSelection = backToChats;
+backToChats = function() {
+    if (selectionMode) exitSelectionMode();
+    return _origBackToChatsForSelection.apply(this, arguments);
+};
+
+const _origLogoutForSelection = logout;
+logout = function() {
+    if (selectionMode) exitSelectionMode();
+    return _origLogoutForSelection.apply(this, arguments);
+};
+
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && selectionMode) {
+        e.preventDefault();
+        e.stopPropagation();
+        exitSelectionMode();
+    }
+}, true);
+
+console.log('☑️ Режим пакетного удаления активен');
+console.log('   • Долгое нажатие на своё сообщение → «☑️ Выбрать несколько»');
+console.log('   • Тап по сообщениям = добавить/убрать');
+console.log('   • Кнопка «Свои» = выделить все свои');
+console.log('   • Кнопка «Удалить» = пакетное удаление + вложения');
+
 </script>
 </body>
 </html>
