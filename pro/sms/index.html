@@ -3923,7 +3923,80 @@ async function getVideoAsMp4(videoUrl, displayName = 'video') {
         cancelBtn.disabled = false;
     }
 }
+/**
+ * Определяет ТИП вложения: 'image' | 'video' | 'audio' | 'file'
+ * Работает по реальному MIME blob, расширению и магическим байтам.
+ *
+ * ⚠️ КЛЮЧЕВОЙ МОМЕНТ: расширение .webm НЕ относится автоматически к audio.
+ *    WebM бывает и видео, и аудио. Определяем по blob.type.
+ */
+async function detectAttachmentKind(blob, fileName, fallbackMime) {
+    const realMime = (blob && blob.type) || fallbackMime || '';
+    const ext = (fileName || '').split('.').pop().toLowerCase();
 
+    // ═══ 1. По реальному MIME (самый надёжный) ═══
+    if (realMime.startsWith('image/')) return 'image';
+    if (realMime.startsWith('video/')) return 'video';
+    if (realMime.startsWith('audio/')) return 'audio';
+
+    // ═══ 2. По магическим байтам (если MIME потерян) ═══
+    if (blob && blob.size >= 16) {
+        try {
+            const head = await blob.slice(0, 16).arrayBuffer();
+            const bytes = new Uint8Array(head);
+
+            // MP4 / MOV: 'ftyp' на позиции 4
+            if (bytes[4] === 0x66 && bytes[5] === 0x74 &&
+                bytes[6] === 0x79 && bytes[7] === 0x70) {
+                return 'video';
+            }
+            // WebM / MKV: EBML header 0x1A 0x45 0xDF 0xA3
+            if (bytes[0] === 0x1A && bytes[1] === 0x45 &&
+                bytes[2] === 0xDF && bytes[3] === 0xA3) {
+                // 🆕 WebM может быть и аудио, и видео — уточняем по расширению
+                if (ext === 'webm' || ext === 'mkv') {
+                    // .webm/.mkv в нашем чате — это ВИДЕО (аудио мы кодируем
+                    // в audio/webm, но тогда blob.type = 'audio/webm' и мы
+                    // сюда не попадём)
+                    return 'video';
+                }
+                return 'video';
+            }
+            // AVI: 'RIFF'....'AVI '
+            if (bytes[0] === 0x52 && bytes[1] === 0x49 &&
+                bytes[2] === 0x46 && bytes[3] === 0x46) {
+                const sub = new Uint8Array(await blob.slice(8, 12).arrayBuffer());
+                if (sub[0] === 0x41 && sub[1] === 0x56 && sub[2] === 0x49) {
+                    return 'video';
+                }
+                return 'audio'; // WAV: RIFF....WAVE
+            }
+            // OGG / OPUS: 'OggS'
+            if (bytes[0] === 0x4F && bytes[1] === 0x67 &&
+                bytes[2] === 0x67 && bytes[3] === 0x53) {
+                return 'audio';
+            }
+            // MP3: 'ID3' или 0xFF 0xFB
+            if ((bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33) ||
+                (bytes[0] === 0xFF && (bytes[1] & 0xE0) === 0xE0)) {
+                return 'audio';
+            }
+            // PNG / JPEG / GIF / WEBP
+            if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47) return 'image';
+            if (bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF) return 'image';
+            if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) return 'image';
+        } catch (e) {
+            // ignore
+        }
+    }
+
+    // ═══ 3. По расширению (fallback) ═══
+    // 🆕 .webm ЗДЕСЬ НЕ В СПИСКЕ audio — иначе видео-WebM станет аудио!
+    if (/^(jpg|jpeg|png|gif|webp|bmp|avif|svg|ico)$/.test(ext)) return 'image';
+    if (/^(mp4|mov|webm|mkv|avi|m4v|3gp|ogv)$/.test(ext)) return 'video';
+    if (/^(mp3|ogg|wav|m4a|aac|flac|opus|oga)$/.test(ext)) return 'audio';
+    return 'file';
+}
 // 🆕 Проверка «реально ли это MP4» по магическим байтам
 async function looksLikeMp4(blob) {
     try {
@@ -7744,78 +7817,117 @@ async function shareAudioToChat(url, fileName) {
         showToast('❌ Не удалось подготовить аудио', 2000);
     }
 }
-// 🆕 Поделиться видео — ВСЕГДА конвертирует в WebM для внешних приложений
+
+/**
+ * Поделиться видео из чата.
+ * НЕ конвертирует — передаёт blob как есть.
+ * Конвертация произойдёт только при отправке в Telegram (внешний шаринг).
+ */
 async function shareVideoToChat(url, fileName) {
     try {
-        // 1. Достаём blob
         const res = await fetch(url);
         const blob = await res.blob();
-        const mime = blob.type || '';
 
-        // 2. Проверяем: уже WebM?
-        const isWebmByMime = mime.includes('webm') || mime.includes('matroska');
-        const isMp4ByMime = mime.includes('mp4') || mime.includes('quicktime');
+        // 🆕 Восстанавливаем реальный MIME по магическим байтам
+        const kind = await detectAttachmentKind(blob, fileName, blob.type);
 
-        let finalBlob = blob;
-        let finalName = fileName || 'video.webm';
-
-        if (isWebmByMime) {
-            // Уже WebM — не трогаем
-            console.log('🎬 shareVideoToChat: уже WebM, не конвертируем');
-            finalName = finalName.replace(/\.[^.]+$/, '') + '.webm';
-        } else {
-            // MP4 или что-то ещё → конвертируем в WebM
-            console.log('🎬 shareVideoToChat: конвертируем в WebM');
-            showToast('🎬 Конвертация в WebM для внешних приложений...', 2000);
-
-            // Прогресс-оверлей
-            const overlay = document.getElementById('uploadProgressOverlay');
-            const nameEl = document.getElementById('uploadNameText');
-            const iconEl = document.getElementById('uploadIconInline');
-            const fillEl = document.getElementById('uploadProgressFill');
-            const pctEl = document.getElementById('uploadProgressPercent');
-            const bytesEl = document.getElementById('uploadProgressBytes');
-            const phaseEl = document.getElementById('uploadPhaseBadge');
-
-            iconEl.textContent = '🎬';
-            nameEl.textContent = `Конвертация в WebM: ${fileName}`;
-            fillEl.style.width = '0%';
-            fillEl.classList.add('compressing');
-            pctEl.textContent = '0%';
-            bytesEl.textContent = 'Обработка…';
-            phaseEl.textContent = '⚙ MP4 → WebM';
-            phaseEl.className = 'phase-badge compressing';
-            overlay.classList.add('show');
-
-            try {
-                finalBlob = await VideoConverterToWebM.toWebM(blob, {
-                    onProgress: (p) => {
-                        fillEl.style.width = p + '%';
-                        pctEl.textContent = Math.round(p) + '%';
-                        bytesEl.textContent = `Обработано ${Math.round(p)}%`;
-                    }
-                });
-                finalName = finalName.replace(/\.[^.]+$/, '') + '.webm';
-                fillEl.style.width = '100%';
-                pctEl.textContent = '100%';
-                phaseEl.textContent = '✓ Готово';
-                phaseEl.className = 'phase-badge done';
-                await new Promise(r => setTimeout(r, 400));
-            } finally {
-                overlay.classList.remove('show');
-                fillEl.classList.remove('compressing');
-            }
-
-            showToast('✅ Готово в WebM', 1500);
+        // Определяем корректный MIME
+        let realMime = blob.type || '';
+        if (!realMime || realMime === 'application/octet-stream') {
+            const ext = (fileName.split('.').pop() || '').toLowerCase();
+            if (ext === 'webm' || kind === 'video') realMime = 'video/webm';
+            else if (ext === 'mp4' || ext === 'mov') realMime = 'video/mp4';
+            else realMime = 'video/mp4';
         }
 
-        // 3. Открываем модалку «Поделиться с чатом»
-        //    (для внешних приложений — WebM, для внутренних чатов пользователь сам выберет)
-        openShareToChatModal(finalBlob, finalName, null);
+        // 🆕 Принудительно ставим video/* — иначе blob.type может быть пустой
+        const fixedBlob = new Blob([blob], { type: realMime });
+
+        console.log('🎬 shareVideoToChat:', {
+            kind,
+            realMime,
+            size: blob.size,
+            name: fileName,
+        });
+
+        // Просто открываем модалку — без конвертаций
+        openShareToChatModal(fixedBlob, fileName, null);
 
     } catch (e) {
         console.error('shareVideoToChat error:', e);
         showToast('❌ Не удалось подготовить видео: ' + e.message, 3000);
+    }
+}
+// ═══ Определяем формат видео по содержимому ═══
+async function detectVideoFormat(blob) {
+    try {
+        const head = await blob.slice(0, 16).arrayBuffer();
+        const bytes = new Uint8Array(head);
+        
+        // ISO BMFF (MP4/MOV): байты 4-7 = 'ftyp'
+        if (bytes[4] === 0x66 && bytes[5] === 0x74 && 
+            bytes[6] === 0x79 && bytes[7] === 0x70) {
+            return 'mp4';
+        }
+        
+        // WebM/MKV: 0x1A 0x45 0xDF 0xA3
+        if (bytes[0] === 0x1A && bytes[1] === 0x45 && 
+            bytes[2] === 0xDF && bytes[3] === 0xA3) {
+            return 'webm';
+        }
+        
+        // AVI: 'RIFF'....'AVI '
+        if (bytes[0] === 0x52 && bytes[1] === 0x49 && 
+            bytes[2] === 0x46 && bytes[3] === 0x46) {
+            const sub = new Uint8Array(await blob.slice(8, 12).arrayBuffer());
+            if (sub[0] === 0x41 && sub[1] === 0x56 && sub[2] === 0x49) {
+                return 'avi';
+            }
+        }
+        
+        return 'unknown';
+    } catch (e) {
+        return 'unknown';
+    }
+}
+
+// ═══ Конвертация с прогресс-оверлеем ═══
+async function convertToWebMWithProgress(blob, fileName) {
+    const overlay = document.getElementById('uploadProgressOverlay');
+    const nameEl = document.getElementById('uploadNameText');
+    const iconEl = document.getElementById('uploadIconInline');
+    const fillEl = document.getElementById('uploadProgressFill');
+    const pctEl = document.getElementById('uploadProgressPercent');
+    const bytesEl = document.getElementById('uploadProgressBytes');
+    const phaseEl = document.getElementById('uploadPhaseBadge');
+
+    iconEl.textContent = '🎬';
+    nameEl.textContent = `Конвертация в WebM: ${fileName}`;
+    fillEl.style.width = '0%';
+    fillEl.classList.add('compressing');
+    pctEl.textContent = '0%';
+    bytesEl.textContent = 'Обработка…';
+    phaseEl.textContent = '⚙ MP4 → WebM';
+    phaseEl.className = 'phase-badge compressing';
+    overlay.classList.add('show');
+
+    try {
+        const result = await VideoConverterToWebM.toWebM(blob, {
+            onProgress: (p) => {
+                fillEl.style.width = p + '%';
+                pctEl.textContent = Math.round(p) + '%';
+                bytesEl.textContent = `Обработано ${Math.round(p)}%`;
+            }
+        });
+        fillEl.style.width = '100%';
+        pctEl.textContent = '100%';
+        phaseEl.textContent = '✓ Готово';
+        phaseEl.className = 'phase-badge done';
+        await new Promise(r => setTimeout(r, 400));
+        return result;
+    } finally {
+        overlay.classList.remove('show');
+        fillEl.classList.remove('compressing');
     }
 }
 // ===================================================================
@@ -9424,68 +9536,41 @@ function openShareToChatModal(blob, fileName, imageUrl, meta = {}) {
 }
 
 
-
-
-
-
 async function confirmShareToChat() {
     if (!_shareToChat.blob || !_shareToChat.selectedFile) return;
+
     const targetFile = _shareToChat.selectedFile;
-    let blob = _shareToChat.blob;
-    let fileName = _shareToChat.fileName;
-    let mime = _shareToChat.mime;
+    const blob = _shareToChat.blob;
+    const fileName = _shareToChat.fileName;
+    const mime = _shareToChat.mime;
 
-    // 🆕 Проверяем: реально ли это MP4?
-if (mime.startsWith('video/') || /\.(webm|mkv|avi|mov|mp4)$/i.test(fileName)) {
-    try {
-        const url = URL.createObjectURL(blob);
-        const realBlob = await fetch(url).then(r => r.blob());
-        const realMime = realBlob.type || '';
-        const isMp4ByMime = realMime.includes('mp4') || realMime.includes('quicktime');
-        const isMp4ByMagic = !isMp4ByMime && await looksLikeMp4(realBlob);
-        URL.revokeObjectURL(url);
-
-        if (!isMp4ByMime && !isMp4ByMagic) {
-            // Реально WebM — конвертируем
-            const url2 = URL.createObjectURL(blob);
-            blob = await getVideoAsMp4(url2, fileName);
-            URL.revokeObjectURL(url2);
-            mime = 'video/mp4';
-            fileName = fileName.replace(/\.[^.]+$/, '') + '.mp4';
-            showToast('🎬 Подготовлено в MP4', 1200);
-        } else {
-            // Уже MP4 — просто нормализуем
-            blob = new Blob([blob], { type: 'video/mp4' });
-            mime = 'video/mp4';
-            fileName = fileName.replace(/\.[^.]+$/, '') + '.mp4';
-        }
-    } catch (e) {
-        console.warn('Проверка/конвертация упала, шлём как есть:', e);
-    }
-}
+    // Закрываем модалку
     $('shareToChatModal').classList.remove('active');
 
+    // Проверяем пароль целевого чата
     const password = state.savedPasswords[targetFile];
     if (!password) {
         showToast('🔐 Сначала войдите в этот чат (нужен пароль)', 3000);
-        pendingOpenChat = { file: targetFile, name: (state.chats.find(c => c.file === targetFile)?.name) || targetFile };
+        pendingOpenChat = {
+            file: targetFile,
+            name: (state.chats.find(c => c.file === targetFile)?.name) || targetFile,
+        };
         _pendingShareAfterUnlock = { blob, fileName, mime, targetFile };
         $('openChatModal').classList.add('active');
         setTimeout(() => $('openChatPasswordInput').focus(), 100);
         return;
     }
 
-
     await doShareToChat(targetFile, password, blob, fileName, mime, _shareToChat.meta || {});
 }
 
 
-
-
 async function doShareToChat(targetFile, targetPassword, blob, fileName, mime, meta = {}) {
-    const isImage = mime.startsWith('image/');
-    const isAudio = mime.startsWith('audio/') ||
-        /\.(mp3|ogg|wav|m4a|aac|flac|opus|webm)$/i.test(fileName);
+    // ═══ 1. Определяем РЕАЛЬНЫЙ тип по blob, а не по расширению ═══
+    const kind = await detectAttachmentKind(blob, fileName, mime || blob.type);
+    const realMime = blob.type || mime || '';
+
+    console.log(`📤 doShareToChat: kind=${kind}, realMime=${realMime}, name=${fileName}, size=${blob.size}`);
 
     showToast(`📤 Отправка в чат…`, 1500);
 
@@ -9511,10 +9596,16 @@ async function doShareToChat(targetFile, targetPassword, blob, fileName, mime, m
 
         const targetKey = await deriveKey(targetPassword, targetSalt);
 
-        const ext = isImage
-            ? 'jpg'
-            : (fileName.split('.').pop() || 'bin').toLowerCase().replace(/[^a-z0-9]/g, '') || 'bin';
-        const attachName = generateAttachmentName(isImage ? 'img' : (isAudio ? 'aud' : 'file'), ext);
+        // ═══ 2. Готовим имя вложения ═══
+        const ext = (fileName.split('.').pop() || 'bin')
+            .toLowerCase().replace(/[^a-z0-9]/g, '') || 'bin';
+        const prefix = kind === 'image' ? 'img'
+                     : kind === 'video' ? 'video'
+                     : kind === 'audio' ? 'aud'
+                     : 'file';
+        const attachName = generateAttachmentName(prefix, ext);
+
+        // ═══ 3. Загружаем вложение ═══
         const buf = await blob.arrayBuffer();
 
         const saveState = {
@@ -9528,8 +9619,21 @@ async function doShareToChat(targetFile, targetPassword, blob, fileName, mime, m
         CRYPTO._key = targetKey;
 
         try {
-            const label = isImage ? `📷 ${fileName}` : (isAudio ? `🎵 ${fileName}` : `📎 ${fileName}`);
-            await uploadAttachmentAuto(targetFile, attachName, buf, mime, label);
+            const label = kind === 'image' ? `📷 ${fileName}`
+                        : kind === 'video' ? `🎬 ${fileName}`
+                        : kind === 'audio' ? `🎵 ${fileName}`
+                        : `📎 ${fileName}`;
+
+            // 🆕 MIME для шифрования: используем realMime, чтобы при расшифровке
+            //    blob получил правильный тип
+            const uploadMime = realMime || (
+                kind === 'video' ? 'video/mp4' :
+                kind === 'audio' ? 'audio/mpeg' :
+                kind === 'image' ? 'image/jpeg' :
+                'application/octet-stream'
+            );
+
+            await uploadAttachmentAuto(targetFile, attachName, buf, uploadMime, label);
         } finally {
             state.chatFile = saveState.chatFile;
             state.chatPassword = saveState.chatPassword;
@@ -9537,42 +9641,31 @@ async function doShareToChat(targetFile, targetPassword, blob, fileName, mime, m
             CRYPTO._key = prevKey;
         }
 
+        // ═══ 4. Формируем payload по реальному типу ═══
         const messageId = Date.now();
-        const plainMsg = {
-            id: messageId,
-            username: state.username,
-            text: '',
-            time: new Date().toISOString(),
-        };
-        if (isImage) {
-            plainMsg.image = attachName;
-        } else if (isAudio) {
-            plainMsg.audio = attachName;
-            plainMsg.audioName = fileName;
-            plainMsg.audioDuration = 0;
-            plainMsg.audioMime = mime;
-        } else {
-            plainMsg.file = attachName;
-            plainMsg.fileName = fileName;
-            plainMsg.fileMime = mime;
-            plainMsg.fileSize = blob.size;
-        }
-
         const payload = { username: state.username, text: '' };
-        if (isImage) {
+
+        if (kind === 'image') {
             payload.image = attachName;
-        } else if (isAudio) {
+        } else if (kind === 'video') {
+            payload.video = attachName;
+            payload.videoName = fileName;
+            payload.videoMime = realMime || 'video/mp4';
+            payload.videoSize = blob.size;
+            payload.videoDuration = meta.duration || 0;
+        } else if (kind === 'audio') {
             payload.audio = attachName;
             payload.audioName = fileName;
-            payload.audioDuration = 0;
-            payload.audioMime = mime;
+            payload.audioDuration = meta.duration || 0;
+            payload.audioMime = realMime || 'audio/mpeg';
         } else {
             payload.file = attachName;
             payload.fileName = fileName;
-            payload.fileMime = mime;
+            payload.fileMime = realMime || 'application/octet-stream';
             payload.fileSize = blob.size;
         }
 
+        // ═══ 5. Шифруем и сохраняем ═══
         const iv = generateIV();
         const encBuf = await crypto.subtle.encrypt(
             { name: 'AES-GCM', iv },
@@ -9595,7 +9688,15 @@ async function doShareToChat(targetFile, targetPassword, blob, fileName, mime, m
         await updateMeta(targetFile, messageId, fileContent.messages.length);
         state._metaEtagsByFile[targetFile] = null;
 
+        // ═══ 6. Локальное обновление ═══
         if (state.chatFile === targetFile) {
+            const plainMsg = {
+                id: messageId,
+                username: state.username,
+                text: '',
+                time: encMsg.time,
+                ...payload,
+            };
             state.messages.push(plainMsg);
             state.sha = saved.blobSha;
             state._lastCommitSha = saved.commitSha;
@@ -9610,14 +9711,13 @@ async function doShareToChat(targetFile, targetPassword, blob, fileName, mime, m
         const chatName = state.chats.find(c => c.file === targetFile)?.name || targetFile;
         showToast(`✅ Отправлено в «${chatName}»`, 2500);
         soundManager.play('send');
+
     } catch (e) {
         console.error('shareToChat error:', e);
         showToast('❌ Не удалось отправить: ' + e.message, 3000);
         soundManager.play('error');
     }
 }
-
-
 
 
 
@@ -10896,50 +10996,77 @@ document.addEventListener('keydown', (e) => {
     btn.addEventListener('mouseup',   () => btn.style.transform = 'scale(1)');
     btn.addEventListener('touchstart',() => btn.style.transform = 'scale(0.98)', { passive: true });
     btn.addEventListener('touchend',  () => btn.style.transform = 'scale(1)');
-    btn.addEventListener('click', async () => {
-        const blob = _shareToChat.blob;
-        const fileName = _shareToChat.fileName || 'video.webm';
-        const mime = _shareToChat.mime || blob.type || 'video/webm';
+btn.addEventListener('click', async () => {
+    const blob = _shareToChat.blob;
+    let fileName = _shareToChat.fileName || 'file.bin';
+    const originalMime = _shareToChat.mime || blob.type || '';
 
-        if (!blob) {
-            showToast('❌ Нет файла для отправки', 2000);
+    if (!blob) {
+        showToast('❌ Нет файла для отправки', 2000);
+        return;
+    }
+
+    // 🆕 Определяем реальный тип
+    const kind = await detectAttachmentKind(blob, fileName, originalMime);
+    let mime = blob.type || originalMime;
+    if (!mime) {
+        mime = kind === 'video' ? 'video/mp4'
+             : kind === 'audio' ? 'audio/mpeg'
+             : kind === 'image' ? 'image/jpeg'
+             : 'application/octet-stream';
+    }
+
+    // 🆕 Для видео: Telegram понимает MP4. Если WebM — предупреждаем, но шлём как есть
+    if (kind === 'video') {
+        const isMp4 = mime.includes('mp4') || mime.includes('quicktime');
+        if (!isMp4) {
+            const ok = await showConfirmModal(
+                '⚠️ Telegram и WebM',
+                'Telegram не принимает WebM как видео — он может показать его как обычный файл.\n\n' +
+                'Продолжить отправку?',
+                'Отправить',
+                'Отмена'
+            );
+            if (!ok) return;
+            // Если пользователь хочет MP4 — дадим выбор
+            // (для этого нужно было бы конвертировать, но на мобилке это ненадёжно)
+        }
+    }
+
+    document.getElementById('shareToChatModal').classList.remove('active');
+    if (navigator.vibrate) navigator.vibrate(20);
+
+    try {
+        const file = new File([blob], fileName, { type: mime });
+
+        if (navigator.canShare && navigator.canShare({ files: [file] })) {
+            await navigator.share({ files: [file], title: fileName });
+            showToast('✅ Отправлено', 1500);
             return;
         }
 
-        document.getElementById('shareToChatModal').classList.remove('active');
-        if (navigator.vibrate) navigator.vibrate(20);
-
-        try {
-            const file = new File([blob], fileName, { type: mime });
-
-            if (navigator.canShare && navigator.canShare({ files: [file] })) {
-                await navigator.share({ files: [file], title: fileName });
-                showToast('✅ Отправлено', 1500);
-                return;
-            }
-
-            if (navigator.share) {
-                await navigator.share({ title: fileName, text: 'Посмотри этот файл' });
-                return;
-            }
-
-            // Fallback — скачивание
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = fileName;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            setTimeout(() => URL.revokeObjectURL(url), 2000);
-            showToast('💾 Файл скачан', 2500);
-
-        } catch (err) {
-            if (err.name === 'AbortError') return;
-            console.error('externalShare error:', err);
-            showToast('❌ Не удалось поделиться', 2000);
+        if (navigator.share) {
+            await navigator.share({ title: fileName, text: 'Посмотри этот файл' });
+            return;
         }
-    });
+
+        // Fallback — скачивание
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = fileName;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 2000);
+        showToast('💾 Файл скачан', 2500);
+
+    } catch (err) {
+        if (err.name === 'AbortError') return;
+        console.error('externalShare error:', err);
+        showToast('❌ Не удалось поделиться', 2000);
+    }
+});
 })();
 // ═══ Долгое нажатие на фото → системное "Поделиться" ═══
 function setupLongPressShare() {
