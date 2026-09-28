@@ -3742,6 +3742,115 @@ async function ensureMp4(videoUrl, onProgress) {
         throw e;
     }
 }
+
+
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🎬 КОНВЕРТЕР MP4 → WebM (для отправки во внешние приложения)
+// ═══════════════════════════════════════════════════════════════
+const VideoConverterToWebM = (() => {
+    async function toWebM(inputBlob, opts = {}) {
+        const onProgress = opts.onProgress || (() => {});
+
+        const video = document.createElement('video');
+        video.playsInline = true;
+        video.muted = false;         // важно: не muted, иначе не будет звука
+        video.preload = 'auto';
+        video.crossOrigin = 'anonymous';
+        video.src = URL.createObjectURL(inputBlob);
+
+        await new Promise((resolve, reject) => {
+            video.onloadedmetadata = resolve;
+            video.onerror = () => reject(new Error('Не удалось прочитать видео'));
+            setTimeout(() => reject(new Error('Таймаут метаданных')), 15000);
+        });
+
+        let w = video.videoWidth || 640;
+        let h = video.videoHeight || 480;
+        const maxDim = 1280;
+        if (w > maxDim || h > maxDim) {
+            const r = Math.min(maxDim / w, maxDim / h);
+            w = Math.floor(w * r);
+            h = Math.floor(h * r);
+        }
+        if (w % 2) w++;
+        if (h % 2) h++;
+
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d', { alpha: false });
+        const videoStream = canvas.captureStream(30);
+
+        // ═══ ЗАХВАТ ЗВУКА ═══
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+        let audioSource = null;
+        try {
+            audioSource = audioCtx.createMediaElementSource(video);
+            const audioDest = audioCtx.createMediaStreamDestination();
+            audioSource.connect(audioDest);
+            // НЕ подключаем к audioCtx.destination — иначе будет эхо
+            audioDest.stream.getAudioTracks().forEach(t => videoStream.addTrack(t));
+        } catch (e) {
+            console.warn('Audio capture не удался:', e);
+        }
+
+        // ═══ ВЫБОР MIME (всегда WebM) ═══
+        const mimeCandidates = [
+            'video/webm;codecs=vp9,opus',
+            'video/webm;codecs=vp8,opus',
+            'video/webm;codecs=vp9',
+            'video/webm;codecs=vp8',
+            'video/webm',
+        ];
+        let mime = mimeCandidates.find(m => MediaRecorder.isTypeSupported(m));
+        if (!mime) throw new Error('Браузер не поддерживает запись WebM');
+
+        const chunks = [];
+        const recorder = new MediaRecorder(videoStream, {
+            mimeType: mime,
+            videoBitsPerSecond: 2000000,
+            audioBitsPerSecond: 96000,
+        });
+        recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+
+        const done = new Promise((resolve) => {
+            recorder.onstop = () => resolve(new Blob(chunks, { type: mime }));
+        });
+
+        recorder.start(100);
+        await video.play();
+
+        const duration = video.duration || 1;
+        const draw = () => {
+            if (video.paused || video.ended) return;
+            try { ctx.drawImage(video, 0, 0, w, h); } catch (e) {}
+            onProgress(Math.min(100, (video.currentTime / duration) * 100));
+            requestAnimationFrame(draw);
+        };
+        draw();
+
+        await new Promise((resolve) => {
+            video.onended = () => {
+                setTimeout(() => {
+                    if (recorder.state === 'recording') recorder.stop();
+                    resolve();
+                }, 400);
+            };
+        });
+
+        const outBlob = await done;
+        try { audioSource?.disconnect(); } catch (e) {}
+        try { audioCtx.close(); } catch (e) {}
+        try { URL.revokeObjectURL(video.src); } catch (e) {}
+        return outBlob;
+    }
+
+    return { toWebM };
+})();
 // ═══ Обёртка с прогресс-оверлеем ═══
 // ═══ Обёртка с прогресс-оверлеем ═══
 async function getVideoAsMp4(videoUrl, displayName = 'video') {
@@ -7635,43 +7744,75 @@ async function shareAudioToChat(url, fileName) {
         showToast('❌ Не удалось подготовить аудио', 2000);
     }
 }
-
-// 🆕 Поделиться видео — конвертирует в MP4 и открывает модалку выбора чата
-// 🆕 Поделиться видео — конвертирует в MP4 ТОЛЬКО если ещё не MP4
+// 🆕 Поделиться видео — ВСЕГДА конвертирует в WebM для внешних приложений
 async function shareVideoToChat(url, fileName) {
     try {
         // 1. Достаём blob
         const res = await fetch(url);
         const blob = await res.blob();
-
-        // 2. 🆕 Проверяем: реально ли это MP4 (по mime + магическим байтам)?
         const mime = blob.type || '';
+
+        // 2. Проверяем: уже WebM?
+        const isWebmByMime = mime.includes('webm') || mime.includes('matroska');
         const isMp4ByMime = mime.includes('mp4') || mime.includes('quicktime');
-        const isMp4ByMagic = !isMp4ByMime && await looksLikeMp4(blob);
 
         let finalBlob = blob;
-        let finalName = fileName || 'video.mp4';
+        let finalName = fileName || 'video.webm';
 
-        if (isMp4ByMime || isMp4ByMagic) {
-            // Уже MP4 — не перекодируем, оставляем как есть
-            finalBlob = new Blob([blob], { type: 'video/mp4' });
-            // Нормализуем имя
-            finalName = finalName.replace(/\.[^.]+$/, '') + '.mp4';
-            console.log('🎬 shareVideoToChat: уже MP4, не конвертируем');
+        if (isWebmByMime) {
+            // Уже WebM — не трогаем
+            console.log('🎬 shareVideoToChat: уже WebM, не конвертируем');
+            finalName = finalName.replace(/\.[^.]+$/, '') + '.webm';
         } else {
-            // WebM → MP4
-            console.log('🎬 shareVideoToChat: конвертируем WebM → MP4');
-            finalBlob = await getVideoAsMp4(url, fileName);
-            finalName = finalName.replace(/\.[^.]+$/, '') + '.mp4';
+            // MP4 или что-то ещё → конвертируем в WebM
+            console.log('🎬 shareVideoToChat: конвертируем в WebM');
+            showToast('🎬 Конвертация в WebM для внешних приложений...', 2000);
+
+            // Прогресс-оверлей
+            const overlay = document.getElementById('uploadProgressOverlay');
+            const nameEl = document.getElementById('uploadNameText');
+            const iconEl = document.getElementById('uploadIconInline');
+            const fillEl = document.getElementById('uploadProgressFill');
+            const pctEl = document.getElementById('uploadProgressPercent');
+            const bytesEl = document.getElementById('uploadProgressBytes');
+            const phaseEl = document.getElementById('uploadPhaseBadge');
+
+            iconEl.textContent = '🎬';
+            nameEl.textContent = `Конвертация в WebM: ${fileName}`;
+            fillEl.style.width = '0%';
+            fillEl.classList.add('compressing');
+            pctEl.textContent = '0%';
+            bytesEl.textContent = 'Обработка…';
+            phaseEl.textContent = '⚙ MP4 → WebM';
+            phaseEl.className = 'phase-badge compressing';
+            overlay.classList.add('show');
+
+            try {
+                finalBlob = await VideoConverterToWebM.toWebM(blob, {
+                    onProgress: (p) => {
+                        fillEl.style.width = p + '%';
+                        pctEl.textContent = Math.round(p) + '%';
+                        bytesEl.textContent = `Обработано ${Math.round(p)}%`;
+                    }
+                });
+                finalName = finalName.replace(/\.[^.]+$/, '') + '.webm';
+                fillEl.style.width = '100%';
+                pctEl.textContent = '100%';
+                phaseEl.textContent = '✓ Готово';
+                phaseEl.className = 'phase-badge done';
+                await new Promise(r => setTimeout(r, 400));
+            } finally {
+                overlay.classList.remove('show');
+                fillEl.classList.remove('compressing');
+            }
+
+            showToast('✅ Готово в WebM', 1500);
         }
 
         // 3. Открываем модалку «Поделиться с чатом»
+        //    (для внешних приложений — WebM, для внутренних чатов пользователь сам выберет)
         openShareToChatModal(finalBlob, finalName, null);
 
-        showToast(isMp4ByMime || isMp4ByMagic
-            ? '🎬 Видео готово к отправке (уже MP4)'
-            : '🎬 Видео конвертировано в MP4',
-            1500);
     } catch (e) {
         console.error('shareVideoToChat error:', e);
         showToast('❌ Не удалось подготовить видео: ' + e.message, 3000);
@@ -10755,33 +10896,10 @@ document.addEventListener('keydown', (e) => {
     btn.addEventListener('mouseup',   () => btn.style.transform = 'scale(1)');
     btn.addEventListener('touchstart',() => btn.style.transform = 'scale(0.98)', { passive: true });
     btn.addEventListener('touchend',  () => btn.style.transform = 'scale(1)');
-
     btn.addEventListener('click', async () => {
-        let blob = _shareToChat.blob;
-let fileName = _shareToChat.fileName || 'file.bin';
-let mime = _shareToChat.mime || 'application/octet-stream';
-
-if (!blob) {
-    showToast('❌ Нет файла для отправки', 2000);
-    return;
-}
-
-// 🆕 Если это видео — конвертируем в MP4
-if (mime.startsWith('video/') || /\.(webm|mkv|avi|mov)$/i.test(fileName)) {
-    try {
-        const url = URL.createObjectURL(blob);
-        blob = await getVideoAsMp4(url, fileName);
-        URL.revokeObjectURL(url);
-        mime = 'video/mp4';
-        fileName = fileName.replace(/\.[^.]+$/, '') + '.mp4';
-        showToast('🎬 Готово в MP4', 1200);
-    } catch (e) {
-        console.warn('Конвертация не удалась, шлём как есть:', e);
-    }
-}
-
-document.getElementById('shareToChatModal').classList.remove('active');
-if (navigator.vibrate) navigator.vibrate(20);
+        const blob = _shareToChat.blob;
+        const fileName = _shareToChat.fileName || 'video.webm';
+        const mime = _shareToChat.mime || blob.type || 'video/webm';
 
         if (!blob) {
             showToast('❌ Нет файла для отправки', 2000);
@@ -10795,22 +10913,17 @@ if (navigator.vibrate) navigator.vibrate(20);
             const file = new File([blob], fileName, { type: mime });
 
             if (navigator.canShare && navigator.canShare({ files: [file] })) {
-                await navigator.share({
-                    files: [file],
-                    title: fileName,
-                });
+                await navigator.share({ files: [file], title: fileName });
                 showToast('✅ Отправлено', 1500);
                 return;
             }
 
             if (navigator.share) {
-                await navigator.share({
-                    title: fileName,
-                    text: 'Посмотри этот файл',
-                });
+                await navigator.share({ title: fileName, text: 'Посмотри этот файл' });
                 return;
             }
 
+            // Fallback — скачивание
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
@@ -10819,7 +10932,7 @@ if (navigator.vibrate) navigator.vibrate(20);
             a.click();
             document.body.removeChild(a);
             setTimeout(() => URL.revokeObjectURL(url), 2000);
-            showToast('💾 Системный ширинг недоступен — файл скачан', 2500);
+            showToast('💾 Файл скачан', 2500);
 
         } catch (err) {
             if (err.name === 'AbortError') return;
@@ -10828,7 +10941,6 @@ if (navigator.vibrate) navigator.vibrate(20);
         }
     });
 })();
-
 // ═══ Долгое нажатие на фото → системное "Поделиться" ═══
 function setupLongPressShare() {
     const LONG_PRESS_MS = 600;
