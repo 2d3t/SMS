@@ -16061,6 +16061,812 @@ enterChat = async function(file, name, password) {
     return result;
 };
 
+
+
+// ═══════════════════════════════════════════════════════════════
+//  👤 ЛОКАЛЬНЫЕ АВАТАРКИ ПОЛЬЗОВАТЕЛЕЙ
+//  Назначаются кликом по кружку рядом с именем в сообщении.
+//  Хранятся только локально (localStorage). Никуда не уходят.
+//  Привязка — глобально по нику: один ник = одна аватарка во всех чатах.
+// ═══════════════════════════════════════════════════════════════
+
+const UserAvatars = (() => {
+    const STORAGE_KEY = 'chathub_user_avatars';
+    const AVATAR_SIZE = 128;            // 128×128 — оптимально для кружка 20px на retina
+    const AVATAR_QUALITY = 0.85;
+    const MAX_DATA_URL = 80 * 1024;     // ~80 КБ на аватарку, чтобы 50+ влезло в localStorage
+
+    let _cache = null;
+    let _hintShown = false;
+
+    // ─── Загрузка / сохранение ───
+    function load() {
+        if (_cache) return _cache;
+        try {
+            const raw = localStorage.getItem(STORAGE_KEY);
+            _cache = raw ? JSON.parse(raw) : {};
+        } catch (e) {
+            _cache = {};
+        }
+        return _cache;
+    }
+
+    function save() {
+        try {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(_cache || {}));
+        } catch (e) {
+            if (e.name === 'QuotaExceededError') {
+                showToast('⚠️ Хранилище переполнено — удалите старые аватарки', 3500);
+            } else {
+                console.warn('userAvatars save failed:', e);
+            }
+        }
+    }
+
+    // ─── Публичные методы ───
+    function get(username) {
+        if (!username) return null;
+        const data = load();
+        return data[username] || null;
+    }
+
+    function set(username, dataUrl) {
+        if (!username || !dataUrl) return;
+        load();
+        _cache[username] = dataUrl;
+        save();
+    }
+
+    function remove(username) {
+        if (!username) return;
+        load();
+        if (_cache[username]) {
+            delete _cache[username];
+            save();
+        }
+    }
+
+    function has(username) {
+        return !!get(username);
+    }
+
+    function all() {
+        return { ...load() };
+    }
+
+    function replaceAll(obj) {
+        _cache = (obj && typeof obj === 'object') ? { ...obj } : {};
+        save();
+    }
+
+    function mergeAll(obj) {
+        if (!obj || typeof obj !== 'object') return;
+        load();
+        for (const [k, v] of Object.entries(obj)) {
+            if (typeof v === 'string' && v.length > 0) {
+                _cache[k] = v;
+            }
+        }
+        save();
+    }
+
+    // ─── Сжатие картинки в квадрат ───
+    function makeDataUrl(file) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onerror = () => reject(new Error('Не удалось прочитать файл'));
+            reader.onload = (e) => {
+                const img = new Image();
+                img.onerror = () => reject(new Error('Невалидное изображение'));
+                img.onload = () => {
+                    // Центральный квадратный кроп
+                    const side = Math.min(img.width, img.height);
+                    const sx = (img.width - side) / 2;
+                    const sy = (img.height - side) / 2;
+
+                    const canvas = document.createElement('canvas');
+                    canvas.width = AVATAR_SIZE;
+                    canvas.height = AVATAR_SIZE;
+                    const ctx = canvas.getContext('2d');
+                    ctx.imageSmoothingEnabled = true;
+                    ctx.imageSmoothingQuality = 'high';
+                    ctx.drawImage(img, sx, sy, side, side, 0, 0, AVATAR_SIZE, AVATAR_SIZE);
+
+                    let dataUrl = canvas.toDataURL('image/jpeg', AVATAR_QUALITY);
+                    if (dataUrl.length > MAX_DATA_URL) {
+                        dataUrl = canvas.toDataURL('image/jpeg', 0.7);
+                    }
+                    if (dataUrl.length > MAX_DATA_URL) {
+                        dataUrl = canvas.toDataURL('image/jpeg', 0.55);
+                    }
+                    resolve(dataUrl);
+                };
+                img.src = e.target.result;
+            };
+            reader.readAsDataURL(file);
+        });
+    }
+
+    // ─── Подсказка (один раз за всю жизнь) ───
+    function showHintOnce() {
+        if (_hintShown) return;
+        if (localStorage.getItem('chathub_avatar_hint_shown') === '1') return;
+        _hintShown = true;
+        localStorage.setItem('chathub_avatar_hint_shown', '1');
+        setTimeout(() => {
+            showToast('💡 Нажмите на кружок рядом с именем, чтобы поставить аватарку', 4500);
+        }, 1500);
+    }
+
+    return { get, set, remove, has, all, replaceAll, mergeAll, makeDataUrl, showHintOnce };
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🎨 УНИВЕРСАЛЬНЫЙ РЕНДЕР КРУЖКА
+// ═══════════════════════════════════════════════════════════════
+function renderUserAvatarHtml(username, sizeClass = 'sender-avatar') {
+    const safeName = escapeHtml(username || '?');
+    const letter = (username || '?').charAt(0).toUpperCase();
+    const dataUrl = UserAvatars.get(username);
+
+    const cls = `user-avatar ${sizeClass}` + (dataUrl ? ' has-custom' : '');
+    const inner = dataUrl
+        ? `<img src="${dataUrl}" alt="" draggable="false">`
+        : letter;
+
+    return `<span class="${cls}" data-user="${safeName}">${inner}</span>`;
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🔧 ПАТЧ buildMessageHTML — вставляем кружок перед именем
+//  ВАЖНО: патчим последним, потому что предыдущие патчи (видео) 
+//  оборачивают функцию через temp.innerHTML — но мы работаем над
+//  финальным HTML, поэтому патч должен быть после них.
+// ═══════════════════════════════════════════════════════════════
+const _origBuildMessageHTMLForAvatars = buildMessageHTML;
+buildMessageHTML = function(msg, opts = {}) {
+    let html = _origBuildMessageHTMLForAvatars.call(this, msg, opts);
+    if (!msg || !msg.username) return html;
+
+    // Проверяем: уже есть кружок?
+    if (html.includes('class="user-avatar sender-avatar')) return html;
+
+    // Заменяем <span class="sender">Имя</span> на обёртку с кружком
+    // У тебя формат: <span class="sender">Вы</span> или <span class="sender">Петя</span>
+    const senderRegex = /<span class="sender">([^<]*)<\/span>/;
+    if (!senderRegex.test(html)) return html;
+
+    const avatarHtml = renderUserAvatarHtml(msg.username, 'sender-avatar');
+
+    html = html.replace(senderRegex, (match, senderText) => {
+        return `<span class="sender">${avatarHtml}<span class="sender-name">${senderText}</span></span>`;
+    });
+
+    return html;
+};
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🖱️ ОБРАБОТЧИКИ КЛИКА И ДОЛГОГО НАЖАТИЯ НА КРУЖОК
+// ═══════════════════════════════════════════════════════════════
+
+// Скрытый input для выбора файла
+const _userAvatarFileInput = document.createElement('input');
+_userAvatarFileInput.type = 'file';
+_userAvatarFileInput.accept = 'image/*';
+_userAvatarFileInput.style.display = 'none';
+document.body.appendChild(_userAvatarFileInput);
+
+let _pendingAvatarUser = null;
+
+_userAvatarFileInput.addEventListener('change', async (e) => {
+    const file = e.target.files && e.target.files[0];
+    _userAvatarFileInput.value = '';
+    if (!file || !_pendingAvatarUser) {
+        _pendingAvatarUser = null;
+        return;
+    }
+    const username = _pendingAvatarUser;
+    _pendingAvatarUser = null;
+
+    if (!file.type.startsWith('image/')) {
+        showToast('❌ Только изображения', 2000);
+        return;
+    }
+    if (file.size > CONFIG.maxImageSize) {
+        showToast(`❌ Максимум ${formatFileSize(CONFIG.maxImageSize)}`, 2500);
+        return;
+    }
+
+    // Визуальная блокировка всех кружков этого человека
+    document.querySelectorAll(`.user-avatar[data-user="${CSS.escape(username)}"]`)
+        .forEach(el => el.classList.add('uploading'));
+
+    try {
+        const dataUrl = await UserAvatars.makeDataUrl(file);
+        UserAvatars.set(username, dataUrl);
+        refreshAllUserAvatars(username);
+        showToast(`✅ Аватарка для «${username}» установлена`, 1800);
+        soundManager.play('click');
+    } catch (e) {
+        console.error('userAvatar save error:', e);
+        showToast('❌ ' + (e.message || 'Ошибка'), 2500);
+        soundManager.play('error');
+    } finally {
+        document.querySelectorAll(`.user-avatar[data-user="${CSS.escape(username)}"]`)
+            .forEach(el => el.classList.remove('uploading'));
+    }
+});
+
+// Быстрая перерисовка всех кружков конкретного юзера в DOM
+function refreshAllUserAvatars(username) {
+    if (!username) return;
+    const safeName = CSS.escape(username);
+    const dataUrl = UserAvatars.get(username);
+    const letter = username.charAt(0).toUpperCase();
+
+    document.querySelectorAll(`.user-avatar[data-user="${safeName}"]`).forEach(el => {
+        if (dataUrl) {
+            el.innerHTML = `<img src="${dataUrl}" alt="" draggable="false">`;
+            el.classList.add('has-custom');
+        } else {
+            el.textContent = letter;
+            el.classList.remove('has-custom');
+        }
+    });
+}
+
+// Показать picker
+function pickUserAvatar(username) {
+    if (!username) return;
+    _pendingAvatarUser = username;
+    _userAvatarFileInput.value = '';
+    _userAvatarFileInput.click();
+}
+
+// ─── Клик по кружку ───
+messagesInner.addEventListener('click', (e) => {
+    const avatar = e.target.closest('.sender-avatar');
+    if (!avatar) return;
+    if (selectionMode) return;   // не мешаем режиму выбора
+    e.stopPropagation();
+    e.preventDefault();
+    const username = avatar.dataset.user;
+    if (!username) return;
+    pickUserAvatar(username);
+    if (navigator.vibrate) navigator.vibrate(12);
+}, true);
+
+// ─── Долгое нажатие / ПКМ → удалить ───
+(function initAvatarLongPress() {
+    const LONG_PRESS = 600;
+    let pressTimer = null;
+    let startX = 0, startY = 0, targetUsername = null;
+    let longPressFired = false;
+
+    function cancel() {
+        if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
+        targetUsername = null;
+    }
+
+    function start(e, username) {
+        longPressFired = false;
+        targetUsername = username;
+        const touch = e.touches ? e.touches[0] : e;
+        startX = touch.clientX;
+        startY = touch.clientY;
+
+        pressTimer = setTimeout(() => {
+            if (!targetUsername) return;
+            longPressFired = true;
+            if (navigator.vibrate) navigator.vibrate(30);
+            const hasAvatar = UserAvatars.has(targetUsername);
+            if (!hasAvatar) {
+                showToast(`ℹ️ У «${targetUsername}» нет аватарки`, 1500);
+                return;
+            }
+            if (confirm(`Удалить аватарку для «${targetUsername}»?`)) {
+                UserAvatars.remove(targetUsername);
+                refreshAllUserAvatars(targetUsername);
+                showToast('🗑️ Аватарка удалена', 1200);
+                soundManager.play('delete');
+            }
+        }, LONG_PRESS);
+    }
+
+    function move(e) {
+        if (!pressTimer) return;
+        const touch = e.touches ? e.touches[0] : e;
+        const dx = touch.clientX - startX;
+        const dy = touch.clientY - startY;
+        if (Math.hypot(dx, dy) > 10) cancel();
+    }
+
+    function end(e) {
+        if (longPressFired) {
+            e.preventDefault?.();
+            e.stopPropagation?.();
+            longPressFired = false;
+        }
+        cancel();
+    }
+
+    // Capture-фаза — чтобы перехватывать раньше свайпа и обычного клика
+    messagesInner.addEventListener('touchstart', (e) => {
+        const avatar = e.target.closest('.sender-avatar');
+        if (!avatar) return;
+        start(e, avatar.dataset.user);
+    }, { passive: true, capture: true });
+
+    messagesInner.addEventListener('touchmove', move, { passive: true, capture: true });
+    messagesInner.addEventListener('touchend', end, { capture: true });
+    messagesInner.addEventListener('touchcancel', end, { capture: true });
+
+    // ПКМ (десктоп)
+    messagesInner.addEventListener('contextmenu', (e) => {
+        const avatar = e.target.closest('.sender-avatar');
+        if (!avatar) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const username = avatar.dataset.user;
+        if (!username) return;
+        if (!UserAvatars.has(username)) {
+            showToast(`ℹ️ У «${username}» нет аватарки`, 1500);
+            return;
+        }
+        if (confirm(`Удалить аватарку для «${username}»?`)) {
+            UserAvatars.remove(username);
+            refreshAllUserAvatars(username);
+            showToast('🗑️ Аватарка удалена', 1200);
+            soundManager.play('delete');
+        }
+    }, true);
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🚫 ИСКЛЮЧАЕМ КРУЖОК ИЗ СВАЙП-ОТВЕТА
+//  Чтобы случайно не открыть reply при клике по аватарке
+// ═══════════════════════════════════════════════════════════════
+(function patchSwipeReplyForAvatars() {
+    // Твой initSwipeReply вешает touchstart на messagesInner и проверяет
+    // e.target.closest('a, button, audio'). Добавим ещё один стоп-лист
+    // через глобальный перехватчик — проще всего.
+    messagesInner.addEventListener('touchstart', (e) => {
+        if (e.target.closest('.sender-avatar')) {
+            e.stopImmediatePropagation();
+        }
+    }, { passive: true, capture: true });
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  📤 ЭКСПОРТ / ИМПОРТ ПРОФИЛЯ — расширяем существующие функции
+// ═══════════════════════════════════════════════════════════════
+
+// ─── Экспорт ───
+const _origBuildProfileObject = buildProfileObject;
+buildProfileObject = function(opts) {
+    const profile = _origBuildProfileObject.call(this, opts);
+    const includeAvatars = $('exportIncludeAvatars')?.checked;
+    if (includeAvatars) {
+        profile.userAvatars = UserAvatars.all();
+        profile._meta = profile._meta || {};
+        profile._meta.includesUserAvatars = true;
+    }
+    return profile;
+};
+
+// ─── Импорт: учим applyImport подхватывать userAvatars ───
+const _origApplyImport = applyImport;
+applyImport = function() {
+    const profile = _pendingImportProfile;
+    const replace = profile && !profile.isSingleChat && $('importReplaceMode')?.checked;
+    const avatars = profile?.userAvatars || null;
+
+    _origApplyImport.apply(this, arguments);
+
+    if (avatars && Object.keys(avatars).length > 0) {
+        if (replace) {
+            UserAvatars.replaceAll(avatars);
+        } else {
+            UserAvatars.mergeAll(avatars);
+        }
+        // Перерисовываем всё видимое
+        document.querySelectorAll('.user-avatar[data-user]').forEach(el => {
+            refreshAllUserAvatars(el.dataset.user);
+        });
+        showToast(`✅ Импортировано аватарок: ${Object.keys(avatars).length}`, 2000);
+    }
+};
+
+// ─── handleImportFile: подхватываем userAvatars в _pendingImportProfile ───
+const _origHandleImportFile = handleImportFile;
+handleImportFile = async function(file) {
+    // Читаем JSON ещё раз до вызова оригинала, чтобы вытащить userAvatars
+    let avatarsToAttach = null;
+    if (file) {
+        try {
+            const text = await file.text();
+            const data = JSON.parse(text);
+            if (data && data.app === 'sms-chat' && data.userAvatars && typeof data.userAvatars === 'object') {
+                avatarsToAttach = data.userAvatars;
+            }
+        } catch (e) { /* ignore */ }
+        // Оригинал откроет файл заново — это нормально
+        const fakeFile = new File([await file.arrayBuffer()], file.name, { type: file.type });
+        await _origHandleImportFile.call(this, fakeFile);
+    } else {
+        await _origHandleImportFile.call(this, file);
+    }
+
+    if (avatarsToAttach && _pendingImportProfile) {
+        _pendingImportProfile.userAvatars = avatarsToAttach;
+    }
+};
+
+// ─── Добавляем чекбокс "включить аватарки" в модалку экспорта ───
+(function addExportAvatarsCheckbox() {
+    const passwordLabel = $('exportIncludeUsername');
+    if (!passwordLabel) return;
+    const container = passwordLabel.closest('label');
+    if (!container || container.parentNode.querySelector('#exportIncludeAvatars')) return;
+
+    const newLabel = document.createElement('label');
+    newLabel.style.cssText = 'display:flex;align-items:center;gap:10px;cursor:pointer;font-size:14px;color:#ccc;margin-bottom:14px;user-select:none;';
+    newLabel.innerHTML = `
+        <input type="checkbox" id="exportIncludeAvatars" checked
+               style="width:18px;height:18px;accent-color:#6c5ce7;cursor:pointer;margin:0;">
+        <span>Включить аватарки пользователей</span>
+    `;
+    container.parentNode.insertBefore(newLabel, container.nextSibling);
+})();
+
+// ─── Сброс при logout не нужен — аватарки пользователя это его профиль ───
+// НО: при "Очистить данные" — надо сбросить
+const _origClearDataBtnHandler = clearDataBtn.onclick;
+clearDataBtn.addEventListener('click', () => {
+    // Проверим, что пользователь реально выбрал "удалить всё"
+    setTimeout(() => {
+        if (!localStorage.getItem('chathub_username') && !localStorage.getItem('chathub_chats')) {
+            // Пользователь очистил всё
+            localStorage.removeItem('chathub_user_avatars');
+            localStorage.removeItem('chathub_avatar_hint_shown');
+        }
+    }, 50);
+});
+
+
+// ═══════════════════════════════════════════════════════════════
+//  💡 ОДНОРАЗОВАЯ ПОДСКАЗКА
+//  Показать при первом входе в чат, где есть хоть одно сообщение
+// ═══════════════════════════════════════════════════════════════
+const _origEnterChatForAvatarHint = enterChat;
+enterChat = async function(file, name, password) {
+    const r = await _origEnterChatForAvatarHint.apply(this, arguments);
+    if (state.chatFile === file && historyState.allMessages.length > 0) {
+        UserAvatars.showHintOnce();
+    }
+    return r;
+};
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🎨 СТИЛИ
+// ═══════════════════════════════════════════════════════════════
+(function injectUserAvatarStyles() {
+    if (document.getElementById('userAvatarStyles')) return;
+    const style = document.createElement('style');
+    style.id = 'userAvatarStyles';
+    style.textContent = `
+        /* Общий контейнер кружка */
+        .user-avatar {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #6c5ce7, #00b894);
+            color: #fff;
+            font-weight: 700;
+            flex-shrink: 0;
+            overflow: hidden;
+            position: relative;
+            user-select: none;
+            -webkit-user-select: none;
+            line-height: 1;
+            cursor: pointer;
+            transition: transform 0.15s, box-shadow 0.15s, opacity 0.15s;
+            -webkit-tap-highlight-color: transparent;
+        }
+        .user-avatar img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            border-radius: 50%;
+            display: block;
+            pointer-events: none;
+            -webkit-user-drag: none;
+        }
+        .user-avatar.has-custom:hover {
+            box-shadow: 0 0 0 2px rgba(108,92,231,0.6);
+        }
+        .user-avatar:active {
+            transform: scale(0.88);
+        }
+        .user-avatar.uploading {
+            opacity: 0.5;
+            pointer-events: none;
+        }
+        .user-avatar.uploading::after {
+            content: '';
+            position: absolute;
+            inset: 0;
+            border-radius: 50%;
+            border: 2px solid transparent;
+            border-top-color: #fff;
+            animation: avatarSpin 0.7s linear infinite;
+        }
+        @keyframes avatarSpin { to { transform: rotate(360deg); } }
+
+        /* Кружок в .sender (рядом с именем автора сообщения) */
+        .sender-avatar {
+            width: 20px;
+            height: 20px;
+            font-size: 11px;
+            margin-right: 6px;
+            vertical-align: middle;
+        }
+
+        /* Родительский .sender — делаем flex, чтобы кружок и имя стояли ровно */
+        .message .sender {
+            display: inline-flex;
+            align-items: center;
+            gap: 0;
+            line-height: 1;
+            margin-bottom: 4px;
+        }
+        .message .sender .sender-name {
+            display: inline-block;
+            line-height: 1.2;
+        }
+
+        /* Своё имя (Вы) — тот же кружок, но свой цвет не нужен, 
+           фон уже с градиентом. Просто работаем как с остальными. */
+
+        /* Небольшие правки для мобилы */
+        @media (max-width: 480px) {
+            .sender-avatar { width: 18px; height: 18px; font-size: 10px; margin-right: 5px; }
+        }
+
+        /* Отключаем в режиме мультивыбора */
+        body.selection-mode .sender-avatar {
+            pointer-events: none;
+            opacity: 0.7;
+        }
+    `;
+    document.head.appendChild(style);
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🚀 СТАРТОВАЯ ИНИЦИАЛИЗАЦИЯ
+// ═══════════════════════════════════════════════════════════════
+console.log('👤 Локальные аватарки пользователей активны');
+console.log('   • Клик по кружку рядом с именем → выбрать файл');
+console.log('   • Долгое нажатие / ПКМ → удалить аватарку');
+console.log('   • Работает и для своих сообщений ("Вы")');
+console.log('   • Хранится в localStorage, никуда не уходит');
+
+// ═══════════════════════════════════════════════════════════════
+//  💬 АВАТАРКИ В КОММЕНТАРИЯХ
+//  Патчим buildCommentsHTML, чтобы в комментариях использовался 
+//  тот же справочник UserAvatars
+// ═══════════════════════════════════════════════════════════════
+
+const _origBuildCommentsHTMLForAvatars = buildCommentsHTML;
+buildCommentsHTML = function(msg) {
+    if (!msg.comments || msg.comments.length === 0) return '';
+
+    const items = msg.comments.map(c => {
+        const isOwn = c.username === state.username;
+        const del = isOwn
+            ? `<button class="comment-del"
+                       onclick="event.stopPropagation(); deleteComment(${msg.id}, ${c.id})"
+                       title="Удалить">✕</button>`
+            : '';
+
+        // 🆕 Вместо getInitials — универсальный рендер кружка
+        const avatarHtml = renderUserAvatarHtml(c.username, 'comment-avatar');
+
+        return `
+            <div class="comment-item">
+                ${avatarHtml}
+                <div class="comment-body">
+                    <div class="comment-author">
+                        ${isOwn ? 'Вы' : escapeHtml(c.username)}
+                        <span class="comment-time">${formatFullTime(c.time)}</span>
+                    </div>
+                    <div class="comment-text">${renderTextWithLinks(c.text)}</div>
+                </div>
+                ${del}
+            </div>
+        `;
+    }).join('');
+
+    return `<div class="comments-block" data-comments-for="${msg.id}">${items}</div>`;
+};
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🎨 СТИЛИ ДЛЯ КРУЖКА В КОММЕНТАРИЯХ
+// ═══════════════════════════════════════════════════════════════
+(function injectCommentAvatarStyles() {
+    if (document.getElementById('commentAvatarStyles')) return;
+    const style = document.createElement('style');
+    style.id = 'commentAvatarStyles';
+    style.textContent = `
+        /* Кружок в комментарии использует общий .user-avatar,
+           но с размером как у старого .comment-avatar (24×24) */
+        .comment-avatar.user-avatar {
+            width: 24px;
+            height: 24px;
+            font-size: 11px;
+            flex-shrink: 0;
+        }
+        .comment-avatar.user-avatar img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        /* Перебиваем старое правило .comment-avatar (у которого был свой градиент) */
+        .comment-item .user-avatar.comment-avatar {
+            background: linear-gradient(135deg, #6c5ce7, #00b894);
+            color: #fff;
+            font-weight: 700;
+        }
+
+        /* В режиме мультивыбора не даём случайно кликать по кружку в комментах */
+        body.selection-mode .comment-avatar.user-avatar {
+            pointer-events: none;
+        }
+
+        @media (max-width: 480px) {
+            .comment-avatar.user-avatar { width: 22px; height: 22px; font-size: 10px; }
+        }
+    `;
+    document.head.appendChild(style);
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🖱️ КЛИК ПО КРУЖКУ В КОММЕНТАРИИ → назначить аватарку
+//  Делегированный обработчик уже есть на messagesInner, 
+//  но он ловит только .sender-avatar. Расширяем его через 
+//  отдельный слушатель — либо просто дополняем селектор.
+// ═══════════════════════════════════════════════════════════════
+
+// Отдельный слушатель именно для .comment-avatar.user-avatar
+// (чтобы не плодить правки в существующем — работает независимо)
+messagesInner.addEventListener('click', (e) => {
+    const avatar = e.target.closest('.comment-avatar.user-avatar');
+    if (!avatar) return;
+    if (selectionMode) return;
+    e.stopPropagation();
+    e.preventDefault();
+    const username = avatar.dataset.user;
+    if (!username) return;
+    pickUserAvatar(username);
+    if (navigator.vibrate) navigator.vibrate(12);
+}, true);
+
+// Долгое нажатие на кружок в комментарии → удалить аватарку
+(function initCommentAvatarLongPress() {
+    const LONG_PRESS = 600;
+    let pressTimer = null;
+    let startX = 0, startY = 0, targetUsername = null;
+    let longPressFired = false;
+
+    function cancel() {
+        if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
+        targetUsername = null;
+    }
+
+    function start(e, username) {
+        longPressFired = false;
+        targetUsername = username;
+        const touch = e.touches ? e.touches[0] : e;
+        startX = touch.clientX;
+        startY = touch.clientY;
+
+        pressTimer = setTimeout(() => {
+            if (!targetUsername) return;
+            longPressFired = true;
+            if (navigator.vibrate) navigator.vibrate(30);
+            if (!UserAvatars.has(targetUsername)) {
+                showToast(`ℹ️ У «${targetUsername}» нет аватарки`, 1500);
+                return;
+            }
+            if (confirm(`Удалить аватарку для «${targetUsername}»?`)) {
+                UserAvatars.remove(targetUsername);
+                refreshAllUserAvatars(targetUsername);
+                showToast('🗑️ Аватарка удалена', 1200);
+                soundManager.play('delete');
+            }
+        }, LONG_PRESS);
+    }
+
+    function move(e) {
+        if (!pressTimer) return;
+        const touch = e.touches ? e.touches[0] : e;
+        const dx = touch.clientX - startX;
+        const dy = touch.clientY - startY;
+        if (Math.hypot(dx, dy) > 10) cancel();
+    }
+
+    function end(e) {
+        if (longPressFired) {
+            e.preventDefault?.();
+            e.stopPropagation?.();
+            longPressFired = false;
+        }
+        cancel();
+    }
+
+    messagesInner.addEventListener('touchstart', (e) => {
+        const avatar = e.target.closest('.comment-avatar.user-avatar');
+        if (!avatar) return;
+        start(e, avatar.dataset.user);
+    }, { passive: true, capture: true });
+
+    messagesInner.addEventListener('touchmove', move, { passive: true, capture: true });
+    messagesInner.addEventListener('touchend', end, { capture: true });
+    messagesInner.addEventListener('touchcancel', end, { capture: true });
+
+    // ПКМ для десктопа
+    messagesInner.addEventListener('contextmenu', (e) => {
+        const avatar = e.target.closest('.comment-avatar.user-avatar');
+        if (!avatar) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const username = avatar.dataset.user;
+        if (!username) return;
+        if (!UserAvatars.has(username)) {
+            showToast(`ℹ️ У «${username}» нет аватарки`, 1500);
+            return;
+        }
+        if (confirm(`Удалить аватарку для «${username}»?`)) {
+            UserAvatars.remove(username);
+            refreshAllUserAvatars(username);
+            showToast('🗑️ Аватарка удалена', 1200);
+            soundManager.play('delete');
+        }
+    }, true);
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🚫 СВАЙП-ОТВЕТ НЕ СРАБАТЫВАЕТ ПО КРУЖКУ В КОММЕНТАРИИ
+// ═══════════════════════════════════════════════════════════════
+messagesInner.addEventListener('touchstart', (e) => {
+    if (e.target.closest('.comment-avatar.user-avatar')) {
+        e.stopImmediatePropagation();
+    }
+}, { passive: true, capture: true });
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🔄 ОБНОВЛЯЕМ refreshAllUserAvatars — теперь он покрывает 
+//  и комментарии тоже (там те же .user-avatar[data-user])
+// ═══════════════════════════════════════════════════════════════
+// Функция refreshAllUserAvatars уже ищет по '.user-avatar[data-user="..."]' 
+// по всему DOM — значит, кружки в комментариях обновляются автоматически.
+// Ничего дополнительно делать не нужно.
+
+
+console.log('💬 Аватарки пользователей теперь и в комментариях');
 </script>
 </body>
 </html>
