@@ -4392,110 +4392,7 @@ let historyState = {
     renderedCount: 0,
     hasMoreOnServer: false,
 };
-// ═══════════════════════════════════════════════════════════════
-//  💾 КЭШ СООБЩЕНИЙ В SESSIONSTORAGE
-//  Мгновенная загрузка при повторном входе в чат.
-//  Данные шифруются тем же ключом (AES-256-GCM), что и на GitHub.
-//  sessionStorage — не переживает закрытие браузера (безопасно).
-// ═══════════════════════════════════════════════════════════════
-const MessageCache = (() => {
-    const PREFIX = 'chathub_cache_';
-    const TTL_MS = 24 * 60 * 60 * 1000;  // 24 часа
-    const MAX_MESSAGES = 500;
 
-    function _key(chatFile) {
-        return PREFIX + chatFile + '_' + (state.username || 'anon');
-    }
-
-    async function save(chatFile, salt, plainMessages, lastCommitSha) {
-        if (!chatFile || !CRYPTO._key) return false;
-        try {
-            const slice = plainMessages.slice(-MAX_MESSAGES);
-            const payload = {
-                v: 1,
-                salt,
-                lastCommitSha: lastCommitSha || null,
-                savedAt: Date.now(),
-                count: slice.length,
-            };
-            const enc = await encryptObject(
-                { meta: payload, messages: slice },
-                CRYPTO._key
-            );
-            const entry = {
-                iv: enc.iv,
-                data: enc.data,
-                _savedAt: payload.savedAt,
-                _salt: salt,
-                _count: slice.length,
-            };
-            sessionStorage.setItem(_key(chatFile), JSON.stringify(entry));
-            return true;
-        } catch (e) {
-            if (e.name === 'QuotaExceededError') {
-                console.warn('Cache quota exceeded, clearing old entries');
-                clearAll();
-            } else {
-                console.warn('MessageCache.save error:', e);
-            }
-            return false;
-        }
-    }
-
-    async function load(chatFile) {
-        if (!chatFile || !CRYPTO._key) return null;
-        try {
-            const raw = sessionStorage.getItem(_key(chatFile));
-            if (!raw) return null;
-            const entry = JSON.parse(raw);
-            if (!entry || !entry.iv || !entry.data) return null;
-
-            if (entry._savedAt && (Date.now() - entry._savedAt) > TTL_MS) {
-                sessionStorage.removeItem(_key(chatFile));
-                return null;
-            }
-
-            const decrypted = await decryptObject(entry.iv, entry.data, CRYPTO._key);
-            if (!decrypted || !Array.isArray(decrypted.messages)) return null;
-            if (!decrypted.meta || decrypted.meta.v !== 1) return null;
-
-            return {
-                messages: decrypted.messages,
-                lastCommitSha: decrypted.meta.lastCommitSha || null,
-                salt: decrypted.meta.salt,
-                savedAt: decrypted.meta.savedAt,
-            };
-        } catch (e) {
-            try { sessionStorage.removeItem(_key(chatFile)); } catch (_) {}
-            return null;
-        }
-    }
-
-    function remove(chatFile) {
-        if (!chatFile) return;
-        try { sessionStorage.removeItem(_key(chatFile)); } catch (_) {}
-    }
-
-    function clearAll() {
-        try {
-            const keys = [];
-            for (let i = 0; i < sessionStorage.length; i++) {
-                const k = sessionStorage.key(i);
-                if (k && k.startsWith(PREFIX)) keys.push(k);
-            }
-            keys.forEach(k => sessionStorage.removeItem(k));
-        } catch (_) {}
-    }
-
-    function has(chatFile) {
-        if (!chatFile) return false;
-        try {
-            return !!sessionStorage.getItem(_key(chatFile));
-        } catch (_) { return false; }
-    }
-
-    return { save, load, remove, clearAll, has };
-})();
 const _attachmentCache = new Map();
 const _pendingAttachmentLoads = new Map();
 let _loadingOlder = false;
@@ -7200,8 +7097,6 @@ if (hasFile) {
         soundManager.play('click');
         soundManager.play('send');
         showToast('✅ Отправлено!', 1000);
-// 💾 Обновляем кэш после успешной отправки
-MessageCache.save(state.chatFile, state.salt, state.messages, saved.commitSha).catch(() => {});
     } catch (error) {
         console.error('Ошибка:', error);
         if (error.message === 'ABORTED') {
@@ -10367,15 +10262,13 @@ async function pollUpdates() {
                 if (m) decrypted.push(m);
             }
             state.messages = decrypted;
-state.lastMessageCount = decrypted.length;
-if (state.currentScreen === 'chat') {
-    renderMessages(state.messages);
-    // 💾 Обновляем кэш при откате
-    MessageCache.save(state.chatFile, state.salt, state.messages, state._lastCommitSha).catch(() => {});
-} else {
-    refreshUnreadBadges();
-}
-return;
+            state.lastMessageCount = decrypted.length;
+            if (state.currentScreen === 'chat') {
+                renderMessages(state.messages);
+            } else {
+                refreshUnreadBadges();
+            }
+            return;
         }
 
         if (encMessages.length === state.lastMessageCount) return;
@@ -10429,8 +10322,6 @@ if (wasAtBottom && stillAtBottom) {
     updateScrollBadge();
     updateScrollButton();
 }
-// 💾 Обновляем кэш после получения новых сообщений
-MessageCache.save(state.chatFile, state.salt, state.messages, state._lastCommitSha).catch(() => {});
         if (!hasOwnMessage) soundManager.play('receive');
         else state._lastSentMessageId = null;
     } catch (error) {
@@ -10751,117 +10642,6 @@ async function confirmOpenChat() {
         }
     }
 }
-/**
- * 🆕 Тихая синхронизация из GitHub в фоне.
- * Вызывается после показа кэша. Никаких спиннеров и перерисовок —
- * просто аккуратно заменяем историю, если пришли новые сообщения.
- */
-async function _silentRefreshFromGitHub(file, path, password) {
-    try {
-        const result = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
-        if (!result.exists) return;
-
-        // Проверяем, что пользователь всё ещё в этом чате
-        if (state.chatFile !== file) return;
-
-        const content = result.content;
-        if (!content || content.v !== CRYPTO.VERSION || !content.salt) return;
-
-        // Salt мог быть другой (если кто-то пересоздал чат) — тогда сбрасываем
-        if (content.salt !== state.salt) {
-            MessageCache.remove(file);
-            showToast('🔄 Данные чата обновились', 2000);
-            setTimeout(() => {
-                if (state.chatFile === file) {
-                    enterChat(file, state.chatName, password).catch(() => {});
-                }
-            }, 300);
-            return;
-        }
-
-        const encMessages = Array.isArray(content.messages) ? content.messages : [];
-
-        // Если ничего не изменилось — ничего не делаем
-        if (result.commitSha === state._lastCommitSha) {
-            try {
-                const metaRes = await fetchMetaFast(file, null);
-                if (metaRes.exists) {
-                    state._metaEtag = metaRes.etag || null;
-                    if (metaRes.content && metaRes.content.version) {
-                        state._lastMetaVersion = metaRes.content.version;
-                    }
-                }
-            } catch (e) {}
-            state.sha = result.sha;
-            MessageCache.save(file, state.salt, state.messages, result.commitSha).catch(() => {});
-            return;
-        }
-
-        // Расшифровываем всё заново
-        let decrypted;
-        try {
-            decrypted = await loadAndDecrypt(content.salt, encMessages);
-        } catch (e) {
-            MessageCache.remove(file);
-            return;
-        }
-
-        // Если мы уже не в этом чате — выходим
-        if (state.chatFile !== file) return;
-
-        const oldCount = historyState.allMessages.length;
-        const newCount = decrypted.length;
-
-        // Проверяем, есть ли вообще различия
-        const oldLastId = oldCount > 0 ? historyState.allMessages[oldCount - 1].id : null;
-        const newLastId = newCount > 0 ? decrypted[newCount - 1].id : null;
-
-        if (oldLastId === newLastId && oldCount === newCount) {
-            state.sha = result.sha;
-            state._lastCommitSha = result.commitSha;
-            state.lastMessageCount = newCount;
-            MessageCache.save(file, state.salt, state.messages, result.commitSha).catch(() => {});
-            return;
-        }
-
-        // ═══ Обновляем плавно ═══
-        const wasAtBottom = isNearBottom();
-        const addedCount = newCount - oldCount;
-
-        state.messages = decrypted;
-        state.sha = result.sha;
-        state._lastCommitSha = result.commitSha;
-        state.lastMessageCount = newCount;
-
-        // Перерисовываем всю историю
-        historyState.allMessages = decrypted.slice();
-        renderHistory();
-
-        // Загружаем Meta
-        try {
-            const metaRes = await fetchMetaFast(file, null);
-            if (metaRes.exists) {
-                state._metaEtag = metaRes.etag || null;
-                if (metaRes.content && metaRes.content.version) {
-                    state._lastMetaVersion = metaRes.content.version;
-                }
-            }
-        } catch (e) {}
-
-        // 💾 Кэш обновлён
-        MessageCache.save(file, state.salt, state.messages, result.commitSha).catch(() => {});
-
-        // Если пришли новые сообщения — уведомляем
-        if (addedCount > 0 && wasAtBottom) {
-            scrollToBottom(true);
-        } else if (addedCount > 0) {
-            showToast(`📨 +${addedCount} новых`, 1500);
-        }
-
-    } catch (e) {
-        console.warn('Silent refresh error:', e.message);
-    }
-}
 
 async function enterChat(file, name, password) {
     showChatTransition(name);
@@ -10894,49 +10674,10 @@ resetHistoryState();
     showInputBar();
 
     try {
-    const path = getChatPath(file);
+        const path = getChatPath(file);
+        const result = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
 
-    // ═══════════════════════════════════════════════════════
-    //  💾 ШАГ 1: Пробуем сначала отрисовать из КЭША
-    // ═══════════════════════════════════════════════════════
-    const cached = await MessageCache.load(file).catch(() => null);
-
-    if (cached && cached.messages && cached.messages.length > 0) {
-        if (cached.salt) {
-            state.salt = cached.salt;
-            try {
-                CRYPTO._key = await deriveKey(password, cached.salt);
-            } catch (e) {
-                MessageCache.remove(file);
-                CRYPTO._key = null;
-                state.salt = null;
-                throw e;
-            }
-        }
-
-        state.messages = cached.messages.slice();
-        state.lastMessageCount = cached.messages.length;
-        state._lastCommitSha = cached.lastCommitSha || null;
-        state.sha = null;
-
-        historyState.allMessages = cached.messages.slice();
-        renderHistory();
-        hideChatTransition();
-        state._chatEntered = true;
-
-        setTimeout(() => { if (state.chatFile === file) markChatAsRead(); }, 1200);
-
-        // 🆕 Тихо проверяем GitHub в фоне
-        _silentRefreshFromGitHub(file, path, password);
-        return;
-    }
-
-    // ═══════════════════════════════════════════════════════
-    //  🌐 ШАГ 2: Кэша нет — грузим с GitHub
-    // ═══════════════════════════════════════════════════════
-    const result = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
-
-    if (!result.exists) {
+        if (!result.exists) {
             const saltBytes = generateSalt();
             state.salt = arrayBufferToBase64(saltBytes);
             CRYPTO._key = await deriveKey(password, state.salt);
@@ -10975,12 +10716,10 @@ setTimeout(() => {
         }
 
         state.messages = decrypted;
-state.sha = result.sha;
-state._lastCommitSha = result.commitSha;
-state.lastMessageCount = decrypted.length;
+        state.sha = result.sha;
+        state._lastCommitSha = result.commitSha;
+        state.lastMessageCount = decrypted.length;
 
-// 💾 Сохраняем в кэш первый раз
-MessageCache.save(file, state.salt, decrypted, result.commitSha).catch(() => {});
         try {
             const metaRes = await fetchMetaFast(file, null);
             if (metaRes.exists) {
@@ -11007,19 +10746,15 @@ setTimeout(() => {
 
         setTimeout(() => { if (state.chatFile === file) markChatAsRead(); }, 1500);
     } catch (e) {
-    // 🆕 Если пароль не подошёл — удаляем устаревший кэш
-    if (e.message && e.message.includes('Неверный пароль')) {
-        MessageCache.remove(file);
+        state.chatFile = null; state.chatName = null;
+        CRYPTO._key = null; state.chatPassword = ''; state.salt = null;
+        state._lastCommitSha = null;
+        state._chatEntered = false;
+        showChatsScreen();
+        throw e;
+    } finally {
+        hideChatTransition();
     }
-    state.chatFile = null; state.chatName = null;
-    CRYPTO._key = null; state.chatPassword = ''; state.salt = null;
-    state._lastCommitSha = null;
-    state._chatEntered = false;
-    showChatsScreen();
-    throw e;
-} finally {
-    hideChatTransition();
-}
 }
 
 // ===================================================================
@@ -11163,9 +10898,8 @@ function logout() {
         delete audioPlayers[id];
     });
     clearAttachmentCache();
-resetHistoryState();
-MessageCache.clearAll();   // 🆕 Очищаем кэш всех чатов при выходе
-state.isPolling = false;
+    resetHistoryState();
+    state.isPolling = false;
     state.isAuthorized = false;
     state._lastSentMessageId = null;
     state._lastMetaVersion = null;
@@ -16221,6 +15955,452 @@ console.log('   • Кнопка «Удалить» = пакетное удал�
 
     console.log('🧊 Пассивный замораживатель позиции активен');
 })();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  💾 КЭШ ЧАТОВ В БРАУЗЕРЕ (localStorage)
+//  Показывает сообщения мгновенно при повторном входе в чат.
+//  Фоновая проверка .meta → если на сервере новее, догружает.
+// ═══════════════════════════════════════════════════════════════
+
+const ChatCache = (() => {
+    const KEY = 'chathub_cache';
+    const MAX_CHATS = 25;
+    const MAX_MESSAGES_PER_CHAT = 500;
+    const TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 дней
+
+    function _load() {
+        try {
+            const raw = localStorage.getItem(KEY);
+            return raw ? JSON.parse(raw) : {};
+        } catch (e) {
+            console.warn('💾 Cache load failed:', e);
+            return {};
+        }
+    }
+
+    function _save(data) {
+        try {
+            localStorage.setItem(KEY, JSON.stringify(data));
+            return true;
+        } catch (e) {
+            // Переполнение квоты — эвакуируем самые старые
+            console.warn('💾 Cache full, evicting oldest...');
+            _evictOldest(data, 5);
+            try {
+                localStorage.setItem(KEY, JSON.stringify(data));
+                return true;
+            } catch (e2) {
+                console.error('💾 Cache save failed even after eviction');
+                return false;
+            }
+        }
+    }
+
+    function _evictOldest(data, count) {
+        const entries = Object.entries(data)
+            .filter(([, v]) => v && typeof v.cachedAt === 'number')
+            .sort((a, b) => a[1].cachedAt - b[1].cachedAt);
+        const toRemove = Math.min(count, entries.length);
+        for (let i = 0; i < toRemove; i++) {
+            delete data[entries[i][0]];
+        }
+    }
+
+    function _enforceLimits(data) {
+        const keys = Object.keys(data);
+        if (keys.length > MAX_CHATS) {
+            _evictOldest(data, keys.length - MAX_CHATS);
+        }
+    }
+
+    function get(file) {
+        if (!file) return null;
+        const data = _load();
+        const entry = data[file];
+        if (!entry) return null;
+        if (!entry.cachedAt || Date.now() - entry.cachedAt > TTL_MS) {
+            delete data[file];
+            _save(data);
+            return null;
+        }
+        if (!Array.isArray(entry.messages) || !entry.salt) return null;
+        return entry;
+    }
+
+    function set(file, payload) {
+        if (!file || !payload || !payload.salt) return false;
+        const data = _load();
+        const messages = Array.isArray(payload.messages)
+            ? payload.messages.slice(-MAX_MESSAGES_PER_CHAT)
+            : [];
+        data[file] = {
+            messages,
+            sha: payload.sha || null,
+            lastCommitSha: payload.lastCommitSha || null,
+            lastMetaVersion: payload.lastMetaVersion || null,
+            salt: payload.salt || null,
+            messagesCount: messages.length,
+            cachedAt: Date.now(),
+        };
+        _enforceLimits(data);
+        return _save(data);
+    }
+
+    function invalidate(file) {
+        if (!file) return;
+        const data = _load();
+        if (data[file]) {
+            delete data[file];
+            _save(data);
+        }
+    }
+
+    function clear() {
+        try { localStorage.removeItem(KEY); } catch (e) {}
+    }
+
+    function stats() {
+        const data = _load();
+        const chats = Object.keys(data);
+        let totalMsgs = 0;
+        let totalBytes = 0;
+        try { totalBytes = (localStorage.getItem(KEY) || '').length; } catch (e) {}
+        chats.forEach(k => { totalMsgs += (data[k].messagesCount || 0); });
+        return { chats: chats.length, messages: totalMsgs, bytes: totalBytes };
+    }
+
+    return { get, set, invalidate, clear, stats };
+})();
+
+console.log('💾 Кэш чатов инициализирован (TTL 7 дней, до 25 чатов)');
+console.log('   Статистика:', ChatCache.stats());
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🚀 ПАТЧ enterChat — мгновенный показ из кэша + фоновая проверка
+// ═══════════════════════════════════════════════════════════════
+
+const _origEnterChatForCache = enterChat;
+
+enterChat = async function(file, name, password) {
+    // ═══ 1. Пробуем показать из кэша ═══
+    const cached = ChatCache.get(file);
+    let renderedFromCache = false;
+
+    if (cached && cached.messages.length > 0 && cached.salt) {
+        try {
+            showChatTransition(name);
+            await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+            // Останавливаем polling от предыдущего чата
+            stopPolling();
+
+            // НЕ рвём blob:URL, которые играют в GlobalPlayer
+            clearAttachmentCache();
+            resetHistoryState();
+
+            // Быстрая расшифровка-проверка: подходит ли пароль к salt из кэша
+            const testKey = await deriveKey(password, cached.salt);
+
+            // Ставим состояние
+            state.chatFile = file;
+            state.chatName = name;
+            state.chatPassword = password;
+            state.salt = cached.salt;
+            CRYPTO._key = testKey;
+            state.sha = cached.sha;
+            state._lastCommitSha = cached.lastCommitSha;
+            state._lastMetaVersion = cached.lastMetaVersion;
+            state._metaEtag = null;
+            state.messages = cached.messages.slice();
+            state.lastMessageCount = cached.messages.length;
+            state._lastSentMessageId = null;
+            state._chatEntered = false;
+            state._lastActivityAt = Date.now();
+
+            chatTitle.textContent = `Чат: ${name}`;
+            userAvatar.textContent = getInitials(state.username);
+
+            messagesInner.dataset.lastDate = '';
+            showChatScreen();
+            showInputBar();
+
+            // Рендерим историю из кэша
+            historyState.allMessages = cached.messages.slice();
+            renderHistory();
+
+            renderedFromCache = true;
+            console.log(`⚡ ${file}: показано из кэша (${cached.messages.length} сообщений)`);
+
+            // Синхронизируем инлайн-плеер с глобальным
+            setTimeout(() => {
+                if (typeof syncInlineWithGlobal === 'function') syncInlineWithGlobal();
+            }, 200);
+
+            // Запускаем polling
+            startPolling();
+
+            state._chatEntered = true;
+            setTimeout(() => {
+                if (state.chatFile === file) markChatAsRead();
+            }, 1500);
+
+            hideChatTransition();
+
+            // ═══ Фоновая проверка — нет ли новых сообщений на сервере ═══
+            checkForUpdatesInBackground(file);
+
+            return;
+
+        } catch (e) {
+            // Не смогли расшифровать из кэша (пароль сменился? salt не подходит?)
+            console.warn('💾 Cache decrypt failed, fallback:', e.message);
+            ChatCache.invalidate(file);
+            renderedFromCache = false;
+            hideChatTransition();
+            // Сбрасываем частичное состояние
+            state.chatFile = null;
+            state.chatName = null;
+            state.chatPassword = '';
+            state.salt = null;
+            CRYPTO._key = null;
+            state._chatEntered = false;
+        }
+    }
+
+    // ═══ 2. Обычный путь (сеть) ═══
+    if (!renderedFromCache) {
+        const r = await _origEnterChatForCache.call(this, file, name, password);
+
+        // Сохраняем в кэш после успешной загрузки
+        if (state.chatFile === file && state.messages && state.salt) {
+            ChatCache.set(file, {
+                messages: state.messages,
+                sha: state.sha,
+                lastCommitSha: state._lastCommitSha,
+                lastMetaVersion: state._lastMetaVersion,
+                salt: state.salt,
+            });
+            console.log(`💾 ${file}: сохранено в кэш (${state.messages.length} сообщений)`);
+        }
+        return r;
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════
+//  🔍 Фоновая проверка обновлений после показа из кэша
+// ═══════════════════════════════════════════════════════════════
+async function checkForUpdatesInBackground(file) {
+    try {
+        const metaRes = await fetchMetaFast(file, null);
+        if (!metaRes.exists || !metaRes.content) return;
+
+        const version = metaRes.content.version;
+        if (!version) return;
+
+        // Сохраняем свежий etag даже если версия та же
+        if (metaRes.etag) state._metaEtag = metaRes.etag;
+
+        // Если версия в кэше совпадает — ничего не грузим
+        if (version === state._lastMetaVersion) {
+            console.log(`✅ ${file}: сервер и кэш синхронны (v=${version})`);
+            return;
+        }
+
+        console.log(`🔄 ${file}: на сервере новее (server=${version}, cache=${state._lastMetaVersion}) — догружаем`);
+
+        // Триггерим полную перезагрузку через pollUpdates
+        state._lastMetaVersion = version;
+        await pollUpdates();
+
+        // После pollUpdates сохраняем обновлённое состояние в кэш
+        if (state.chatFile === file && state.messages && state.salt) {
+            ChatCache.set(file, {
+                messages: state.messages,
+                sha: state.sha,
+                lastCommitSha: state._lastCommitSha,
+                lastMetaVersion: state._lastMetaVersion,
+                salt: state.salt,
+            });
+            console.log(`💾 ${file}: кэш обновлён (${state.messages.length} сообщений)`);
+        }
+    } catch (e) {
+        console.warn(`⚠️ ${file}: фоновая проверка не удалась:`, e.message);
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+//  ♻️ ИНВАЛИДАЦИЯ КЭША при мутациях
+//  Обновляем кэш при: отправке, удалении, редактировании,
+//  реакциях, комментариях, пакетном удалении
+// ═══════════════════════════════════════════════════════════════
+
+// 1) Отправка сообщения (включая видео, шаринг) → обновляем кэш
+const _origSendMessageForCache = sendMessage;
+sendMessage = async function(...args) {
+    const r = await _origSendMessageForCache.apply(this, args);
+    // Обновляем кэш — состояние уже актуальное в state.messages
+    if (state.chatFile && state.messages && state.salt) {
+        ChatCache.set(state.chatFile, {
+            messages: state.messages,
+            sha: state.sha,
+            lastCommitSha: state._lastCommitSha,
+            lastMetaVersion: state._lastMetaVersion,
+            salt: state.salt,
+        });
+    }
+    return r;
+};
+
+// 2) Удаление сообщения — обновляем (не инвалидируем полностью, чтобы не мигало)
+const _origDeleteMessageForCache = deleteMessage;
+deleteMessage = async function(messageId) {
+    const r = await _origDeleteMessageForCache.call(this, messageId);
+    if (state.chatFile && state.messages && state.salt) {
+        ChatCache.set(state.chatFile, {
+            messages: state.messages,
+            sha: state.sha,
+            lastCommitSha: state._lastCommitSha,
+            lastMetaVersion: state._lastMetaVersion,
+            salt: state.salt,
+        });
+    }
+    return r;
+};
+
+// 3) Редактирование — обновляем
+const _origConfirmEditMessageForCache = confirmEditMessage;
+confirmEditMessage = async function() {
+    const r = await _origConfirmEditMessageForCache.apply(this, arguments);
+    if (state.chatFile && state.messages && state.salt) {
+        ChatCache.set(state.chatFile, {
+            messages: state.messages,
+            sha: state.sha,
+            lastCommitSha: state._lastCommitSha,
+            lastMetaVersion: state._lastMetaVersion,
+            salt: state.salt,
+        });
+    }
+    return r;
+};
+
+// 4) Реакции — инвалидируем (структура messages изменилась)
+const _origPersistReactionsForCache = persistReactions;
+persistReactions = async function(msgId, reactions) {
+    const r = await _origPersistReactionsForCache.call(this, msgId, reactions);
+    if (state.chatFile) ChatCache.invalidate(state.chatFile);
+    return r;
+};
+
+// 5) Комментарии — инвалидируем
+const _origPersistCommentsForCache = persistComments;
+persistComments = async function(msgId, comments) {
+    const r = await _origPersistCommentsForCache.call(this, msgId, comments);
+    if (state.chatFile) ChatCache.invalidate(state.chatFile);
+    return r;
+};
+
+// 6) Пакетное удаление — обновляем после завершения
+const _origPerformBatchDeleteForCache = performBatchDelete;
+performBatchDelete = async function(messageIds) {
+    const r = await _origPerformBatchDeleteForCache.call(this, messageIds);
+    if (state.chatFile && state.messages && state.salt) {
+        ChatCache.set(state.chatFile, {
+            messages: state.messages,
+            sha: state.sha,
+            lastCommitSha: state._lastCommitSha,
+            lastMetaVersion: state._lastMetaVersion,
+            salt: state.salt,
+        });
+    }
+    return r;
+};
+
+// 7) doShareToChat — если отправили в текущий чат, обновляем кэш
+const _origDoShareToChatForCache = doShareToChat;
+doShareToChat = async function(targetFile, targetPassword, blob, fileName, mime, meta) {
+    const r = await _origDoShareToChatForCache.call(
+        this, targetFile, targetPassword, blob, fileName, mime, meta
+    );
+    // Если шарили в текущий чат — обновляем кэш
+    if (state.chatFile === targetFile && state.messages && state.salt) {
+        ChatCache.set(targetFile, {
+            messages: state.messages,
+            sha: state.sha,
+            lastCommitSha: state._lastCommitSha,
+            lastMetaVersion: state._lastMetaVersion,
+            salt: state.salt,
+        });
+    } else {
+        // Шарили в другой чат — его кэш устарел
+        ChatCache.invalidate(targetFile);
+    }
+    return r;
+};
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🧹 ОЧИСТКА КЭША при выходе из аккаунта
+//  (опционально — можно и не чистить, но чище так)
+// ═══════════════════════════════════════════════════════════════
+const _origLogoutForCache = logout;
+logout = function() {
+    // Кэш оставляем — это часть профиля пользователя
+    // Но можно и почистить, если хотите приватности:
+    // ChatCache.clear();
+    return _origLogoutForCache.apply(this, arguments);
+};
+
+// При "Очистить данные" с полной очисткой — тоже чистим кэш
+const _origClearDataBtnHandler = clearDataBtn.onclick;
+clearDataBtn.addEventListener('click', () => {
+    // Оригинальный обработчик уже отработал, проверим состояние
+    setTimeout(() => {
+        const chatsEmpty = state.chats.length === 0;
+        if (chatsEmpty) {
+            ChatCache.clear();
+            console.log('💾 Кэш чатов очищен вместе с данными');
+        }
+    }, 100);
+});
+
+
+// ═══════════════════════════════════════════════════════════════
+//  📊 ДИАГНОСТИКА (можно вызывать из консоли)
+// ═══════════════════════════════════════════════════════════════
+window.chatCacheStats = () => {
+    const s = ChatCache.stats();
+    const kb = (s.bytes / 1024).toFixed(1);
+    console.log(`💾 Кэш: ${s.chats} чатов, ${s.messages} сообщений, ~${kb} КБ`);
+    return s;
+};
+window.chatCacheClear = () => {
+    ChatCache.clear();
+    console.log('💾 Кэш полностью очищен');
+    showToast('💾 Кэш очищен', 1500);
+};
+window.chatCacheInspect = (file) => {
+    const e = ChatCache.get(file);
+    if (!e) { console.log('❌ Нет в кэше:', file); return null; }
+    console.log('💾 Запись:', {
+        file,
+        messages: e.messagesCount,
+        salt: e.salt ? e.salt.slice(0, 12) + '…' : null,
+        sha: e.sha ? e.sha.slice(0, 8) + '…' : null,
+        lastMetaVersion: e.lastMetaVersion,
+        ageMin: Math.round((Date.now() - e.cachedAt) / 60000),
+    });
+    return e;
+};
+
+console.log('💾 Кэш чатов активен. Команды в консоли:');
+console.log('   chatCacheStats()       — статистика');
+console.log('   chatCacheClear()       — очистить всё');
+console.log('   chatCacheInspect(file) — посмотреть конкретный чат');
+console.log('   ⚡ При повторном входе в чат — показ мгновенный из кэша');
+console.log('   🔄 В фоне автоматически проверяется .meta → догрузка если новее');
 </script>
 </body>
 </html>
