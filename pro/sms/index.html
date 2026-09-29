@@ -2515,6 +2515,15 @@ body.player-active .gallery-actions { bottom: 56px; }
     font-size: 20px;
     flex-shrink: 0;
     animation: gpPulse 2.2s ease-in-out infinite;
+    cursor: pointer;                       /* 🆕 */
+    transition: transform 0.15s, box-shadow 0.15s;   /* 🆕 */
+}
+#globalPlayerBar .gp-thumb:hover {         /* 🆕 */
+    transform: scale(1.05);
+    box-shadow: 0 0 0 2px rgba(108,92,231,0.5);
+}
+#globalPlayerBar .gp-thumb:active {        /* 🆕 */
+    transform: scale(0.94);
 }
 @keyframes gpPulse {
     0%, 100% { box-shadow: 0 0 0 0 rgba(108,92,231,0.4); }
@@ -2530,6 +2539,11 @@ body.player-active .gallery-actions { bottom: 56px; }
 #globalPlayerBar .gp-title {
     font-size: 14px; font-weight: 600; color: #fff;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    cursor: pointer;                       /* 🆕 */
+    transition: color 0.15s;
+}
+#globalPlayerBar .gp-title:hover {         /* 🆕 */
+    color: #a78bfa;
 }
 #globalPlayerBar .gp-sub {
     font-size: 11px; color: #888;
@@ -6170,6 +6184,12 @@ async function loadAttachmentsIn(root) {
     });
     await Promise.allSettled(tasks);
 setTimeout(initAudioPlayers, 0);
+// 🆕 Догоняем синхронизацию после создания плееров
+[0, 150, 400, 800].forEach(delay => {
+    setTimeout(() => {
+        if (typeof syncInlineWithGlobal === 'function') syncInlineWithGlobal();
+    }, delay);
+});
 
 // 🆕 После того как все вложения превратились в реальные элементы —
 // если юзер был у низа, аккуратно досылаем вниз
@@ -10736,9 +10756,12 @@ setTimeout(() => {
         
 startPolling();
 // 🆕 Синхронизируем инлайн-плеер с глобальным (если музыка играет)
-setTimeout(() => {
-    if (typeof syncInlineWithGlobal === 'function') syncInlineWithGlobal();
-}, 200);
+//     Вызываем НЕСКОЛЬКО РАЗ — потому что вложения грузятся асинхронно
+[100, 300, 600, 1000, 1800, 3000].forEach(delay => {
+    setTimeout(() => {
+        if (typeof syncInlineWithGlobal === 'function') syncInlineWithGlobal();
+    }, delay);
+});
 
 
 
@@ -12494,20 +12517,21 @@ let _savePositionTimer = null;
     function buildUI() {
         if (el.bar) return;
         const bar = document.createElement('div');
-        bar.id = 'globalPlayerBar';
-        bar.innerHTML = `
-            <div class="gp-progress" id="gpProgress">
-                <div class="gp-progress-fill" id="gpProgressFill"></div>
-            </div>
-            <div class="gp-thumb" id="gpThumb">🎵</div>
-            <div class="gp-info">
-                <div class="gp-title" id="gpTitle">—</div>
-                <div class="gp-sub" id="gpSub">
-                    <span id="gpTimeCur">0:00</span>
-                    <span class="gp-dot">·</span>
-                    <span id="gpTimeTotal">0:00</span>
-                </div>
-            </div>
+bar.id = 'globalPlayerBar';
+bar.innerHTML = `
+    <div class="gp-progress" id="gpProgress">
+        <div class="gp-progress-fill" id="gpProgressFill"></div>
+    </div>
+    <div class="gp-thumb" id="gpThumb" title="Перейти к треку в чате">🎵</div>
+    <div class="gp-info">
+        <div class="gp-title" id="gpTitle" title="Перейти к треку в чате">—</div>
+        <div class="gp-sub" id="gpSub">
+            <span id="gpTimeCur">0:00</span>
+            <span class="gp-dot">·</span>
+            <span id="gpTimeTotal">0:00</span>
+        </div>
+    </div>
+   
             <div class="gp-controls">
                 <button class="gp-btn" id="gpPrev" title="Предыдущий">⏮</button>
                 <button class="gp-btn gp-btn-main" id="gpPlay" title="Пауза">⏸</button>
@@ -12537,6 +12561,16 @@ el.dirBtn = bar.querySelector('#gpDir');
         el.nextBtn.addEventListener('click', next);
         el.closeBtn.addEventListener('click', stop);
 el.dirBtn.addEventListener('click', toggleDirection);
+
+// 🆕 Клик по иконке/названию → прыжок к треку в чате
+el.thumb.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (typeof jumpToPlayingTrack === 'function') jumpToPlayingTrack();
+});
+el.title.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (typeof jumpToPlayingTrack === 'function') jumpToPlayingTrack();
+});
 
         el.progressBar.addEventListener('click', (e) => {
             if (!audio.duration || !isFinite(audio.duration)) return;
@@ -12901,6 +12935,7 @@ if ('mediaSession' in navigator) {
         get queue() { return queue; },
         get audioEl() { return audio; },
         get currentChatFile() { return currentChatFile; },
+        get currentMsgId() { return currentMsgId; },   // 🆕 ГЕТТЕР
     };
 })();
 
@@ -13016,6 +13051,144 @@ function syncPlayerWithCurrentChat() {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  🎯 ПРЫЖОК К ТРЕКУ ИЗ ГЛОБАЛЬНОГО ПЛЕЕРА
+//  Клик по иконке/названию в плеере → открыть чат-источник,
+//  проскроллить к сообщению, подсветить.
+// ═══════════════════════════════════════════════════════════════
+async function jumpToPlayingTrack() {
+    if (typeof GlobalPlayer === 'undefined') return;
+
+    const targetChat = GlobalPlayer.currentChatFile;
+    const targetMsgId = GlobalPlayer.currentMsgId;
+
+    if (!targetChat || !targetMsgId) {
+        showToast('ℹ️ Нет играющего трека', 1500);
+        return;
+    }
+
+    // ═══ 1. Если это ДРУГОЙ чат — переходим в него ═══
+    if (state.chatFile !== targetChat) {
+        const chat = state.chats.find(c => c.file === targetChat);
+        if (!chat) {
+            showToast('❌ Чат-источник не найден в списке', 2500);
+            return;
+        }
+        const password = state.savedPasswords[targetChat];
+        if (!password) {
+            showToast('🔐 Нужен пароль чата для перехода', 2500);
+            return;
+        }
+
+        // Показываем тост и переходим
+        showToast(`🎵 Переход в «${chat.name || targetChat}»…`, 1500);
+
+        try {
+            await enterChat(targetChat, chat.name || targetChat, password);
+        } catch (e) {
+            console.error('jumpToPlayingTrack enterChat error:', e);
+            showToast('❌ Не удалось открыть чат: ' + e.message, 2500);
+            return;
+        }
+
+        // После перехода надо дождаться, пока история и вложения прогрузятся
+        // — иначе сообщение может ещё не быть в DOM
+        // Ждём появления элемента
+        let tries = 0;
+        const maxTries = 40;   // максимум 4 секунды
+        const waitForMessage = () => {
+            const found = messagesInner.querySelector(
+                `.message-wrapper[data-msg-id="${targetMsgId}"]`
+            );
+            if (found) {
+                doScrollAndFlash(found, targetMsgId);
+                return;
+            }
+            tries++;
+            if (tries < maxTries) {
+                setTimeout(waitForMessage, 100);
+            } else {
+                showToast('⚠️ Трек далеко в истории — потяните вверх', 2500);
+            }
+        };
+        setTimeout(waitForMessage, 200);
+        return;
+    }
+
+    // ═══ 2. Мы УЖЕ в этом чате — просто скроллим ═══
+    const el = messagesInner.querySelector(
+        `.message-wrapper[data-msg-id="${targetMsgId}"]`
+    );
+
+    if (el) {
+        doScrollAndFlash(el, targetMsgId);
+        return;
+    }
+
+    // ═══ 3. Сообщение не в DOM — значит оно выше в истории ═══
+    // Пробуем дозагрузить историю, пока не найдём
+    showToast('🔎 Ищем трек в истории…', 1500);
+
+    const msgIndex = historyState.allMessages.findIndex(
+        m => String(m.id) === String(targetMsgId)
+    );
+
+    if (msgIndex === -1) {
+        showToast('❌ Трек не найден в этом чате', 2500);
+        return;
+    }
+
+    // Если он выше текущего startIndex — подгружаем пачками
+    let loadAttempts = 0;
+    const maxLoadAttempts = 30;
+
+    const tryLoadUntilFound = () => {
+        const found = messagesInner.querySelector(
+            `.message-wrapper[data-msg-id="${targetMsgId}"]`
+        );
+        if (found) {
+            doScrollAndFlash(found, targetMsgId);
+            return;
+        }
+
+        loadAttempts++;
+        if (loadAttempts >= maxLoadAttempts || historyState.startIndex <= 0) {
+            showToast('⚠️ Не удалось дойти до трека', 2500);
+            return;
+        }
+
+        // Грузим ещё страницу истории
+        if (!_loadingOlder && historyState.startIndex > 0) {
+            loadOlderMessages().then(() => {
+                setTimeout(tryLoadUntilFound, 300);
+            });
+        } else {
+            setTimeout(tryLoadUntilFound, 300);
+        }
+    };
+
+    // Быстро проматываем к началу, чтобы вызвать подгрузку
+    messagesContainer.scrollTop = 0;
+    setTimeout(tryLoadUntilFound, 400);
+}
+
+// Вспомогалка — скролл + подсветка
+function doScrollAndFlash(el, msgId) {
+    // Снимаем все старые подсветки
+    messagesInner.querySelectorAll('.message-wrapper.highlight-flash')
+        .forEach(x => x.classList.remove('highlight-flash'));
+
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+    // Небольшая задержка — чтобы скролл начался
+    setTimeout(() => {
+        el.classList.add('highlight-flash');
+        setTimeout(() => el.classList.remove('highlight-flash'), 1300);
+    }, 200);
+
+    if (navigator.vibrate) navigator.vibrate(20);
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  🆕 СИНХРОНИЗАЦИЯ ИНЛАЙН-ПЛЕЕРА С ГЛОБАЛЬНЫМ
 // ═══════════════════════════════════════════════════════════════
 
@@ -13056,12 +13229,15 @@ function syncInlineWithGlobal() {
         coverBtn.classList.toggle('playing', !isGlobalPaused);
     }
 
-            // Волны
-            if (isGlobalPaused) {
-                p.waveEl.classList.remove('playing');
-            } else {
-                p.waveEl.classList.add('playing');
-            }
+            // Волны — 🆕 через getElementById напрямую, чтобы не зависеть от кэша
+const waveNow = document.getElementById(`wave-${id}`);
+if (waveNow) {
+    if (isGlobalPaused) {
+        waveNow.classList.remove('playing');
+    } else {
+        waveNow.classList.add('playing');
+    }
+}
 
             // Прогресс и время
             if (globalDuration > 0) {
@@ -13095,9 +13271,22 @@ function syncInlineWithGlobal() {
                 p.progressFill.style.width = '0%';
                 if (p.audio && isFinite(p.audio.duration)) {
                     p.timeEl.textContent = formatAudioTime(p.audio.duration);
-                }
-                p.isPlaying = false;
+                }                p.isPlaying = false;
             }
+        }
+    });
+
+    // 🆕 СТРАХОВКА: напрямую пробегаем по всем видимым плеерам в DOM
+    //     и приводим их волны в порядок — на случай если что-то в кэше устарело
+    document.querySelectorAll('.audio-container[data-audio-id]').forEach(container => {
+        const id = container.dataset.audioId;
+        const wave = document.getElementById(`wave-${id}`);
+        if (!wave) return;
+        const isCurrent = String(id) === String(globalMsgId);
+        if (isCurrent && !isGlobalPaused) {
+            wave.classList.add('playing');
+        } else {
+            wave.classList.remove('playing');
         }
     });
 }
@@ -17043,6 +17232,106 @@ console.log('💬 Аватарки пользователей теперь и в
 console.log('🖼️ Экспорт/импорт аватарок чатов активирован');
 console.log('   • Чекбокс «Включить аватарки чатов» в модалке экспорта');
 console.log('   • Merge или Replace — по тому же принципу, что чаты и userAvatars');
+
+// ═══════════════════════════════════════════════════════════════
+//  🆕 НАДЁЖНАЯ СИНХРОНИЗАЦИЯ ВОЛН — не зависит ни от чего
+//  Работает через интервал, пока пользователь в чате.
+//  Если глобальный плеер играет — ставит .playing на нужной волне.
+// ═══════════════════════════════════════════════════════════════
+
+(function installWaveSynchronizer() {
+    let _waveSyncTimer = null;
+
+    function syncWavesNow() {
+        if (typeof GlobalPlayer === 'undefined') return;
+        if (state.currentScreen !== 'chat') return;
+        if (!state.chatFile) return;
+
+        const globalMsgId = GlobalPlayer.getCurrentMsgId();
+        const globalAudio = GlobalPlayer.audioEl;
+        if (!globalAudio) return;
+
+        const isPaused = globalAudio.paused;
+        const hasTrack = !!globalMsgId;
+
+        // Пробегаем по ВСЕМ волнам в DOM
+        document.querySelectorAll('.audio-wave[id^="wave-"]').forEach(waveEl => {
+            const id = waveEl.id.replace('wave-', '');
+            const isCurrent = hasTrack && String(id) === String(globalMsgId);
+
+            if (isCurrent && !isPaused) {
+                if (!waveEl.classList.contains('playing')) {
+                    waveEl.classList.add('playing');
+                }
+            } else {
+                if (waveEl.classList.contains('playing')) {
+                    waveEl.classList.remove('playing');
+                }
+            }
+        });
+    }
+
+    // ─── Слушатели на события глобального плеера ───
+    function attachListeners() {
+        if (typeof GlobalPlayer === 'undefined') {
+            setTimeout(attachListeners, 500);
+            return;
+        }
+        const audio = GlobalPlayer.audioEl;
+        if (!audio) {
+            setTimeout(attachListeners, 500);
+            return;
+        }
+        if (audio._waveSyncAttached) return;
+        audio._waveSyncAttached = true;
+
+        audio.addEventListener('play',  () => { syncWavesNow(); setTimeout(syncWavesNow, 50); });
+        audio.addEventListener('pause', () => { syncWavesNow(); });
+        audio.addEventListener('ended', () => { setTimeout(syncWavesNow, 50); });
+        audio.addEventListener('loadedmetadata', () => { setTimeout(syncWavesNow, 50); });
+    }
+    attachListeners();
+
+    // ─── Хук на playTrack — когда трек переключается ───
+    if (typeof GlobalPlayer !== 'undefined') {
+        // Патчим playQueue, чтобы вызывать syncWavesNow после старта
+        const _origPlayQueue = GlobalPlayer.playQueue;
+        // Но GlobalPlayer.playQueue — замыкание, его нельзя переопределить снаружи.
+        // Поэтому — просто ставим интервал.
+    }
+
+    // ─── Интервал: каждые 700 мс проверяем и синхронизируем ───
+    // Работает всегда, когда пользователь в чате.
+    if (_waveSyncTimer) clearInterval(_waveSyncTimer);
+    _waveSyncTimer = setInterval(() => {
+        if (state.currentScreen === 'chat') {
+            syncWavesNow();
+        }
+    }, 700);
+
+    // ─── Также вызываем при смене чата и после входа ───
+    const _origEnterChatWaveSync = enterChat;
+    enterChat = async function(...args) {
+        const r = await _origEnterChatWaveSync.apply(this, args);
+        // Синхронизируем несколько раз, пока вложения грузятся
+        [0, 100, 300, 600, 1000, 1800, 3000, 5000].forEach(delay => {
+            setTimeout(syncWavesNow, delay);
+        });
+        return r;
+    };
+
+    // ─── Также синхронизируем после renderHistory / appendMessages ───
+    // Проще — через MutationObserver на messagesInner:
+    const observer = new MutationObserver(() => {
+        // Дебаунсим — не чаще раза в 200 мс
+        if (observer._debounceTimer) clearTimeout(observer._debounceTimer);
+        observer._debounceTimer = setTimeout(syncWavesNow, 200);
+    });
+    observer.observe(messagesInner, { childList: true, subtree: true });
+
+    console.log('🌊 Надёжная синхронизация волн установлена');
+})();
+
 </script>
 </body>
 </html>
