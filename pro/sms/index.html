@@ -232,7 +232,7 @@
     padding: 16px 14px 8px; display: block;
     -webkit-overflow-scrolling: touch;
     overscroll-behavior: contain; min-height: 0; max-height: 100%;
-    /* 🆕 Отключаем автоматический скролл-анкор браузера — будем управлять сами */
+    /* 🆕 Включён автоматический скролл-анкор браузера */
     overflow-anchor: none;
 }
         .messages-container > .messages-inner {
@@ -8534,78 +8534,19 @@ let _scrollPreserver = null;   // активный "замораживатель
  * Пока активен — любые изменения высоты сверху компенсируются автопрокруткой.
  * @param {HTMLElement} anchorEl — элемент, к которому привязываемся
  * @param {number} offsetTop — насколько этот элемент был от верха контейнера
- */
-function startScrollPreserve(anchorEl, offsetTop) {
-    // Если уже есть активный — останавливаем
-    stopScrollPreserve();
-
-    if (!anchorEl || !anchorEl.isConnected) {
-        // Фолбэк: просто запомним scrollTop
-        _scrollPreserver = {
-            anchorEl: null,
-            offsetTop: offsetTop,
-            rafId: null,
-            ro: null,
-            active: true,
-        };
-        return;
-    }
-
-    const container = messagesContainer;
-
-    const keepPosition = () => {
-        if (!_scrollPreserver || !_scrollPreserver.active) return;
-        if (!anchorEl.isConnected) {
-            stopScrollPreserve();
-            return;
-        }
-        const newTop = anchorEl.offsetTop;
-        const diff = newTop - offsetTop;
-        if (Math.abs(diff) > 0.5) {
-            // Прокручиваем так, чтобы anchor вернулся на ту же визуальную позицию
-            container.scrollTop += diff;
-            _scrollPreserver.offsetTop = anchorEl.offsetTop;
-        }
-    };
-
-    // ResizeObserver на контейнер — ловит любое изменение высоты
-    const ro = new ResizeObserver(() => {
-        if (!_scrollPreserver || !_scrollPreserver.active) return;
-        // Двойной rAF, чтобы дать браузеру применить layout
-        requestAnimationFrame(() => {
-            requestAnimationFrame(keepPosition);
-        });
-    });
-    ro.observe(messagesInner);
-
-    _scrollPreserver = {
-        anchorEl,
-        offsetTop: anchorEl.offsetTop,
-        rafId: null,
-        ro,
-        active: true,
-    };
-
-    // Первичная коррекция
-    keepPosition();
+ */function startScrollPreserve(anchorEl, offsetTop) {
+    // 🆕 ОТКЛЮЧЕНО — конфликтует с overflow-anchor: auto.
+    // Браузер сам удерживает позицию при вставке сверху.
+    return;
 }
-
 function stopScrollPreserve() {
-    if (_scrollPreserver) {
-        _scrollPreserver.active = false;
-        if (_scrollPreserver.rafId) cancelAnimationFrame(_scrollPreserver.rafId);
-        if (_scrollPreserver.ro) {
-            try { _scrollPreserver.ro.disconnect(); } catch (e) {}
-        }
-        _scrollPreserver = null;
-    }
+    // 🆕 ОТКЛЮЧЕНО — парная к startScrollPreserve.
+    return;
 }
-
 async function loadOlderMessages() {
     if (_loadingOlder) return;
     if (historyState.startIndex <= 0) return;
 
-    // 🆕 Если палец на экране — откладываем до touchend
     if (_isUserScrolling) {
         _pendingLoadOlder = true;
         return;
@@ -8614,32 +8555,31 @@ async function loadOlderMessages() {
     _loadingOlder = true;
     _pendingLoadOlder = false;
 
-    // ═══ 1. Находим «якорь» — первое видимое сейчас сообщение ═══
-    //    К нему будем привязывать позицию скролла
+    // ═══ 1. Запоминаем anchor через getBoundingClientRect ═══
+    // Используем визуальную позицию относительно контейнера, а не offsetTop
     const containerRect = messagesContainer.getBoundingClientRect();
-    const allWrappers = messagesInner.querySelectorAll('.message-wrapper, .message.system, .history-sentinel');
+    const allWrappers = messagesInner.querySelectorAll('.message-wrapper[data-msg-id]');
     let anchorEl = null;
-    let anchorOffset = 0;
+    let anchorId = null;
+    let anchorVisualTop = 0;   // позиция anchor относительно верха контейнера
 
     for (const el of allWrappers) {
         const r = el.getBoundingClientRect();
         if (r.bottom >= containerRect.top) {
             anchorEl = el;
-            anchorOffset = el.offsetTop;
+            anchorId = el.dataset.msgId;
+            // Насколько anchor был от верха видимой области
+            anchorVisualTop = r.top - containerRect.top;
             break;
         }
     }
 
-    // Фолбэк — если ничего не нашли, запоминаем scrollTop
+    // Fallback — если не нашли anchor, не компенсируем вообще
     if (!anchorEl) {
-        anchorEl = null;
-        anchorOffset = messagesContainer.scrollTop;
+        anchorVisualTop = null;
     }
 
-    // ═══ 2. Стартуем «замораживатель» позиции ДО вставки ═══
-    startScrollPreserve(anchorEl, anchorOffset);
-
-    // ═══ 3. Вставляем новые сообщения ═══
+    // ═══ 2. Вставляем старые сообщения ═══
     const more = Math.min(CONFIG.renderPageSize, historyState.startIndex);
     const newStart = historyState.startIndex - more;
 
@@ -8648,9 +8588,11 @@ async function loadOlderMessages() {
     for (let i = newStart; i < historyState.startIndex; i++) {
         const msg = historyState.allMessages[i];
         const msgDate = formatDate(msg.time);
-        if (msgDate !== lastDate) { html += `<div class="message system">${msgDate}</div>`; lastDate = msgDate; }
-        // 🆕 noFade: не анимируем появление — важно для плавности
-html += buildMessageHTML(msg, { noFade: true });
+        if (msgDate !== lastDate) {
+            html += `<div class="message system">${msgDate}</div>`;
+            lastDate = msgDate;
+        }
+        html += buildMessageHTML(msg, { noFade: true });
     }
 
     const sentinel = $('historySentinel');
@@ -8660,17 +8602,51 @@ html += buildMessageHTML(msg, { noFade: true });
     historyState.startIndex = newStart;
     historyState.renderedCount += more;
 
-    // ═══ 4. Загружаем вложения — ResizeObserver сам удержит позицию ═══
+    // ═══ 3. Восстановление позиции через getBoundingClientRect ═══
+    // diff = (текущая визуальная позиция anchor) - (былая)
+    // Если anchor стал НИЖЕ, чем был — мы должны поднять scrollTop ВВЕРХ
+    // на эту разницу. Если anchor стал ВЫШЕ — опустить вниз.
+    //
+    // Ключевое: компенсация = -diff
+    const restoreAnchor = () => {
+        if (!anchorId || anchorVisualTop === null) return;
+        const found = messagesInner.querySelector(
+            `.message-wrapper[data-msg-id="${anchorId}"]`
+        );
+        if (!found) return;
+
+        const contRect = messagesContainer.getBoundingClientRect();
+        const anchorRect = found.getBoundingClientRect();
+        const currentVisualTop = anchorRect.top - contRect.top;
+
+        // Насколько anchor уехал относительно изначальной позиции
+        const diff = currentVisualTop - anchorVisualTop;
+
+        // Компенсируем: если anchor уехал ВНИЗ на diff, значит мы должны
+        // поднять scrollTop ВВЕРХ на diff (уменьшить scrollTop)
+        // Формула: scrollTop += diff  →  если diff > 0, scrollTop растёт
+        // → контент едет вверх → anchor возвращается на место
+        if (Math.abs(diff) > 0.5) {
+            messagesContainer.scrollTop += diff;
+        }
+    };
+
+    // Мгновенно
+    restoreAnchor();
+
+    // ═══ 4. Загружаем вложения ═══
     await loadAttachmentsIn(messagesInner);
 
-    // ═══ 5. Финальная коррекция — даём вложениям время догрузиться ═══
-    //    (картинки могут прийти с задержкой и изменить высоту)
-    await new Promise(r => setTimeout(r, 50));
+    // ═══ 5. Восстановление позиции после загрузки вложений ═══
+    // Каскад — картинки грузятся асинхронно
+    requestAnimationFrame(() => requestAnimationFrame(restoreAnchor));
+    setTimeout(restoreAnchor, 100);
+    setTimeout(restoreAnchor, 300);
+    setTimeout(restoreAnchor, 700);
+    setTimeout(restoreAnchor, 1500);
 
-    // ═══ 6. Останавливаем «замораживатель» через 400 мс после подгрузки ═══
-    //    Это время ловит все асинхронные изменения (img.onload и т.п.)
+    // ═══ 6. Финализация ═══
     setTimeout(() => {
-        stopScrollPreserve();
         if (historyState.startIndex === 0) {
             const s = $('historySentinel');
             if (s) s.outerHTML = '<div class="history-start">— Начало истории —</div>';
@@ -8678,7 +8654,6 @@ html += buildMessageHTML(msg, { noFade: true });
         _loadingOlder = false;
     }, 400);
 }
-
 // ===================================================================
 //  ГАЛЕРЕЯ
 // ===================================================================
@@ -15827,6 +15802,92 @@ console.log('   • Тап по сообщениям = добавить/убра
 console.log('   • Кнопка «Свои» = выделить все свои');
 console.log('   • Кнопка «Удалить» = пакетное удаление + вложения');
 
+// ═══════════════════════════════════════════════════════════════
+//  🆕 ПАССИВНЫЙ ЗАМОРАЖИВАТЕЛЬ ПОЗИЦИИ
+//  Пока пользователь НЕ у низа — компенсирует любое изменение
+//  высоты messagesInner через getBoundingClientRect (правильная формула).
+//  Не конфликтует с loadOlderMessages — просто доводит до идеала.
+// ═══════════════════════════════════════════════════════════════
+(function installScrollFreezer() {
+    // Следим за состоянием «у низа или нет»
+    let userAtBottom = true;
+    let anchorEl = null;         // первое видимое сообщение
+    let anchorVisualTop = 0;     // его визуальная позиция относительно контейнера
+    let freezeActive = false;
+
+    function updateUserPosition() {
+        const diff = messagesContainer.scrollHeight
+            - messagesContainer.scrollTop
+            - messagesContainer.clientHeight;
+        userAtBottom = diff < 80;
+    }
+
+    // При любом скролле — обновляем флаг
+    messagesContainer.addEventListener('scroll', updateUserPosition, { passive: true });
+
+    // Функция — пересчитать anchor (первое видимое сообщение)
+    function updateAnchor() {
+        const contRect = messagesContainer.getBoundingClientRect();
+        const wrappers = messagesInner.querySelectorAll('.message-wrapper[data-msg-id]');
+        for (const el of wrappers) {
+            const r = el.getBoundingClientRect();
+            if (r.bottom >= contRect.top) {
+                anchorEl = el;
+                anchorVisualTop = r.top - contRect.top;
+                return;
+            }
+        }
+        anchorEl = null;
+    }
+
+    // Компенсация — вернуть anchor на место
+    function restoreAnchor() {
+        if (!anchorEl || !anchorEl.isConnected) {
+            anchorEl = null;
+            return;
+        }
+        const contRect = messagesContainer.getBoundingClientRect();
+        const r = anchorEl.getBoundingClientRect();
+        const currentTop = r.top - contRect.top;
+        const diff = currentTop - anchorVisualTop;
+        if (Math.abs(diff) > 0.5) {
+            messagesContainer.scrollTop += diff;
+        }
+    }
+
+    // ResizeObserver на messagesInner — ловит любое изменение высоты
+    const ro = new ResizeObserver(() => {
+        // Если у низа — не компенсируем, пусть контент догоняет сам
+        if (userAtBottom) {
+            freezeActive = false;
+            anchorEl = null;
+            return;
+        }
+
+        // Если заморозка ещё не активна — фиксируем anchor
+        if (!freezeActive) {
+            updateAnchor();
+            freezeActive = true;
+        }
+
+        // Компенсируем немедленно
+        restoreAnchor();
+
+        // И ещё разок через rAF — для случая, когда DOM ещё применяет layout
+        requestAnimationFrame(restoreAnchor);
+    });
+
+    ro.observe(messagesInner);
+
+    // При новом касании экрана — сбрасываем заморозку
+    // (пользователь может начать скроллить, и тогда нужно новое anchor)
+    messagesContainer.addEventListener('touchstart', () => {
+        freezeActive = false;
+        anchorEl = null;
+    }, { passive: true });
+
+    console.log('🧊 Пассивный замораживатель позиции активен');
+})();
 </script>
 </body>
 </html>
