@@ -8108,7 +8108,22 @@ async function shareAudioToChat(url, fileName) {
     try {
         const res = await fetch(url);
         const blob = await res.blob();
-        openShareToChatModal(blob, fileName, null, { isAudio: true });
+
+        // 🆕 Находим сообщение с этим аудио, чтобы взять метаданные (обложку, длительность, имя)
+        let meta = {};
+        for (const msg of historyState.allMessages) {
+            if (!msg.audio) continue;
+            const cached = _attachmentCache.get(msg.audio);
+            if (cached === url) {
+                meta.duration = msg.audioDuration || 0;
+                meta.coverName = msg.audioCover || null;
+                meta.audioName = msg.audioName || fileName;
+                console.log('🖼️ Найдено аудио с обложкой:', meta.coverName);
+                break;
+            }
+        }
+
+        openShareToChatModal(blob, fileName, null, meta);
     } catch (e) {
         console.error(e);
         showToast('❌ Не удалось подготовить аудио', 2000);
@@ -9844,12 +9859,14 @@ async function confirmShareToChat() {
 }
 
 
+
 async function doShareToChat(targetFile, targetPassword, blob, fileName, mime, meta = {}) {
-    // ═══ 1. Определяем РЕАЛЬНЫЙ тип по blob, а не по расширению ═══
+    // ═══ 1. Определяем РЕАЛЬНЫЙ тип по blob ═══
     const kind = await detectAttachmentKind(blob, fileName, mime || blob.type);
     const realMime = blob.type || mime || '';
 
     console.log(`📤 doShareToChat: kind=${kind}, realMime=${realMime}, name=${fileName}, size=${blob.size}`);
+    console.log(`📤 meta:`, meta);
 
     showToast(`📤 Отправка в чат…`, 1500);
 
@@ -9884,7 +9901,22 @@ async function doShareToChat(targetFile, targetPassword, blob, fileName, mime, m
                      : 'file';
         const attachName = generateAttachmentName(prefix, ext);
 
-        // ═══ 3. Загружаем вложение ═══
+        // ═══ 3. ШАГ 1: Загружаем обложку из ИСХОДНОГО чата (пока state.chatFile ещё старый!) ═══
+        let coverBlob = null;
+        if (kind === 'audio' && meta.coverName) {
+            try {
+                console.log('🖼️ Загружаем обложку из исходного чата:', meta.coverName);
+                const coverBlobUrl = await loadAttachment(state.chatFile, meta.coverName);
+                const coverRes = await fetch(coverBlobUrl);
+                coverBlob = await coverRes.blob();
+                console.log('✅ Обложка в памяти:', coverBlob.size, 'байт');
+            } catch (e) {
+                console.warn('⚠️ Обложка не загружена:', e);
+                coverBlob = null;
+            }
+        }
+
+        // ═══ 4. ШАГ 2: Грузим аудио и обложку в ЦЕЛЕВОЙ чат ═══
         const buf = await blob.arrayBuffer();
 
         const saveState = {
@@ -9897,14 +9929,14 @@ async function doShareToChat(targetFile, targetPassword, blob, fileName, mime, m
         state.salt = targetSalt;
         CRYPTO._key = targetKey;
 
+        let newCoverName = null;
+
         try {
             const label = kind === 'image' ? `📷 ${fileName}`
                         : kind === 'video' ? `🎬 ${fileName}`
                         : kind === 'audio' ? `🎵 ${fileName}`
                         : `📎 ${fileName}`;
 
-            // 🆕 MIME для шифрования: используем realMime, чтобы при расшифровке
-            //    blob получил правильный тип
             const uploadMime = realMime || (
                 kind === 'video' ? 'video/mp4' :
                 kind === 'audio' ? 'audio/mpeg' :
@@ -9913,6 +9945,36 @@ async function doShareToChat(targetFile, targetPassword, blob, fileName, mime, m
             );
 
             await uploadAttachmentAuto(targetFile, attachName, buf, uploadMime, label);
+            console.log('✅ Основной файл загружен:', attachName);
+
+            // 🆕 Заливаем обложку в целевой чат
+            if (coverBlob) {
+                try {
+                    let coverExt = 'jpg';
+                    if (meta.coverName) {
+                        const m = meta.coverName.match(/\.([a-z0-9]+)$/i);
+                        if (m) coverExt = m[1].toLowerCase();
+                    }
+                    if (coverBlob.type.includes('png')) coverExt = 'png';
+                    else if (coverBlob.type.includes('webp')) coverExt = 'webp';
+
+                    newCoverName = generateAttachmentName('cover', coverExt);
+
+                    const coverBuf = await coverBlob.arrayBuffer();
+                    await uploadAttachmentAuto(
+                        targetFile,
+                        newCoverName,
+                        coverBuf,
+                        coverBlob.type || 'image/jpeg',
+                        `🎨 Обложка: ${fileName}`
+                    );
+
+                    console.log('✅ Обложка залита:', newCoverName);
+                } catch (e) {
+                    console.warn('⚠️ Не удалось залить обложку:', e);
+                    newCoverName = null;
+                }
+            }
         } finally {
             state.chatFile = saveState.chatFile;
             state.chatPassword = saveState.chatPassword;
@@ -9920,7 +9982,7 @@ async function doShareToChat(targetFile, targetPassword, blob, fileName, mime, m
             CRYPTO._key = prevKey;
         }
 
-        // ═══ 4. Формируем payload по реальному типу ═══
+        // ═══ 5. Формируем payload ═══
         const messageId = Date.now();
         const payload = { username: state.username, text: '' };
 
@@ -9937,6 +9999,12 @@ async function doShareToChat(targetFile, targetPassword, blob, fileName, mime, m
             payload.audioName = fileName;
             payload.audioDuration = meta.duration || 0;
             payload.audioMime = realMime || 'audio/mpeg';
+
+            // 🆕 Вставляем НОВОЕ имя обложки (из целевого чата)
+            if (newCoverName) {
+                payload.audioCover = newCoverName;
+                console.log('📎 payload.audioCover =', newCoverName);
+            }
         } else {
             payload.file = attachName;
             payload.fileName = fileName;
@@ -9944,7 +10012,7 @@ async function doShareToChat(targetFile, targetPassword, blob, fileName, mime, m
             payload.fileSize = blob.size;
         }
 
-        // ═══ 5. Шифруем и сохраняем ═══
+        // ═══ 6. Шифруем и сохраняем ═══
         const iv = generateIV();
         const encBuf = await crypto.subtle.encrypt(
             { name: 'AES-GCM', iv },
@@ -9967,7 +10035,7 @@ async function doShareToChat(targetFile, targetPassword, blob, fileName, mime, m
         await updateMeta(targetFile, messageId, fileContent.messages.length);
         state._metaEtagsByFile[targetFile] = null;
 
-        // ═══ 6. Локальное обновление ═══
+        // ═══ 7. Локальное обновление ═══
         if (state.chatFile === targetFile) {
             const plainMsg = {
                 id: messageId,
@@ -9997,7 +10065,6 @@ async function doShareToChat(targetFile, targetPassword, blob, fileName, mime, m
         soundManager.play('error');
     }
 }
-
 
 
 // ===================================================================
