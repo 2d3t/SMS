@@ -16867,6 +16867,151 @@ messagesInner.addEventListener('touchstart', (e) => {
 
 
 console.log('💬 Аватарки пользователей теперь и в комментариях');
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🖼️ ЭКСПОРТ / ИМПОРТ АВАТАРОК ЧАТОВ
+//  Дополняет существующий экспорт профиля — добавляет chathub_avatars
+//  Работает независимо от аватарок пользователей.
+// ═══════════════════════════════════════════════════════════════
+
+// ─── 1. Экспорт: цепляем к buildProfileObject ───
+// Наша функция buildProfileObject уже запатчена выше для userAvatars,
+// теперь перепатчиваем ещё раз — чтобы добавить и chatAvatars.
+(function patchBuildProfileForChatAvatars() {
+    const _prev = buildProfileObject;
+    buildProfileObject = function(opts) {
+        const profile = _prev.call(this, opts);
+        const includeChatAvatars = $('exportIncludeChatAvatars')?.checked;
+        if (includeChatAvatars) {
+            // _avatars — это глобальный объект из блока "ЛИЧНЫЕ АВАТАРКИ ЧАТОВ"
+            profile.chatAvatars = (typeof _avatars !== 'undefined' && _avatars)
+                ? { ..._avatars }
+                : {};
+            profile._meta = profile._meta || {};
+            profile._meta.includesChatAvatars = true;
+        }
+        return profile;
+    };
+})();
+
+
+// ─── 2. Импорт: цепляем к applyImport ───
+(function patchApplyImportForChatAvatars() {
+    const _prev = applyImport;
+    applyImport = function() {
+        const profile = _pendingImportProfile;
+        const replace = profile && !profile.isSingleChat && $('importReplaceMode')?.checked;
+        const chatAvatars = profile?.chatAvatars || null;
+
+        // Вызываем предыдущий патч (тот, что для userAvatars + оригинал)
+        _prev.apply(this, arguments);
+
+        if (chatAvatars && Object.keys(chatAvatars).length > 0) {
+            if (replace) {
+                // Полная замена: сносим все прежние аватарки чатов
+                _avatars = { ...chatAvatars };
+            } else {
+                // Merge: добавляем/перезаписываем по ключу
+                if (typeof _avatars === 'undefined' || !_avatars) _avatars = {};
+                for (const [k, v] of Object.entries(chatAvatars)) {
+                    if (typeof v === 'string' && v.length > 0) {
+                        _avatars[k] = v;
+                    }
+                }
+            }
+            saveAvatars();
+
+            // Обновляем видимые аватарки в UI
+            if (typeof refreshAllAvatarsForChat === 'function') {
+                for (const file of Object.keys(chatAvatars)) {
+                    refreshAllAvatarsForChat(file);
+                }
+            }
+
+            showToast(`✅ Импортировано аватарок чатов: ${Object.keys(chatAvatars).length}`, 2500);
+        }
+    };
+})();
+
+
+// ─── 3. handleImportFile: вытаскиваем chatAvatars из файла ───
+// Предыдущий патч (для userAvatars) оборачивает handleImportFile.
+// Теперь оборачиваем ещё раз — чтобы добавить chatAvatars.
+(function patchHandleImportFileForChatAvatars() {
+    const _prev = handleImportFile;
+    handleImportFile = async function(file) {
+        let chatAvatarsToAttach = null;
+        if (file) {
+            try {
+                const text = await file.text();
+                const data = JSON.parse(text);
+                if (data && data.app === 'sms-chat' &&
+                    data.chatAvatars && typeof data.chatAvatars === 'object') {
+                    chatAvatarsToAttach = data.chatAvatars;
+                }
+            } catch (e) { /* ignore */ }
+
+            // Пересоздаём file — оригинал его прочитает заново
+            const fakeFile = new File([await file.arrayBuffer()], file.name, { type: file.type });
+            await _prev.call(this, fakeFile);
+        } else {
+            await _prev.call(this, file);
+        }
+
+        if (chatAvatarsToAttach && _pendingImportProfile) {
+            _pendingImportProfile.chatAvatars = chatAvatarsToAttach;
+        }
+    };
+})();
+
+
+// ─── 4. Чекбокс «Включить аватарки чатов» в модалке экспорта ───
+(function addExportChatAvatarsCheckbox() {
+    // Сначала убедимся, что чекбокс userAvatars уже добавлен (он идёт первым)
+    const userAvatarsLabel = document.querySelector('#exportIncludeAvatars')?.closest('label');
+    const usernameLabel = $('exportIncludeUsername')?.closest('label');
+    const anchor = userAvatarsLabel || usernameLabel;
+    if (!anchor) return;
+
+    // Уже есть? Не дублируем
+    if (document.getElementById('exportIncludeChatAvatars')) return;
+
+    const newLabel = document.createElement('label');
+    newLabel.style.cssText = 'display:flex;align-items:center;gap:10px;cursor:pointer;font-size:14px;color:#ccc;margin-bottom:14px;user-select:none;';
+    newLabel.innerHTML = `
+        <input type="checkbox" id="exportIncludeChatAvatars" checked
+               style="width:18px;height:18px;accent-color:#6c5ce7;cursor:pointer;margin:0;">
+        <span>Включить аватарки чатов</span>
+    `;
+    anchor.parentNode.insertBefore(newLabel, anchor.nextSibling);
+})();
+
+
+// ─── 5. Обновляем превью импорта — показываем кол-во аватарок чатов ───
+// Это необязательно, но красиво. Обновляем превью после парсинга файла.
+(function patchImportPreviewForChatAvatars() {
+    const _prev = handleImportFile;
+    handleImportFile = async function(file) {
+        await _prev.call(this, file);
+        // После отработки — если есть chatAvatars в pending, дописываем инфу
+        const chatAvatars = _pendingImportProfile?.chatAvatars;
+        if (!chatAvatars) return;
+        const preview = $('importPreview');
+        if (!preview || preview.style.display === 'none') return;
+        // Добавляем строчку про аватарки чатов, если её ещё нет
+        if (preview.querySelector('.chat-avatars-info')) return;
+        const count = Object.keys(chatAvatars).length;
+        if (count === 0) return;
+        preview.insertAdjacentHTML('beforeend',
+            `<div class="chat-avatars-info">🖼️ Аватарок чатов: <strong>${count}</strong></div>`);
+    };
+})();
+
+
+console.log('🖼️ Экспорт/импорт аватарок чатов активирован');
+console.log('   • Чекбокс «Включить аватарки чатов» в модалке экспорта');
+console.log('   • Merge или Replace — по тому же принципу, что чаты и userAvatars');
 </script>
 </body>
 </html>
