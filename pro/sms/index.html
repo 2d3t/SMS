@@ -2348,25 +2348,37 @@ body.player-active .gallery-actions { bottom: 56px; }
     display: block;
     pointer-events: none;
 }
+/* 🆕 Маленькая круглая кнопка в правом нижнем углу */
 .audio-cover-play {
     position: absolute;
-    inset: 0;
-    background: rgba(0,0,0,0.45);
-    border: none;
+    right: 4px;
+    bottom: 4px;
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: rgba(0, 0, 0, 0.65);
+    border: 1.5px solid rgba(255, 255, 255, 0.9);
     color: #fff;
-    font-size: 20px;
+    font-size: 10px;
     cursor: pointer;
     display: flex;
     align-items: center;
     justify-content: center;
-    opacity: 0;
-    transition: opacity 0.2s;
-    backdrop-filter: blur(2px);
-    -webkit-backdrop-filter: blur(2px);
+    padding: 0;
+    line-height: 1;
+    padding-left: 2px; /* компенсация ▶ */
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    transition: transform 0.15s ease, background 0.2s ease;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.6);
+    z-index: 2;
 }
-.audio-cover-wrap:hover .audio-cover-play,
-.audio-cover-wrap:active .audio-cover-play {
-    opacity: 1;
+.audio-cover-play:active {
+    transform: scale(0.85);
+    background: rgba(108, 92, 231, 0.9);
+}
+.audio-cover-play.playing {
+    padding-left: 0;
 }
 /* Обложка играющего трека в мини-плеере */
 #globalPlayerBar .gp-thumb img {
@@ -2380,7 +2392,7 @@ body.player-active .gallery-actions { bottom: 56px; }
 
 @media (max-width: 480px) {
     .audio-cover-wrap { width: 46px; height: 46px; border-radius: 8px; }
-    .audio-cover-play { font-size: 18px; }
+    .audio-cover-play { width: 22px; height: 22px; font-size: 9px; right: 3px; bottom: 3px; }
     .audio-container.has-cover { padding: 3px 8px 3px 3px; gap: 8px; }
 }
 
@@ -7836,16 +7848,29 @@ function createAudioPlayerHTML(msgId, audioSrc, duration, mime, trackName, cover
     let labelHtml;
 
     if (coverSrc) {
-        playBtnHtml = `
-            <div class="audio-cover-wrap">
-                <div class="audio-cover" onclick="event.stopPropagation(); openImageModal('${coverSrc}')">
-                    <img src="${coverSrc}" alt="Обложка">
-                </div>
-                <button class="audio-cover-play" onclick="event.stopPropagation(); toggleAudioPlayback(${msgId})" title="Воспроизвести">▶</button>
+    // 🆕 Если это трек, который сейчас играет в глобальном плеере — показываем ⏸
+    let playIcon = '▶';
+    if (typeof GlobalPlayer !== 'undefined') {
+        const curId = GlobalPlayer.getCurrentMsgId();
+        if (String(curId) === String(msgId)) {
+            const paused = GlobalPlayer.audioEl ? GlobalPlayer.audioEl.paused : true;
+            playIcon = paused ? '▶' : '⏸';
+        }
+    }
+    const playingClass = playIcon === '⏸' ? ' playing' : '';
+
+    playBtnHtml = `
+        <div class="audio-cover-wrap">
+            <div class="audio-cover" onclick="event.stopPropagation(); openImageModal('${coverSrc}')">
+                <img src="${coverSrc}" alt="Обложка">
             </div>
-        `;
-        labelHtml = '';
-    } else {
+            <button class="audio-cover-play${playingClass}"
+                    onclick="event.stopPropagation(); toggleAudioPlayback(${msgId})"
+                    title="${playIcon === '⏸' ? 'Пауза' : 'Воспроизвести'}">${playIcon}</button>
+        </div>
+    `;
+    labelHtml = '';
+} else {
         playBtnHtml = `<button class="audio-play-btn" onclick="toggleAudioPlayback(${msgId})" title="${icon} Воспроизвести">▶</button>`;
         labelHtml = `<div class="audio-label">${icon}${displayName ? '' : ' ' + (isVoice ? 'Голосовое' : 'Аудио')}</div>`;
     }
@@ -12573,6 +12598,13 @@ function renderPlayState(playing) {
             wave.classList.remove('playing');
             const btn = container.querySelector('.audio-play-btn');
             if (btn) btn.textContent = '▶';
+            // 🆕 Гасим и кнопку поверх обложки
+            const coverBtn = container.querySelector('.audio-cover-play');
+            if (coverBtn) {
+                coverBtn.textContent = '▶';
+                coverBtn.title = 'Воспроизвести';
+                coverBtn.classList.remove('playing');
+            }
         }
     });
 
@@ -12584,6 +12616,14 @@ function renderPlayState(playing) {
             const btn = container.querySelector('.audio-play-btn');
             if (wave) wave.classList.toggle('playing', playing);
             if (btn) btn.textContent = playing ? '⏸' : '▶';
+
+            // 🆕 Кнопка поверх обложки
+            const coverBtn = container.querySelector('.audio-cover-play');
+            if (coverBtn) {
+                coverBtn.textContent = playing ? '⏸' : '▶';
+                coverBtn.title = playing ? 'Пауза' : 'Воспроизвести';
+                coverBtn.classList.toggle('playing', playing);
+            }
         }
     }
 
@@ -12936,9 +12976,19 @@ function syncInlineWithGlobal() {
         const isCurrent = String(id) === String(globalMsgId);
 
         if (isCurrent) {
-            // ═══ ЭТО текущий трек глобального плеера ═══
-            // Иконка кнопки
-            p.btn.textContent = isGlobalPaused ? '▶' : '⏸';
+    // ═══ ЭТО текущий трек глобального плеера ═══
+    // Иконка обычной кнопки (для голосовых без обложки)
+    p.btn.textContent = isGlobalPaused ? '▶' : '⏸';
+
+    // 🆕 Иконка кнопки поверх обложки (если она есть)
+    const coverBtn = document.querySelector(
+        `.audio-container[data-audio-id="${id}"] .audio-cover-play`
+    );
+    if (coverBtn) {
+        coverBtn.textContent = isGlobalPaused ? '▶' : '⏸';
+        coverBtn.title = isGlobalPaused ? 'Воспроизвести' : 'Пауза';
+        coverBtn.classList.toggle('playing', !isGlobalPaused);
+    }
 
             // Волны
             if (isGlobalPaused) {
