@@ -2320,6 +2320,69 @@ body.player-active .gallery-actions { bottom: 56px; }
     .message .text.emoji-only.emoji-3 { font-size: 36px; }
 }
 
+/* ═══ 🎵 Обложка альбома в аудио-плеере ═══ */
+.audio-container.has-cover {
+    padding: 4px 10px 4px 4px;
+    gap: 10px;
+}
+.audio-cover-wrap {
+    position: relative;
+    width: 52px;
+    height: 52px;
+    flex-shrink: 0;
+    border-radius: 10px;
+    overflow: hidden;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.4);
+}
+.audio-cover {
+    width: 100%;
+    height: 100%;
+    cursor: pointer;
+    background: rgba(0,0,0,0.3);
+    display: block;
+}
+.audio-cover img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+    pointer-events: none;
+}
+.audio-cover-play {
+    position: absolute;
+    inset: 0;
+    background: rgba(0,0,0,0.45);
+    border: none;
+    color: #fff;
+    font-size: 20px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    transition: opacity 0.2s;
+    backdrop-filter: blur(2px);
+    -webkit-backdrop-filter: blur(2px);
+}
+.audio-cover-wrap:hover .audio-cover-play,
+.audio-cover-wrap:active .audio-cover-play {
+    opacity: 1;
+}
+/* Обложка играющего трека в мини-плеере */
+#globalPlayerBar .gp-thumb img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    border-radius: inherit;
+    display: block;
+    pointer-events: none;
+}
+
+@media (max-width: 480px) {
+    .audio-cover-wrap { width: 46px; height: 46px; border-radius: 8px; }
+    .audio-cover-play { font-size: 18px; }
+    .audio-container.has-cover { padding: 3px 8px 3px 3px; gap: 8px; }
+}
 
 /* ═══ Стили для названия трека и кнопок в аудио-плеере ═══ */
 .audio-track-name {
@@ -6062,16 +6125,28 @@ async function loadAttachmentsIn(root) {
             try {
                 const url = await loadAttachment(state.chatFile, name);
                 if (isImage) {
-                    el.innerHTML = `<img src="${url}" alt="Изображение" onclick="openImageModal('${url}')">`;
-                } else if (isAudio) {
-                    const msgId = el.dataset.msgid || '';
-                    const duration = parseFloat(el.dataset.duration) || 0;
-                    const mime = el.dataset.audiomime || '';
-                    const trackName = el.dataset.audioname || '';
-                    const wrapper = document.createElement('div');
-                    wrapper.innerHTML = createAudioPlayerHTML(msgId, url, duration, mime, trackName);
-                    el.replaceWith(wrapper.firstElementChild);
-                } else if (isFile) {
+    el.innerHTML = `<img src="${url}" alt="Изображение" onclick="openImageModal('${url}')">`;
+} else if (isAudio) {
+    const msgId = el.dataset.msgid || '';
+    const duration = parseFloat(el.dataset.duration) || 0;
+    const mime = el.dataset.audiomime || '';
+    const trackName = el.dataset.audioname || '';
+    const coverName = el.dataset.audiocover || '';
+
+    // 🆕 Загружаем обложку, если она есть
+    let coverSrc = null;
+    if (coverName && isAttachmentRef(coverName)) {
+        try {
+            coverSrc = await loadAttachment(state.chatFile, coverName);
+        } catch (e) {
+            console.warn('Cover load failed:', e);
+        }
+    }
+
+    const wrapper = document.createElement('div');
+    wrapper.innerHTML = createAudioPlayerHTML(msgId, url, duration, mime, trackName, coverSrc);
+    el.replaceWith(wrapper.firstElementChild);
+} else if (isFile) {
     const fileName = el.dataset.filename || 'file';
     const fileSize = parseInt(el.dataset.filesize) || 0;
 
@@ -6127,13 +6202,12 @@ async function encryptMessage(msg) {
     }
     if (msg.image) payload.image = msg.image;
 
-
-
-    if (msg.audio) {
+if (msg.audio) {
     payload.audio = msg.audio;
     payload.audioDuration = msg.audioDuration || 0;
     payload.audioMime = msg.audioMime || 'audio/webm';
-    if (msg.audioName) payload.audioName = msg.audioName;  // 🆕
+    if (msg.audioName) payload.audioName = msg.audioName;
+    if (msg.audioCover) payload.audioCover = msg.audioCover;  // 🆕
 }
 
 
@@ -6173,15 +6247,12 @@ async function decryptMessage(encMsg) {
             msg.comments = payload.comments;
         }
         if (payload.image) msg.image = payload.image;
-
-
-
-
-        if (payload.audio) {
+if (payload.audio) {
     msg.audio = payload.audio;
     msg.audioDuration = payload.audioDuration || 0;
     msg.audioMime = payload.audioMime || 'audio/webm';
-    msg.audioName = payload.audioName || '';  // 🆕
+    msg.audioName = payload.audioName || '';
+    msg.audioCover = payload.audioCover || '';  // 🆕
 }
 
 
@@ -6946,7 +7017,26 @@ if (hasAudioFile) {
     plainMsg.audio = attachName;
     plainMsg.audioDuration = audioFile.duration || 0;
     plainMsg.audioMime = audioFile.mime || guessMimeFromName(audioFile.name);
-    plainMsg.audioName = audioFile.name;  // 🆕 публикуем название
+    plainMsg.audioName = audioFile.name;
+
+    // 🆕 Обложка — грузим отдельным вложением
+    if (audioFile.coverBlob && audioFile.coverBlob.size > 0) {
+        try {
+            const coverExt = (audioFile.coverBlob.type || '').includes('png') ? 'png' : 'jpg';
+            const coverName = generateAttachmentName('cover', coverExt);
+            const coverBuf = await audioFile.coverBlob.arrayBuffer();
+            await uploadAttachmentAuto(
+                state.chatFile,
+                coverName,
+                coverBuf,
+                audioFile.coverBlob.type || 'image/jpeg',
+                `🎨 Обложка: ${audioFile.name}`
+            );
+            plainMsg.audioCover = coverName;
+        } catch (e) {
+            console.warn('Cover upload failed:', e);
+        }
+    }
 }
 
 
@@ -7442,6 +7532,7 @@ async function handleAnyFileUpload(file) {
 
 
 // 🆕 Загрузка и отправка аудиофайла
+
 async function handleAudioFileUpload(file) {
     if (!file) return;
     if (!state.isAuthorized || !state.chatFile) {
@@ -7453,7 +7544,6 @@ async function handleAudioFileUpload(file) {
         return;
     }
 
-    // Проверка, что это действительно аудио
     const isAudio = file.type.startsWith('audio/') ||
         /\.(mp3|ogg|wav|m4a|aac|flac|opus|webm)$/i.test(file.name);
     if (!isAudio) {
@@ -7461,7 +7551,6 @@ async function handleAudioFileUpload(file) {
         return;
     }
 
-    // Проверка размера с предупреждением
     const confirmed = await confirmLargeFile(file.size, file.name || 'audio.mp3');
     if (!confirmed) return;
 
@@ -7470,7 +7559,6 @@ async function handleAudioFileUpload(file) {
         return;
     }
 
-    // Определяем длительность через Audio API
     let duration = 0;
     try {
         duration = await getAudioDuration(file);
@@ -7478,7 +7566,17 @@ async function handleAudioFileUpload(file) {
         console.warn('Не удалось получить длительность:', e);
     }
 
-    // Определяем расширение
+    // 🆕 Извлекаем обложку из метаданных
+    let coverBlob = null;
+    try {
+        coverBlob = await AudioCoverReader.extractCover(file);
+        if (coverBlob) {
+            console.log('🎨 Обложка найдена:', coverBlob.size, 'байт');
+        }
+    } catch (e) {
+        console.warn('Cover extract:', e);
+    }
+
     const ext = (file.name.split('.').pop() || 'mp3')
         .toLowerCase().replace(/[^a-z0-9]/g, '') || 'mp3';
 
@@ -7488,13 +7586,13 @@ async function handleAudioFileUpload(file) {
             name: file.name || `audio.${ext}`,
             mime: file.type || guessMimeFromName(file.name),
             duration: duration,
+            coverBlob: coverBlob,   // 🆕
         });
     } catch (e) {
         console.error('Audio upload error:', e);
         showToast('❌ Ошибка отправки аудио: ' + e.message, 3000);
     }
 }
-
 // 🆕 Получение длительности аудиофайла
 function getAudioDuration(file) {
     return new Promise((resolve, reject) => {
@@ -7520,6 +7618,176 @@ function getAudioDuration(file) {
     });
 }
 
+// ═══════════════════════════════════════════════════════════════
+//  🖼️ ЧТЕНИЕ ОБЛОЖКИ ИЗ ID3v2 / MP4 / FLAC
+// ═══════════════════════════════════════════════════════════════
+const AudioCoverReader = (() => {
+
+    async function extractCover(file) {
+        try {
+            const buffer = await file.slice(0, 512 * 1024).arrayBuffer();
+            const view = new DataView(buffer);
+            const bytes = new Uint8Array(buffer);
+
+            // ID3v2 (MP3)
+            if (bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33) {
+                const cover = readID3v2Cover(view, bytes);
+                if (cover) return cover;
+            }
+
+            // MP4 / M4A
+            if (bytes[4] === 0x66 && bytes[5] === 0x74 &&
+                bytes[6] === 0x79 && bytes[7] === 0x70) {
+                const cover = readMP4Cover(view, bytes);
+                if (cover) return cover;
+            }
+
+            // FLAC
+            if (bytes[0] === 0x66 && bytes[1] === 0x4C &&
+                bytes[2] === 0x61 && bytes[3] === 0x43) {
+                const cover = readFLACCover(view, bytes);
+                if (cover) return cover;
+            }
+
+        } catch (e) {
+            console.warn('Cover extract failed:', e);
+        }
+        return null;
+    }
+
+    function readID3v2Cover(view, bytes) {
+        const verMajor = bytes[3];
+        const tagSize = (bytes[6] << 21) | (bytes[7] << 14) |
+                        (bytes[8] << 7)  |  bytes[9];
+        const tagEnd = 10 + tagSize;
+        if (tagEnd > bytes.length) return null;
+
+        let pos = 10;
+        const frameHeaderSize = verMajor === 2 ? 6 : 10;
+        const wantId = verMajor === 2 ? 'PIC' : 'APIC';
+
+        while (pos + frameHeaderSize < tagEnd) {
+            const frameId = String.fromCharCode(
+                bytes[pos], bytes[pos + 1], bytes[pos + 2],
+                verMajor === 2 ? 0 : bytes[pos + 3]
+            ).replace(/\0/g, '');
+
+            if (!frameId || !/^[A-Z0-9]+$/.test(frameId)) break;
+
+            let frameSize;
+            if (verMajor === 4) {
+                frameSize = (bytes[pos + 4] << 21) | (bytes[pos + 5] << 14) |
+                            (bytes[pos + 6] << 7)  |  bytes[pos + 7];
+            } else {
+                frameSize = (bytes[pos + 4] << 24) | (bytes[pos + 5] << 16) |
+                            (bytes[pos + 6] << 8)  |  bytes[pos + 7];
+            }
+
+            if (frameSize <= 0 || pos + frameHeaderSize + frameSize > bytes.length) break;
+
+            if (frameId === wantId) {
+                const dataStart = pos + frameHeaderSize;
+                const dataEnd = dataStart + frameSize;
+                const cover = parseAPICFrame(bytes, dataStart, dataEnd, verMajor);
+                if (cover) return cover;
+            }
+
+            pos += frameHeaderSize + frameSize;
+        }
+        return null;
+    }
+
+    function parseAPICFrame(bytes, start, end, ver) {
+        let p = start;
+
+        if (ver === 2) {
+            const encoding = bytes[p]; p += 1;
+            const format = String.fromCharCode(bytes[p], bytes[p+1], bytes[p+2]).toLowerCase();
+            p += 3;
+            p += 1;
+            while (p < end && bytes[p] !== 0) p++;
+            p++;
+            const mime = format === 'png' ? 'image/png' : 'image/jpeg';
+            return new Blob([bytes.slice(p, end)], { type: mime });
+        }
+
+        const encoding = bytes[p]; p += 1;
+
+        let mimeEnd = p;
+        while (mimeEnd < end && bytes[mimeEnd] !== 0) mimeEnd++;
+        const mime = String.fromCharCode(...bytes.slice(p, mimeEnd)) || 'image/jpeg';
+        p = mimeEnd + 1;
+
+        p += 1;
+
+        if (encoding === 1 || encoding === 2) {
+            while (p + 1 < end && !(bytes[p] === 0 && bytes[p + 1] === 0)) p += 2;
+            p += 2;
+        } else {
+            while (p < end && bytes[p] !== 0) p++;
+            p += 1;
+        }
+
+        if (p >= end) return null;
+        return new Blob([bytes.slice(p, end)], {
+            type: mime.startsWith('image/') ? mime : 'image/jpeg'
+        });
+    }
+
+    function readMP4Cover(view, bytes) {
+        const needle = [0x63, 0x6F, 0x76, 0x72]; // 'covr'
+        for (let i = 0; i < bytes.length - 16; i++) {
+            if (bytes[i] === needle[0] && bytes[i+1] === needle[1] &&
+                bytes[i+2] === needle[2] && bytes[i+3] === needle[3]) {
+                const covrSize = view.getUint32(i - 4);
+                const dataStart = i + 16;
+                const dataEnd = Math.min(i - 4 + covrSize, bytes.length);
+                if (dataEnd <= dataStart) continue;
+
+                const sig = bytes.slice(dataStart, dataStart + 8);
+                const isPng = sig[0] === 0x89 && sig[1] === 0x50;
+                const isJpeg = sig[0] === 0xFF && sig[1] === 0xD8;
+                if (!isPng && !isJpeg) continue;
+
+                return new Blob([bytes.slice(dataStart, dataEnd)], {
+                    type: isPng ? 'image/png' : 'image/jpeg'
+                });
+            }
+        }
+        return null;
+    }
+
+    function readFLACCover(view, bytes) {
+        let pos = 4;
+        while (pos + 4 < bytes.length) {
+            const header = bytes[pos];
+            const isLast = (header & 0x80) !== 0;
+            const blockType = header & 0x7F;
+            const blockSize = (bytes[pos+1] << 16) | (bytes[pos+2] << 8) | bytes[pos+3];
+            pos += 4;
+
+            if (blockType === 6) {
+                let p = pos + 4;
+                const mimeLen = view.getUint32(p); p += 4;
+                const mime = String.fromCharCode(...bytes.slice(p, p + mimeLen)); p += mimeLen;
+                const descLen = view.getUint32(p); p += 4;
+                p += descLen;
+                p += 16;
+                const dataLen = view.getUint32(p); p += 4;
+                if (p + dataLen > bytes.length) return null;
+                return new Blob([bytes.slice(p, p + dataLen)], {
+                    type: mime || 'image/jpeg'
+                });
+            }
+
+            pos += blockSize;
+            if (isLast) break;
+        }
+        return null;
+    }
+
+    return { extractCover };
+})();
 
 
 // ===================================================================
@@ -7530,31 +7798,25 @@ const audioPlayers = {};
 
 
 
-
-
-function createAudioPlayerHTML(msgId, audioSrc, duration, mime, trackName) {
+function createAudioPlayerHTML(msgId, audioSrc, duration, mime, trackName, coverSrc) {
     const safeDuration = duration || 0;
     const displayTime = formatAudioTime(safeDuration);
 
-    // 🆕 Логика: есть trackName → это аудиофайл, нет trackName → голосовое
     const hasTrackName = !!(trackName && trackName.trim());
-    const isVoice = !hasTrackName;   // если нет имени → это голосовое
+    const isVoice = !hasTrackName;
     const icon = isVoice ? '🎤' : '🎵';
 
-    // Название трека показываем только если оно есть
     const displayName = hasTrackName ? trackName : '';
 
-
-const nameHtml = displayName
+    const nameHtml = displayName
         ? `<div class="audio-track-name" title="${escapeHtml(displayName)}">${escapeHtml(displayName)}</div>`
         : '';
-    
-    // 🆕 Кнопки «Скачать» и «Поделиться»
+
     const escapedName = (trackName || (isVoice ? 'voice.webm' : 'audio.mp3'))
         .replace(/\\/g, '\\\\').replace(/'/g, "\\'");
     const actionsHtml = `
         <div class="audio-actions">
-            <button class="audio-action-btn" 
+            <button class="audio-action-btn"
                     onclick="event.stopPropagation(); downloadAttachedFile('${audioSrc}', '${escapedName}')"
                     title="Скачать">⬇</button>
             <button class="audio-action-btn"
@@ -7562,18 +7824,37 @@ const nameHtml = displayName
                     title="Поделиться">↗</button>
         </div>
     `;
-    
+
     let waveBars = '';
     for (let i = 0; i < 24; i++) {
         const h = 4 + Math.floor(Math.random() * 14);
         waveBars += `<span style="height:${h}px"></span>`;
     }
-    
+
+    // 🆕 Разметка: если есть обложка — она слева, поверх неё кнопка play
+    let playBtnHtml;
+    let labelHtml;
+
+    if (coverSrc) {
+        playBtnHtml = `
+            <div class="audio-cover-wrap">
+                <div class="audio-cover" onclick="event.stopPropagation(); openImageModal('${coverSrc}')">
+                    <img src="${coverSrc}" alt="Обложка">
+                </div>
+                <button class="audio-cover-play" onclick="event.stopPropagation(); toggleAudioPlayback(${msgId})" title="Воспроизвести">▶</button>
+            </div>
+        `;
+        labelHtml = '';
+    } else {
+        playBtnHtml = `<button class="audio-play-btn" onclick="toggleAudioPlayback(${msgId})" title="${icon} Воспроизвести">▶</button>`;
+        labelHtml = `<div class="audio-label">${icon}${displayName ? '' : ' ' + (isVoice ? 'Голосовое' : 'Аудио')}</div>`;
+    }
+
     return `
-        <div class="audio-container" data-audio-id="${msgId}">
-            <button class="audio-play-btn" onclick="toggleAudioPlayback(${msgId})" title="${icon} Воспроизвести">▶</button>
+        <div class="audio-container ${coverSrc ? 'has-cover' : ''}" data-audio-id="${msgId}">
+            ${playBtnHtml}
             <div class="audio-info">
-                <div class="audio-label">${icon}${displayName ? '' : ' ' + (isVoice ? 'Голосовое' : 'Аудио')}</div>
+                ${labelHtml}
                 ${nameHtml}
                 <div class="audio-wave" id="wave-${msgId}">${waveBars}</div>
                 <div class="audio-progress" id="progress-${msgId}" onclick="seekAudio(event, ${msgId})">
@@ -7586,8 +7867,6 @@ const nameHtml = displayName
         </div>
     `;
 }
-
-
 
 
 function initAudioPlayers() {
@@ -7977,7 +8256,7 @@ if (msg.image) {
 
 // ═══ Аудио ═══
 if (msg.audio) {
-    hasMedia = true;  // 🆕 Теперь аудио тоже считается медиа
+    hasMedia = true;
     if (isAttachmentRef(msg.audio)) {
         const hasName = !!(msg.audioName && msg.audioName.trim());
         const isVoice = !hasName;
@@ -7991,10 +8270,11 @@ if (msg.audio) {
                          data-msgid="${msg.id}" 
                          data-duration="${msg.audioDuration || 0}"
                          data-audiomime="${escapeHtml(msg.audioMime || '')}"
-                         data-audioname="${escapeHtml(msg.audioName || '')}">⏳ ${icon} ${trackLabel}</div>`;
+                         data-audioname="${escapeHtml(msg.audioName || '')}"
+                         data-audiocover="${escapeHtml(msg.audioCover || '')}">⏳ ${icon} ${trackLabel}</div>`;
     } else {
         content += createAudioPlayerHTML(
-            msg.id, msg.audio, msg.audioDuration, msg.audioMime, msg.audioName
+            msg.id, msg.audio, msg.audioDuration, msg.audioMime, msg.audioName, null
         );
     }
 }
@@ -9486,37 +9766,43 @@ function openShareToChatModal(blob, fileName, imageUrl, meta = {}) {
     $('shareToChatFileSize').textContent = formatFileSize(blob.size);
 
     const list = $('shareToChatList');
-    list.innerHTML = state.chats.map(c => {
-        const isCurrent = c.file === state.chatFile;
-        return `
-            <div class="share-to-chat-item" data-file="${c.file}" style="
-                display: flex;
-                align-items: center;
-                gap: 10px;
-                padding: 10px 12px;
-                background: rgba(255,255,255,0.05);
-                border: 1px solid rgba(255,255,255,0.08);
-                border-radius: 12px;
-                cursor: pointer;
-                transition: all 0.15s;
-            ">
-                <div style="
-                    width: 36px;height:36px;border-radius:50%;
-                    background: linear-gradient(135deg, #6c5ce7, #00b894);
-                    display:flex;align-items:center;justify-content:center;
-                    font-weight:700;color:#fff;flex-shrink:0;font-size:14px;
-                ">${(c.name || c.file).charAt(0).toUpperCase()}</div>
-                <div style="flex:1;min-width:0;">
-                    <div style="font-size:14px;font-weight:600;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
-                        ${escapeHtml(c.name || c.file)}
-                    </div>
-                    <div style="font-size:11px;color:#666;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
-                        ${escapeHtml(c.file)}${isCurrent ? ' · текущий' : ''}
-                    </div>
+list.innerHTML = state.chats.map(c => {
+    const isCurrent = c.file === state.chatFile;
+    const avatarData = getChatAvatar(c.file);
+    const letter = (c.name || c.file).charAt(0).toUpperCase();
+    const avatarHtml = avatarData
+        ? `<img src="${avatarData}" alt="" style="width:100%;height:100%;object-fit:cover;pointer-events:none;">`
+        : letter;
+    return `
+        <div class="share-to-chat-item" data-file="${c.file}" style="
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px 12px;
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 12px;
+            cursor: pointer;
+            transition: all 0.15s;
+        ">
+            <div style="
+                width: 36px;height:36px;border-radius:50%;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                display:flex;align-items:center;justify-content:center;
+                font-weight:700;color:#fff;flex-shrink:0;font-size:14px;
+                overflow:hidden;position:relative;
+            ">${avatarHtml}</div>
+            <div style="flex:1;min-width:0;">
+                <div style="font-size:14px;font-weight:600;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+                    ${escapeHtml(c.name || c.file)}
+                </div>
+                <div style="font-size:11px;color:#666;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+                    ${escapeHtml(c.file)}${isCurrent ? ' · текущий' : ''}
                 </div>
             </div>
-        `;
-    }).join('');
+        </div>
+    `;
+}).join('');
 
     list.querySelectorAll('.share-to-chat-item').forEach(el => {
         el.addEventListener('click', () => {
@@ -12313,20 +12599,34 @@ function renderPlayState(playing) {
     });
 }
 
-
-    function renderMeta() {
+function renderMeta() {
     const track = queue[currentIndex];
     if (!track) {
         el.title.textContent = '—';
         el.sub.textContent = '';
+        if (el.thumb) {
+            el.thumb.innerHTML = '🎵';
+            el.thumb.style.background = '';
+            el.thumb.style.animation = '';
+        }
         return;
     }
     el.title.textContent = track.name || 'Аудио';
-    el.thumb.textContent = track.name && !/голосов/i.test(track.name) ? '🎵' : '🎤';
+
+    // 🆕 Обложка в thumb мини-плеера
+    if (track.coverUrl) {
+        el.thumb.innerHTML = `<img src="${track.coverUrl}" alt="">`;
+        el.thumb.style.background = 'transparent';
+        el.thumb.style.animation = 'none';
+    } else {
+        const isVoice = /голосов/i.test(track.name || '');
+        el.thumb.innerHTML = isVoice ? '🎤' : '🎵';
+        el.thumb.style.background = '';
+        el.thumb.style.animation = '';
+    }
 
     const isReverse = direction === -1;
 
-    // В reverse режиме "next" ведёт к началу плейлиста
     const nextDisabled = isReverse
         ? currentIndex <= 0
         : currentIndex >= queue.length - 1;
@@ -12339,7 +12639,6 @@ function renderPlayState(playing) {
     el.nextBtn.style.opacity = nextDisabled ? '0.3' : '1';
     el.prevBtn.style.opacity = prevDisabled ? '0.3' : '1';
 
-    // Меняем иконки и подсказки в reverse — визуальная подсказка
     if (isReverse) {
         el.nextBtn.textContent = '⏮';
         el.prevBtn.textContent = '⏭';
@@ -12352,7 +12651,6 @@ function renderPlayState(playing) {
         el.prevBtn.title = 'Предыдущий';
     }
 }
-
     
 // ─── Управление ───
 function show() {
@@ -12384,21 +12682,34 @@ function hide() {
     show();
 
     // 🆕 Media Session API — управление с локскрина телефона
-    if ('mediaSession' in navigator) {
-        try {
-            navigator.mediaSession.metadata = new MediaMetadata({
-                title: track.name || 'Аудио',
-                artist: track.username === state.username ? 'Вы' : (track.username || 'Аноним'),
-                album: state.chatName || 'SMS Чат',
-            });
-            navigator.mediaSession.setActionHandler('play', () => { toggle(); });
-            navigator.mediaSession.setActionHandler('pause', () => { toggle(); });
-            navigator.mediaSession.setActionHandler('previoustrack', () => { prev(); });
-            navigator.mediaSession.setActionHandler('nexttrack', () => { next(); });
-        } catch (e) {
-            console.warn('Media Session error:', e);
-        }
+if ('mediaSession' in navigator) {
+    try {
+        // 🆕 Если есть обложка — подсовываем её в artwork
+        const artwork = track.coverUrl
+            ? [
+                { src: track.coverUrl, sizes: '96x96',   type: 'image/jpeg' },
+                { src: track.coverUrl, sizes: '128x128', type: 'image/jpeg' },
+                { src: track.coverUrl, sizes: '192x192', type: 'image/jpeg' },
+                { src: track.coverUrl, sizes: '256x256', type: 'image/jpeg' },
+                { src: track.coverUrl, sizes: '384x384', type: 'image/jpeg' },
+                { src: track.coverUrl, sizes: '512x512', type: 'image/jpeg' },
+            ]
+            : [];
+
+        navigator.mediaSession.metadata = new MediaMetadata({
+            title: track.name || 'Аудио',
+            artist: track.username === state.username ? 'Вы' : (track.username || 'Аноним'),
+            album: state.chatName || 'SMS Чат',
+            artwork,   // 🆕 вот это добавилось
+        });
+        navigator.mediaSession.setActionHandler('play', () => { toggle(); });
+        navigator.mediaSession.setActionHandler('pause', () => { toggle(); });
+        navigator.mediaSession.setActionHandler('previoustrack', () => { prev(); });
+        navigator.mediaSession.setActionHandler('nexttrack', () => { next(); });
+    } catch (e) {
+        console.warn('Media Session error:', e);
     }
+}
 
     try {
         await audio.play();
@@ -12510,10 +12821,12 @@ function buildAudioQueueFromHistory() {
             : (msg.username === state.username ? 'Ваше голосовое' : `Голосовое от ${msg.username}`);
         items.push({
             id: msg.id,
-            src: null,                 // src установим лениво
+            src: null,
             name,
             duration: msg.audioDuration || 0,
             username: msg.username,
+            coverUrl: null,                        // 🆕
+            _coverName: msg.audioCover || null,    // 🆕
             _msg: msg,
         });
     }
@@ -12521,29 +12834,38 @@ function buildAudioQueueFromHistory() {
 }
 
 // ═══ Запуск плейлиста из текущего чата, начиная с msgId ═══
+
 async function playAudioFromMessage(msgId) {
     const queue = buildAudioQueueFromHistory();
     if (queue.length === 0) return;
 
-    // Ленивая загрузка blob:URL для каждого элемента
-    // Сначала найдём индекс
     const startIndex = queue.findIndex(x => String(x.id) === String(msgId));
     if (startIndex === -1) return;
 
-    // Предзагружаем только нужный + следующий (чтобы быстро)
     const load = async (idx) => {
         if (idx < 0 || idx >= queue.length) return;
-        if (queue[idx].src) return;
-        try {
-            const url = await loadAttachment(state.chatFile, queue[idx]._msg.audio);
-            queue[idx].src = url;
-        } catch (e) {
-            console.warn('failed to load audio', queue[idx].id, e);
-            queue[idx].src = null;
+        const item = queue[idx];
+
+        // Аудио
+        if (!item.src) {
+            try {
+                item.src = await loadAttachment(state.chatFile, item._msg.audio);
+            } catch (e) {
+                console.warn('failed to load audio', item.id, e);
+                item.src = null;
+            }
+        }
+
+        // 🆕 Обложка
+        if (item._coverName && !item.coverUrl) {
+            try {
+                item.coverUrl = await loadAttachment(state.chatFile, item._coverName);
+            } catch (e) {
+                console.warn('failed to load cover', item.id, e);
+            }
         }
     };
 
-    // Грузим все сразу — параллельно (blob:URL дешёвый после кэша)
     await Promise.all(queue.map((_, i) => load(i)));
 
     const playable = queue.filter(x => x.src);
@@ -12551,11 +12873,9 @@ async function playAudioFromMessage(msgId) {
         showToast('❌ Не удалось загрузить аудио', 2000);
         return;
     }
-    // Перенаходим индекс в playable
     const realStart = playable.findIndex(x => String(x.id) === String(msgId));
     GlobalPlayer.playQueue(playable, realStart >= 0 ? realStart : 0, state.chatFile);
 }
-
 // ═══ Перехват toggleAudioPlayback — теперь через GlobalPlayer ═══
 
 const _origToggleAudio = window.toggleAudioPlayback;
@@ -13994,12 +14314,13 @@ encryptMessage = async function(msg) {
     if (msg.reactions && Object.keys(msg.reactions).length > 0) payload.reactions = msg.reactions;
     if (msg.comments && msg.comments.length > 0) payload.comments = msg.comments;
     if (msg.image) payload.image = msg.image;
-    if (msg.audio) {
-        payload.audio = msg.audio;
-        payload.audioDuration = msg.audioDuration || 0;
-        payload.audioMime = msg.audioMime || 'audio/webm';
-        if (msg.audioName) payload.audioName = msg.audioName;
-    }
+   if (msg.audio) {
+    payload.audio = msg.audio;
+    payload.audioDuration = msg.audioDuration || 0;
+    payload.audioMime = msg.audioMime || 'audio/webm';
+    if (msg.audioName) payload.audioName = msg.audioName;
+    if (msg.audioCover) payload.audioCover = msg.audioCover;  // 🆕
+}
     if (msg.file) {
         payload.file = msg.file;
         payload.fileName = msg.fileName || 'file.bin';
@@ -14040,11 +14361,12 @@ decryptMessage = async function(encMsg) {
         if (Array.isArray(payload.comments) && payload.comments.length > 0) msg.comments = payload.comments;
         if (payload.image) msg.image = payload.image;
         if (payload.audio) {
-            msg.audio = payload.audio;
-            msg.audioDuration = payload.audioDuration || 0;
-            msg.audioMime = payload.audioMime || 'audio/webm';
-            msg.audioName = payload.audioName || '';
-        }
+    msg.audio = payload.audio;
+    msg.audioDuration = payload.audioDuration || 0;
+    msg.audioMime = payload.audioMime || 'audio/webm';
+    msg.audioName = payload.audioName || '';
+    msg.audioCover = payload.audioCover || '';  // 🆕
+}
         if (payload.file) {
             msg.file = payload.file;
             msg.fileName = payload.fileName || 'file.bin';
