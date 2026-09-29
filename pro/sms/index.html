@@ -4408,6 +4408,7 @@ function clearAttachmentCache() {
     if (typeof GlobalPlayer !== 'undefined' && GlobalPlayer.queue) {
         for (const track of GlobalPlayer.queue) {
             if (track.src) protectedUrls.add(track.src);
+            if (track.coverUrl) protectedUrls.add(track.coverUrl);   // 🆕 ЗАЩИТА ОБЛОЖКИ
         }
     }
     // Защищаем src текущего играющего трека
@@ -12688,17 +12689,34 @@ function renderMeta() {
     }
     el.title.textContent = track.name || 'Аудио';
 
-    // 🆕 Обложка в thumb мини-плеера
-    if (track.coverUrl) {
-        el.thumb.innerHTML = `<img src="${track.coverUrl}" alt="">`;
-        el.thumb.style.background = 'transparent';
-        el.thumb.style.animation = 'none';
-    } else {
-        const isVoice = /голосов/i.test(track.name || '');
-        el.thumb.innerHTML = isVoice ? '🎤' : '🎵';
-        el.thumb.style.background = '';
-        el.thumb.style.animation = '';
-    }
+// 🆕 ЛЕНИВАЯ ПОДГРУЗКА ОБЛОЖКИ
+//    Если обложки нет, но имя и чат-источник известны — грузим её
+if (!track.coverUrl && track._coverName && track._chatFile && !track._coverFileLoading) {
+    track._coverFileLoading = true;
+    loadAttachment(track._chatFile, track._coverName).then(url => {
+        track.coverUrl = url;
+        track._coverFileLoading = false;
+        // Если это всё ещё текущий трек — перерисовываем мета
+        if (String(queue[currentIndex]?.id) === String(track.id)) {
+            renderMeta();
+        }
+    }).catch(e => {
+        console.warn('lazy cover load failed:', e);
+        track._coverFileLoading = false;
+    });
+}
+
+// 🆕 Обложка в thumb мини-плеера
+if (track.coverUrl) {
+    el.thumb.innerHTML = `<img src="${track.coverUrl}" alt="">`;
+    el.thumb.style.background = 'transparent';
+    el.thumb.style.animation = 'none';
+} else {
+    const isVoice = /голосов/i.test(track.name || '');
+    el.thumb.innerHTML = isVoice ? '🎤' : '🎵';
+    el.thumb.style.background = '';
+    el.thumb.style.animation = '';
+}
 
     const isReverse = direction === -1;
 
@@ -12889,6 +12907,7 @@ if ('mediaSession' in navigator) {
 // ═══ Сборка очереди аудио из истории текущего чата ═══
 function buildAudioQueueFromHistory() {
     const items = [];
+    const sourceChat = state.chatFile;   // 🆕 запоминаем чат-источник
     for (const msg of historyState.allMessages) {
         if (!msg.audio) continue;
         const name = msg.audioName && msg.audioName.trim()
@@ -12900,8 +12919,9 @@ function buildAudioQueueFromHistory() {
             name,
             duration: msg.audioDuration || 0,
             username: msg.username,
-            coverUrl: null,                        // 🆕
-            _coverName: msg.audioCover || null,    // 🆕
+            coverUrl: null,
+            _coverName: msg.audioCover || null,
+            _chatFile: sourceChat,   // 🆕 сохраняем чат-источник в треке
             _msg: msg,
         });
     }
@@ -12914,34 +12934,45 @@ async function playAudioFromMessage(msgId) {
     const queue = buildAudioQueueFromHistory();
     if (queue.length === 0) return;
 
+
     const startIndex = queue.findIndex(x => String(x.id) === String(msgId));
     if (startIndex === -1) return;
+
+
+    // 🆕 Фиксируем чат-источник — даже если пользователь выйдет из чата,
+    //     обложки всё равно загрузятся из правильного места
+    const sourceChatFile = queue[0]._chatFile || state.chatFile;
+
 
     const load = async (idx) => {
         if (idx < 0 || idx >= queue.length) return;
         const item = queue[idx];
 
+
         // Аудио
         if (!item.src) {
             try {
-                item.src = await loadAttachment(state.chatFile, item._msg.audio);
+                item.src = await loadAttachment(sourceChatFile, item._msg.audio);
             } catch (e) {
                 console.warn('failed to load audio', item.id, e);
                 item.src = null;
             }
         }
 
-        // 🆕 Обложка
+
+        // 🆕 Обложка — через sourceChatFile, а не state.chatFile
         if (item._coverName && !item.coverUrl) {
             try {
-                item.coverUrl = await loadAttachment(state.chatFile, item._coverName);
+                item.coverUrl = await loadAttachment(sourceChatFile, item._coverName);
             } catch (e) {
                 console.warn('failed to load cover', item.id, e);
             }
         }
     };
 
+
     await Promise.all(queue.map((_, i) => load(i)));
+
 
     const playable = queue.filter(x => x.src);
     if (playable.length === 0) {
@@ -12949,7 +12980,7 @@ async function playAudioFromMessage(msgId) {
         return;
     }
     const realStart = playable.findIndex(x => String(x.id) === String(msgId));
-    GlobalPlayer.playQueue(playable, realStart >= 0 ? realStart : 0, state.chatFile);
+    GlobalPlayer.playQueue(playable, realStart >= 0 ? realStart : 0, sourceChatFile);
 }
 // ═══ Перехват toggleAudioPlayback — теперь через GlobalPlayer ═══
 
