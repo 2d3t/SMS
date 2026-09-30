@@ -4452,15 +4452,7 @@ function clearAttachmentCache() {
 
 let networkState = { isOnline: navigator.onLine };
 let pendingOpenChat = null;
-let _pendingShareAfterUnlock = null;// 🆔 Хелпер: «это моё сообщение/комментарий/реакция?»
-function isMineIdentity(entry) {
-    if (!entry) return false;
-    if (state.identityId && entry.identityId) {
-        return entry.identityId === state.identityId;
-    }
-    // fallback для старых сообщений (без identityId)
-    return entry.username === state.username;
-}
+let _pendingShareAfterUnlock = null;
 
 let _shareToChat = {
     blob: null,
@@ -6233,11 +6225,7 @@ if (scrollState.isAtBottom && !_isUserScrolling
 
 
 async function encryptMessage(msg) {
-    const payload = { 
-    username: msg.username, 
-    text: msg.text || '',
-    identityId: msg.identityId || state.identityId || undefined,
-};
+    const payload = { username: msg.username, text: msg.text || '' };
     if (msg.reactions && Object.keys(msg.reactions).length > 0) {
         payload.reactions = msg.reactions;
     }
@@ -6283,13 +6271,7 @@ if (msg.audio) {
 async function decryptMessage(encMsg) {
     try {
         const payload = await decryptObject(encMsg.iv, encMsg.data, CRYPTO._key);
-        const msg = { 
-    id: encMsg.id, 
-    time: encMsg.time, 
-    username: payload.username, 
-    text: payload.text || '',
-    identityId: payload.identityId || null,
-};
+        const msg = { id: encMsg.id, time: encMsg.time, username: payload.username, text: payload.text || '' };
         if (payload.reactions && typeof payload.reactions === 'object') {
             msg.reactions = payload.reactions;
         }
@@ -8295,7 +8277,7 @@ async function convertToWebMWithProgress(blob, fileName) {
 
  
 function buildMessageHTML(msg, opts = {}) {
-    const isOwn = state.isAuthorized && isMineIdentity(msg);
+    const isOwn = msg.username === state.username && state.isAuthorized;
     const isUnread = opts.isUnread || false;
     const senderName = msg.username || 'Аноним';
     const fullTime = formatFullTime(msg.time);
@@ -10909,31 +10891,9 @@ async function login() {
     resetFailedAttempts();
     tokenInput.classList.add('valid');
     clearTokenHint();
-    // 🆔 Вычисляем уникальную личность
-const avatarPwdEl = document.getElementById('avatarPasswordInput');
-const avatarPwd = avatarPwdEl ? avatarPwdEl.value : '';
-if (!avatarPwd || avatarPwd.length < 3) {
-    setAuthError('Пароль аватара — минимум 3 символа');
-    avatarPwdEl?.focus();
-    loginBtn.disabled = false;
-    loginBtn.textContent = '🚀 Войти';
-    soundManager.play('error');
-    return;
-}
-const _idInput = `${username}:${avatarPwd}`;
-const _idHashBuf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(_idInput));
-const _idBytes = new Uint8Array(_idHashBuf);
-const _idAlphabet = 'abcdefghijklmnopqrstuvwxyz0123456789';
-let _idStr = '';
-for (let i = 0; i < 16; i++) _idStr += _idAlphabet[_idBytes[i] % _idAlphabet.length];
-state.identityId = _idStr;
-localStorage.setItem('chathub_identity_id', _idStr);
-localStorage.setItem('chathub_identity_username', username);
-
-
-state.username = username;
-state.token = rawToken.trim();
-state.isAuthorized = true;
+    state.username = username;
+    state.token = rawToken.trim();
+    state.isAuthorized = true;
     loadChatsList();
     loadSavedPasswords();
     if (rememberMeInput.checked) {
@@ -11505,9 +11465,8 @@ async function restoreSession() {
         if (!accessCheck.ok) { setTokenHint('Сохранённый токен недействителен', 'error'); return; }
     } catch (e) { return; }
     state.username = savedUsername;
-state.token = savedToken.trim();
-state.isAuthorized = true;
-state.identityId = localStorage.getItem('chathub_identity_id') || null;
+    state.token = savedToken.trim();
+    state.isAuthorized = true;
     loadChatsList();
     loadSavedPasswords();
     const autorunFile = getAutorunChat();
@@ -11642,12 +11601,11 @@ async function submitComment(msgId, text) {
     if (!msg) { showToast('❌ Сообщение не найдено', 1500); return; }
 
     const newComment = {
-    id: Date.now(),
-    username: state.username,
-    identityId: state.identityId || undefined,
-    text: text.trim().slice(0, 2000),
-    time: new Date().toISOString(),
-};
+        id: Date.now(),
+        username: state.username,
+        text: text.trim().slice(0, 2000),
+        time: new Date().toISOString(),
+    };
 
     // Оптимистичное обновление
     if (!msg.comments) msg.comments = [];
@@ -11772,7 +11730,7 @@ function updateCommentsInDOM(msgId) {
 function buildCommentsHTML(msg) {
     if (!msg.comments || msg.comments.length === 0) return '';
     const items = msg.comments.map(c => {
-        const isOwn = isMineIdentity(c);
+        const isOwn = c.username === state.username;
         const del = isOwn
             ? `<button class="comment-del"
                        onclick="event.stopPropagation(); deleteComment(${msg.id}, ${c.id})"
@@ -11780,7 +11738,7 @@ function buildCommentsHTML(msg) {
             : '';
         return `
             <div class="comment-item">
-                <div class="comment-avatar" data-identity="${escapeHtml(c.identityId || c.username)}">${getInitials(c.username)}</div>
+                <div class="comment-avatar">${getInitials(c.username)}</div>
                 <div class="comment-body">
                     <div class="comment-author">
                         ${isOwn ? 'Вы' : escapeHtml(c.username)}
@@ -11907,8 +11865,7 @@ function buildReactionsHTML(msg) {
 
     // Отображаемые реакции-чипы
     entries.forEach(([emoji, users]) => {
-        const myId = state.identityId || state.username;
-const mine = users.includes(myId) || users.includes(state.username);
+        const mine = users.includes(state.username);
         html += `<div class="reaction-chip ${mine ? 'mine' : ''}"
                       onclick="event.stopPropagation(); toggleReaction(${msg.id}, '${emoji}')"
                       title="${users.map(escapeHtml).join(', ')}">
@@ -12005,27 +11962,18 @@ async function toggleReaction(msgId, emoji) {
     if (!msg) return;
     if (!msg.reactions) msg.reactions = {};
 
-    const myId = state.identityId || state.username;
-const list = msg.reactions[emoji] || [];
-let idx = list.indexOf(myId);
-// миграция старых реакций с ником
-if (idx === -1 && state.identityId) {
-    const legacyIdx = list.indexOf(state.username);
-    if (legacyIdx !== -1) {
-        list[legacyIdx] = myId;
-        idx = legacyIdx;
-    }
-}
+    const list = msg.reactions[emoji] || [];
+    const idx = list.indexOf(state.username);
     let added;
     if (idx >= 0) {
         list.splice(idx, 1);
         added = false;
         if (list.length === 0) delete msg.reactions[emoji];
     } else {
-    list.push(myId);
-    msg.reactions[emoji] = list;
-    added = true;
-}
+        list.push(state.username);
+        msg.reactions[emoji] = list;
+        added = true;
+    }
 
     // Обновляем DOM конкретного сообщения
     updateReactionsInDOM(msgId);
@@ -12039,8 +11987,8 @@ if (idx === -1 && state.identityId) {
         console.error('reaction save error', e);
         // откат
         if (added) {
-    const l = msg.reactions[emoji] || [];
-    const i = l.indexOf(myId);
+            const l = msg.reactions[emoji] || [];
+            const i = l.indexOf(state.username);
             if (i >= 0) l.splice(i, 1);
             if (l.length === 0) delete msg.reactions[emoji];
         } else {
