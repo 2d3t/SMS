@@ -11438,101 +11438,7 @@ btn.addEventListener('click', async () => {
     }
 });
 })();
-// ═══ Долгое нажатие на фото → системное "Поделиться" ═══
-function setupLongPressShare() {
-    const LONG_PRESS_MS = 600;
-    let pressTimer = null;
-    let startX = 0, startY = 0;
-    let longPressFired = false;
 
-    function cancelPress() {
-        if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
-    }
-
-    function onStart(e) {
-        if (e.touches && e.touches.length > 1) { cancelPress(); return; }
-        const touch = e.touches ? e.touches[0] : e;
-        startX = touch.clientX;
-        startY = touch.clientY;
-        longPressFired = false;
-
-        pressTimer = setTimeout(async () => {
-            longPressFired = true;
-            if (navigator.vibrate) navigator.vibrate(30);
-            const src = galleryState.images[galleryState.currentIndex];
-            if (src) await systemShareImage(src);
-        }, LONG_PRESS_MS);
-    }
-
-    function onMove(e) {
-        if (!pressTimer) return;
-        const touch = e.touches ? e.touches[0] : e;
-        const dx = touch.clientX - startX;
-        const dy = touch.clientY - startY;
-        if (Math.hypot(dx, dy) > 10) cancelPress();
-    }
-
-    function onEnd(e) {
-        cancelPress();
-        if (longPressFired) {
-            e.preventDefault?.();
-            longPressFired = false;
-        }
-    }
-
-    const viewport = document.getElementById('galleryViewport');
-    viewport.addEventListener('touchstart', onStart, { passive: true });
-    viewport.addEventListener('touchmove', onMove, { passive: true });
-    viewport.addEventListener('touchend', onEnd);
-    viewport.addEventListener('touchcancel', onEnd);
-    viewport.addEventListener('mousedown', onStart);
-    viewport.addEventListener('mousemove', onMove);
-    viewport.addEventListener('mouseup', onEnd);
-    viewport.addEventListener('mouseleave', onEnd);
-}
-
-async function systemShareImage(src) {
-    try {
-        const res = await fetch(src);
-        const blob = await res.blob();
-        const file = new File(
-            [blob],
-            'image_' + Date.now() + '.jpg',
-            { type: blob.type || 'image/jpeg' }
-        );
-
-        if (navigator.canShare && navigator.canShare({ files: [file] })) {
-            await navigator.share({
-                files: [file],
-                title: 'Изображение',
-            });
-            return;
-        }
-
-        if (navigator.share) {
-            await navigator.share({
-                title: 'Изображение',
-                text: 'Посмотри это изображение',
-            });
-            return;
-        }
-
-        const a = document.createElement('a');
-        a.href = src;
-        a.download = file.name;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        showToast('💾 Файл скачан (системный шаринг недоступен)', 2500);
-
-    } catch (err) {
-        if (err.name === 'AbortError') return;
-        console.error('systemShare error:', err);
-        showToast('❌ Не удалось поделиться', 2000);
-    }
-}
-
-setupLongPressShare();
 
 // ===================================================================
 //  ВОССТАНОВЛЕНИЕ СЕССИИ
@@ -17650,6 +17556,703 @@ showMessageMenu = function(x, y, msgId, isOwn) {
 
     if (navigator.vibrate) navigator.vibrate(15);
 };
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🖼️ ИНФО-КАРТОЧКА ФОТО В ГАЛЕРЕЕ
+//  Долгое нажатие в галерее → всплывает окно с информацией.
+//  Показывает: отправитель, дата отправки, размер, разрешение,
+//  вес файла, тип, имя вложения.
+// ═══════════════════════════════════════════════════════════════
+
+(function installPhotoInfoCard() {
+    // ─── Стили ───
+    if (!document.getElementById('photoInfoCardStyles')) {
+        const style = document.createElement('style');
+        style.id = 'photoInfoCardStyles';
+        style.textContent = `
+            #photoInfoOverlay {
+                position: fixed;
+                inset: 0;
+                background: rgba(0,0,0,0.75);
+                backdrop-filter: blur(12px);
+                -webkit-backdrop-filter: blur(12px);
+                z-index: 5000;
+                display: none;
+                align-items: center;
+                justify-content: center;
+                padding: 20px;
+                animation: photoInfoFadeIn 0.2s ease;
+            }
+            #photoInfoOverlay.show { display: flex; }
+            @keyframes photoInfoFadeIn {
+                from { opacity: 0; }
+                to   { opacity: 1; }
+            }
+
+            #photoInfoCard {
+                background: #1a1a2e;
+                border: 1px solid rgba(255,255,255,0.12);
+                border-radius: 20px;
+                padding: 0;
+                max-width: 420px;
+                width: 100%;
+                max-height: 85vh;
+                overflow: hidden;
+                box-shadow: 0 20px 60px rgba(0,0,0,0.7);
+                animation: photoInfoSlideUp 0.25s cubic-bezier(0.22, 0.61, 0.36, 1);
+                display: flex;
+                flex-direction: column;
+            }
+            @keyframes photoInfoSlideUp {
+                from { transform: translateY(20px) scale(0.96); opacity: 0; }
+                to   { transform: translateY(0) scale(1); opacity: 1; }
+            }
+
+            #photoInfoCard .pi-header {
+                display: flex;
+                align-items: center;
+                gap: 12px;
+                padding: 16px 18px;
+                border-bottom: 1px solid rgba(255,255,255,0.08);
+                background: linear-gradient(135deg, rgba(108,92,231,0.15), rgba(0,184,148,0.08));
+                flex-shrink: 0;
+            }
+            #photoInfoCard .pi-header .pi-icon {
+                width: 40px;
+                height: 40px;
+                border-radius: 12px;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 20px;
+                flex-shrink: 0;
+                box-shadow: 0 4px 12px rgba(108,92,231,0.35);
+            }
+            #photoInfoCard .pi-header .pi-title {
+                flex: 1;
+                min-width: 0;
+            }
+            #photoInfoCard .pi-header .pi-title h3 {
+                font-size: 16px;
+                font-weight: 700;
+                color: #fff;
+                margin-bottom: 2px;
+            }
+            #photoInfoCard .pi-header .pi-title p {
+                font-size: 12px;
+                color: #888;
+            }
+            #photoInfoCard .pi-close {
+                width: 32px;
+                height: 32px;
+                border-radius: 50%;
+                background: rgba(255,255,255,0.08);
+                border: none;
+                color: #ccc;
+                font-size: 16px;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                flex-shrink: 0;
+                transition: all 0.15s;
+            }
+            #photoInfoCard .pi-close:hover {
+                background: rgba(255,107,107,0.2);
+                color: #ff6b6b;
+            }
+            #photoInfoCard .pi-close:active { transform: scale(0.9); }
+
+            #photoInfoCard .pi-preview {
+                width: 100%;
+                height: 220px;
+                background: #0a0a0f;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                overflow: hidden;
+                flex-shrink: 0;
+                position: relative;
+            }
+            #photoInfoCard .pi-preview img {
+                max-width: 100%;
+                max-height: 100%;
+                object-fit: contain;
+                display: block;
+            }
+
+            #photoInfoCard .pi-body {
+                padding: 14px 18px 18px;
+                overflow-y: auto;
+                flex: 1;
+                min-height: 0;
+            }
+            #photoInfoCard .pi-row {
+                display: flex;
+                align-items: flex-start;
+                gap: 12px;
+                padding: 10px 0;
+                border-bottom: 1px solid rgba(255,255,255,0.05);
+            }
+            #photoInfoCard .pi-row:last-child { border-bottom: none; }
+            #photoInfoCard .pi-row .pi-label {
+                flex-shrink: 0;
+                width: 130px;
+                font-size: 12px;
+                color: #888;
+                text-transform: uppercase;
+                letter-spacing: 0.3px;
+                padding-top: 2px;
+            }
+            #photoInfoCard .pi-row .pi-value {
+                flex: 1;
+                min-width: 0;
+                font-size: 14px;
+                color: #e0e0e0;
+                word-break: break-word;
+                line-height: 1.4;
+            }
+            #photoInfoCard .pi-row .pi-value.mono {
+                font-family: 'SF Mono', 'Courier New', monospace;
+                font-size: 12px;
+                color: #a78bfa;
+                background: rgba(108,92,231,0.08);
+                padding: 2px 8px;
+                border-radius: 6px;
+                display: inline-block;
+                max-width: 100%;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            #photoInfoCard .pi-row .pi-value.hint {
+                font-size: 12px;
+                color: #666;
+                font-style: italic;
+            }
+            #photoInfoCard .pi-loading {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                font-size: 13px;
+                color: #888;
+                padding: 8px 0;
+            }
+            #photoInfoCard .pi-loading .pi-spinner {
+                width: 16px;
+                height: 16px;
+                border: 2px solid rgba(108,92,231,0.25);
+                border-top-color: #6c5ce7;
+                border-radius: 50%;
+                animation: piSpin 0.8s linear infinite;
+            }
+            @keyframes piSpin { to { transform: rotate(360deg); } }
+
+            @media (max-width: 480px) {
+                #photoInfoCard .pi-preview { height: 180px; }
+                #photoInfoCard .pi-row .pi-label { width: 110px; font-size: 11px; }
+                #photoInfoCard .pi-row .pi-value { font-size: 13px; }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ─── Создаём оверлей и карточку один раз ───
+    let overlay = document.getElementById('photoInfoOverlay');
+    if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.id = 'photoInfoOverlay';
+        overlay.innerHTML = `
+            <div id="photoInfoCard" onclick="event.stopPropagation()">
+                <div class="pi-header">
+                    <div class="pi-icon">🖼️</div>
+                    <div class="pi-title">
+                        <h3>Информация о фото</h3>
+                        <p id="piSubtitle">—</p>
+                    </div>
+                    <button class="pi-close" id="piCloseBtn" title="Закрыть">✕</button>
+                </div>
+                <div class="pi-preview" id="piPreview"></div>
+                <div class="pi-body" id="piBody">
+                    <div class="pi-loading">
+                        <div class="pi-spinner"></div>
+                        <span>Собираем информацию…</span>
+                    </div>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(overlay);
+
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) closePhotoInfoCard();
+        });
+        overlay.querySelector('#piCloseBtn').addEventListener('click', closePhotoInfoCard);
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && overlay.classList.contains('show')) {
+                closePhotoInfoCard();
+            }
+        });
+    }
+
+    // ─── Открытие / закрытие ───
+    function closePhotoInfoCard() {
+        overlay.classList.remove('show');
+    }
+
+    // ─── Хелпер: получить размер blob ───
+    async function getBlobSize(url) {
+        try {
+            const res = await fetch(url);
+            const blob = await res.blob();
+            return { size: blob.size, type: blob.type };
+        } catch (e) {
+            return { size: 0, type: '' };
+        }
+    }
+
+    // ─── Хелпер: получить размеры картинки ───
+    function getImageDimensions(url) {
+        return new Promise((resolve) => {
+            const img = new Image();
+            img.onload = () => resolve({ w: img.naturalWidth, h: img.naturalHeight });
+            img.onerror = () => resolve({ w: 0, h: 0 });
+            img.src = url;
+        });
+    }
+
+    // ─── Хелпер: отформатировать дату ───
+    function formatDateFull(iso) {
+        if (!iso) return '—';
+        const d = new Date(iso);
+        if (isNaN(d.getTime())) return '—';
+        return d.toLocaleString('ru-RU', {
+            day: 'numeric',
+            month: 'long',
+            year: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit',
+        });
+    }
+
+    // ─── Хелпер: «сколько назад» ───
+    function timeAgo(iso) {
+        if (!iso) return '';
+        const diff = Date.now() - new Date(iso).getTime();
+        if (diff < 0) return '';
+        const min = Math.floor(diff / 60000);
+        if (min < 1) return 'только что';
+        if (min < 60) return `${min} мин назад`;
+        const h = Math.floor(min / 60);
+        if (h < 24) return `${h} ч назад`;
+        const d = Math.floor(h / 24);
+        if (d < 30) return `${d} дн назад`;
+        const mo = Math.floor(d / 30);
+        if (mo < 12) return `${mo} мес назад`;
+        const y = Math.floor(mo / 12);
+        return `${y} г назад`;
+    }
+
+    // ─── Хелпер: отформатировать размер файла ───
+    function fmtSize(bytes) {
+        if (!bytes || bytes < 1024) return (bytes || 0) + ' Б';
+        if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' КБ';
+        if (bytes < 1024 * 1024 * 1024) return (bytes / 1024 / 1024).toFixed(2) + ' МБ';
+        return (bytes / 1024 / 1024 / 1024).toFixed(2) + ' ГБ';
+    }
+
+    // ─── Главная функция: открыть карточку ───
+    async function openPhotoInfoCard(imageUrl) {
+        overlay.classList.add('show');
+
+        // Сбрасываем содержимое
+        const preview = overlay.querySelector('#piPreview');
+        const body = overlay.querySelector('#piBody');
+        const subtitle = overlay.querySelector('#piSubtitle');
+
+        preview.innerHTML = `<img src="${imageUrl}" alt="Фото">`;
+        subtitle.textContent = 'Загрузка…';
+        body.innerHTML = `
+            <div class="pi-loading">
+                <div class="pi-spinner"></div>
+                <span>Собираем информацию…</span>
+            </div>
+        `;
+
+        // ═══ 1. Ищем сообщение с этим фото ═══
+        let matchedMsg = null;
+
+        // Пробуем найти по blob:URL в DOM
+        const domImg = messagesInner.querySelector(`.image-container img[src="${imageUrl}"]`);
+        if (domImg) {
+            const wrapper = domImg.closest('.message-wrapper');
+            if (wrapper) {
+                const msgId = parseInt(wrapper.dataset.msgId);
+                matchedMsg = historyState.allMessages.find(m => m.id === msgId);
+            }
+        }
+
+        // Если не нашли в DOM — ищем по кэшу
+        if (!matchedMsg) {
+            for (const [attachName, cachedUrl] of _attachmentCache.entries()) {
+                if (cachedUrl === imageUrl) {
+                    matchedMsg = historyState.allMessages.find(m => m.image === attachName);
+                    if (matchedMsg) break;
+                }
+            }
+        }
+
+        // ═══ 2. Собираем данные ═══
+        const info = {
+            sender: '—',
+            sentAt: '—',
+            sentAgo: '',
+            w: 0,
+            h: 0,
+            sizeBytes: 0,
+            mimeType: '',
+            attachName: '—',
+            batchInfo: null,
+            isOwn: false,
+        };
+
+        if (matchedMsg) {
+            info.sender = matchedMsg.username === state.username
+                ? `Вы (${matchedMsg.username})`
+                : (matchedMsg.username || 'Аноним');
+            info.sentAt = formatDateFull(matchedMsg.time);
+            info.sentAgo = timeAgo(matchedMsg.time);
+            info.attachName = matchedMsg.image || '—';
+            info.isOwn = matchedMsg.username === state.username;
+
+            // Batch-инфо
+            if (matchedMsg.batchId && typeof matchedMsg.batchIndex === 'number') {
+                info.batchInfo = `Фото ${matchedMsg.batchIndex + 1} из ${matchedMsg.batchTotal}`;
+            }
+        }
+
+        // ═══ 3. Параллельно: размер файла + разрешение ═══
+        const [sizeInfo, dims] = await Promise.all([
+            getBlobSize(imageUrl),
+            getImageDimensions(imageUrl),
+        ]);
+
+        info.sizeBytes = sizeInfo.size;
+        info.mimeType = sizeInfo.type || 'image/jpeg';
+        info.w = dims.w;
+        info.h = dims.h;
+
+        // ═══ 4. Рендерим карточку ═══
+        subtitle.textContent = info.sender === '—'
+            ? 'Фото'
+            : `От: ${info.sender}`;
+
+        const rows = [];
+
+        rows.push({
+            label: 'Отправитель',
+            value: escapeHtml(info.sender),
+        });
+
+        rows.push({
+            label: 'Отправлено',
+            value: escapeHtml(info.sentAt) +
+                (info.sentAgo ? ` <span style="color:#666;font-size:12px;">· ${escapeHtml(info.sentAgo)}</span>` : ''),
+            raw: true,
+        });
+
+        if (info.w > 0 && info.h > 0) {
+            rows.push({
+                label: 'Разрешение',
+                value: `${info.w} × ${info.h} <span style="color:#666;font-size:12px;">(${(info.w * info.h / 1e6).toFixed(1)} Мп)</span>`,
+                raw: true,
+            });
+        }
+
+        if (info.sizeBytes > 0) {
+            rows.push({
+                label: 'Вес файла',
+                value: fmtSize(info.sizeBytes),
+            });
+        }
+
+        if (info.mimeType) {
+            rows.push({
+                label: 'Тип',
+                value: escapeHtml(info.mimeType),
+            });
+        }
+
+        if (info.attachName && info.attachName !== '—') {
+            rows.push({
+                label: 'Файл',
+                value: escapeHtml(info.attachName),
+                mono: true,
+            });
+        }
+
+        if (info.batchInfo) {
+            rows.push({
+                label: 'Группа',
+                value: `📷 ${escapeHtml(info.batchInfo)}`,
+            });
+        }
+
+        // 🆕 Информация о том, что EXIF недоступен
+        rows.push({
+            label: 'Дата съёмки',
+            value: 'недоступна — фото сжато при отправке',
+            hint: true,
+        });
+
+        body.innerHTML = rows.map(r => {
+            let valueHtml;
+            if (r.raw) valueHtml = r.value;
+            else valueHtml = r.value;
+
+            let cls = 'pi-value';
+            if (r.mono) cls += ' mono';
+            if (r.hint) cls += ' hint';
+
+            return `
+                <div class="pi-row">
+                    <div class="pi-label">${escapeHtml(r.label)}</div>
+                    <div class="${cls}">${valueHtml}</div>
+                </div>
+            `;
+        }).join('');
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  🖱️ ДОЛГОЕ НАЖАТИЕ В ГАЛЕРЕЕ → открыть инфо-карточку
+    //  Ставим свой обработчик в CAPTURE-фазе, чтобы перехватить
+    //  раньше, чем сработает логика самой галереи (свайпы, зум).
+    // ═══════════════════════════════════════════════════════════════
+
+    const LONG_PRESS_MS = 600;
+    let _pressTimer = null;
+    let _startX = 0, _startY = 0;
+    let _longPressFired = false;
+    let _targetUrl = null;
+
+    function cancelLongPress() {
+        if (_pressTimer) {
+            clearTimeout(_pressTimer);
+            _pressTimer = null;
+        }
+    }
+
+    function onTouchStart(e) {
+        if (!galleryState.isOpen) return;
+        if (e.touches.length !== 1) {
+            cancelLongPress();
+            return;
+        }
+
+        _startX = e.touches[0].clientX;
+        _startY = e.touches[0].clientY;
+        _longPressFired = false;
+        _targetUrl = galleryState.images[galleryState.currentIndex];
+
+        if (!_targetUrl) return;
+
+        _pressTimer = setTimeout(() => {
+            _longPressFired = true;
+            if (navigator.vibrate) navigator.vibrate(30);
+
+            // 🆕 Открываем инфо-карточку
+            openPhotoInfoCard(_targetUrl);
+        }, LONG_PRESS_MS);
+    }
+
+    function onTouchMove(e) {
+        if (!_pressTimer) return;
+        if (e.touches.length !== 1) {
+            cancelLongPress();
+            return;
+        }
+        const dx = e.touches[0].clientX - _startX;
+        const dy = e.touches[0].clientY - _startY;
+        // Если палец сдвинулся больше чем на 10px — это уже не «долгое нажатие»,
+        // а свайп или зум. Отменяем таймер.
+        if (Math.hypot(dx, dy) > 10) {
+            cancelLongPress();
+        }
+    }
+
+    function onTouchEnd(e) {
+        cancelLongPress();
+        if (_longPressFired) {
+            // Гасим все дальнейшие действия галереи (там может быть тап по экрану,
+            // зум, переход и т.д.) — потому что мы показали инфо-карточку.
+            e.stopPropagation?.();
+            e.preventDefault?.();
+            _longPressFired = false;
+        }
+    }
+
+    // Вешаем на viewport галереи в CAPTURE-фазе, чтобы перехватить раньше
+    // внутренних обработчиков ImageZoom
+    const galleryViewport = document.getElementById('galleryViewport');
+    if (galleryViewport) {
+        galleryViewport.addEventListener('touchstart', onTouchStart, { passive: true, capture: true });
+        galleryViewport.addEventListener('touchmove', onTouchMove, { passive: true, capture: true });
+        galleryViewport.addEventListener('touchend', onTouchEnd, { capture: true });
+        galleryViewport.addEventListener('touchcancel', onTouchEnd, { capture: true });
+    }
+
+    // 🆕 Для десктопа — правый клик открывает ту же карточку
+    if (galleryViewport) {
+        galleryViewport.addEventListener('contextmenu', (e) => {
+            if (!galleryState.isOpen) return;
+            e.preventDefault();
+            const url = galleryState.images[galleryState.currentIndex];
+            if (url) openPhotoInfoCard(url);
+        });
+    }
+
+    console.log('📸 Инфо-карточка фото активна — долгое нажатие в галерее');
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🚫 ОТКЛЮЧЕНИЕ СИСТЕМНОГО МЕНЮ БРАУЗЕРА В ГАЛЕРЕЕ
+//  Работает на Android, iOS, Desktop. Гасит:
+//   • contextmenu (правый клик / долгое нажатие на десктопе)
+//   • touch-callout (iOS Safari системное меню)
+//   • long-press выбор изображения (Android Chrome)
+// ═══════════════════════════════════════════════════════════════
+
+(function disableNativeContextMenuInGallery() {
+    // ═══ 1. Глобальные CSS-правила ═══
+    if (!document.getElementById('galleryNoContextStyles')) {
+        const style = document.createElement('style');
+        style.id = 'galleryNoContextStyles';
+        style.textContent = `
+            /* Отключаем системное меню и выделение во ВСЕЙ галерее */
+            #imageModal,
+            #imageModal *,
+            #imageModal img,
+            .gallery-viewport,
+            .gallery-viewport *,
+            .gallery-slide {
+                -webkit-touch-callout: none !important;
+                -webkit-user-select: none !important;
+                -moz-user-select: none !important;
+                -ms-user-select: none !important;
+                user-select: none !important;
+                -webkit-user-drag: none !important;
+                -khtml-user-drag: none !important;
+                -moz-user-drag: none !important;
+                -o-user-drag: none !important;
+                user-drag: none !important;
+                -webkit-tap-highlight-color: transparent !important;
+            }
+
+            /* Также гасим на всякий случай для превью в инфо-карточке */
+            #photoInfoCard .pi-preview,
+            #photoInfoCard .pi-preview img {
+                -webkit-touch-callout: none !important;
+                -webkit-user-select: none !important;
+                user-select: none !important;
+                -webkit-user-drag: none !important;
+                user-drag: none !important;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══ 2. Глушим contextmenu на всей галерее ═══
+    // Вешаем в CAPTURE-фазе, чтобы поймать РАНЬШЕ любых других слушателей
+    function killContextMenu(e) {
+        if (!galleryState || !galleryState.isOpen) return;
+        e.preventDefault();
+        e.stopPropagation();
+        return false;
+    }
+
+    // И на viewport, и на modal, и на document (страховка)
+    const galleryViewport = document.getElementById('galleryViewport');
+    const imageModalEl = document.getElementById('imageModal');
+
+    [galleryViewport, imageModalEl, document].forEach(el => {
+        if (!el) return;
+        el.addEventListener('contextmenu', killContextMenu, { capture: true });
+    });
+
+    // ═══ 3. iOS Safari: гасим touch-callout через preventDefault на touchstart ═══
+    // Плюс Android Chrome: некоторые версии игнорируют CSS touch-callout
+    // и триггерят системное меню после ~500 мс долгого нажатия.
+    // Ловим touchstart в НЕ-passive режиме и предотвращаем выделение картинок.
+
+    function handleGalleryTouchStart(e) {
+        if (!galleryState || !galleryState.isOpen) return;
+
+        // Если касание по интерактивному элементу галереи (кнопки закрытия,
+        // стрелки, кнопки «Скачать/Отправить») — не трогаем
+        const target = e.target;
+        if (target.closest(
+            '.close-modal, .gallery-arrow, .gallery-actions, ' +
+            '.gallery-action-btn, .image-modal .close-modal'
+        )) return;
+
+        // Разрешаем only однo касание для «тихого» запрета
+        // (мультитач для зума не трогаем)
+        if (e.touches.length === 1) {
+            // Просто preventDefault на img-элементах запрещает long-press
+            // системное меню на iOS/Android.
+            if (target.tagName === 'IMG' || target.closest('.gallery-slide')) {
+                e.preventDefault();
+            }
+        }
+    }
+
+    // ⚠️ ВАЖНО: passive: false — иначе preventDefault не сработает
+    if (galleryViewport) {
+        galleryViewport.addEventListener('touchstart', handleGalleryTouchStart, {
+            passive: false,
+            capture: true,
+        });
+    }
+
+    // ═══ 4. iOS Safari: отдельная страховка через touch-callout-событие ═══
+    // Некоторые iOS-версии всё равно вызывают callout, даже с CSS.
+    // Ловим событие напрямую.
+    document.addEventListener('touchstart', (e) => {
+        if (!galleryState || !galleryState.isOpen) return;
+        const target = e.target;
+        if (target.tagName === 'IMG' && target.closest('#imageModal')) {
+            e.preventDefault();
+        }
+    }, { passive: false, capture: true });
+
+    // ═══ 5. Desktop: убираем все выделения через mouse-события ═══
+    if (galleryViewport) {
+        galleryViewport.addEventListener('mousedown', (e) => {
+            if (!galleryState || !galleryState.isOpen) return;
+            // Разрешаем только левую кнопку (drag/zoom)
+            if (e.button !== 0) {
+                e.preventDefault();
+            }
+            // Также предотвращаем начало выделения на img
+            if (e.target.tagName === 'IMG') {
+                e.preventDefault();
+            }
+        });
+    }
+
+    // ═══ 6. Финальный колокол — disable drag-and-drop ═══
+    document.addEventListener('dragstart', (e) => {
+        if (!galleryState || !galleryState.isOpen) return;
+        if (e.target.tagName === 'IMG') {
+            e.preventDefault();
+        }
+    }, { capture: true });
+
+    console.log('🚫 Системное меню в галерее отключено (Android, iOS, Desktop)');
+})();
 </script>
 </body>
 </html>
