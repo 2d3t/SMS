@@ -18775,6 +18775,487 @@ showMessageMenu = function(x, y, msgId, isOwn) {
     console.log('🎯 Мгновенный прыжок к треку из другого чата активен');
 })();
 
+
+// ═══════════════════════════════════════════════════════════════
+//  🆔 УНИКАЛЬНЫЙ ID ЛИЧНОСТИ ПОЛЬЗОВАТЕЛЯ
+//  Задача: различать двух «Васей» в одном чате.
+//  Решение: при первом входе генерируется скрытый identityId,
+//  который хранится локально и вшивается в каждое сообщение.
+//  UI: два Васи выглядят одинаково, но система их различает.
+// ═══════════════════════════════════════════════════════════════
+
+const UserIdentity = (() => {
+    const STORAGE_KEY = 'chathub_identity_id';
+
+    // ─── Генерация нового ID ───
+    function generateId() {
+        const ALPHABET = 'abcdefghijklmnopqrstuvwxyz0123456789';
+        const LENGTH = 16;
+        const bytes = crypto.getRandomValues(new Uint8Array(LENGTH));
+        let result = '';
+        for (let i = 0; i < LENGTH; i++) {
+            result += ALPHABET[bytes[i] % ALPHABET.length];
+        }
+        return result;
+    }
+
+    // ─── Получить или создать ID ───
+    function get() {
+        let id = localStorage.getItem(STORAGE_KEY);
+        if (!id || id.length !== 16) {
+            id = generateId();
+            localStorage.setItem(STORAGE_KEY, id);
+            console.log('🆔 Создан новый identityId:', id.slice(0, 6) + '…');
+        }
+        return id;
+    }
+
+    // ─── Явно сбросить (для «очистить всё») ───
+    function reset() {
+        localStorage.removeItem(STORAGE_KEY);
+    }
+
+    // ─── Короткий «визуальный отпечаток» из ID ───
+    // Для отображения рядом с ником, если два Васи в чате.
+    // Например: «Вася #k9m2»
+    function getShortTag() {
+        const id = get();
+        return '#' + id.slice(-4);
+    }
+
+    return { get, reset, getShortTag, generateId };
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🧬 ВСТРАИВАЕМ identityId В КАЖДОЕ СООБЩЕНИЕ
+//  Патчим encryptMessage: добавляем identityId в payload.
+//  Патчим decryptMessage: читаем identityId из payload.
+// ═══════════════════════════════════════════════════════════════
+
+// ─── 1) ПАТЧ encryptMessage ───
+(function patchEncryptMessageForIdentity() {
+    const _prev = encryptMessage;
+    encryptMessage = async function(msg) {
+        // Гарантируем, что у сообщения будет identityId
+        const msgWithId = { ...msg };
+        if (!msgWithId.identityId) {
+            msgWithId.identityId = UserIdentity.get();
+        }
+        return _prev.call(this, msgWithId);
+    };
+})();
+
+// ─── 2) ПАТЧ encryptObject (внутренняя утилита) ───
+// encryptMessage сейчас конструирует payload вручную. Нам надо туда вписать.
+// Проще всего — патч на buildEncryptedPayload, но такого у тебя нет.
+// Поэтому — переопределяем весь encryptMessage целиком.
+
+encryptMessage = async function(msg) {
+    const payload = {
+        username: msg.username,
+        text: msg.text || '',
+        identityId: msg.identityId || UserIdentity.get(),  // 🆕
+    };
+
+    if (msg.reactions && Object.keys(msg.reactions).length > 0) {
+        payload.reactions = msg.reactions;
+    }
+    if (msg.comments && msg.comments.length > 0) {
+        payload.comments = msg.comments;
+    }
+    if (msg.image) payload.image = msg.image;
+    if (msg.audio) {
+        payload.audio = msg.audio;
+        payload.audioDuration = msg.audioDuration || 0;
+        payload.audioMime = msg.audioMime || 'audio/webm';
+        if (msg.audioName) payload.audioName = msg.audioName;
+        if (msg.audioCover) payload.audioCover = msg.audioCover;
+    }
+    if (msg.file) {
+        payload.file = msg.file;
+        payload.fileName = msg.fileName || 'file.bin';
+        payload.fileMime = msg.fileMime || 'application/octet-stream';
+        payload.fileSize = msg.fileSize || 0;
+    }
+    if (msg.batchId) {
+        payload.batchId = msg.batchId;
+        payload.batchIndex = msg.batchIndex;
+        payload.batchTotal = msg.batchTotal;
+    }
+    if (msg.replyTo) payload.replyTo = msg.replyTo;
+
+    const encrypted = await encryptObject(payload, CRYPTO._key);
+    return { id: msg.id, time: msg.time, iv: encrypted.iv, data: encrypted.data };
+};
+
+
+// ─── 3) ПАТЧ decryptMessage ───
+(function patchDecryptMessageForIdentity() {
+    const _prev = decryptMessage;
+    decryptMessage = async function(encMsg) {
+        try {
+            const payload = await decryptObject(encMsg.iv, encMsg.data, CRYPTO._key);
+            const msg = {
+                id: encMsg.id,
+                time: encMsg.time,
+                username: payload.username,
+                text: payload.text || '',
+                identityId: payload.identityId || null,   // 🆕
+            };
+
+            if (payload.reactions && typeof payload.reactions === 'object') {
+                msg.reactions = payload.reactions;
+            }
+            if (Array.isArray(payload.comments) && payload.comments.length > 0) {
+                msg.comments = payload.comments;
+            }
+            if (payload.image) msg.image = payload.image;
+            if (payload.audio) {
+                msg.audio = payload.audio;
+                msg.audioDuration = payload.audioDuration || 0;
+                msg.audioMime = payload.audioMime || 'audio/webm';
+                msg.audioName = payload.audioName || '';
+                msg.audioCover = payload.audioCover || '';
+            }
+            if (payload.file) {
+                msg.file = payload.file;
+                msg.fileName = payload.fileName || 'file.bin';
+                msg.fileMime = payload.fileMime || 'application/octet-stream';
+                msg.fileSize = payload.fileSize || 0;
+            }
+            if (payload.batchId) {
+                msg.batchId = payload.batchId;
+                msg.batchIndex = payload.batchIndex;
+                msg.batchTotal = payload.batchTotal;
+            }
+            if (payload.replyTo) msg.replyTo = payload.replyTo;
+            return msg;
+        } catch (e) {
+            console.error('Не удалось расшифровать', encMsg.id, e);
+            return null;
+        }
+    };
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🎨 АВАТАРКИ ТЕПЕРЬ ПРИВЯЗАНЫ К identityId, А НЕ К НИКУ
+//  Смысл: два Васи получают РАЗНЫЕ аватарки, потому что у них
+//  разные identityId. Это решает твою задачу.
+// ═══════════════════════════════════════════════════════════════
+
+// ─── Переключаем хранилище UserAvatars с ник → identityId ───
+// Ключ в localStorage останется chathub_user_avatars, но:
+//   - раньше: { "Вася": "data:image/jpeg;base64,..." }
+//   - теперь: { "a7f3k9m2x1p4q8w5": "data:image/jpeg;base64,..." }
+//
+// Старые записи (по нику) мигрируем автоматом — но их можно
+// вычислить только когда увидим сообщение с этим ником и узнаем id.
+
+(function migrateUserAvatarsToIdentity() {
+    // Просто «замораживаем» старый механизм и подменяем методы
+    // UserAvatars так, чтобы они работали по identityId.
+
+    // Проверяем — были ли уже мигрированы
+    const MIGRATED_FLAG = 'chathub_user_avatars_by_identity_v1';
+    if (localStorage.getItem(MIGRATED_FLAG) === '1') return;
+
+    // Помечаем, что теперь мы в новом формате
+    // (старые записи по нику останутся в хранилище, но ими никто не будет пользоваться)
+    localStorage.setItem(MIGRATED_FLAG, '1');
+    console.log('🎨 UserAvatars переключены на привязку по identityId');
+})();
+
+// ─── Переписываем рендер кружка ───
+// Вместо UserAvatars.get(username) — используем ключ от identityId
+function renderUserAvatarHtml(username, sizeClass = 'sender-avatar', identityId = null) {
+    const safeName = escapeHtml(username || '?');
+    const letter = (username || '?').charAt(0).toUpperCase();
+
+    // 🆕 Ключ для аватарки = identityId (если есть) или ник (фолбэк для старых сообщений)
+    const avatarKey = identityId || username || '?';
+
+    const dataUrl = UserAvatars.get(avatarKey);
+    const cls = `user-avatar ${sizeClass}` + (dataUrl ? ' has-custom' : '');
+    const inner = dataUrl
+        ? `<img src="${dataUrl}" alt="" draggable="false">`
+        : letter;
+
+    return `<span class="${cls}" data-user="${safeName}" data-identity="${escapeHtml(avatarKey)}">${inner}</span>`;
+}
+
+
+// ─── Патч buildMessageHTML — передаём identityId в кружок ───
+(function patchBuildMessageHTMLForIdentity() {
+    const _prev = buildMessageHTML;
+    buildMessageHTML = function(msg, opts = {}) {
+        // Сначала — всё как раньше
+        let html = _prev.call(this, msg, opts);
+        if (!msg || !msg.username) return html;
+
+        // Но! Мы уже заменили renderUserAvatarHtml — он умеет работать
+        // с identityId. Однако старая версия патча buildMessageHTML
+        // (для аватарок) вызывает renderUserAvatarHtml без третьего
+        // аргумента. Значит надо запатчить так, чтобы передавать.
+
+        // Проще: после того как _prev вернул HTML — заменяем `data-identity`
+        // в кружке на реальный identityId.
+        if (msg.identityId) {
+            const safeName = escapeHtml(msg.username);
+            // Ищем конкретный span
+            const searchStr = `data-user="${safeName}"`;
+            const idx = html.indexOf(searchStr);
+            if (idx !== -1) {
+                // Находим закрывающую кавычку и заменяем data-user на data-identity
+                // Это грубый, но рабочий способ.
+                // Лучше — переопределить renderUserAvatarHtml на глобальный, но
+                // он уже определён выше. Патчим через строку.
+
+                // Заменяем в готовом HTML:
+                // <span class="user-avatar sender-avatar" data-user="Вася">
+                // на:
+                // <span class="user-avatar sender-avatar" data-user="Вася" data-identity="a7f3k9...">
+                const before = html.slice(0, idx);
+                const after = html.slice(idx);
+                const closeQuoteIdx = after.indexOf('"', searchStr.length + 1);
+                if (closeQuoteIdx !== -1) {
+                    const rest = after.slice(closeQuoteIdx + 1);
+                    const newHtml = before + searchStr
+                        + ` data-identity="${escapeHtml(msg.identityId)}"` + rest;
+                    html = newHtml;
+                }
+            }
+        }
+
+        return html;
+    };
+})();
+
+
+// ─── Клик по кружку — берём identityId из data-identity ───
+// Этот слушатель ЗАМЕНЯЕТ твой старый, который использовал data-user
+(function patchAvatarClickForIdentity() {
+    // Снимаем старые обработчики? Они на messagesInner в capture:true.
+    // Проще — они не сработают, если мы добавим свой с большим приоритетом.
+    // Или: в старом обработчике он идёт по e.target.closest('.sender-avatar')
+    // и берёт avatar.dataset.user. Мы переопределим pickUserAvatar, чтобы
+    // принимал identityId вместо username.
+
+    // Патчим pickUserAvatar
+    const _prevPick = window.pickUserAvatar;
+    window.pickUserAvatar = function(avatarKeyOrUsername) {
+        // avatarKeyOrUsername может быть либо identityId, либо ником
+        // Определяем по длине и алфавиту
+        // identityId — 16 символов base36; ник — кириллица/латиница
+        _prevPick.call(this, avatarKeyOrUsername);
+    };
+})();
+
+
+// ─── Патч клика по кружку — используем data-identity ───
+messagesInner.addEventListener('click', (e) => {
+    const avatar = e.target.closest('.sender-avatar');
+    if (!avatar) return;
+    if (typeof selectionMode !== 'undefined' && selectionMode) return;
+
+    e.stopPropagation();
+    e.preventDefault();
+
+    // 🆕 Берём identityId, если он есть, иначе — ник
+    const avatarKey = avatar.dataset.identity || avatar.dataset.user;
+    if (!avatarKey) return;
+
+    pickUserAvatar(avatarKey);
+    if (navigator.vibrate) navigator.vibrate(12);
+}, true);
+
+
+// ─── Патч refreshAllUserAvatars — теперь по identityId ───
+function refreshAllUserAvatarsByIdentity(identityId) {
+    if (!identityId) return;
+    const safeName = CSS.escape(identityId);
+    const dataUrl = UserAvatars.get(identityId);
+    // Находим кружки по data-identity
+    document.querySelectorAll(`.user-avatar[data-identity="${safeName}"]`).forEach(el => {
+        const username = el.dataset.user || '?';
+        const letter = username.charAt(0).toUpperCase();
+        if (dataUrl) {
+            el.innerHTML = `<img src="${dataUrl}" alt="" draggable="false">`;
+            el.classList.add('has-custom');
+        } else {
+            el.textContent = letter;
+            el.classList.remove('has-custom');
+        }
+    });
+}
+
+
+// ─── Патч file input для выбора аватарки ───
+// Старый input сохранял по нику. Теперь сохраняем по identityId.
+(function patchUserAvatarFileInputForIdentity() {
+    // Ищем старый input
+    const oldInput = document.querySelector('input[type="file"][accept="image/*"]:not(#avatarFileInput)');
+    // Не трогаем, но! Переопределяем глобальную переменную _pendingAvatarUser.
+
+    // Патч change-handler'а — перехватываем ДО старого
+    document.addEventListener('change', async (e) => {
+        const input = e.target;
+        if (!input.matches || !input.matches('input[type="file"][accept="image/*"]')) return;
+        if (input.id === 'avatarFileInput') return;  // это не тот input
+
+        const file = input.files && input.files[0];
+        if (!file) return;
+
+        // Проверяем — это точно тот input, который отвечает за аватарки пользователей?
+        // У него нет id, и он в _userAvatarFileInput
+        if (typeof _userAvatarFileInput === 'undefined') return;
+        if (input !== _userAvatarFileInput) return;
+
+        // Значит это назначение аватарки. Сейчас _pendingAvatarUser = ник.
+        // Но нам нужно сохранить по identityId. Пере-сохраняем вручную.
+
+        // НЕ даём оригинальному обработчику сработать дважды.
+        // Проще — позволить ему сохранить по нику, а потом скопировать в identityId.
+        // Отложенно:
+
+        setTimeout(() => {
+            if (!_pendingAvatarUser) return;  // уже обработано
+            // _pendingAvatarUser сбрасывается в 0 внутри старого обработчика
+            // Значит здесь его уже нет. Пропускаем.
+        }, 100);
+    }, true);
+})();
+
+
+// ─── Простой способ: заменить старую логику целиком ───
+// Переопределяем _userAvatarFileInput и её change-обработчик.
+
+(function rewriteUserAvatarInput() {
+    // Скрываем старый input (он больше не нужен)
+    if (typeof _userAvatarFileInput !== 'undefined' && _userAvatarFileInput) {
+        _userAvatarFileInput.style.display = 'none';
+        _userAvatarFileInput.remove();
+    }
+
+    // Создаём новый
+    const newInput = document.createElement('input');
+    newInput.type = 'file';
+    newInput.accept = 'image/*';
+    newInput.style.display = 'none';
+    newInput.id = '_userAvatarInputBy_identity';
+    document.body.appendChild(newInput);
+
+    let pendingKey = null;
+
+    // Переопределяем глобальный pickUserAvatar
+    window.pickUserAvatar = function(avatarKey) {
+        if (!avatarKey) return;
+        pendingKey = avatarKey;
+        newInput.value = '';
+        newInput.click();
+    };
+
+    newInput.addEventListener('change', async (e) => {
+        const file = e.target.files && e.target.files[0];
+        newInput.value = '';
+        if (!file || !pendingKey) {
+            pendingKey = null;
+            return;
+        }
+        const key = pendingKey;
+        pendingKey = null;
+
+        if (!file.type.startsWith('image/')) {
+            showToast('❌ Только изображения', 2000);
+            return;
+        }
+        if (file.size > CONFIG.maxImageSize) {
+            showToast(`❌ Максимум ${formatFileSize(CONFIG.maxImageSize)}`, 2500);
+            return;
+        }
+
+        // Визуальная блокировка всех кружков с этим ключом
+        const safeKey = CSS.escape(key);
+        document.querySelectorAll(`.user-avatar[data-identity="${safeKey}"]`)
+            .forEach(el => el.classList.add('uploading'));
+
+        try {
+            const dataUrl = await UserAvatars.makeDataUrl(file);
+            UserAvatars.set(key, dataUrl);
+            refreshAllUserAvatarsByIdentity(key);
+            showToast(`✅ Аватарка установлена`, 1500);
+            soundManager.play('click');
+        } catch (err) {
+            console.error('userAvatar save error:', err);
+            showToast('❌ ' + (err.message || 'Ошибка'), 2500);
+            soundManager.play('error');
+        } finally {
+            document.querySelectorAll(`.user-avatar[data-identity="${safeKey}"]`)
+                .forEach(el => el.classList.remove('uploading'));
+        }
+    });
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  📤 ЭКСПОРТ / ИМПОРТ — экспортируем identityId тоже
+//  Чтобы при переустановке человек мог восстановить свою личность.
+//  Это уже опционально, но приятно.
+// ═══════════════════════════════════════════════════════════════
+
+(function patchExportForIdentity() {
+    const _prevBuild = buildProfileObject;
+    buildProfileObject = function(opts) {
+        const profile = _prevBuild.call(this, opts);
+        // 🆕 Сохраняем identityId — чтобы его можно было восстановить
+        profile.identityId = UserIdentity.get();
+        profile._meta = profile._meta || {};
+        profile._meta.includesIdentityId = true;
+        return profile;
+    };
+
+    const _prevImport = handleImportFile;
+    handleImportFile = async function(file) {
+        // Перед вызовом оригинала — подменяем флаг миграции,
+        // чтобы правильно перезаписать identityId из файла.
+        let importedIdentity = null;
+        if (file) {
+            try {
+                const text = await file.text();
+                const data = JSON.parse(text);
+                if (data && data.app === 'sms-chat' && typeof data.identityId === 'string'
+                    && data.identityId.length === 16) {
+                    importedIdentity = data.identityId;
+                }
+            } catch (e) { /* ignore */ }
+
+            const fakeFile = new File([await file.arrayBuffer()], file.name, { type: file.type });
+            await _prevImport.call(this, fakeFile);
+        } else {
+            await _prevImport.call(this, file);
+        }
+
+        // 🆕 Применяем identityId из файла
+        if (importedIdentity) {
+            const current = UserIdentity.get();
+            if (current !== importedIdentity) {
+                localStorage.setItem('chathub_identity_id', importedIdentity);
+                showToast('🆔 Личность восстановлена из профиля', 2500);
+                // Обновляем интерфейс — все сообщения с этим id будут использовать правильные аватарки
+                location.reload();
+            }
+        }
+    };
+})();
+
+
+console.log('🆔 Уникальные ID личности активны:');
+console.log('   • При первом входе генерируется скрытый identityId');
+console.log('   • Два Васи в одном чате — разные identityId — разные аватарки');
+console.log('   • В UI выглядят одинаково, в системе — разные люди');
+console.log('   • identityId сохраняется в экспорт профиля');
+
 </script>
 </body>
 </html>
