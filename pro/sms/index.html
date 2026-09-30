@@ -18253,6 +18253,306 @@ showMessageMenu = function(x, y, msgId, isOwn) {
 
     console.log('🚫 Системное меню в галерее отключено (Android, iOS, Desktop)');
 })();
+
+// ═══════════════════════════════════════════════════════════════
+//  🔽 СВОРАЧИВАНИЕ ПЛЕЕРА В ЛЕВЫЙ УГОЛ
+//  Свёрнутый — круглая кнопка в ЛЕВОМ нижнем углу.
+//  Тап по шарику — РАЗВОРАЧИВАЕТ плеер (не переходит в чат!).
+//  Состояние сохраняется в localStorage.
+// ═══════════════════════════════════════════════════════════════
+
+(function installPlayerMinimize() {
+    const STORAGE_KEY = 'chathub_player_minimized';
+
+    // ─── Стили ───
+    if (!document.getElementById('playerMinimizeStyles')) {
+        const style = document.createElement('style');
+        style.id = 'playerMinimizeStyles';
+        style.textContent = `
+            /* ═══ Кнопка «Свернуть» внутри плеера ═══ */
+            #globalPlayerBar .gp-btn-minimize {
+                color: #888;
+                font-size: 14px;
+            }
+            #globalPlayerBar .gp-btn-minimize:hover {
+                color: #a78bfa;
+                background: rgba(108,92,231,0.12);
+            }
+
+            /* ═══ Свёрнутый плеер — круглый шарик в ЛЕВОМ углу ═══ */
+            #globalPlayerBar.minimized {
+                width: 64px !important;
+                height: 64px !important;
+                max-width: 64px !important;
+                min-width: 64px !important;
+                padding: 0 !important;
+                border-radius: 50% !important;
+                bottom: 16px !important;
+                left: 16px !important;
+                right: auto !important;
+                transform: translateY(120%) !important;
+                cursor: pointer;
+                transition: transform 0.3s cubic-bezier(0.22, 0.61, 0.36, 1),
+                            opacity 0.3s,
+                            box-shadow 0.2s,
+                            left 0.3s, right 0.3s;
+                overflow: visible !important;
+                /* 🆕 Меньше z-index, чтобы не перекрывать модалки */
+                z-index: 3400;
+            }
+            #globalPlayerBar.minimized.show {
+                transform: translateY(0) !important;
+                opacity: 1 !important;
+                pointer-events: auto !important;
+            }
+            #globalPlayerBar.minimized:hover {
+                box-shadow: 0 8px 24px rgba(108,92,231,0.5) !important;
+            }
+            #globalPlayerBar.minimized:active {
+                transform: translateY(0) scale(0.92) !important;
+            }
+
+            /* Скрываем всё содержимое плеера, кроме thumb */
+            #globalPlayerBar.minimized .gp-progress,
+            #globalPlayerBar.minimized .gp-info,
+            #globalPlayerBar.minimized .gp-controls {
+                display: none !important;
+            }
+
+            /* Круглая кнопка-шарик */
+            #globalPlayerBar.minimized .gp-thumb {
+                width: 100% !important;
+                height: 100% !important;
+                border-radius: 50% !important;
+                margin: 0 !important;
+                position: relative;
+                z-index: 2;
+                cursor: pointer;
+                /* 🆕 Отключаем «прыжок к треку» в свёрнутом виде —
+                   оставляем только разворачивание */
+                pointer-events: none !important;
+            }
+
+            /* Пульсация при игре */
+            #globalPlayerBar.minimized.is-playing .gp-thumb::after {
+                content: '';
+                position: absolute;
+                inset: -4px;
+                border-radius: 50%;
+                border: 2px solid rgba(108,92,231,0.7);
+                animation: gpMinimizedPulse 1.6s ease-in-out infinite;
+                pointer-events: none;
+            }
+            @keyframes gpMinimizedPulse {
+                0%, 100% {
+                    transform: scale(1);
+                    opacity: 0.8;
+                }
+                50% {
+                    transform: scale(1.15);
+                    opacity: 0;
+                }
+            }
+
+            /* На мобиле — меньше и с отступом */
+            @media (max-width: 480px) {
+                #globalPlayerBar.minimized {
+                    width: 58px !important;
+                    height: 58px !important;
+                    max-width: 58px !important;
+                    min-width: 58px !important;
+                    bottom: 12px !important;
+                    left: 12px !important;
+                }
+            }
+
+            /* Отступ снизу у инпута — чтобы шарик не перекрывал */
+            body.player-active-minimized .input-bar {
+                padding-bottom: 14px !important;
+            }
+            body.player-active-minimized .messages-container {
+                padding-bottom: 8px !important;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ─── Функции сворачивания / разворачивания ───
+    function minimizePlayer() {
+        const bar = document.getElementById('globalPlayerBar');
+        if (!bar) return;
+        bar.classList.add('minimized');
+        document.body.classList.add('player-active-minimized');
+        localStorage.setItem(STORAGE_KEY, '1');
+        if (navigator.vibrate) navigator.vibrate(10);
+        showToast('🔽 Плеер свёрнут', 1200);
+    }
+
+    function expandPlayer() {
+        const bar = document.getElementById('globalPlayerBar');
+        if (!bar) return;
+        bar.classList.remove('minimized');
+        document.body.classList.remove('player-active-minimized');
+        localStorage.setItem(STORAGE_KEY, '0');
+        if (navigator.vibrate) navigator.vibrate(10);
+        showToast('🔼 Плеер развёрнут', 1200);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  🎯 ПЕРЕХВАТ КЛИКА В CAPTURE-ФАЗЕ
+    //  Ключевое: клик по шарику должен РАЗВОРАЧИВАТЬ плеер,
+    //  а не проваливаться в gp-thumb (который вызывает jumpToPlayingTrack).
+    //  Поэтому ловим событие РАНЬШЕ — на bar в capture: true.
+    // ═══════════════════════════════════════════════════════════════
+    function attachExpandHandler(bar) {
+        if (bar._expandHandlerAttached) return;
+        bar._expandHandlerAttached = true;
+
+        bar.addEventListener('click', (e) => {
+            if (!bar.classList.contains('minimized')) return;
+            // Глушим всё — событие НЕ должно доходить до gp-thumb
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+            e.preventDefault();
+            expandPlayer();
+        }, true);  // ⬅️ CAPTURE-фаза — перехватываем ДО gp-thumb
+
+        bar.addEventListener('touchend', (e) => {
+            if (!bar.classList.contains('minimized')) return;
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+            e.preventDefault();
+            expandPlayer();
+        }, true);
+
+        // Также гасим mousedown/pointerdown — чтобы не было никаких побочных эффектов
+        bar.addEventListener('pointerdown', (e) => {
+            if (!bar.classList.contains('minimized')) return;
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+        }, true);
+    }
+
+    // ─── Ждём пока плеер построится ───
+    function attachWhenReady() {
+        const bar = document.getElementById('globalPlayerBar');
+        if (!bar) {
+            setTimeout(attachWhenReady, 300);
+            return;
+        }
+        const minimizeBtn = bar.querySelector('#gpMinimize');
+        if (!minimizeBtn) {
+            setTimeout(attachWhenReady, 300);
+            return;
+        }
+
+        // Обработчик кнопки «Свернуть»
+        if (!minimizeBtn._minimizeClickAttached) {
+            minimizeBtn._minimizeClickAttached = true;
+            minimizeBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                e.stopImmediatePropagation();
+                minimizePlayer();
+            });
+        }
+
+        // ⚠️ ГЛАВНОЕ: обработчик разворачивания в CAPTURE-фазе
+        attachExpandHandler(bar);
+
+        // ═══ Восстанавливаем состояние из localStorage ═══
+        if (localStorage.getItem(STORAGE_KEY) === '1') {
+            bar.classList.add('minimized');
+            document.body.classList.add('player-active-minimized');
+        }
+
+        // ═══ Следим за play/pause, чтобы показывать пульсацию ═══
+        function updatePlayingClass() {
+            if (typeof GlobalPlayer === 'undefined') return;
+            const audio = GlobalPlayer.audioEl;
+            if (!audio) return;
+            if (!audio.paused && bar.classList.contains('minimized')) {
+                bar.classList.add('is-playing');
+            } else {
+                bar.classList.remove('is-playing');
+            }
+        }
+        if (!window._playerMinimizePulseTimer) {
+            window._playerMinimizePulseTimer = setInterval(updatePlayingClass, 400);
+        }
+
+        // Слушатели на события аудио
+        if (typeof GlobalPlayer !== 'undefined' && GlobalPlayer.audioEl) {
+            const audio = GlobalPlayer.audioEl;
+            if (!audio._minimizeHandlerAttached) {
+                audio._minimizeHandlerAttached = true;
+                audio.addEventListener('play', updatePlayingClass);
+                audio.addEventListener('pause', updatePlayingClass);
+                audio.addEventListener('ended', updatePlayingClass);
+            }
+        }
+    }
+    attachWhenReady();
+
+    console.log('🔽 Сворачивание плеера в левый угол активно');
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🆕 ПАТЧ: добавляем кнопку «Свернуть» в плеер при его создании
+// ═══════════════════════════════════════════════════════════════
+
+(function patchPlayerUIForMinimize() {
+    const observer = new MutationObserver((mutations) => {
+        for (const mut of mutations) {
+            for (const node of mut.addedNodes) {
+                if (node.nodeType !== 1) continue;
+                if (node.id === 'globalPlayerBar') {
+                    injectMinimizeButton(node);
+                } else if (node.querySelector && node.querySelector('#globalPlayerBar')) {
+                    injectMinimizeButton(node.querySelector('#globalPlayerBar'));
+                }
+            }
+        }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    const existing = document.getElementById('globalPlayerBar');
+    if (existing) injectMinimizeButton(existing);
+
+    function injectMinimizeButton(bar) {
+        if (!bar || bar.querySelector('#gpMinimize')) return;
+        const controls = bar.querySelector('.gp-controls');
+        if (!controls) return;
+
+        const btn = document.createElement('button');
+        btn.className = 'gp-btn gp-btn-minimize';
+        btn.id = 'gpMinimize';
+        btn.title = 'Свернуть плеер';
+        btn.textContent = '🔽';
+
+        const closeBtn = bar.querySelector('#gpClose');
+        if (closeBtn) {
+            controls.insertBefore(btn, closeBtn);
+        } else {
+            controls.appendChild(btn);
+        }
+
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+            const bar = document.getElementById('globalPlayerBar');
+            if (!bar) return;
+            bar.classList.add('minimized');
+            document.body.classList.add('player-active-minimized');
+            localStorage.setItem('chathub_player_minimized', '1');
+            if (navigator.vibrate) navigator.vibrate(10);
+            showToast('🔽 Плеер свёрнут', 1200);
+        });
+
+        console.log('✅ Кнопка «Свернуть» добавлена в плеер');
+    }
+})();
+
 </script>
 </body>
 </html>
