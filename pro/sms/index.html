@@ -17002,150 +17002,6 @@ console.log('💬 Аватарки пользователей теперь и в
 
 
 // ═══════════════════════════════════════════════════════════════
-//  🖼️ ЭКСПОРТ / ИМПОРТ АВАТАРОК ЧАТОВ
-//  Дополняет существующий экспорт профиля — добавляет chathub_avatars
-//  Работает независимо от аватарок пользователей.
-// ═══════════════════════════════════════════════════════════════
-
-// ─── 1. Экспорт: цепляем к buildProfileObject ───
-// Наша функция buildProfileObject уже запатчена выше для userAvatars,
-// теперь перепатчиваем ещё раз — чтобы добавить и chatAvatars.
-(function patchBuildProfileForChatAvatars() {
-    const _prev = buildProfileObject;
-    buildProfileObject = function(opts) {
-        const profile = _prev.call(this, opts);
-        const includeChatAvatars = $('exportIncludeChatAvatars')?.checked;
-        if (includeChatAvatars) {
-            // _avatars — это глобальный объект из блока "ЛИЧНЫЕ АВАТАРКИ ЧАТОВ"
-            profile.chatAvatars = (typeof _avatars !== 'undefined' && _avatars)
-                ? { ..._avatars }
-                : {};
-            profile._meta = profile._meta || {};
-            profile._meta.includesChatAvatars = true;
-        }
-        return profile;
-    };
-})();
-
-
-// ─── 2. Импорт: цепляем к applyImport ───
-(function patchApplyImportForChatAvatars() {
-    const _prev = applyImport;
-    applyImport = function() {
-        const profile = _pendingImportProfile;
-        const replace = profile && !profile.isSingleChat && $('importReplaceMode')?.checked;
-        const chatAvatars = profile?.chatAvatars || null;
-
-        // Вызываем предыдущий патч (тот, что для userAvatars + оригинал)
-        _prev.apply(this, arguments);
-
-        if (chatAvatars && Object.keys(chatAvatars).length > 0) {
-            if (replace) {
-                // Полная замена: сносим все прежние аватарки чатов
-                _avatars = { ...chatAvatars };
-            } else {
-                // Merge: добавляем/перезаписываем по ключу
-                if (typeof _avatars === 'undefined' || !_avatars) _avatars = {};
-                for (const [k, v] of Object.entries(chatAvatars)) {
-                    if (typeof v === 'string' && v.length > 0) {
-                        _avatars[k] = v;
-                    }
-                }
-            }
-            saveAvatars();
-
-            // Обновляем видимые аватарки в UI
-            if (typeof refreshAllAvatarsForChat === 'function') {
-                for (const file of Object.keys(chatAvatars)) {
-                    refreshAllAvatarsForChat(file);
-                }
-            }
-
-            showToast(`✅ Импортировано аватарок чатов: ${Object.keys(chatAvatars).length}`, 2500);
-        }
-    };
-})();
-
-
-// ─── 3. handleImportFile: вытаскиваем chatAvatars из файла ───
-// Предыдущий патч (для userAvatars) оборачивает handleImportFile.
-// Теперь оборачиваем ещё раз — чтобы добавить chatAvatars.
-(function patchHandleImportFileForChatAvatars() {
-    const _prev = handleImportFile;
-    handleImportFile = async function(file) {
-        let chatAvatarsToAttach = null;
-        if (file) {
-            try {
-                const text = await file.text();
-                const data = JSON.parse(text);
-                if (data && data.app === 'sms-chat' &&
-                    data.chatAvatars && typeof data.chatAvatars === 'object') {
-                    chatAvatarsToAttach = data.chatAvatars;
-                }
-            } catch (e) { /* ignore */ }
-
-            // Пересоздаём file — оригинал его прочитает заново
-            const fakeFile = new File([await file.arrayBuffer()], file.name, { type: file.type });
-            await _prev.call(this, fakeFile);
-        } else {
-            await _prev.call(this, file);
-        }
-
-        if (chatAvatarsToAttach && _pendingImportProfile) {
-            _pendingImportProfile.chatAvatars = chatAvatarsToAttach;
-        }
-    };
-})();
-
-
-// ─── 4. Чекбокс «Включить аватарки чатов» в модалке экспорта ───
-(function addExportChatAvatarsCheckbox() {
-    // Сначала убедимся, что чекбокс userAvatars уже добавлен (он идёт первым)
-    const userAvatarsLabel = document.querySelector('#exportIncludeAvatars')?.closest('label');
-    const usernameLabel = $('exportIncludeUsername')?.closest('label');
-    const anchor = userAvatarsLabel || usernameLabel;
-    if (!anchor) return;
-
-    // Уже есть? Не дублируем
-    if (document.getElementById('exportIncludeChatAvatars')) return;
-
-    const newLabel = document.createElement('label');
-    newLabel.style.cssText = 'display:flex;align-items:center;gap:10px;cursor:pointer;font-size:14px;color:#ccc;margin-bottom:14px;user-select:none;';
-    newLabel.innerHTML = `
-        <input type="checkbox" id="exportIncludeChatAvatars" checked
-               style="width:18px;height:18px;accent-color:#6c5ce7;cursor:pointer;margin:0;">
-        <span>Включить аватарки чатов</span>
-    `;
-    anchor.parentNode.insertBefore(newLabel, anchor.nextSibling);
-})();
-
-
-// ─── 5. Обновляем превью импорта — показываем кол-во аватарок чатов ───
-// Это необязательно, но красиво. Обновляем превью после парсинга файла.
-(function patchImportPreviewForChatAvatars() {
-    const _prev = handleImportFile;
-    handleImportFile = async function(file) {
-        await _prev.call(this, file);
-        // После отработки — если есть chatAvatars в pending, дописываем инфу
-        const chatAvatars = _pendingImportProfile?.chatAvatars;
-        if (!chatAvatars) return;
-        const preview = $('importPreview');
-        if (!preview || preview.style.display === 'none') return;
-        // Добавляем строчку про аватарки чатов, если её ещё нет
-        if (preview.querySelector('.chat-avatars-info')) return;
-        const count = Object.keys(chatAvatars).length;
-        if (count === 0) return;
-        preview.insertAdjacentHTML('beforeend',
-            `<div class="chat-avatars-info">🖼️ Аватарок чатов: <strong>${count}</strong></div>`);
-    };
-})();
-
-
-console.log('🖼️ Экспорт/импорт аватарок чатов активирован');
-console.log('   • Чекбокс «Включить аватарки чатов» в модалке экспорта');
-console.log('   • Merge или Replace — по тому же принципу, что чаты и userAvatars');
-
-// ═══════════════════════════════════════════════════════════════
 //  🆕 НАДЁЖНАЯ СИНХРОНИЗАЦИЯ ВОЛН — не зависит ни от чего
 //  Работает через интервал, пока пользователь в чате.
 //  Если глобальный плеер играет — ставит .playing на нужной волне.
@@ -19242,424 +19098,362 @@ console.log('   • Можно ввести простой пароль — ва
 
 
 // ═══════════════════════════════════════════════════════════════
-//  💥 РАДИКАЛЬНЫЙ ИМПОРТ — полностью переопределён
-//  Заменяет всю цепочку патчей одной чистой функцией.
-//  Читает файл → сам создаёт _pendingImportProfile → 
-//  сам заливает чаты, пароли, аватарки, username.
-//  Не вызывает оригиналы вообще.
+//  🎨 УНИКАЛЬНЫЙ ЦВЕТ КРУЖКА ПО identityId
+//  Пока картинки-аватарки нет — кружок окрашивается в стабильный
+//  цвет, вычисленный из identityId (или ника как fallback).
+//
+//  Один identityId → один цвет на ВСЕХ устройствах и у ВСЕХ
+//  пользователей. Два Васи с разными паролями аватара → разные цвета.
+//  Это защищает от путаницы, когда двое пишут с одного ника.
 // ═══════════════════════════════════════════════════════════════
 
-(function radicalImportRewrite() {
+const AvatarColor = (() => {
+    // Палитра — 16 насыщенных, но не кислотных цветов.
+    // Подобраны так, чтобы:
+    //   • хорошо читался белый текст-буква
+    //   • соседние цвета в палитре заметно отличались
+    //   • контраст с тёмным фоном мессенджера (#1a1a2e) был достаточным
+    const PALETTE = [
+        { bg: '#e74c3c', fg: '#fff' },   // красный
+        { bg: '#e67e22', fg: '#fff' },   // оранжевый
+        { bg: '#f1c40f', fg: '#2c2c2c' }, // жёлтый (тёмная буква — контраст)
+        { bg: '#2ecc71', fg: '#fff' },   // зелёный
+        { bg: '#1abc9c', fg: '#fff' },   // бирюзовый
+        { bg: '#3498db', fg: '#fff' },   // синий
+        { bg: '#9b59b6', fg: '#fff' },   // фиолетовый
+        { bg: '#e84393', fg: '#fff' },   // розовый
+        { bg: '#6c5ce7', fg: '#fff' },   // indigo (наш бренд)
+        { bg: '#00b894', fg: '#fff' },   // мятный (наш бренд)
+        { bg: '#d35400', fg: '#fff' },   // тёмно-оранжевый
+        { bg: '#c0392b', fg: '#fff' },   // тёмно-красный
+        { bg: '#16a085', fg: '#fff' },   // тёмно-бирюзовый
+        { bg: '#2980b9', fg: '#fff' },   // тёмно-синий
+        { bg: '#8e44ad', fg: '#fff' },   // тёмно-фиолетовый
+        { bg: '#c2185b', fg: '#fff' },   // малиновый
+    ];
 
-    // ═══════════════════════════════════════════════════════════
-    //  1. ПОЛНОСТЬЮ НОВЫЙ handleImportFile
-    // ═══════════════════════════════════════════════════════════
-    handleImportFile = async function(file) {
-        if (!file) return;
+    // Кэш: ключ → { bg, fg }
+    const _cache = new Map();
 
-        if (file.size > 15 * 1024 * 1024) {
-            showToast('❌ Файл слишком большой (>15MB)', 2500);
-            return;
+    // Простой, но стабильный строковый хеш (FNV-1a, 32 бита).
+    // Не криптографический — нам важна только стабильность.
+    function hashStr(str) {
+        let h = 0x811c9dc5;   // FNV offset
+        for (let i = 0; i < str.length; i++) {
+            h ^= str.charCodeAt(i);
+            // Умножение на простое число FNV (16777619) с переполнением uint32
+            h = (h * 0x01000193) >>> 0;
         }
+        return h >>> 0;
+    }
 
-        try {
-            // ═══ Читаем файл ═══
-            const text = await file.text();
-            const data = JSON.parse(text);
+    /**
+     * Возвращает { bg, fg } для заданного ключа.
+     * Ключ — identityId (предпочтительно) или ник (fallback).
+     * Один и тот же ключ ВСЕГДА даёт один и тот же цвет.
+     */
+    function get(key) {
+        const safeKey = String(key || '?');
+        if (_cache.has(safeKey)) return _cache.get(safeKey);
 
-            if (!data || typeof data !== 'object') {
-                throw new Error('Неверный формат файла');
-            }
-            if (data.app !== PROFILE_FORMAT.APP) {
-                throw new Error('Это не файл SMS Чат');
-            }
+        const h = hashStr(safeKey);
+        const entry = PALETTE[h % PALETTE.length];
+        _cache.set(safeKey, entry);
+        return entry;
+    }
 
-            // ═══════════════════════════════════════════════════
-            //  ВЕТКА 1: файл с одним чатом (приглашение)
-            // ═══════════════════════════════════════════════════
-            if (data.type === 'single-chat') {
-                if (!data.chat || typeof data.chat !== 'object') {
-                    throw new Error('Не найден чат в файле');
-                }
-                const fileId = sanitizeChatFile(data.chat.file);
-                if (!fileId) throw new Error('Неверный ID чата');
+    /**
+     * Возвращает CSS-строку для background:
+     * линейный градиент с небольшим затемнением того же оттенка,
+     * чтобы кружок не выглядел плоским.
+     */
+    function getBackgroundStyle(key) {
+        const { bg } = get(key);
+        return `linear-gradient(135deg, ${bg}, ${darken(bg, 0.18)})`;
+    }
 
-                const chatName = String(data.chat.name || fileId).slice(0, 40);
-                const password = typeof data.password === 'string' ? data.password : '';
+    /**
+     * Возвращает цвет текста (для буквы в кружке).
+     */
+    function getForegroundStyle(key) {
+        return get(key).fg;
+    }
 
-                _pendingImportProfile = {
-                    chats: [{ name: chatName, file: fileId, createdAt: data.chat.createdAt || null }],
-                    savedPasswords: password ? { [fileId]: password } : {},
-                    username: null,
-                    exportedAt: data.exportedAt || null,
-                    isSingleChat: true,
-                    userAvatars: null,
-                    chatAvatars: null,
-                };
+    // Затемнение hex-цвета на коэффициент (0..1)
+    function darken(hex, amount) {
+        const c = hex.replace('#', '');
+        const r = Math.max(0, Math.round(parseInt(c.slice(0, 2), 16) * (1 - amount)));
+        const g = Math.max(0, Math.round(parseInt(c.slice(2, 4), 16) * (1 - amount)));
+        const b = Math.max(0, Math.round(parseInt(c.slice(4, 6), 16) * (1 - amount)));
+        return '#' + [r, g, b].map(v => v.toString(16).padStart(2, '0')).join('');
+    }
 
-                const preview = $('importPreview');
-                preview.style.display = 'block';
-                preview.innerHTML = `
-                    💾 <strong>Приглашение в чат</strong><br>
-                    💬 Название: <strong>${escapeHtml(chatName)}</strong><br>
-                    🆔 ID: <code style="background:rgba(255,255,255,0.1);padding:2px 6px;border-radius:4px;font-size:11px;">${escapeHtml(fileId)}</code><br>
-                    🔑 Пароль: <strong style="color:${password ? '#00b894' : '#ff6b6b'};">${password ? 'включён' : 'отсутствует'}</strong>
-                `;
-                $('importReplaceModeLabel').style.display = 'none';
-                $('confirmImportBtn').disabled = false;
-                $('importFileInput').value = '';
-                $('importFileInfo').innerHTML = `Выбран файл: <strong>${escapeHtml(file.name)}</strong>`;
-                soundManager.play('click');
-                return;
-            }
-
-            // ═══════════════════════════════════════════════════
-            //  ВЕТКА 2: полный профиль
-            // ═══════════════════════════════════════════════════
-            if (typeof data.version !== 'number' || data.version > PROFILE_FORMAT.VERSION) {
-                throw new Error(`Неподдерживаемая версия (${data.version})`);
-            }
-            if (!Array.isArray(data.chats)) {
-                throw new Error('Нет списка чатов');
-            }
-
-            // ═══ Валидация чатов ═══
-            const validChats = [];
-            for (const c of data.chats) {
-                if (!c || typeof c !== 'object') continue;
-                const file_ = sanitizeChatFile(c.file);
-                if (!file_) continue;
-                validChats.push({
-                    name: String(c.name || file_).slice(0, 40),
-                    file: file_,
-                    createdAt: c.createdAt || null,
-                });
-            }
-            if (validChats.length === 0) {
-                throw new Error('Нет валидных чатов в файле');
-            }
-
-            // ═══ Пароли ═══
-            const importedPasswords = {};
-            if (data.savedPasswords && typeof data.savedPasswords === 'object') {
-                for (const [k, v] of Object.entries(data.savedPasswords)) {
-                    const file_ = sanitizeChatFile(k);
-                    if (file_ && typeof v === 'string' && v.length > 0) {
-                        importedPasswords[file_] = v;
-                    }
-                }
-            }
-
-            // ═══ username ═══
-            const username = typeof data.username === 'string'
-                ? data.username.slice(0, 20)
-                : null;
-
-            // ═══ 🆕 АВАТАРКИ ПОЛЬЗОВАТЕЛЕЙ ═══
-            const userAvatars = {};
-            if (data.userAvatars && typeof data.userAvatars === 'object') {
-                for (const [k, v] of Object.entries(data.userAvatars)) {
-                    if (typeof v === 'string' && v.length > 0) {
-                        userAvatars[k] = v;
-                    }
-                }
-            }
-
-            // ═══ 🆕 АВАТАРКИ ЧАТОВ ═══
-            const chatAvatars = {};
-            if (data.chatAvatars && typeof data.chatAvatars === 'object') {
-                for (const [k, v] of Object.entries(data.chatAvatars)) {
-                    if (typeof v === 'string' && v.length > 0) {
-                        chatAvatars[k] = v;
-                    }
-                }
-            }
-
-            // ═══ 🆕 identityId ═══
-            const identityId = (typeof data.identityId === 'string' && data.identityId.length === 16)
-                ? data.identityId
-                : null;
-
-            // ═══ Собираем профиль ═══
-            _pendingImportProfile = {
-                chats: validChats,
-                savedPasswords: importedPasswords,
-                username,
-                exportedAt: data.exportedAt || null,
-                includesPasswords: !!data._meta?.includesPasswords,
-                isSingleChat: false,
-                userAvatars,
-                chatAvatars,
-                identityId,
-            };
-
-            // ═══ Превью ═══
-            const preview = $('importPreview');
-            preview.style.display = 'block';
-            preview.innerHTML = `
-                ✅ <strong>Файл валиден</strong><br>
-                📅 Экспортирован: ${data.exportedAt ? new Date(data.exportedAt).toLocaleString('ru-RU') : '—'}<br>
-                💬 Чатов: <strong>${validChats.length}</strong><br>
-                🔑 Паролей: <strong>${Object.keys(importedPasswords).length}</strong><br>
-                👤 Имя: <strong>${username ? escapeHtml(username) : '—'}</strong><br>
-                👥 Аватарок польз.: <strong style="color:#a78bfa;">${Object.keys(userAvatars).length}</strong><br>
-                🖼️ Аватарок чатов: <strong style="color:#a78bfa;">${Object.keys(chatAvatars).length}</strong>
-            `;
-            $('importReplaceModeLabel').style.display = 'flex';
-            $('confirmImportBtn').disabled = false;
-            $('importFileInput').value = '';
-            $('importFileInfo').innerHTML = `Выбран файл: <strong>${escapeHtml(file.name)}</strong>`;
-            soundManager.play('click');
-
-            console.log('📥 handleImportFile:',
-                        'чатов =', validChats.length,
-                        '| паролей =', Object.keys(importedPasswords).length,
-                        '| userAvatars =', Object.keys(userAvatars).length,
-                        '| chatAvatars =', Object.keys(chatAvatars).length);
-
-        } catch (e) {
-            console.error('Import error:', e);
-            _pendingImportProfile = null;
-            $('importPreview').style.display = 'none';
-            $('confirmImportBtn').disabled = true;
-            showToast('❌ ' + e.message, 3000);
-            soundManager.play('error');
-        }
-    };
-
-
-    // ═══════════════════════════════════════════════════════════
-    //  2. ПОЛНОСТЬЮ НОВЫЙ applyImport
-    // ═══════════════════════════════════════════════════════════
-    applyImport = function() {
-        if (!_pendingImportProfile) {
-            console.warn('applyImport: нет _pendingImportProfile');
-            return;
-        }
-
-        const profile = _pendingImportProfile;
-        const replace = profile.isSingleChat
-            ? false
-            : ($('importReplaceMode')?.checked || false);
-
-        console.log('📥 applyImport НАЧАЛО:',
-                    'чатов =', profile.chats?.length || 0,
-                    '| userAvatars =', Object.keys(profile.userAvatars || {}).length,
-                    '| chatAvatars =', Object.keys(profile.chatAvatars || {}).length,
-                    '| replace =', replace);
-
-        // ═══════════════════════════════════════════════════════
-        //  1. ЧАТЫ
-        // ═══════════════════════════════════════════════════════
-        if (replace) {
-            state.chats = profile.chats.slice();
-        } else {
-            const existing = new Map(state.chats.map(c => [c.file, c]));
-            for (const c of profile.chats) {
-                if (existing.has(c.file)) {
-                    existing.get(c.file).name = c.name || existing.get(c.file).name;
-                } else {
-                    state.chats.push(c);
-                }
-            }
-        }
-
-        // ═══════════════════════════════════════════════════════
-        //  2. ПАРОЛИ
-        // ═══════════════════════════════════════════════════════
-        if (replace) {
-            state.savedPasswords = { ...profile.savedPasswords };
-        } else {
-            for (const [k, v] of Object.entries(profile.savedPasswords)) {
-                if (!state.savedPasswords[k]) state.savedPasswords[k] = v;
-            }
-        }
-
-        // ═══════════════════════════════════════════════════════
-        //  3. USERNAME
-        // ═══════════════════════════════════════════════════════
-        if (profile.username && !state.username) {
-            state.username = profile.username;
-            if (!usernameInput.value) usernameInput.value = profile.username;
-        }
-
-        // ═══════════════════════════════════════════════════════
-        //  4. СОХРАНЯЕМ ЧАТЫ И ПАРОЛИ
-        // ═══════════════════════════════════════════════════════
-        saveChatsList();
-        saveSavedPasswords();
-
-        // ═══════════════════════════════════════════════════════
-        //  5. 👥 АВАТАРКИ ПОЛЬЗОВАТЕЛЕЙ — пишем НАПРЯМУЮ в localStorage
-        // ═══════════════════════════════════════════════════════
-        if (profile.userAvatars && Object.keys(profile.userAvatars).length > 0) {
-            try {
-                let current = {};
-                try {
-                    current = JSON.parse(localStorage.getItem('chathub_user_avatars') || '{}');
-                } catch (e) { current = {}; }
-
-                const merged = replace
-                    ? { ...profile.userAvatars }
-                    : { ...current, ...profile.userAvatars };
-
-                localStorage.setItem('chathub_user_avatars', JSON.stringify(merged));
-
-                console.log('✅ userAvatars записаны:', Object.keys(merged).length);
-
-                // 🆕 Сбрасываем in-memory кэш UserAvatars,
-                //    чтобы при следующем get() он перечитал из localStorage.
-                try {
-                    if (typeof UserAvatars !== 'undefined') {
-                        // Если у UserAvatars есть метод-получение all(),
-                        // можно вынудить перечитывание, вызвав get с любым ключом
-                        // (внутри он перечитает _cache, если тот null).
-                        // Но _cache уже заполнен — надо его обнулить.
-                        // У нас нет прямого доступа к _cache, но можно
-                        // использовать хитрость: вызвать UserAvatars.replaceAll
-                        // с объединённым объектом.
-                        if (typeof UserAvatars.replaceAll === 'function') {
-                            UserAvatars.replaceAll(merged);
-                        }
-                    }
-                } catch (e) {
-                    console.warn('Не удалось обновить in-memory UserAvatars:', e);
-                }
-
-                // Обновляем DOM: все видимые кружки пользователей
-                document.querySelectorAll('.user-avatar[data-user], .user-avatar[data-identity]').forEach(el => {
-                    const key = el.dataset.identity || el.dataset.user;
-                    if (!key) return;
-                    const dataUrl = merged[key];
-                    if (dataUrl) {
-                        el.innerHTML = `<img src="${dataUrl}" alt="" draggable="false">`;
-                        el.classList.add('has-custom');
-                    } else {
-                        const letter = (el.dataset.user || '?').charAt(0).toUpperCase();
-                        el.textContent = letter;
-                        el.classList.remove('has-custom');
-                    }
-                });
-            } catch (e) {
-                console.error('❌ Ошибка userAvatars:', e);
-            }
-        }
-
-        // ═══════════════════════════════════════════════════════
-        //  6. 🖼️ АВАТАРКИ ЧАТОВ — пишем НАПРЯМУЮ в localStorage
-        // ═══════════════════════════════════════════════════════
-        if (profile.chatAvatars && Object.keys(profile.chatAvatars).length > 0) {
-            try {
-                let current = {};
-                try {
-                    current = JSON.parse(localStorage.getItem('chathub_avatars') || '{}');
-                } catch (e) { current = {}; }
-
-                const merged = replace
-                    ? { ...profile.chatAvatars }
-                    : { ...current, ...profile.chatAvatars };
-
-                localStorage.setItem('chathub_avatars', JSON.stringify(merged));
-
-                console.log('✅ chatAvatars записаны:', Object.keys(merged).length);
-
-                // 🆕 Обновляем in-memory переменную _avatars в основном скрипте
-                try {
-                    if (typeof _avatars !== 'undefined') {
-                        // Мутируем СУЩЕСТВУЮЩИЙ объект, чтобы все ссылки
-                        // остались валидными. Это важно!
-                        for (const k of Object.keys(_avatars)) delete _avatars[k];
-                        Object.assign(_avatars, merged);
-                    }
-                } catch (e) {
-                    console.warn('Не удалось обновить in-memory _avatars:', e);
-                }
-
-                // Обновляем DOM: все видимые кружки чатов
-                document.querySelectorAll('#chatsList .chat-list-item').forEach(item => {
-                    const file = item.dataset.file;
-                    if (!file) return;
-                    const avatarEl = item.querySelector('.chat-avatar');
-                    if (!avatarEl) return;
-
-                    const dataUrl = merged[file];
-                    if (dataUrl) {
-                        avatarEl.innerHTML = `<img src="${dataUrl}" alt="">`;
-                        avatarEl.classList.add('has-custom-avatar');
-                    } else {
-                        const name = item.querySelector('.chat-name')?.textContent || file;
-                        avatarEl.textContent = name.charAt(0).toUpperCase();
-                        avatarEl.classList.remove('has-custom-avatar');
-                    }
-                });
-
-                // Обновляем шапку открытого чата
-                if (state.chatFile && merged[state.chatFile]) {
-                    const headerAvatar = document.getElementById('userAvatar');
-                    if (headerAvatar) {
-                        headerAvatar.innerHTML = `<img src="${merged[state.chatFile]}" alt="">`;
-                        headerAvatar.classList.add('has-custom-avatar');
-                    }
-                }
-            } catch (e) {
-                console.error('❌ Ошибка chatAvatars:', e);
-            }
-        }
-
-        // ═══════════════════════════════════════════════════════
-        //  7. 🆔 identityId (если в файле было)
-        // ═══════════════════════════════════════════════════════
-        if (profile.identityId && typeof UserIdentity !== 'undefined') {
-            const current = UserIdentity.get();
-            if (current !== profile.identityId) {
-                localStorage.setItem('chathub_identity_id', profile.identityId);
-                console.log('✅ identityId восстановлен:', profile.identityId.slice(0, 6) + '…');
-            }
-        }
-
-        // ═══════════════════════════════════════════════════════
-        //  8. ФИНАЛИЗАЦИЯ
-        // ═══════════════════════════════════════════════════════
-        try {
-            if (typeof clearAutorunIfInvalid === 'function') clearAutorunIfInvalid();
-        } catch (e) {}
-
-        $('importModal').classList.remove('active');
-        _pendingImportProfile = null;
-
-        // Тост
-        if (profile.isSingleChat) {
-            showToast(`✅ Чат «${profile.chats[0].name}» добавлен`, 2500);
-        } else {
-            const parts = [`${state.chats.length} чатов`];
-            if (Object.keys(profile.userAvatars || {}).length > 0) {
-                parts.push(`${Object.keys(profile.userAvatars).length} аватарок польз.`);
-            }
-            if (Object.keys(profile.chatAvatars || {}).length > 0) {
-                parts.push(`${Object.keys(profile.chatAvatars).length} аватарок чатов`);
-            }
-            showToast(`✅ Импортировано: ${parts.join(', ')}`, 3000);
-        }
-        soundManager.play('send');
-
-        // Перерисовываем список чатов
-        if (state.currentScreen === 'chats') {
-            try {
-                renderChatsList();
-                setTimeout(() => {
-                    try { refreshUnreadBadges(); } catch (e) {}
-                }, 300);
-            } catch (e) {
-                console.warn('Ошибка рендера списка чатов:', e);
-            }
-        }
-    };
-
-    console.log('💥 Радикальный импорт установлен');
-    console.log('   • handleImportFile полностью переопределён');
-    console.log('   • applyImport полностью переопределён');
-    console.log('   • Аватарки пишутся НАПРЯМУЮ в localStorage');
+    return { get, getBackgroundStyle, getForegroundStyle };
 })();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🎨 СТИЛИ: убираем стандартный градиент, красим по identityId
+// ═══════════════════════════════════════════════════════════════
+
+(function injectAvatarColorStyles() {
+    if (document.getElementById('avatarColorStyles')) return;
+    const style = document.createElement('style');
+    style.id = 'avatarColorStyles';
+    style.textContent = `
+        /* Перебиваем старые градиенты — теперь цвет задаётся inline-стилем */
+        .user-avatar:not(.has-custom),
+        .chat-avatar:not(.has-custom-avatar),
+        .chat-header .avatar:not(.has-custom-avatar),
+        .comment-avatar.user-avatar:not(.has-custom) {
+            background: var(--avatar-bg, linear-gradient(135deg, #6c5ce7, #00b894)) !important;
+            color: var(--avatar-fg, #fff) !important;
+        }
+
+        /* Плавный переход при смене */
+        .user-avatar,
+        .chat-avatar,
+        .chat-header .avatar,
+        .comment-avatar.user-avatar {
+            transition: background 0.2s ease, color 0.2s ease, transform 0.15s, box-shadow 0.15s, opacity 0.15s;
+        }
+    `;
+    document.head.appendChild(style);
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🎨 ПРИМЕНЕНИЕ ЦВЕТА К ЭЛЕМЕНТАМ
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Применяет фоновый цвет к элементу-кружку.
+ * Если у элемента есть класс .has-custom (то есть стоит картинка) —
+ * цвет не трогаем.
+ *
+ * @param {HTMLElement} el — сам кружок (.user-avatar / .chat-avatar / …)
+ * @param {string} key — identityId или ник
+ */
+function applyAvatarColor(el, key) {
+    if (!el || !key) return;
+
+    // Если стоит картинка — цвет не нужен
+    if (el.classList.contains('has-custom') ||
+        el.classList.contains('has-custom-avatar')) {
+        el.style.removeProperty('--avatar-bg');
+        el.style.removeProperty('--avatar-fg');
+        return;
+    }
+
+    const bg = AvatarColor.getBackgroundStyle(key);
+    const fg = AvatarColor.getForegroundStyle(key);
+    el.style.setProperty('--avatar-bg', bg);
+    el.style.setProperty('--avatar-fg', fg);
+}
+
+/**
+ * Обходит все кружки в DOM и красит их по data-identity (или data-user).
+ * Полезно вызвать после рендера списка / сообщений.
+ */
+function refreshAllAvatarColors() {
+    // 1. Кружки пользователей (сообщения, комментарии)
+    document.querySelectorAll('.user-avatar').forEach(el => {
+        const key = el.dataset.identity || el.dataset.user;
+        if (!key) return;
+        applyAvatarColor(el, key);
+    });
+
+    // 2. Кружки чатов (список + шапка открытого чата)
+    document.querySelectorAll('.chat-avatar').forEach(el => {
+        // В списке чатов кружок лежит внутри .chat-list-item[data-file]
+        const item = el.closest('.chat-list-item');
+        const file = item?.dataset.file;
+        if (file) applyAvatarColor(el, file);
+    });
+
+    // 3. Кружок чата в шапке открытого чата
+    if (state.chatFile && userAvatar) {
+        applyAvatarColor(userAvatar, state.chatFile);
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🔧 ПАТЧИ: прокидываем цвет в рендер кружков
+// ═══════════════════════════════════════════════════════════════
+
+// ─── 1. buildMessageHTML — кружок рядом с именем ───
+// Оборачиваем renderUserAvatarHtml (он вызывается внутри buildMessageHTML)
+// Однако проще — патчим сам buildMessageHTML через MutationObserver.
+
+// ─── 2. MutationObserver: следим за новыми кружками в DOM ───
+(function installAvatarColorObserver() {
+    // Основной наблюдатель на весь чат-интерфейс
+    const root = document.body;
+    if (!root) return;
+
+    let _debounceTimer = null;
+
+    function scheduleRefresh() {
+        if (_debounceTimer) return;
+        _debounceTimer = setTimeout(() => {
+            _debounceTimer = null;
+            refreshAllAvatarColors();
+        }, 60);
+    }
+
+    const observer = new MutationObserver((mutations) => {
+        // Оптимизация: реагируем только если среди добавленных узлов
+        // есть что-то похожее на кружок
+        for (const m of mutations) {
+            if (m.type !== 'childList') continue;
+            for (const node of m.addedNodes) {
+                if (node.nodeType !== 1) continue;
+                // Сам узел — кружок?
+                if (node.classList && (
+                    node.classList.contains('user-avatar') ||
+                    node.classList.contains('chat-avatar')
+                )) {
+                    scheduleRefresh();
+                    return;
+                }
+                // Внутри узла есть кружки?
+                if (node.querySelector && node.querySelector(
+                    '.user-avatar, .chat-avatar'
+                )) {
+                    scheduleRefresh();
+                    return;
+                }
+            }
+        }
+    });
+
+    observer.observe(root, {
+        childList: true,
+        subtree: true,
+    });
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🔧 ПАТЧ renderUserAvatarHtml — сразу красим при создании HTML
+//  Это надёжнее, чем ждать MutationObserver
+// ═══════════════════════════════════════════════════════════════
+
+const _origRenderUserAvatarHtmlForColor = renderUserAvatarHtml;
+renderUserAvatarHtml = function(username, sizeClass = 'sender-avatar', identityId = null) {
+    const html = _origRenderUserAvatarHtmlForColor.call(this, username, sizeClass, identityId);
+
+    // Ключ для цвета = identityId (если есть) или ник
+    const colorKey = identityId || username || '?';
+    const bg = AvatarColor.getBackgroundStyle(colorKey);
+    const fg = AvatarColor.getForegroundStyle(colorKey);
+
+    // Если картинка уже стоит (has-custom) — не подменяем стиль
+    if (html.includes('has-custom')) return html;
+
+    // Добавляем inline-стиль с CSS-переменными
+    // Заменяем class="... user-avatar ..." на class="..." + style="--avatar-bg:…;--avatar-fg:…"
+    return html.replace(
+        /class="(user-avatar[^"]*)"/,
+        `class="$1" style="--avatar-bg:${bg};--avatar-fg:${fg};"`
+    );
+};
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🔧 ПАТЧ renderChatsList — красим кружки чатов при рендере
+// ═══════════════════════════════════════════════════════════════
+
+const _origRenderChatsListForColor = renderChatsList;
+renderChatsList = function() {
+    _origRenderChatsListForColor.apply(this, arguments);
+
+    // После рендера — красим каждый кружок чата
+    document.querySelectorAll('#chatsList .chat-list-item').forEach(item => {
+        const file = item.dataset.file;
+        const avatar = item.querySelector('.chat-avatar');
+        if (avatar && file) {
+            applyAvatarColor(avatar, file);
+        }
+    });
+};
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🔧 ПАТЧ applyAvatarToElement — при снятии картинки возвращаем цвет
+//  (когда пользователь удаляет свою картинку-аватарку)
+// ═══════════════════════════════════════════════════════════════
+
+const _origApplyAvatarToElementForColor = applyAvatarToElement;
+applyAvatarToElement = function(el, chatFile) {
+    _origApplyAvatarToElementForColor.call(this, el, chatFile);
+
+    // После применения — перекрашиваем (если картинки нет)
+    if (el && chatFile) {
+        applyAvatarColor(el, chatFile);
+    }
+};
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🔧 ПАТЧ refreshAllUserAvatarsByIdentity — перекрашиваем при смене
+// ═══════════════════════════════════════════════════════════════
+
+const _origRefreshAllUserAvatarsByIdentityForColor = refreshAllUserAvatarsByIdentity;
+refreshAllUserAvatarsByIdentity = function(identityId) {
+    _origRefreshAllUserAvatarsByIdentityForColor.call(this, identityId);
+
+    // Перекрашиваем кружки этого пользователя (если картинки нет — вернётся цвет)
+    if (!identityId) return;
+    const safeKey = CSS.escape(identityId);
+    document.querySelectorAll(`.user-avatar[data-identity="${safeKey}"]`).forEach(el => {
+        applyAvatarColor(el, identityId);
+    });
+};
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🎬 ПЕРВЫЙ ПРОГОН
+// ═══════════════════════════════════════════════════════════════
+
+// Прогоняем сразу — на случай, если DOM уже отрендерен
+refreshAllAvatarColors();
+
+// И ещё раз чуть позже — на случай, если какие-то элементы догрузились
+setTimeout(refreshAllAvatarColors, 500);
+setTimeout(refreshAllAvatarColors, 1500);
+
+// Плюс — прогоняем при каждом входе в чат
+(function hookEnterChatForColor() {
+    const _origEnterChat = enterChat;
+    enterChat = async function(...args) {
+        const r = await _origEnterChat.apply(this, args);
+        // После входа в чат — красим всё
+        setTimeout(refreshAllAvatarColors, 100);
+        setTimeout(refreshAllAvatarColors, 500);
+        setTimeout(refreshAllAvatarColors, 1500);
+        return r;
+    };
+})();
+
+// И при выходе в список чатов
+(function hookBackToChatsForColor() {
+    const _origBackToChats = backToChats;
+    backToChats = function(...args) {
+        const r = _origBackToChats.apply(this, args);
+        setTimeout(refreshAllAvatarColors, 100);
+        return r;
+    };
+})();
+
+
+console.log('🎨 Уникальные цвета кружков активны');
+console.log('   • Цвет = хеш(identityId) по палитре из 16 оттенков');
+console.log('   • Один identityId → один цвет на всех устройствах');
+console.log('   • Два Васи с разными паролями → разные цвета');
+console.log('   • Когда ставится картинка — цвет скрывается, картинка на месте');
+console.log('   • Когда картинка удаляется — цвет возвращается');
 </script>
 </body>
 </html>
