@@ -4452,7 +4452,15 @@ function clearAttachmentCache() {
 
 let networkState = { isOnline: navigator.onLine };
 let pendingOpenChat = null;
-let _pendingShareAfterUnlock = null;
+let _pendingShareAfterUnlock = null;// 🆔 Хелпер: «это моё сообщение/комментарий/реакция?»
+function isMineIdentity(entry) {
+    if (!entry) return false;
+    if (state.identityId && entry.identityId) {
+        return entry.identityId === state.identityId;
+    }
+    // fallback для старых сообщений (без identityId)
+    return entry.username === state.username;
+}
 
 let _shareToChat = {
     blob: null,
@@ -6225,7 +6233,11 @@ if (scrollState.isAtBottom && !_isUserScrolling
 
 
 async function encryptMessage(msg) {
-    const payload = { username: msg.username, text: msg.text || '' };
+    const payload = { 
+    username: msg.username, 
+    text: msg.text || '',
+    identityId: msg.identityId || state.identityId || undefined,
+};
     if (msg.reactions && Object.keys(msg.reactions).length > 0) {
         payload.reactions = msg.reactions;
     }
@@ -6271,7 +6283,13 @@ if (msg.audio) {
 async function decryptMessage(encMsg) {
     try {
         const payload = await decryptObject(encMsg.iv, encMsg.data, CRYPTO._key);
-        const msg = { id: encMsg.id, time: encMsg.time, username: payload.username, text: payload.text || '' };
+        const msg = { 
+    id: encMsg.id, 
+    time: encMsg.time, 
+    username: payload.username, 
+    text: payload.text || '',
+    identityId: payload.identityId || null,
+};
         if (payload.reactions && typeof payload.reactions === 'object') {
             msg.reactions = payload.reactions;
         }
@@ -8277,7 +8295,7 @@ async function convertToWebMWithProgress(blob, fileName) {
 
  
 function buildMessageHTML(msg, opts = {}) {
-    const isOwn = msg.username === state.username && state.isAuthorized;
+    const isOwn = state.isAuthorized && isMineIdentity(msg);
     const isUnread = opts.isUnread || false;
     const senderName = msg.username || 'Аноним';
     const fullTime = formatFullTime(msg.time);
@@ -10891,9 +10909,31 @@ async function login() {
     resetFailedAttempts();
     tokenInput.classList.add('valid');
     clearTokenHint();
-    state.username = username;
-    state.token = rawToken.trim();
-    state.isAuthorized = true;
+    // 🆔 Вычисляем уникальную личность
+const avatarPwdEl = document.getElementById('avatarPasswordInput');
+const avatarPwd = avatarPwdEl ? avatarPwdEl.value : '';
+if (!avatarPwd || avatarPwd.length < 3) {
+    setAuthError('Пароль аватара — минимум 3 символа');
+    avatarPwdEl?.focus();
+    loginBtn.disabled = false;
+    loginBtn.textContent = '🚀 Войти';
+    soundManager.play('error');
+    return;
+}
+const _idInput = `${username}:${avatarPwd}`;
+const _idHashBuf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(_idInput));
+const _idBytes = new Uint8Array(_idHashBuf);
+const _idAlphabet = 'abcdefghijklmnopqrstuvwxyz0123456789';
+let _idStr = '';
+for (let i = 0; i < 16; i++) _idStr += _idAlphabet[_idBytes[i] % _idAlphabet.length];
+state.identityId = _idStr;
+localStorage.setItem('chathub_identity_id', _idStr);
+localStorage.setItem('chathub_identity_username', username);
+
+
+state.username = username;
+state.token = rawToken.trim();
+state.isAuthorized = true;
     loadChatsList();
     loadSavedPasswords();
     if (rememberMeInput.checked) {
@@ -11465,8 +11505,9 @@ async function restoreSession() {
         if (!accessCheck.ok) { setTokenHint('Сохранённый токен недействителен', 'error'); return; }
     } catch (e) { return; }
     state.username = savedUsername;
-    state.token = savedToken.trim();
-    state.isAuthorized = true;
+state.token = savedToken.trim();
+state.isAuthorized = true;
+state.identityId = localStorage.getItem('chathub_identity_id') || null;
     loadChatsList();
     loadSavedPasswords();
     const autorunFile = getAutorunChat();
@@ -11601,11 +11642,12 @@ async function submitComment(msgId, text) {
     if (!msg) { showToast('❌ Сообщение не найдено', 1500); return; }
 
     const newComment = {
-        id: Date.now(),
-        username: state.username,
-        text: text.trim().slice(0, 2000),
-        time: new Date().toISOString(),
-    };
+    id: Date.now(),
+    username: state.username,
+    identityId: state.identityId || undefined,
+    text: text.trim().slice(0, 2000),
+    time: new Date().toISOString(),
+};
 
     // Оптимистичное обновление
     if (!msg.comments) msg.comments = [];
@@ -11730,7 +11772,7 @@ function updateCommentsInDOM(msgId) {
 function buildCommentsHTML(msg) {
     if (!msg.comments || msg.comments.length === 0) return '';
     const items = msg.comments.map(c => {
-        const isOwn = c.username === state.username;
+        const isOwn = isMineIdentity(c);
         const del = isOwn
             ? `<button class="comment-del"
                        onclick="event.stopPropagation(); deleteComment(${msg.id}, ${c.id})"
@@ -11738,7 +11780,7 @@ function buildCommentsHTML(msg) {
             : '';
         return `
             <div class="comment-item">
-                <div class="comment-avatar">${getInitials(c.username)}</div>
+                <div class="comment-avatar" data-identity="${escapeHtml(c.identityId || c.username)}">${getInitials(c.username)}</div>
                 <div class="comment-body">
                     <div class="comment-author">
                         ${isOwn ? 'Вы' : escapeHtml(c.username)}
@@ -11865,7 +11907,8 @@ function buildReactionsHTML(msg) {
 
     // Отображаемые реакции-чипы
     entries.forEach(([emoji, users]) => {
-        const mine = users.includes(state.username);
+        const myId = state.identityId || state.username;
+const mine = users.includes(myId) || users.includes(state.username);
         html += `<div class="reaction-chip ${mine ? 'mine' : ''}"
                       onclick="event.stopPropagation(); toggleReaction(${msg.id}, '${emoji}')"
                       title="${users.map(escapeHtml).join(', ')}">
@@ -11962,18 +12005,27 @@ async function toggleReaction(msgId, emoji) {
     if (!msg) return;
     if (!msg.reactions) msg.reactions = {};
 
-    const list = msg.reactions[emoji] || [];
-    const idx = list.indexOf(state.username);
+    const myId = state.identityId || state.username;
+const list = msg.reactions[emoji] || [];
+let idx = list.indexOf(myId);
+// миграция старых реакций с ником
+if (idx === -1 && state.identityId) {
+    const legacyIdx = list.indexOf(state.username);
+    if (legacyIdx !== -1) {
+        list[legacyIdx] = myId;
+        idx = legacyIdx;
+    }
+}
     let added;
     if (idx >= 0) {
         list.splice(idx, 1);
         added = false;
         if (list.length === 0) delete msg.reactions[emoji];
     } else {
-        list.push(state.username);
-        msg.reactions[emoji] = list;
-        added = true;
-    }
+    list.push(myId);
+    msg.reactions[emoji] = list;
+    added = true;
+}
 
     // Обновляем DOM конкретного сообщения
     updateReactionsInDOM(msgId);
@@ -11987,8 +12039,8 @@ async function toggleReaction(msgId, emoji) {
         console.error('reaction save error', e);
         // откат
         if (added) {
-            const l = msg.reactions[emoji] || [];
-            const i = l.indexOf(state.username);
+    const l = msg.reactions[emoji] || [];
+    const i = l.indexOf(myId);
             if (i >= 0) l.splice(i, 1);
             if (l.length === 0) delete msg.reactions[emoji];
         } else {
@@ -19095,786 +19147,6 @@ console.log('   • При переустановке вводите тот же
 console.log('   • Два Васи с разными паролями — разные identityId');
 console.log('   • Можно ввести простой пароль — важно лишь, чтобы он был уникальным');
 
-</script>
-<script>
-// ═══════════════════════════════════════════════════════════════
-//  🆔 ЕДИНЫЙ ПАТЧ: УНИКАЛЬНАЯ ЛИЧНОСТЬ ЧЕРЕЗ ПАРОЛЬ АВАТАРА
-//  identityId = SHA-256(ник + ":" + пароль_аватара)
-//  Два Васи с разными паролями → разные identityId.
-//  Вставляется в конец основного <script>.
-// ═══════════════════════════════════════════════════════════════
-
-(function installIdentityPatch() {
-    'use strict';
-
-    // ═══════════════════════════════════════════════════════════════
-    //  1. МОДУЛЬ UserIdentity
-    // ═══════════════════════════════════════════════════════════════
-    const UserIdentity = (() => {
-        const ID_KEY = 'chathub_identity_id';
-        const USERNAME_KEY = 'chathub_identity_username';
-
-        async function computeId(username, avatarPassword) {
-            const input = `${username}:${avatarPassword}`;
-            const buf = new TextEncoder().encode(input);
-            const hashBuf = await crypto.subtle.digest('SHA-256', buf);
-            const hashArr = new Uint8Array(hashBuf);
-            const ALPHABET = 'abcdefghijklmnopqrstuvwxyz0123456789';
-            let result = '';
-            for (let i = 0; i < 16; i++) {
-                result += ALPHABET[hashArr[i] % ALPHABET.length];
-            }
-            return result;
-        }
-
-        function get() {
-            return localStorage.getItem(ID_KEY) || null;
-        }
-
-        function set(id, username) {
-            localStorage.setItem(ID_KEY, id);
-            if (username) localStorage.setItem(USERNAME_KEY, username);
-        }
-
-        function reset() {
-            localStorage.removeItem(ID_KEY);
-            localStorage.removeItem(USERNAME_KEY);
-        }
-
-        return { computeId, get, set, reset };
-    })();
-
-    // Экспортируем глобально (на случай внешних вызовов)
-    window.UserIdentity = UserIdentity;
-
-    // ═══════════════════════════════════════════════════════════════
-    //  2. ГЛОБАЛЬНЫЙ ХЕЛПЕР: «это моё?»
-    //  Работает и для новых (с identityId), и для старых (без) сообщений.
-    // ═══════════════════════════════════════════════════════════════
-    function isMineIdentity(entry) {
-        if (!entry) return false;
-        if (!state.identityId) {
-            // Мы ещё не знаем свою личность — только по нику
-            return entry.username === state.username;
-        }
-        // Если у сообщения есть identityId — сравниваем строго по нему
-        if (entry.identityId) {
-            return entry.identityId === state.identityId;
-        }
-        // Legacy: если identityId нет — по нику
-        return entry.username === state.username;
-    }
-
-    window.isMineIdentity = isMineIdentity;
-
-    // ═══════════════════════════════════════════════════════════════
-    //  3. ПАТЧ login — проверка пароля аватара + установка identityId
-    // ═══════════════════════════════════════════════════════════════
-    const _origLogin = window.login;
-
-    window.login = async function() {
-        const usernameEl = document.getElementById('usernameInput');
-        const avatarPwdEl = document.getElementById('avatarPasswordInput');
-
-        const username = usernameEl ? usernameEl.value.trim() : '';
-        const avatarPwd = avatarPwdEl ? avatarPwdEl.value : '';
-
-        // Ранняя валидация username, чтобы не показывать окно поверх ошибки
-        if (!username || username.length < 2) {
-            // отдаём оригиналу — он сам покажет ошибку
-            return _origLogin.apply(this, arguments);
-        }
-
-        // 🆕 Проверка пароля аватара
-        if (!avatarPwd) {
-            if (typeof setAuthError === 'function') {
-                setAuthError('Введите пароль аватара (любой, но запомните его)');
-            }
-            if (avatarPwdEl) avatarPwdEl.focus();
-            if (typeof soundManager !== 'undefined') soundManager.play('error');
-            return;
-        }
-        if (avatarPwd.length < 3) {
-            if (typeof setAuthError === 'function') {
-                setAuthError('Пароль аватара — минимум 3 символа');
-            }
-            if (avatarPwdEl) avatarPwdEl.focus();
-            if (typeof soundManager !== 'undefined') soundManager.play('error');
-            return;
-        }
-
-        // 🆕 Вычисляем identityId и сохраняем
-        try {
-            const newId = await UserIdentity.computeId(username, avatarPwd);
-            state.identityId = newId;
-            UserIdentity.set(newId, username);
-        } catch (e) {
-            console.error('identity compute failed:', e);
-            if (typeof setAuthError === 'function') {
-                setAuthError('Не удалось вычислить личность');
-            }
-            return;
-        }
-
-        // Передаём управление оригинальному login
-        return _origLogin.apply(this, arguments);
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    //  4. ПАТЧ encryptMessage — вшиваем identityId в payload
-    // ═══════════════════════════════════════════════════════════════
-    const _origEncryptMessage = window.encryptMessage;
-
-    window.encryptMessage = async function(msg) {
-        // Клонируем сообщение и подкладываем identityId
-        const patched = Object.assign({}, msg);
-        if (!patched.identityId) {
-            patched.identityId = state.identityId || undefined;
-        }
-        return _origEncryptMessage.call(this, patched);
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    //  5. ПАТЧ decryptMessage — вытаскиваем identityId из payload
-    // ═══════════════════════════════════════════════════════════════
-    const _origDecryptMessage = window.decryptMessage;
-
-    window.decryptMessage = async function(encMsg) {
-        const msg = await _origDecryptMessage.call(this, encMsg);
-        if (!msg) return msg;
-        // _origDecryptMessage уже возвращает msg, но без identityId —
-        // потому что оригинальный decrypt его не читает. Дочитываем вручную.
-        if (!msg.identityId) {
-            try {
-                const payload = await decryptObject(encMsg.iv, encMsg.data, CRYPTO._key);
-                if (payload && payload.identityId) {
-                    msg.identityId = payload.identityId;
-                }
-            } catch (e) {
-                // ignore — уже расшифровали выше
-            }
-        }
-        return msg;
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    //  6. ПАТЧ buildMessageHTML — isOwn по identityId
-    //     (заменяем только саму проверку isOwn внутри базового шаблона)
-    // ═══════════════════════════════════════════════════════════════
-    const _origBuildMessageHTML = window.buildMessageHTML;
-
-    window.buildMessageHTML = function(msg, opts = {}) {
-        // Временно подменяем state.username на псевдо-«свой маркер»,
-        // чтобы внутренняя проверка msg.username === state.username
-        // не срабатывала для чужого Васи с тем же ником.
-        //
-        // Самый простой способ: заранее вычислить isOwn и передать через opts.
-        const computedIsOwn = isMineIdentity(msg);
-        const patchedOpts = Object.assign({}, opts, { _forceIsOwn: computedIsOwn });
-
-        // Заходим внутрь базовой функции и перехватываем проверку через
-        // геттер на state.username — точнее, через временную подмену.
-        //
-        // Проще: сохранить текущий state.username, подставить туда
-        // специальный объект-обёртку нельзя. Поэтому используем другой трюк:
-        // временно меняем username у самого msg на совпадающий/несовпадающий.
-        const realUsername = msg.username;
-        const wasOwn = computedIsOwn;
-
-        // Если isOwn должно быть true, но оригинал решит false —
-        // временно подменим username на state.username,
-        // чтобы оригинал выставил .own.
-        // И наоборот.
-        let tempMsg = msg;
-        if (wasOwn && realUsername !== state.username) {
-            tempMsg = Object.assign({}, msg, { username: state.username });
-        } else if (!wasOwn && realUsername === state.username) {
-            // ⚠️ Два Васи с одинаковым ником — чужой Вася выдаёт себя за нашего
-            tempMsg = Object.assign({}, msg, { username: '__NOT_ME__' });
-        }
-
-        return _origBuildMessageHTML.call(this, tempMsg, patchedOpts);
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    //  7. ПАТЧ buildCommentsHTML — isOwn по identityId
-    // ═══════════════════════════════════════════════════════════════
-    const _origBuildCommentsHTML = window.buildCommentsHTML;
-
-    window.buildCommentsHTML = function(msg) {
-        if (!msg.comments || msg.comments.length === 0) return '';
-
-        const items = msg.comments.map(c => {
-            const isOwn = isMineIdentity(c);
-            const del = isOwn
-                ? `<button class="comment-del"
-                           onclick="event.stopPropagation(); deleteComment(${msg.id}, ${c.id})"
-                           title="Удалить">✕</button>`
-                : '';
-
-            const avatarHtml = typeof renderUserAvatarHtml === 'function'
-                ? renderUserAvatarHtml(c.username, 'comment-avatar', c.identityId)
-                : `<div class="comment-avatar">${(c.username || '?').charAt(0).toUpperCase()}</div>`;
-
-            const safeText = typeof renderTextWithLinks === 'function'
-                ? renderTextWithLinks(c.text)
-                : escapeHtml(c.text);
-
-            return `
-                <div class="comment-item">
-                    ${avatarHtml}
-                    <div class="comment-body">
-                        <div class="comment-author">
-                            ${isOwn ? 'Вы' : escapeHtml(c.username)}
-                            <span class="comment-time">${formatFullTime(c.time)}</span>
-                        </div>
-                        <div class="comment-text">${safeText}</div>
-                    </div>
-                    ${del}
-                </div>
-            `;
-        }).join('');
-
-        return `<div class="comments-block" data-comments-for="${msg.id}">${items}</div>`;
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    //  8. ПАТЧ buildReactionsHTML — моя реакция по identityId
-    // ═══════════════════════════════════════════════════════════════
-    const _origBuildReactionsHTML = window.buildReactionsHTML;
-
-    window.buildReactionsHTML = function(msg) {
-        const reactions = msg.reactions || {};
-        const entries = Object.entries(reactions).filter(([, users]) =>
-            Array.isArray(users) && users.length > 0
-        );
-
-        const myId = state.identityId || state.username;
-
-        let html = '<div class="reactions-row">';
-
-        entries.forEach(([emoji, users]) => {
-            // Совместимость: старые реакции хранят ники, новые — identityId
-            const mine = users.includes(myId) || users.includes(state.username);
-
-            // Показываем количество уникальных
-            const count = users.length;
-
-            html += `<div class="reaction-chip ${mine ? 'mine' : ''}"
-                          onclick="event.stopPropagation(); toggleReaction(${msg.id}, '${emoji}')"
-                          title="${users.map(escapeHtml).join(', ')}">
-                        <span>${emoji}</span>
-                        <span class="reaction-count">${count}</span>
-                     </div>`;
-        });
-
-        html += `<button class="reaction-add-btn"
-                         onclick="event.stopPropagation(); openReactionPicker(event, ${msg.id})"
-                         title="Добавить реакцию">😊+</button>`;
-
-        html += '</div>';
-        return html;
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    //  9. ПАТЧ toggleReaction — используем identityId
-    // ═══════════════════════════════════════════════════════════════
-    const _origToggleReaction = window.toggleReaction;
-
-    window.toggleReaction = async function(msgId, emoji) {
-        if (!state.isAuthorized || !state.chatFile) return;
-        if (!networkState.isOnline) { showToast('📵 Нет подключения', 2000); return; }
-
-        const msg = historyState.allMessages.find(m => m.id === msgId);
-        if (!msg) return;
-        if (!msg.reactions) msg.reactions = {};
-
-        // 🆕 Мой уникальный ID
-        const myId = state.identityId || state.username;
-
-        const list = msg.reactions[emoji] || [];
-
-        // 🆕 Проверяем наличие и по myId, и по старому нику
-        // (миграция: если там лежит ник и он мой — заменяем на identityId)
-        let idx = list.indexOf(myId);
-        if (idx === -1 && state.identityId) {
-            // Может, там лежит мой старый ник?
-            const legacyIdx = list.indexOf(state.username);
-            if (legacyIdx !== -1) {
-                // Мигрируем: заменяем ник на identityId
-                list[legacyIdx] = myId;
-                idx = legacyIdx;
-            }
-        }
-
-        let added;
-        if (idx >= 0) {
-            list.splice(idx, 1);
-            added = false;
-            if (list.length === 0) delete msg.reactions[emoji];
-        } else {
-            list.push(myId);
-            msg.reactions[emoji] = list;
-            added = true;
-        }
-
-        updateReactionsInDOM(msgId);
-        if (added) soundManager.play('click');
-
-        try {
-            await persistReactions(msgId, msg.reactions);
-        } catch (e) {
-            console.error('reaction save error', e);
-            // откат
-            if (added) {
-                const l = msg.reactions[emoji] || [];
-                const i = l.indexOf(myId);
-                if (i >= 0) l.splice(i, 1);
-                if (l.length === 0) delete msg.reactions[emoji];
-            } else {
-                msg.reactions[emoji] = msg.reactions[emoji] || [];
-                msg.reactions[emoji].push(myId);
-            }
-            updateReactionsInDOM(msgId);
-            showToast('❌ Не удалось сохранить реакцию', 2500);
-        }
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    //  10. ПАТЧ deleteMessage — только своё
-    // ═══════════════════════════════════════════════════════════════
-    const _origDeleteMessage = window.deleteMessage;
-
-    window.deleteMessage = async function(messageId) {
-        // Предварительная проверка — до того как оригинал начнёт работу
-        const localMsg = historyState.allMessages.find(m => m.id === messageId);
-        if (localMsg && !isMineIdentity(localMsg)) {
-            showToast('❌ Только свои сообщения', 1500);
-            return;
-        }
-        return _origDeleteMessage.apply(this, arguments);
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    //  11. ПАТЧ deleteComment — только своё
-    // ═══════════════════════════════════════════════════════════════
-    const _origDeleteComment = window.deleteComment;
-
-    window.deleteComment = async function(msgId, commentId) {
-        const msg = historyState.allMessages.find(m => m.id === msgId);
-        if (!msg || !msg.comments) return;
-        const comment = msg.comments.find(c => c.id === commentId);
-        if (!comment) return;
-
-        if (!isMineIdentity(comment)) {
-            showToast('❌ Только свои комментарии', 1500);
-            return;
-        }
-        return _origDeleteComment.apply(this, arguments);
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    //  12. ПАТЧ submitComment — вшиваем identityId в комментарий
-    // ═══════════════════════════════════════════════════════════════
-    const _origSubmitComment = window.submitComment;
-
-    window.submitComment = async function(msgId, text) {
-        // Перед вызовом оригинала подменим id генерации
-        // Проще: перехватим момент добавления комментария через хук на persistComments.
-        // Но проще всего — обернуть весь вызов и после него «дописать» identityId
-        // в последний комментарий. Однако это хрупко.
-        //
-        // Правильный способ — патчить саму логику. Но у нас submitComment сам
-        // создаёт объект. Переопределим его полностью:
-        if (!text || !text.trim()) return;
-        if (!state.isAuthorized || !state.chatFile) return;
-        if (!networkState.isOnline) { showToast('📵 Нет подключения', 2000); return; }
-
-        const msg = historyState.allMessages.find(m => m.id === msgId);
-        if (!msg) { showToast('❌ Сообщение не найдено', 1500); return; }
-
-        const newComment = {
-            id: Date.now(),
-            username: state.username,
-            identityId: state.identityId || undefined,   // 🆕
-            text: text.trim().slice(0, 2000),
-            time: new Date().toISOString(),
-        };
-
-        if (!msg.comments) msg.comments = [];
-        msg.comments.push(newComment);
-        updateCommentsInDOM(msgId);
-
-        try {
-            await persistComments(msgId, msg.comments);
-            soundManager.play('send');
-            showToast('💬 Комментарий добавлен', 1200);
-        } catch (e) {
-            console.error('comment save error', e);
-            msg.comments = msg.comments.filter(c => c.id !== newComment.id);
-            updateCommentsInDOM(msgId);
-            showToast('❌ Не удалось сохранить: ' + e.message, 2500);
-        }
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    //  13. ПАТЧ confirmEditMessage — только своё
-    // ═══════════════════════════════════════════════════════════════
-    const _origConfirmEditMessage = window.confirmEditMessage;
-
-    window.confirmEditMessage = async function() {
-        const msgId = window._editingMessageId;
-        if (msgId) {
-            const msg = historyState.allMessages.find(m => m.id === msgId);
-            if (msg && !isMineIdentity(msg)) {
-                showToast('❌ Только свои сообщения', 1500);
-                if (typeof closeEditMessageModal === 'function') closeEditMessageModal();
-                return;
-            }
-        }
-        return _origConfirmEditMessage.apply(this, arguments);
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    //  14. ПАТЧ openEditMessageModal — проверка на своё
-    // ═══════════════════════════════════════════════════════════════
-    const _origOpenEditMessageModal = window.openEditMessageModal;
-
-    window.openEditMessageModal = function(msgId) {
-        const msg = historyState.allMessages.find(m => m.id === msgId);
-        if (!msg) { showToast('❌ Сообщение не найдено', 1500); return; }
-        if (!isMineIdentity(msg)) {
-            showToast('❌ Только свои сообщения', 1500);
-            return;
-        }
-        return _origOpenEditMessageModal.apply(this, arguments);
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    //  15. ПАТЧ selectAllOwn — только свои
-    // ═══════════════════════════════════════════════════════════════
-    const _origSelectAllOwn = window.selectAllOwn;
-
-    window.selectAllOwn = function() {
-        // Работает через DOM, поэтому перезапишем полностью.
-        if (!window.historyState) return;
-        if (!messagesInner) return;
-
-        const ownMessages = historyState.allMessages.filter(m => isMineIdentity(m));
-
-        if (selectedIds.size === ownMessages.length && ownMessages.length > 0) {
-            selectedIds.clear();
-            document.querySelectorAll('.message-wrapper.selected').forEach(el => el.classList.remove('selected'));
-            updateSelectionUI();
-            if (navigator.vibrate) navigator.vibrate(10);
-            return;
-        }
-
-        selectedIds.clear();
-        document.querySelectorAll('.message-wrapper.selected').forEach(el => el.classList.remove('selected'));
-
-        // Теперь идём по DOM и для каждой обёртки проверяем сообщение
-        document.querySelectorAll('.message-wrapper[data-msg-id]').forEach(el => {
-            const id = parseInt(el.dataset.msgId);
-            if (isNaN(id)) return;
-            const msg = historyState.allMessages.find(m => m.id === id);
-            if (!msg) return;
-            if (isMineIdentity(msg)) {
-                selectedIds.add(id);
-                el.classList.add('selected');
-            }
-        });
-
-        updateSelectionUI();
-        if (navigator.vibrate) navigator.vibrate(15);
-        showToast(`☑ Выбрано: ${selectedIds.size}`, 1200);
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    //  16. ПАТЧ performBatchDelete — свои по identityId
-    //  Полностью копируем оригинал, но меняем проверку.
-    //  Т.к. функция длинная — патчим только ключевой фильтр:
-    //  пересобираем удаление только для «своих» сообщений.
-    // ═══════════════════════════════════════════════════════════════
-    const _origPerformBatchDelete = window.performBatchDelete;
-
-    window.performBatchDelete = async function(messageIds) {
-        // Фильтруем ids: оставляем только те, что принадлежат нам
-        const safeIds = [];
-        for (const id of messageIds) {
-            const msg = historyState.allMessages.find(m => m.id === id);
-            if (msg && isMineIdentity(msg)) {
-                safeIds.push(id);
-            }
-        }
-        if (safeIds.length === 0) {
-            showToast('❌ Нет своих сообщений среди выбранных', 2000);
-            return;
-        }
-        return _origPerformBatchDelete.call(this, safeIds);
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    //  17. ПАТЧ renderUserAvatarHtml — привязка к identityId
-    // ═══════════════════════════════════════════════════════════════
-    const _origRenderUserAvatarHtml = window.renderUserAvatarHtml;
-
-    window.renderUserAvatarHtml = function(username, sizeClass = 'sender-avatar', identityId = null) {
-        const safeName = escapeHtml(username || '?');
-        const letter = (username || '?').charAt(0).toUpperCase();
-
-        // 🆕 Ключ — identityId, если есть. Иначе fallback на ник.
-        const avatarKey = identityId || username || '?';
-
-        // 🆕 Универсальный рендер через общий кэш
-        const dataUrl = (typeof UserAvatars !== 'undefined' && UserAvatars.get)
-            ? UserAvatars.get(avatarKey)
-            : null;
-
-        const cls = `user-avatar ${sizeClass}` + (dataUrl ? ' has-custom' : '');
-        const inner = dataUrl
-            ? `<img src="${dataUrl}" alt="" draggable="false">`
-            : letter;
-
-        return `<span class="${cls}" data-user="${safeName}" data-identity="${escapeHtml(avatarKey)}">${inner}</span>`;
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    //  18. ПАТЧ refreshAllUserAvatars — поддержка ключей-identityId
-    // ═══════════════════════════════════════════════════════════════
-    window.refreshAllUserAvatars = function(key) {
-        if (!key) return;
-        const safeKey = CSS.escape(key);
-        const dataUrl = (typeof UserAvatars !== 'undefined' && UserAvatars.get)
-            ? UserAvatars.get(key)
-            : null;
-
-        document.querySelectorAll(`.user-avatar[data-identity="${safeKey}"]`).forEach(el => {
-            const username = el.dataset.user || '?';
-            const letter = username.charAt(0).toUpperCase();
-            if (dataUrl) {
-                el.innerHTML = `<img src="${dataUrl}" alt="" draggable="false">`;
-                el.classList.add('has-custom');
-            } else {
-                el.textContent = letter;
-                el.classList.remove('has-custom');
-            }
-        });
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    //  19. ПАТЧ обработчика клика по кружку — берём data-identity
-    // ═══════════════════════════════════════════════════════════════
-    // Существующий обработчик клика по .sender-avatar уже добавлен в код,
-    // но он берёт avatar.dataset.user. Мы добавляем свой в capture-фазе
-    // и глушим старый.
-    if (typeof messagesInner !== 'undefined' && messagesInner) {
-        messagesInner.addEventListener('click', (e) => {
-            const avatar = e.target.closest('.sender-avatar, .comment-avatar.user-avatar');
-            if (!avatar) return;
-            if (typeof selectionMode !== 'undefined' && selectionMode) return;
-
-            e.stopPropagation();
-            e.stopImmediatePropagation();
-            e.preventDefault();
-
-            // 🆕 Ключ — identityId, fallback на ник
-            const avatarKey = avatar.dataset.identity || avatar.dataset.user;
-            if (!avatarKey) return;
-
-            if (typeof pickUserAvatar === 'function') pickUserAvatar(avatarKey);
-            if (navigator.vibrate) navigator.vibrate(12);
-        }, true); // capture
-
-        // Долгое нажатие (удаление) — тоже по data-identity
-        let _lpTimer = null;
-        let _lpKey = null;
-        let _lpFired = false;
-
-        messagesInner.addEventListener('touchstart', (e) => {
-            const avatar = e.target.closest('.sender-avatar, .comment-avatar.user-avatar');
-            if (!avatar) return;
-            if (typeof selectionMode !== 'undefined' && selectionMode) return;
-
-            _lpKey = avatar.dataset.identity || avatar.dataset.user;
-            _lpFired = false;
-
-            _lpTimer = setTimeout(() => {
-                if (!_lpKey) return;
-                _lpFired = true;
-                if (navigator.vibrate) navigator.vibrate(30);
-                const hasAvatar = (typeof UserAvatars !== 'undefined' && UserAvatars.has)
-                    ? UserAvatars.has(_lpKey)
-                    : false;
-                if (!hasAvatar) {
-                    showToast('ℹ️ Аватарки нет', 1200);
-                    return;
-                }
-                if (confirm('Удалить аватарку?')) {
-                    UserAvatars.remove(_lpKey);
-                    window.refreshAllUserAvatars(_lpKey);
-                    showToast('🗑️ Аватарка удалена', 1200);
-                    soundManager.play('delete');
-                }
-            }, 600);
-        }, { passive: true, capture: true });
-
-        messagesInner.addEventListener('touchend', (e) => {
-            if (_lpTimer) { clearTimeout(_lpTimer); _lpTimer = null; }
-            if (_lpFired) {
-                e.stopImmediatePropagation();
-                e.preventDefault();
-                _lpFired = false;
-            }
-            _lpKey = null;
-        }, { capture: true });
-
-        messagesInner.addEventListener('touchcancel', () => {
-            if (_lpTimer) { clearTimeout(_lpTimer); _lpTimer = null; }
-            _lpFired = false;
-            _lpKey = null;
-        }, { capture: true });
-    }
-
-    // ═══════════════════════════════════════════════════════════════
-    //  20. ПАТЧ renderChatsList — превью-аватарки не трогаем
-    //  (аватарки чатов — отдельная система, к личностям не относятся)
-    // ═══════════════════════════════════════════════════════════════
-
-    // ═══════════════════════════════════════════════════════════════
-    //  21. ПАТЧ restoreSession — восстанавливаем identityId
-    // ═══════════════════════════════════════════════════════════════
-    const _origRestoreSession = window.restoreSession;
-
-    window.restoreSession = async function() {
-        // До вызова оригинала — вытащим сохранённый identityId
-        const savedId = UserIdentity.get();
-        if (savedId) state.identityId = savedId;
-
-        return _origRestoreSession.apply(this, arguments);
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    //  22. ПАТЧ выхода/очистки — сброс identityId
-    // ═══════════════════════════════════════════════════════════════
-    // — logout НЕ сбрасывает identityId (это часть профиля, а не сессии)
-    // — «Очистить данные» — сбрасывает, если пользователь выбрал удалить всё
-
-    if (typeof clearDataBtn !== 'undefined' && clearDataBtn) {
-        clearDataBtn.addEventListener('click', () => {
-            setTimeout(() => {
-                const noUser = !localStorage.getItem('chathub_username');
-                const noChats = !localStorage.getItem('chathub_chats');
-                if (noUser && noChats) {
-                    UserIdentity.reset();
-                    state.identityId = null;
-                }
-            }, 120);
-        });
-    }
-
-    // ═══════════════════════════════════════════════════════════════
-    //  23. ПАТЧ поиска — превью сообщений
-    //  (identityId не нужен в превью, ничего не меняем)
-    // ═══════════════════════════════════════════════════════════════
-
-    // ═══════════════════════════════════════════════════════════════
-    //  24. ПАТЧ экспорта — включаем identityId в профиль
-    // ═══════════════════════════════════════════════════════════════
-    const _origBuildProfileObject = window.buildProfileObject;
-
-    window.buildProfileObject = function(opts) {
-        const profile = _origBuildProfileObject.call(this, opts);
-        const id = UserIdentity.get();
-        if (id) {
-            profile.identityId = id;
-            profile._meta = profile._meta || {};
-            profile._meta.includesIdentityId = true;
-        }
-        return profile;
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    //  25. ПАТЧ импорта — восстанавливаем identityId, если в файле был
-    // ═══════════════════════════════════════════════════════════════
-    const _origApplyImport = window.applyImport;
-
-    window.applyImport = function() {
-        const profile = (typeof _pendingImportProfile !== 'undefined')
-            ? _pendingImportProfile : null;
-
-        _origApplyImport.apply(this, arguments);
-
-        // 🆕 Если в импортированном профиле есть identityId и у нас его нет
-        // — это НЕ значит, что мы должны взять чужой. Восстанавливаем только
-        // если он сохранён в самом файле как «текущая личность экспортёра».
-        // По логике: identityId в экспорте — это личность того, кто экспортировал.
-        // Если импортирует тот же человек — норм. Если другой — нельзя навязывать.
-        //
-        // Оставляем как есть: восстанавливаем только когда экспорт включал
-        // username == текущий username.
-        if (profile && profile.identityId) {
-            const currentUsername = state.username || '';
-            const fileUsername = profile.username || '';
-            if (currentUsername && fileUsername && currentUsername === fileUsername) {
-                state.identityId = profile.identityId;
-                UserIdentity.set(profile.identityId, currentUsername);
-                console.log('🆔 identityId восстановлен из импорта:', profile.identityId);
-            }
-        }
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    //  26. UI: показываем короткий тег личности
-    // ═══════════════════════════════════════════════════════════════
-    (function showIdentityTag() {
-        // Добавляем тег к метке пользователя на экране чатов
-        const label = document.getElementById('chatsUserLabel');
-        if (!label) return;
-
-        function update() {
-            const id = UserIdentity.get();
-            if (!id) {
-                label.textContent = state.username || '';
-                return;
-            }
-            const tag = '#' + id.slice(-4);
-            label.textContent = `${state.username} · ${tag}`;
-        }
-
-        // Пересобираем каждый раз, когда меняется экран
-        const _origShowChatsScreen = window.showChatsScreen;
-        if (typeof _origShowChatsScreen === 'function') {
-            window.showChatsScreen = function() {
-                const r = _origShowChatsScreen.apply(this, arguments);
-                update();
-                return r;
-            };
-        }
-
-        // И при логине
-        const _origShowChatsScreen2 = window.showChatsScreen;
-        if (typeof showChatsScreen === 'function') {
-            const _s = showChatsScreen;
-            window.showChatsScreen = function() {
-                _s.apply(this, arguments);
-                update();
-            };
-        }
-
-        update();
-    })();
-
-    // ═══════════════════════════════════════════════════════════════
-    //  27. ДИАГНОСТИКА — при входе логируем
-    // ═══════════════════════════════════════════════════════════════
-    console.log('🆔 Патч личности (identityId) установлен');
-    console.log('   • identityId = SHA-256(ник + ":" + пароль аватара)');
-    console.log('   • Два Васи с разными паролями → разные личности');
-    console.log('   • Реакции, комментарии, удаление, аватарки — всё по identityId');
-    console.log('   • Старые сообщения (без identityId) — fallback на ник');
-
-})();
 </script>
 </body>
 </html>
