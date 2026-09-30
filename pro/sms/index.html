@@ -18553,6 +18553,223 @@ showMessageMenu = function(x, y, msgId, isOwn) {
     }
 })();
 
+
+// ═══════════════════════════════════════════════════════════════
+//  🎯 МГНОВЕННЫЙ ПРЫЖОК К ТРЕКУ ИЗ ДРУГОГО ЧАТА
+//  Как работает:
+//   1. При переходе в другой чат — сохраняем «цель» (msgId).
+//   2. renderHistory при следующем вызове видит цель.
+//   3. Рендерит историю, начиная с (targetMsgId - 20), а не только последние 5.
+//   4. Скроллит к цели и подсвечивает.
+//  Работает мгновенно — никаких циклов подгрузки.
+// ═══════════════════════════════════════════════════════════════
+
+(function installInstantJumpToTrack() {
+    // Глобальный флаг: «после рендера нужно прыгнуть к этому сообщению»
+    window._pendingJumpToMsgId = null;
+
+    // ═══════════════════════════════════════════════════════════════
+    //  ПАТЧ renderHistory
+    //  Если установлен _pendingJumpToMsgId — рендерим историю так,
+    //  чтобы цель точно была в DOM, и сразу скроллим к ней.
+    // ═══════════════════════════════════════════════════════════════
+    const _origRenderHistory = renderHistory;
+
+    renderHistory = function() {
+        const jumpTarget = window._pendingJumpToMsgId;
+
+        // Если нет цели — обычная логика
+        if (!jumpTarget) {
+            return _origRenderHistory.apply(this, arguments);
+        }
+
+        // ═══ Есть цель — рендерим расширенный кусок истории ═══
+        const all = historyState.allMessages;
+        const total = all.length;
+
+        if (total === 0) {
+            window._pendingJumpToMsgId = null;
+            return _origRenderHistory.apply(this, arguments);
+        }
+
+        // Находим индекс целевого сообщения
+        const targetIdx = all.findIndex(m => String(m.id) === String(jumpTarget));
+
+        if (targetIdx === -1) {
+            // Цели нет в истории — сбрасываем и делаем обычный рендер
+            window._pendingJumpToMsgId = null;
+            return _origRenderHistory.apply(this, arguments);
+        }
+
+        // 🆕 Рендерим от (targetIdx - CONTEXT_BEFORE) до конца
+        // CONTEXT_BEFORE = 10 сообщений до цели + все после
+        const CONTEXT_BEFORE = 10;
+        const start = Math.max(0, targetIdx - CONTEXT_BEFORE);
+        const end = total;   // до конца (обычно именно там последние сообщения)
+
+        // Сбрасываем флаг СРАЗУ — чтобы повторные renderHistory не ушли в цикл
+        window._pendingJumpToMsgId = null;
+
+        // Сохраняем состояние в historyState
+        historyState.startIndex = start;
+        historyState.renderedCount = end - start;
+
+        // Сбрасываем старые audioPlayers
+        Object.keys(audioPlayers).forEach(id => {
+            try { audioPlayers[id].audio.pause(); } catch (e) {}
+            delete audioPlayers[id];
+        });
+
+        // Очищаем контейнер
+        let html = '';
+
+        // Sentinel сверху, если есть что грузить
+        if (start > 0) {
+            html += `<div class="history-sentinel" id="historySentinel">↑ Потяните вверх, чтобы загрузить ещё</div>`;
+        }
+
+        // Рендерим сообщения
+        let lastDate = '';
+        const lastReadId = state.chatFile ? getLastReadId(state.chatFile) : null;
+        let firstUnreadIdx = -1;
+
+        // Находим первое непрочитанное (для подсветки новых)
+        if (!state._chatEntered) {
+            for (let i = start; i < end; i++) {
+                const m = all[i];
+                if (m.username === state.username) continue;
+                if (!lastReadId || m.id > lastReadId) {
+                    firstUnreadIdx = i;
+                    break;
+                }
+            }
+        }
+
+        for (let i = start; i < end; i++) {
+            const msg = all[i];
+            if (i === firstUnreadIdx && i > start) {
+                html += `<div class="unread-divider">Новые сообщения</div>`;
+            }
+            const msgDate = formatDate(msg.time);
+            if (msgDate !== lastDate) {
+                html += `<div class="message system">${msgDate}</div>`;
+                lastDate = msgDate;
+            }
+            const isUnread = firstUnreadIdx >= 0 && i >= firstUnreadIdx
+                && msg.username !== state.username;
+            html += buildMessageHTML(msg, { isUnread });
+        }
+
+        // Применяем
+        messagesInner.innerHTML = html;
+        messagesInner.dataset.lastDate = lastDate;
+
+        // Подгружаем вложения
+        loadAttachmentsIn(messagesInner);
+
+        // ═══ Скролл к цели ═══
+        requestAnimationFrame(() => {
+            // Сначала на всякий случай прокрутим вниз — чтобы DOM успел отрисоваться
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+
+            // Затем — точно на цель
+            setTimeout(() => {
+                const el = messagesInner.querySelector(
+                    `.message-wrapper[data-msg-id="${jumpTarget}"]`
+                );
+                if (el) {
+                    // Плавный скролл к цели
+                    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+                    // Подсветка
+                    setTimeout(() => {
+                        el.classList.remove('highlight-flash');
+                        void el.offsetWidth;
+                        el.classList.add('highlight-flash');
+                        setTimeout(() => el.classList.remove('highlight-flash'), 1400);
+                    }, 300);
+
+                    if (navigator.vibrate) navigator.vibrate(20);
+                } else {
+                    // Не нашли — не должно случиться, но на всякий случай
+                    showToast('⚠️ Не удалось найти трек в истории', 2000);
+                }
+            }, 250);
+        });
+    };
+
+
+    // ═══════════════════════════════════════════════════════════════
+    //  ПАТЧ jumpToPlayingTrack
+    //  Вместо ожидания с подгрузкой — просто ставим флаг и переходим в чат.
+    //  renderHistory увидит флаг и отрисует нужный кусок.
+    // ═══════════════════════════════════════════════════════════════
+    const _origJumpToPlayingTrack = window.jumpToPlayingTrack;
+
+    window.jumpToPlayingTrack = async function() {
+        if (typeof GlobalPlayer === 'undefined') return;
+
+        const targetChat = GlobalPlayer.currentChatFile;
+        const targetMsgId = GlobalPlayer.currentMsgId;
+
+        if (!targetChat || !targetMsgId) {
+            showToast('ℹ️ Нет играющего трека', 1500);
+            return;
+        }
+
+        // ═══ Если мы УЖЕ в этом чате ═══
+        if (state.chatFile === targetChat) {
+            // Обычная логика: сообщение уже в DOM или его можно найти
+            const el = messagesInner.querySelector(
+                `.message-wrapper[data-msg-id="${targetMsgId}"]`
+            );
+            if (el) {
+                // Проскроллить и подсветить
+                el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                el.classList.remove('highlight-flash');
+                void el.offsetWidth;
+                el.classList.add('highlight-flash');
+                setTimeout(() => el.classList.remove('highlight-flash'), 1300);
+                if (navigator.vibrate) navigator.vibrate(20);
+                return;
+            }
+
+            // Сообщения нет в DOM — используем флаг + renderHistory
+            window._pendingJumpToMsgId = targetMsgId;
+            renderHistory();
+            return;
+        }
+
+        // ═══ Мы в ДРУГОМ чате — переходим ═══
+        const chat = state.chats.find(c => c.file === targetChat);
+        if (!chat) {
+            showToast('❌ Чат-источник не найден в списке', 2500);
+            return;
+        }
+        const password = state.savedPasswords[targetChat];
+        if (!password) {
+            showToast('🔐 Нужен пароль чата для перехода', 2500);
+            return;
+        }
+
+        // 🆕 Устанавливаем флаг ДО перехода — чтобы renderHistory при
+        //    enterChat сработала сразу с нужным диапазоном
+        window._pendingJumpToMsgId = targetMsgId;
+
+        showToast(`🎵 Переход в «${chat.name || targetChat}»…`, 1500);
+
+        try {
+            await enterChat(targetChat, chat.name || targetChat, password);
+        } catch (e) {
+            console.error('jumpToPlayingTrack enterChat error:', e);
+            window._pendingJumpToMsgId = null;
+            showToast('❌ Не удалось открыть чат: ' + e.message, 2500);
+        }
+    };
+
+    console.log('🎯 Мгновенный прыжок к треку из другого чата активен');
+})();
+
 </script>
 </body>
 </html>
