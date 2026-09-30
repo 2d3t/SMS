@@ -17332,6 +17332,324 @@ console.log('   • Merge или Replace — по тому же принципу
     console.log('🌊 Надёжная синхронизация волн установлена');
 })();
 
+
+// ═══════════════════════════════════════════════════════════════
+//  🎨 УЛУЧШЕНИЕ РЕЖИМА ВЫДЕЛЕНИЯ СООБЩЕНИЙ
+//  1) Яркая рамка и подсветка у выделенных
+//  2) Запрет выделения текста в режиме выбора
+//  3) Принудительное снятие выделения при входе в режим
+// ═══════════════════════════════════════════════════════════════
+
+(function improveSelectionVisuals() {
+    if (document.getElementById('selectionVisualsStyles')) return;
+    const style = document.createElement('style');
+    style.id = 'selectionVisualsStyles';
+    style.textContent = `
+        /* ═══ Запрет выделения текста в режиме выбора ═══ */
+        body.selection-mode,
+        body.selection-mode * {
+            -webkit-user-select: none !important;
+            -moz-user-select: none !important;
+            -ms-user-select: none !important;
+            user-select: none !important;
+            -webkit-touch-callout: none !important;
+            -webkit-tap-highlight-color: transparent !important;
+        }
+
+        /* ═══ Выделенное сообщение — ярко ═══ */
+        body.selection-mode .message-wrapper[data-msg-id].selected .message {
+            box-shadow:
+                0 0 0 3px #a78bfa,
+                0 0 0 6px rgba(108,92,231,0.3),
+                0 8px 28px rgba(108,92,231,0.35) !important;
+            transform: scale(1.01);
+            transition: box-shadow 0.15s ease, transform 0.15s ease;
+        }
+
+        /* 🆕 Для own-сообщений — рамка более контрастная */
+        body.selection-mode .message-wrapper.own[data-msg-id].selected .message {
+            box-shadow:
+                0 0 0 3px #feca57,
+                0 0 0 6px rgba(254,202,87,0.3),
+                0 8px 28px rgba(254,202,87,0.3) !important;
+        }
+
+        /* 🆕 Синяя сетка-галочка становится ярче и больше */
+        body.selection-mode .message-wrapper[data-msg-id]::before {
+            width: 26px !important;
+            height: 26px !important;
+            border-width: 2px !important;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+        }
+        body.selection-mode .message-wrapper.own[data-msg-id]::before {
+            left: auto !important;
+            right: -30px !important;
+        }
+        body.selection-mode .message-wrapper.other[data-msg-id]::before {
+            left: -30px !important;
+        }
+
+        /* ═══ Не выделенные сообщения — приглушаем ═══ */
+        body.selection-mode .message-wrapper[data-msg-id]:not(.selected) {
+            opacity: 0.5;
+        }
+        body.selection-mode .message-wrapper[data-msg-id]:not(.selected) .message {
+            filter: grayscale(0.3);
+        }
+
+        /* 🆕 Выделенное — наоборот, чёткое и «приподнятое» */
+        body.selection-mode .message-wrapper[data-msg-id].selected {
+            opacity: 1 !important;
+            z-index: 2;
+        }
+        body.selection-mode .message-wrapper[data-msg-id].selected .message {
+            filter: none !important;
+        }
+
+        /* 🆕 У системных сообщений (день/ночь) — не приглушаем и не даём кликать */
+        body.selection-mode .message.system {
+            opacity: 0.4 !important;
+        }
+    `;
+    document.head.appendChild(style);
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🆕 СНЯТИЕ ВЫДЕЛЕНИЯ ТЕКСТА ПРИ ВХОДЕ В РЕЖИМ ВЫБОРА
+//  Когда мы делаем долгое нажатие — браузер может начать выделять
+//  текст ещё до того, как мы тапнем по пункту меню. К моменту
+//  клика на «Выбрать несколько» выделение уже случилось.
+//  Здесь — принудительно его снимаем.
+// ═══════════════════════════════════════════════════════════════
+
+(function patchEnterSelectionForTextClear() {
+    const _prevEnterSelection = enterSelectionMode;
+    enterSelectionMode = function(initialMsgId) {
+        // Снимаем любое активное выделение текста ДО входа
+        try {
+            const sel = window.getSelection();
+            if (sel && sel.rangeCount > 0) {
+                sel.removeAllRanges();
+            }
+        } catch (e) { /* ignore */ }
+
+        // Вызываем оригинал
+        const result = _prevEnterSelection.call(this, initialMsgId);
+
+        // И ещё раз — через небольшой таймаут, чтобы поймать случай,
+        // когда выделение появляется чуть позже (после touchend)
+        setTimeout(() => {
+            try {
+                const sel = window.getSelection();
+                if (sel && sel.rangeCount > 0) {
+                    sel.removeAllRanges();
+                }
+            } catch (e) { /* ignore */ }
+        }, 50);
+
+        setTimeout(() => {
+            try {
+                const sel = window.getSelection();
+                if (sel && sel.rangeCount > 0) {
+                    sel.removeAllRanges();
+                }
+            } catch (e) { /* ignore */ }
+        }, 200);
+
+        return result;
+    };
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🆕 СНЯТИЕ ВЫДЕЛЕНИЯ ПРИ ВЫХОДЕ ИЗ РЕЖИМА ВЫБОРА
+// ═══════════════════════════════════════════════════════════════
+
+(function patchExitSelectionForTextClear() {
+    const _prevExitSelection = exitSelectionMode;
+    exitSelectionMode = function() {
+        try {
+            const sel = window.getSelection();
+            if (sel && sel.rangeCount > 0) {
+                sel.removeAllRanges();
+            }
+        } catch (e) { /* ignore */ }
+
+        return _prevExitSelection.apply(this, arguments);
+    };
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🆕 ГЛОБАЛЬНЫЙ ПЕРЕХВАТ ВЫДЕЛЕНИЯ В РЕЖИМЕ ВЫБОРА
+//  На некоторых браузерах (особенно Android WebView) выделение
+//  может проскакивать в обход CSS user-select. Ловим на selectionchange
+//  и мгновенно снимаем.
+// ═══════════════════════════════════════════════════════════════
+
+(function preventSelectionInSelectionMode() {
+    document.addEventListener('selectionchange', () => {
+        if (!selectionMode) return;
+        try {
+            const sel = window.getSelection();
+            if (sel && sel.rangeCount > 0 && sel.toString().length > 0) {
+                sel.removeAllRanges();
+            }
+        } catch (e) { /* ignore */ }
+    }, { passive: true });
+})();
+
+
+console.log('🎨 Улучшен режим выделения:');
+console.log('   • Яркая рамка у выделенных (фиолетовая — чужие, жёлтая — свои)');
+console.log('   • Невыделенные приглушаются');
+console.log('   • Текст больше не выделяется в режиме выбора');
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🎯 УМНОЕ ПОЗИЦИОНИРОВАНИЕ МЕНЮ + ЗАЩИТА ОТ СЛУЧАЙНОГО ТАПА
+//  1) Меню сдвигается в сторону от точки нажатия
+//  2) Между появлением и кликом — 250 мс защиты
+//  3) Палец, который ещё висит, не сможет активировать кнопку
+// ═══════════════════════════════════════════════════════════════
+
+const _origShowMessageMenuForPositioning = showMessageMenu;
+showMessageMenu = function(x, y, msgId, isOwn) {
+    closeMessageMenu();
+
+    const menu = document.createElement('div');
+    menu.className = 'edit-menu';
+
+    let itemsHtml = '';
+
+    if (isOwn) {
+        itemsHtml += `
+            <div class="edit-menu-item" data-action="select">
+                <span class="emi-icon">☑️</span>
+                <span>Выбрать несколько</span>
+            </div>
+            <div class="edit-menu-item" data-action="edit">
+                <span class="emi-icon">✏️</span>
+                <span>Редактировать</span>
+            </div>
+        `;
+    }
+
+    itemsHtml += `
+        <div class="edit-menu-item" data-action="reply">
+            <span class="emi-icon">↩</span>
+            <span>Ответить</span>
+        </div>
+        <div class="edit-menu-item" data-action="copy">
+            <span class="emi-icon">📋</span>
+            <span>Копировать текст</span>
+        </div>
+    `;
+
+    if (isOwn) {
+        itemsHtml += `
+            <div class="edit-menu-item danger" data-action="delete">
+                <span class="emi-icon">🗑️</span>
+                <span>Удалить</span>
+            </div>
+        `;
+    }
+
+    menu.innerHTML = itemsHtml;
+
+    // ═══ 🆕 Временно отключаем взаимодействие с меню ═══
+    // Пока палец ещё висит на экране — не даём ни кликнуть,
+    // ни выделить кнопку. Через 250 мс включим.
+    menu.style.pointerEvents = 'none';
+    menu.style.userSelect = 'none';
+    menu.style.webkitUserSelect = 'none';
+
+    document.body.appendChild(menu);
+
+    // ═══ 🆕 Умное позиционирование ═══
+    const menuRect = menu.getBoundingClientRect();
+    const menuW = menuRect.width;
+    const menuH = menuRect.height;
+
+    const margin = 12;             // минимальный отступ от краёв экрана
+    const offsetFromFinger = 28;   // насколько меню отодвигаем от точки касания
+    const verticalGap = 44;        // насколько поднимаем над пальцем
+
+    const screenW = window.innerWidth;
+    const screenH = window.innerHeight;
+
+    // ─── Горизонтальное позиционирование ───
+    // Если палец в левой половине экрана → меню вправо
+    // Если в правой → меню влево
+    // Так палец не будет нависать над пунктами меню.
+    let left;
+    const isLeftHalf = x < screenW / 2;
+
+    if (isLeftHalf) {
+        // Ставим меню правее пальца
+        left = x + offsetFromFinger;
+    } else {
+        // Ставим меню левее пальца
+        left = x - menuW - offsetFromFinger;
+    }
+
+    // Если всё равно вылезает за экран — корректируем
+    if (left < margin) left = margin;
+    if (left + menuW > screenW - margin) left = screenW - menuW - margin;
+
+    // ─── Вертикальное позиционирование ───
+    // Пытаемся поставить выше пальца, но с запасом.
+    let top = y - menuH - verticalGap;
+
+    // Если не влезает сверху — ставим ниже пальца
+    if (top < margin) {
+        top = y + verticalGap;
+    }
+
+    // Если и снизу не влезает — центруем по вертикали
+    if (top + menuH > screenH - margin) {
+        top = Math.max(margin, Math.min(
+            screenH - menuH - margin,
+            y - menuH / 2
+        ));
+    }
+
+    menu.style.left = left + 'px';
+    menu.style.top = top + 'px';
+
+    // ═══ Обработчики на пункты ═══
+    menu.querySelectorAll('.edit-menu-item').forEach(el => {
+        el.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const action = el.dataset.action;
+            if (typeof closeMessageMenu === 'function') closeMessageMenu();
+
+            if (action === 'select') {
+                enterSelectionMode(msgId);
+            } else if (typeof handleMessageAction === 'function') {
+                handleMessageAction(action, msgId);
+            }
+        });
+    });
+
+    _editMenuEl = menu;
+
+    // ═══ 🆕 Включаем взаимодействие через 250 мс ═══
+    setTimeout(() => {
+        if (_editMenuEl === menu) {
+            menu.style.pointerEvents = 'auto';
+        }
+    }, 250);
+
+    // Закрытие по клику вне
+    setTimeout(() => {
+        document.addEventListener('click', closeMessageMenuOnOutside);
+        document.addEventListener('scroll', closeMessageMenu, true);
+    }, 300);
+
+    if (navigator.vibrate) navigator.vibrate(15);
+};
 </script>
 </body>
 </html>
