@@ -19060,7 +19060,173 @@ showMessageMenu = function(x, y, msgId, isOwn) {
     console.log('   • Разовый автоскролл при входе в чат (без прыжка)');
 })();
 
+// ═══════════════════════════════════════════════════════════════
+//  🔢 ФИКС: счётчик непрочитанных на кнопке «вниз»
+//  Кнопка появляется при новом сообщении и показывает циферку.
+//  Счётчик сбрасывается только когда пользователь реально у низа
+//  или сам нажал «вниз».
+// ═══════════════════════════════════════════════════════════════
 
+(function fixUnreadBadge() {
+
+    // ─── 1. Патчим updateScrollButton — не сбрасываем unreadCount, ───
+    //       если есть непрочитанные. Сбрасываем только если у низа И
+    //       счётчик уже был показан «по делу».
+    const _origUpdateScrollButton = window.updateScrollButton;
+    window.updateScrollButton = function() {
+        const diff = messagesContainer.scrollHeight
+                   - messagesContainer.scrollTop
+                   - messagesContainer.clientHeight;
+
+        const SHOW_THRESHOLD = 100;   // как в нашем патче
+
+        if (diff > SHOW_THRESHOLD) {
+            // Не у низа — показываем кнопку, счётчик НЕ трогаем
+            scrollDownBtn.classList.add('show');
+            updateScrollBadge();
+        } else {
+            // У низа — можно скрыть и обнулить
+            scrollDownBtn.classList.remove('show');
+            scrollState.unreadCount = 0;
+            updateScrollBadge();
+        }
+    };
+
+    // ─── 2. Патчим refreshScrollButton (наш новый) — не обнулять счётчик ───
+    //       Он уже определён внутри IIFE, но мы перезапишем его поведение
+    //       через собственный обработчик на скролл в capture-фазе.
+    //       Проще: перехватываем момент, когда новый скролл-листенер
+    //       вызывается и обнуляет счётчик — не даём ему это сделать.
+    //
+    //       Делаем это так: оборачиваем scrollState.unreadCount в
+    //       defineProperty на объекте scrollState — не даём обнулить,
+    //       если это не «настоящее» обнуление (кнопка «вниз» или прибытие к низу).
+
+    let _realReset = false;   // ставим в true когда ХОТИМ сбросить
+
+    // Экспортируем функцию для явного сброса
+    window.reallyResetUnreadCount = function() {
+        _realReset = true;
+        scrollState.unreadCount = 0;
+        _realReset = false;
+        updateScrollBadge();
+    };
+
+    // Переопределяем scrollState.unreadCount через defineProperty
+    let _rawUnreadCount = 0;
+    try {
+        Object.defineProperty(scrollState, 'unreadCount', {
+            get() {
+                return _rawUnreadCount;
+            },
+            set(v) {
+                // Если кто-то пытается обнулить счётчик, но у нас есть
+                // непрочитанные и пользователь не у низа — блокируем
+                if (v === 0 && _rawUnreadCount > 0 && !_realReset) {
+                    const diff = messagesContainer.scrollHeight
+                               - messagesContainer.scrollTop
+                               - messagesContainer.clientHeight;
+                    // Если мы не у низа — не даём обнулить
+                    if (diff > 100) return;
+                }
+                _rawUnreadCount = v;
+            },
+            configurable: true,
+        });
+    } catch (e) {
+        console.warn('Не удалось переопределить unreadCount:', e);
+    }
+
+    // ─── 3. Явно обнуляем счётчик при: ───
+    //   • Клике по кнопке «вниз»
+    //   • Реальном достижении низа
+    //   • Ручном скролле в самый низ
+
+    // Клик по кнопке «вниз» — уже обрабатывается в нашем патче через
+    // scrollState.unreadCount = 0, но теперь это заблокируется. Ставим
+    // явный сброс:
+    const _btn = document.getElementById('scrollDownBtn');
+    if (_btn) {
+        _btn.addEventListener('click', () => {
+            setTimeout(() => window.reallyResetUnreadCount(), 50);
+        });
+    }
+
+    // При скролле: если пользователь доехал до низа — обнуляем
+    messagesContainer.addEventListener('scroll', () => {
+        const diff = messagesContainer.scrollHeight
+                   - messagesContainer.scrollTop
+                   - messagesContainer.clientHeight;
+        if (diff < 30) {
+            // У низа — можно обнулить
+            _realReset = true;
+            scrollState.unreadCount = 0;
+            _realReset = false;
+            updateScrollBadge();
+        }
+    }, { passive: true });
+
+    // ─── 4. Патчим pollUpdates — при новом сообщении гарантированно ───
+    //       увеличиваем счётчик и показываем кнопку с бейджем.
+    //       Перехватываем сразу после того как пришли сообщения.
+    const _origAppendMessagesForBadge = window.appendMessages;
+    window.appendMessages = function(newMsgs) {
+        const wasAtBottom = isNearBottom();
+        const result = _origAppendMessagesForBadge.apply(this, arguments);
+
+        // Если мы НЕ у низа (или только что перестали быть) — крутим счётчик
+        if (newMsgs && newMsgs.length > 0 && !wasAtBottom) {
+            // Не увеличиваем здесь — pollUpdates уже увеличивает.
+            // Просто гарантируем что кнопка покажется с бейджем.
+            scrollDownBtn.classList.add('show');
+            updateScrollBadge();
+        }
+
+        return result;
+    };
+
+    // ─── 5. Форсим показ кнопки, когда пришло новое сообщение и мы не внизу ───
+    //       Патчим appendMessages внутри pollUpdates — но проще перехватить
+    //       саму функцию pollUpdates и после неё проверить состояние.
+    //
+    //       Альтернатива: MutationObserver на messagesInner — если появились
+    //       новые .message-wrapper и мы не у низа — показать кнопку.
+    const observer = new MutationObserver((mutations) => {
+        // Проверяем: были добавления?
+        let hasAdditions = false;
+        for (const m of mutations) {
+            if (m.type === 'childList' && m.addedNodes.length > 0) {
+                // Пропускаем системные сообщения (дата) — они тоже добавляются
+                for (const node of m.addedNodes) {
+                    if (node.nodeType === 1 && (
+                        node.classList?.contains('message-wrapper') ||
+                        node.querySelector?.('.message-wrapper')
+                    )) {
+                        hasAdditions = true;
+                        break;
+                    }
+                }
+            }
+            if (hasAdditions) break;
+        }
+
+        if (!hasAdditions) return;
+
+        // Не у низа? Показываем кнопку с бейджем
+        const diff = messagesContainer.scrollHeight
+                   - messagesContainer.scrollTop
+                   - messagesContainer.clientHeight;
+
+        if (diff > 100) {
+            scrollDownBtn.classList.add('show');
+            updateScrollBadge();
+        }
+    });
+
+    observer.observe(messagesInner, { childList: true, subtree: false });
+
+    console.log('🔢 Фикс бейджа непрочитанных на кнопке «вниз» установлен');
+})();
 
 </script>
 </body>
