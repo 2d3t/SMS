@@ -1141,6 +1141,17 @@ body.player-active .gallery-actions {
             transition: transform 0.2s ease, opacity 0.2s ease;
             animation: fadeInBtn 0.25s ease;
         }
+/* 🆕 Кнопка «вниз» поднимается, когда плеер активен */
+body.player-active .scroll-down-btn {
+    bottom: 165px;
+}
+
+/* 🆕 И для мобилы тоже */
+@media (max-width: 480px) {
+    body.player-active .scroll-down-btn {
+        bottom: 145px;
+    }
+}
         .scroll-down-btn.show { display: flex; }
         .scroll-down-btn:active { transform: scale(0.88); }
         @keyframes fadeInBtn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
@@ -3082,7 +3093,12 @@ body.player-active .messages-container { padding-bottom: 68px; }
     color: #ff6b6b;
 }
 
-
+/* 🆕 Режим фиксации при поиске — отключаем автоскролл браузера */
+.messages-container.scroll-lock {
+    overflow-anchor: none !important;
+    scroll-behavior: auto !important;
+    overscroll-behavior: contain;
+}
     </style>
 </head>
 <body>
@@ -3473,7 +3489,7 @@ body.player-active .messages-container { padding-bottom: 68px; }
                 align-items: center;
                 justify-content: center;
                 font-size: 24px;
-            ">📷</div>
+            ">📎</div>
             <div style="flex:1;min-width:0;">
                 <div id="shareToChatFileName" style="font-size:13px;font-weight:600;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
                     image.jpg
@@ -9786,11 +9802,35 @@ function openShareToChatModal(blob, fileName, imageUrl, meta = {}) {
     _shareToChat.meta = meta || {};
 
     const thumb = $('shareToChatThumb');
-    if (imageUrl) {
-        thumb.innerHTML = `<img src="${imageUrl}" style="width:100%;height:100%;object-fit:cover;">`;
-    } else {
-        thumb.innerHTML = '📷';
+if (imageUrl) {
+    // Есть preview (фото) — показываем картинку
+    thumb.innerHTML = `<img src="${imageUrl}" style="width:100%;height:100%;object-fit:cover;">`;
+} else {
+    // 🆕 Определяем иконку по типу файла
+    const name = (_shareToChat.fileName || fileName || '').toLowerCase();
+    const mime = (_shareToChat.mime || blob.type || '').toLowerCase();
+    let icon = '📎';   // дефолт — файл
+
+    if (mime.startsWith('audio/') || /\.(mp3|ogg|wav|m4a|aac|flac|opus|webm)$/i.test(name)) {
+        icon = '🎵';   // аудио
+    } else if (mime.startsWith('video/') || /\.(mp4|mov|avi|mkv|webm|m4v|3gp)$/i.test(name)) {
+        icon = '🎬';   // видео
+    } else if (mime.startsWith('image/') || /\.(jpg|jpeg|png|gif|webp|bmp|avif)$/i.test(name)) {
+        icon = '🖼️';   // картинка без preview
+    } else if (/\.(zip|rar|7z|tar|gz)$/i.test(name)) {
+        icon = '🗜️';   // архив
+    } else if (/\.(pdf)$/i.test(name)) {
+        icon = '📕';   // pdf
+    } else if (/\.(doc|docx)$/i.test(name)) {
+        icon = '📘';   // word
+    } else if (/\.(xls|xlsx)$/i.test(name)) {
+        icon = '📊';   // excel
+    } else if (/\.smschat$/i.test(name)) {
+        icon = '💌';   // приглашение в чат
     }
+
+    thumb.innerHTML = icon;
+}
     $('shareToChatFileName').textContent = _shareToChat.fileName;
     $('shareToChatFileSize').textContent = formatFileSize(blob.size);
 
@@ -11747,7 +11787,223 @@ function buildCommentsHTML(msg) {
     return `<div class="comments-block" data-comments-for="${msg.id}">${items}</div>`;
 }
 
+// ═══════════════════════════════════════════════════════════════
+//  🔒 ФИКСАЦИЯ СКРОЛЛА ПРИ ПОИСКЕ (эмуляция «касания»)
+//  Когда пользователь нашёл сообщение и оно подсвечивается зелёным,
+//  любые попытки браузера сдвинуть скролл (из-за асинхронной загрузки
+//  вложений, изменения высоты DOM и т.п.) немедленно компенсируются.
+//  Как только пользователь коснулся экрана — фиксация снимается.
+// ═══════════════════════════════════════════════════════════════
 
+const ScrollLock = (() => {
+    let _active = false;
+    let _lockedScrollTop = 0;
+    let _rafId = null;
+    let _observer = null;
+    let _autoUnlockTimer = null;
+    let _touchHandlers = null;
+
+    /**
+     * Включает фиксацию позиции скролла на указанное время.
+     * @param {number} durationMs — сколько держать (по умолчанию 1200 мс,
+     *                              ровно столько длится .highlight-flash)
+     */
+    function lock(durationMs = 1200) {
+        // Если уже активна — продлеваем
+        if (_active) {
+            _lockedScrollTop = messagesContainer.scrollTop;
+            if (_autoUnlockTimer) clearTimeout(_autoUnlockTimer);
+            _autoUnlockTimer = setTimeout(unlock, durationMs);
+            return;
+        }
+
+        _active = true;
+        _lockedScrollTop = messagesContainer.scrollTop;
+        messagesContainer.classList.add('scroll-lock');
+
+        // ─── 1. Синхронная компенсация через rAF ───
+        // Каждый кадр проверяем: если скролл уехал — возвращаем на место.
+        // Это ловит даже те изменения, которые происходят между кадрами.
+        function tick() {
+            if (!_active) return;
+            const diff = messagesContainer.scrollTop - _lockedScrollTop;
+            if (Math.abs(diff) > 0.5) {
+                messagesContainer.scrollTop = _lockedScrollTop;
+            }
+            _rafId = requestAnimationFrame(tick);
+        }
+        _rafId = requestAnimationFrame(tick);
+
+        // ─── 2. ResizeObserver — ловим изменения высоты DOM ───
+        // Когда загружается картинка/видео — messagesInner становится выше,
+        // браузер автоматически сдвигает scrollTop. Компенсируем мгновенно.
+        if (typeof ResizeObserver !== 'undefined') {
+            _observer = new ResizeObserver(() => {
+                if (!_active) return;
+                // Возвращаем на зафиксированную позицию
+                messagesContainer.scrollTop = _lockedScrollTop;
+            });
+            _observer.observe(messagesInner);
+        }
+
+        // ─── 3. Снимаем фиксацию при любом касании / скролле / колесе ───
+        _touchHandlers = {
+            touchstart: onUserInteraction,
+            wheel: onUserInteraction,
+            mousedown: onUserInteraction,
+            keydown: onUserInteraction,
+        };
+        Object.keys(_touchHandlers).forEach(evt => {
+            messagesContainer.addEventListener(evt, _touchHandlers[evt], { passive: true });
+        });
+
+        // ─── 4. Автоматическое снятие через durationMs ───
+        _autoUnlockTimer = setTimeout(unlock, durationMs);
+
+        console.log('🔒 Скролл зафиксирован на', Math.round(_lockedScrollTop), 'px');
+    }
+
+    function onUserInteraction() {
+        // Пользователь коснулся экрана → снимаем фиксацию немедленно
+        if (_active) {
+            console.log('👆 Пользователь коснулся — фиксация снята');
+            unlock();
+        }
+    }
+
+    function unlock() {
+        if (!_active) return;
+        _active = false;
+
+        messagesContainer.classList.remove('scroll-lock');
+
+        if (_rafId) { cancelAnimationFrame(_rafId); _rafId = null; }
+        if (_observer) { _observer.disconnect(); _observer = null; }
+        if (_autoUnlockTimer) { clearTimeout(_autoUnlockTimer); _autoUnlockTimer = null; }
+
+        if (_touchHandlers) {
+            Object.keys(_touchHandlers).forEach(evt => {
+                messagesContainer.removeEventListener(evt, _touchHandlers[evt]);
+            });
+            _touchHandlers = null;
+        }
+    }
+
+    return { lock, unlock, isActive: () => _active };
+})();
+
+// ═══════════════════════════════════════════════════════════════
+//  🔁 АВТОПОВТОР ПРЫЖКА К ТРЕКУ ПОСЛЕ ПЕРЕХОДА В ЧАТ
+//  Решает проблему «первого промаха»: когда пользователь кликает
+//  по названию трека в плеере, находясь в другом чате, первый
+//  прыжок может промахнуться (DOM ещё не устоялся, вложения грузятся).
+//  Через N мс после входа в целевой чат — повторяем прыжок.
+// ═══════════════════════════════════════════════════════════════
+
+(function installAutoRetryJump() {
+    let _pendingRetry = null;
+
+    // Запоминаем «состояние прыжка» при клике на плеер
+    const _origJumpToPlayingTrack = window.jumpToPlayingTrack;
+
+    window.jumpToPlayingTrack = async function() {
+        const targetChat = GlobalPlayer.currentChatFile;
+        const targetMsgId = GlobalPlayer.currentMsgId;
+        const wasInSameChat = state.chatFile === targetChat;
+
+        // Вызываем оригинал
+        const result = await _origJumpToPlayingTrack.apply(this, arguments);
+
+        // 🆕 Если это был ПЕРЕХОД между чатами — ставим авто-повтор
+        if (!wasInSameChat && targetChat && targetMsgId) {
+            scheduleAutoRetry(targetChat, targetMsgId);
+        }
+
+        return result;
+    };
+
+    function scheduleAutoRetry(targetChat, targetMsgId) {
+        // Отменяем предыдущий, если был
+        if (_pendingRetry) {
+            clearTimeout(_pendingRetry.timer1);
+            clearTimeout(_pendingRetry.timer2);
+            clearTimeout(_pendingRetry.timer3);
+            _pendingRetry = null;
+        }
+
+        const retry = () => {
+            // Проверяем: мы всё ещё в нужном чате? трек всё ещё тот же?
+            if (state.chatFile !== targetChat) return;
+            if (typeof GlobalPlayer === 'undefined') return;
+            if (String(GlobalPlayer.currentMsgId) !== String(targetMsgId)) return;
+            if (GlobalPlayer.currentChatFile !== targetChat) return;
+
+            // Ищем элемент в DOM
+            const el = messagesInner.querySelector(
+                `.message-wrapper[data-msg-id="${targetMsgId}"]`
+            );
+
+            if (el) {
+                // Нашли — скроллим и подсвечиваем
+                doScrollAndFlash(el, targetMsgId);
+                console.log('🔁 Автоповтор: нашли трек в DOM');
+                return true;
+            }
+
+            // Не нашли — возможно, история ещё не загрузилась полностью.
+            // Попробуем «умный» поиск: находим индекс в allMessages и
+            // запускаем renderHistory с флагом _pendingJumpToMsgId
+            const msgIdx = historyState.allMessages.findIndex(
+                m => String(m.id) === String(targetMsgId)
+            );
+
+            if (msgIdx >= 0) {
+                // Сообщение в истории есть — рендерим расширенный кусок
+                window._pendingJumpToMsgId = targetMsgId;
+                renderHistory();
+                console.log('🔁 Автоповтор: запустили renderHistory с флагом');
+                return true;
+            }
+
+            return false;
+        };
+
+        // 🆕 Три попытки с разными задержками:
+        // 1-я — быстрая, вдруг всё уже готово
+        // 2-я — средняя, для случая «вложения грузятся»
+        // 3-я — поздняя, для медленной сети
+        _pendingRetry = {
+            timer1: setTimeout(() => retry(), 800),
+            timer2: setTimeout(() => retry(), 1800),
+            timer3: setTimeout(() => retry(), 3200),
+        };
+
+        console.log('🔁 Запланирован автоповтор прыжка к треку');
+    }
+
+    // Сбрасываем отложенный прыжок, если пользователь сам начал скроллить
+    // (не хотим «дёргать» экран, когда он уже что-то делает)
+    messagesContainer.addEventListener('touchstart', () => {
+        if (_pendingRetry) {
+            clearTimeout(_pendingRetry.timer1);
+            clearTimeout(_pendingRetry.timer2);
+            clearTimeout(_pendingRetry.timer3);
+            _pendingRetry = null;
+            console.log('🔁 Автоповтор отменён — пользователь коснулся экрана');
+        }
+    }, { passive: true });
+
+    messagesContainer.addEventListener('wheel', () => {
+        if (_pendingRetry) {
+            clearTimeout(_pendingRetry.timer1);
+            clearTimeout(_pendingRetry.timer2);
+            clearTimeout(_pendingRetry.timer3);
+            _pendingRetry = null;
+        }
+    }, { passive: true });
+
+    console.log('🔁 Автоповтор прыжка к треку активен');
+})();
 
 console.log('✅ SMS Чат собран!');
 console.log('🔐 AES-256-GCM + PBKDF2 (200k)');
@@ -12109,16 +12365,74 @@ function cancelReply() {
 
 $('replyCancelBtn').addEventListener('click', cancelReply);
 
+
 function scrollToMessage(msgId) {
-    const el = messagesInner.querySelector(`.message-wrapper[data-msg-id="${msgId}"]`);
-    if (!el) { showToast('⚠️ Сообщение не в зоне видимости', 1500); return; }
-    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    el.classList.remove('highlight-flash');
-    void el.offsetWidth;
-    el.classList.add('highlight-flash');
-    setTimeout(() => el.classList.remove('highlight-flash'), 1300);
+    if (!msgId || !state.chatFile) return;
+
+    // ═══ 1. Если уже в DOM — скролл + каскадное подтверждение ═══
+    const existing = messagesInner.querySelector(
+        `.message-wrapper[data-msg-id="${msgId}"]`
+    );
+    if (existing) {
+        doScrollAndFlash(existing, msgId);
+        cascadeScrollToElement(existing, msgId);
+        return;
+    }
+
+    // ═══ 2. Не в DOM — ставим флаг и вызываем renderHistory ═══
+    window._pendingJumpToMsgId = msgId;
+    renderHistory();
 }
 
+// ═══════════════════════════════════════════════════════════════
+//  🔄 КАСКАДНЫЙ СКРОЛЛ К СООБЩЕНИЮ
+//  Повторяет прокрутку несколько раз, пока грузятся вложения
+//  и меняется высота контейнера. Именно это решает проблему
+//  «первого промаха», когда DOM ещё не устоялся.
+// ═══════════════════════════════════════════════════════════════
+function cascadeScrollToElement(el, msgId) {
+    if (!el || !el.isConnected) return;
+
+    // Запоминаем «якорь» — считаем куда нужно вернуться
+    const scrollToAnchor = () => {
+        // Если элемент уже не в DOM (перерисовали) — ищем заново
+        let target = el;
+        if (!target.isConnected) {
+            target = messagesInner.querySelector(
+                `.message-wrapper[data-msg-id="${msgId}"]`
+            );
+            if (!target) return;
+        }
+
+        // Считаем, где элемент сейчас относительно контейнера
+        const contRect = messagesContainer.getBoundingClientRect();
+        const elRect = target.getBoundingClientRect();
+        const elTopInContainer = elRect.top - contRect.top;
+        const contH = messagesContainer.clientHeight;
+        const targetTop = (contH - elRect.height) / 2;   // центр
+        const delta = elTopInContainer - targetTop;
+
+        // Если элемент сместился больше чем на 20% высоты экрана —
+        // жёстко возвращаем scrollTop (без smooth — чтобы быстро)
+        if (Math.abs(delta) > contH * 0.2) {
+            messagesContainer.scrollTop += delta;
+        }
+    };
+
+    // Каскад: сразу + через 100, 300, 600, 1000, 1800, 3000 мс
+    // Этого хватает, чтобы все вложения (картинки/видео/аудио) загрузились
+    // и высота контейнера устоялась.
+    scrollToAnchor();
+
+    const delays = [100, 300, 600, 1000, 1800, 3000];
+    delays.forEach(d => {
+        setTimeout(() => {
+            // Прерываемся, если пользователь сам начал скроллить
+            if (_isUserScrolling) return;
+            scrollToAnchor();
+        }, d);
+    });
+}
 
 
 
@@ -12875,45 +13189,29 @@ async function playAudioFromMessage(msgId) {
     const queue = buildAudioQueueFromHistory();
     if (queue.length === 0) return;
 
-
     const startIndex = queue.findIndex(x => String(x.id) === String(msgId));
     if (startIndex === -1) return;
 
-
-    // 🆕 Фиксируем чат-источник — даже если пользователь выйдет из чата,
-    //     обложки всё равно загрузятся из правильного места
     const sourceChatFile = queue[0]._chatFile || state.chatFile;
 
-
-    const load = async (idx) => {
+    // ═══ 1. Загружаем ТОЛЬКО текущий трек + 1 сосед (для быстрого next) ═══
+    const loadOne = async (idx) => {
         if (idx < 0 || idx >= queue.length) return;
         const item = queue[idx];
-
-
-        // Аудио
-        if (!item.src) {
-            try {
-                item.src = await loadAttachment(sourceChatFile, item._msg.audio);
-            } catch (e) {
-                console.warn('failed to load audio', item.id, e);
-                item.src = null;
-            }
-        }
-
-
-        // 🆕 Обложка — через sourceChatFile, а не state.chatFile
-        if (item._coverName && !item.coverUrl) {
-            try {
-                item.coverUrl = await loadAttachment(sourceChatFile, item._coverName);
-            } catch (e) {
-                console.warn('failed to load cover', item.id, e);
-            }
+        if (item.src) return;
+        try {
+            item.src = await loadAttachment(sourceChatFile, item._msg.audio);
+        } catch (e) {
+            console.warn('failed to load audio', item.id, e);
         }
     };
 
-
-    await Promise.all(queue.map((_, i) => load(i)));
-
+    // Грузим сам трек и его "соседа" — параллельно
+    await Promise.all([
+        loadOne(startIndex),
+        loadOne(startIndex + 1),
+        loadOne(startIndex - 1),
+    ]);
 
     const playable = queue.filter(x => x.src);
     if (playable.length === 0) {
@@ -12921,7 +13219,47 @@ async function playAudioFromMessage(msgId) {
         return;
     }
     const realStart = playable.findIndex(x => String(x.id) === String(msgId));
+
+    // ═══ 2. СРАЗУ играем ═══
     GlobalPlayer.playQueue(playable, realStart >= 0 ? realStart : 0, sourceChatFile);
+
+    // ═══ 3. Остальные треки + обложки — грузим В ФОНЕ ═══
+    (async () => {
+        for (let i = 0; i < queue.length; i++) {
+            // Прерываемся, если пользователь уже вышел из чата
+            if (state.chatFile !== sourceChatFile && GlobalPlayer.currentChatFile !== sourceChatFile) {
+                break;
+            }
+            const item = queue[i];
+
+            // Аудио
+            if (!item.src) {
+                try {
+                    item.src = await loadAttachment(sourceChatFile, item._msg.audio);
+                    // Обновляем src в глобальном плеере, чтобы next() работал
+                    const globalTrack = GlobalPlayer.queue.find(t => String(t.id) === String(item.id));
+                    if (globalTrack) globalTrack.src = item.src;
+                } catch (e) {
+                    console.warn('bg audio load failed', item.id, e);
+                }
+            }
+
+            // Обложка — тоже в фоне
+            if (item._coverName && !item.coverUrl) {
+                try {
+                    item.coverUrl = await loadAttachment(sourceChatFile, item._coverName);
+                    const globalTrack = GlobalPlayer.queue.find(t => String(t.id) === String(item.id));
+                    if (globalTrack) globalTrack.coverUrl = item.coverUrl;
+                } catch (e) {
+                    console.warn('bg cover load failed', item.id, e);
+                }
+            }
+
+            // Небольшая пауза, чтобы не забивать сеть
+            await new Promise(r => setTimeout(r, 100));
+        }
+        console.log('🎵 Фоновая загрузка плейлиста завершена');
+    })();
 }
 // ═══ Перехват toggleAudioPlayback — теперь через GlobalPlayer ═══
 
