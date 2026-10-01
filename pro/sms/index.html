@@ -18519,19 +18519,35 @@ showMessageMenu = function(x, y, msgId, isOwn) {
 
     console.log('🎯 Мгновенный прыжок к треку из другого чата активен');
 })();
+
+
 // ═══════════════════════════════════════════════════════════════
-//  🎯 УНИВЕРСАЛЬНЫЙ ПРЫЖОК К СООБЩЕНИЮ ПО ID
-//  Если сообщение вне DOM (обрезано pagination) — перерисовывает
-//  историю с расширенным окном вокруг цели и скроллит к ней.
-//  Работает и для поиска, и для ответов, и для jump-to-track.
+//  🎯 УМНЫЙ ПОИСК + ГЛОБАЛЬНОЕ ОТКЛЮЧЕНИЕ АВТОСКРОЛЛОВ ВНИЗ
+//  Финальный патч: гарантирует прыжок к сообщению, если оно было
+//  найдено через поиск, но находится за пределами DOM (пагинация).
+//
+//  Что делает:
+//   1. ensureMessageVisible(msgId) — если сообщение уже в DOM,
+//      скроллит и подсвечивает его. Если нет — перерисовывает
+//      историю с расширенным окном вокруг цели и скроллит к ней.
+//   2. Гасит ВСЕ автоскроллы вниз (догон после вложений, заморозки,
+//      автоскролл в renderHistory, appendMessages, pollUpdates).
+//   3. Работают только: ручной скролл, кнопка «вниз», отправка
+//      сообщения и сам прыжок.
 // ═══════════════════════════════════════════════════════════════
 
-(function installEnsureMessageVisible() {
+(function installSmartJumpAndDisableAutoScrollsDown() {
+
+    console.log('🔧 Устанавливаем умный поиск + отключаем автоскроллы...');
+
+    // ═══════════════════════════════════════════════════════════════
+    //  ЧАСТЬ 1. УНИВЕРСАЛЬНЫЙ ПРЫЖОК К СООБЩЕНИЮ
+    // ═══════════════════════════════════════════════════════════════
 
     /**
      * Делает сообщение видимым в DOM.
      * 1. Если уже в DOM — скроллит и подсвечивает.
-     * 2. Если нет — перерисовывает историю с окном вокруг цели.
+     * 2. Если нет — перерисовывает историю с расширенным окном.
      * Возвращает true если удалось, false если сообщения нет в истории.
      */
     window.ensureMessageVisible = async function(msgId, opts = {}) {
@@ -18542,9 +18558,7 @@ showMessageMenu = function(x, y, msgId, isOwn) {
         const targetIdx = historyState.allMessages.findIndex(
             m => String(m.id) === targetId
         );
-        if (targetIdx === -1) {
-            return false;
-        }
+        if (targetIdx === -1) return false;
 
         // ─── 2. Уже в DOM? ───
         const existing = messagesInner.querySelector(
@@ -18556,23 +18570,19 @@ showMessageMenu = function(x, y, msgId, isOwn) {
         }
 
         // ─── 3. Нет в DOM — перерисовываем окно вокруг цели ───
-        const CONTEXT_BEFORE = 15;   // сколько сообщений до цели
-        const CONTEXT_AFTER  = 15;   // и после — чтобы контекст был живой
+        const CONTEXT_BEFORE = 15;
+        const CONTEXT_AFTER  = 15;
         const total = historyState.allMessages.length;
 
         const start = Math.max(0, targetIdx - CONTEXT_BEFORE);
         const end   = Math.min(total, targetIdx + CONTEXT_AFTER + 1);
 
-        // Ставим флаг — renderHistoryExtended сам всё сделает
-        window._pendingJumpToMsgId = targetId;
         renderHistoryExtended(start, end, targetId);
-
         return true;
     };
 
     /**
      * Расширенный рендер: диапазон [start, end) + автопрыжок к anchorId.
-     * Не ломает существующий renderHistory — просто временный режим.
      */
     function renderHistoryExtended(start, end, anchorId) {
         // Останавливаем текущие аудио-плееры
@@ -18583,7 +18593,6 @@ showMessageMenu = function(x, y, msgId, isOwn) {
 
         historyState.startIndex = start;
         historyState.renderedCount = end - start;
-        window._pendingJumpToMsgId = null;
 
         const all = historyState.allMessages;
         let html = '';
@@ -18636,14 +18645,6 @@ showMessageMenu = function(x, y, msgId, isOwn) {
                 // Затем плавная доводка и подсветка
                 setTimeout(() => scrollAndFlashToMessage(el), 80);
             }
-
-            // Если история большая и у нас ещё есть старше — подстрахуемся
-            // обновлением sentinel в observer
-            setTimeout(() => {
-                if (typeof observeHistorySentinel === 'function') {
-                    observeHistorySentinel();
-                }
-            }, 300);
         });
     }
 
@@ -18669,25 +18670,20 @@ showMessageMenu = function(x, y, msgId, isOwn) {
     }
 
     // ═══════════════════════════════════════════════════════════════
-    //  ПЕРЕОПРЕДЕЛЯЕМ scrollToMessage — теперь с автодогрузкой
-    //  Это чинит: поиск по чату, ответы на сообщения (reply-quote)
+    //  Переопределяем scrollToMessage — теперь с автодогрузкой.
+    //  Это чинит: поиск по чату, ответы на сообщения (reply-quote).
     // ═══════════════════════════════════════════════════════════════
-    const _origScrollToMessage = window.scrollToMessage;
     window.scrollToMessage = async function(msgId) {
         if (!msgId) return;
-
-        const found = await ensureMessageVisible(msgId);
-
+        const found = await window.ensureMessageVisible(msgId);
         if (!found) {
             showToast('⚠️ Сообщение не найдено в истории', 2000);
         }
     };
 
-
     // ═══════════════════════════════════════════════════════════════
-    //  ПЕРЕОПРЕДЕЛЯЕМ jumpToPlayingTrack — теперь через ensureMessageVisible
+    //  Переопределяем jumpToPlayingTrack — теперь через ensureMessageVisible.
     // ═══════════════════════════════════════════════════════════════
-    const _origJumpToPlayingTrack2 = window.jumpToPlayingTrack;
     window.jumpToPlayingTrack = async function() {
         if (typeof GlobalPlayer === 'undefined') return;
 
@@ -18706,7 +18702,7 @@ showMessageMenu = function(x, y, msgId, isOwn) {
 
         // ─── Мы в том же чате? ───
         if (state.chatFile === targetChat) {
-            const ok = await ensureMessageVisible(targetMsgId);
+            const ok = await window.ensureMessageVisible(targetMsgId);
             if (!ok) showToast('⚠️ Трек не найден в истории', 2000);
             return;
         }
@@ -18723,7 +18719,7 @@ showMessageMenu = function(x, y, msgId, isOwn) {
             return;
         }
 
-        // Устанавливаем флаг — renderHistory увидит его и отрисует окно с целью
+        // Устанавливаем флаг — renderHistory отрисует окно с целью
         window._pendingJumpToMsgId = String(targetMsgId);
 
         showToast(`🎵 Переход в «${chat.name || targetChat}»…`, 1500);
@@ -18737,1508 +18733,335 @@ showMessageMenu = function(x, y, msgId, isOwn) {
         }
     };
 
-    console.log('🎯 ensureMessageVisible: универсальный прыжок к сообщению');
-    console.log('   • Работает для поиска, ответов и jump-to-track');
-    console.log('   • Автоматически перерисовывает окно, если сообщение за пределами DOM');
-})();
+    // ═══════════════════════════════════════════════════════════════
+    //  Патч renderHistory — поддержка флага _pendingJumpToMsgId
+    //  (используется при переходе в чат через jump-to-track)
+    // ═══════════════════════════════════════════════════════════════
+    window._pendingJumpToMsgId = null;
 
-// ═══════════════════════════════════════════════════════════════
-//  🛑 МЯГКАЯ БЛОКИРОВКА СКРОЛЛА ВНИЗ ПОСЛЕ ПРЫЖКА К СООБЩЕНИЮ
-//  Пока активна — никакие автоматические скроллы вниз не работают.
-//  Пользователь может скроллить сам — ручной скролл снимает блокировку.
-// ═══════════════════════════════════════════════════════════════
+    const _origRenderHistory = renderHistory;
+    renderHistory = function() {
+        const jumpTarget = window._pendingJumpToMsgId;
 
-(function installScrollLockAfterJump() {
-
-    // ─── Состояние блокировки ───
-    let _lockUntil = 0;                  // timestamp, до которого блокировка активна
-    let _lockAnchorMsgId = null;         // ID сообщения, к которому прыгнули
-    let _lockReleasedByUser = false;
-    let _lockTimerHandle = null;
-
-    const LOCK_DURATION_MS = 3000;       // 3 секунды
-
-    // Публичный флаг
-    window.isScrollDownLocked = () => Date.now() < _lockUntil;
-
-    /**
-     * Активирует блокировку на durationMs миллисекунд.
-     * @param {string|number} anchorId - ID сообщения (для логов)
-     */
-    window.lockScrollDown = function(anchorId) {
-        _lockUntil = Date.now() + LOCK_DURATION_MS;
-        _lockAnchorMsgId = anchorId;
-        _lockReleasedByUser = false;
-
-        // Обнуляем scrollState, чтобы фоновые таски не решили, что мы «у низа»
-        scrollState.isAtBottom = false;
-        scrollState.unreadCount = 0;
-        updateScrollBadge();
-
-        // Прячем кнопку «вниз» на время блокировки, чтобы не мешала
-        scrollDownBtn.classList.remove('show');
-
-        // Отменяем все отложенные «догонялки» вниз
-        if (typeof _bottomCatchupTimers !== 'undefined' && Array.isArray(_bottomCatchupTimers)) {
-            _bottomCatchupTimers.forEach(t => clearTimeout(t));
-            _bottomCatchupTimers.length = 0;
+        if (!jumpTarget) {
+            return _origRenderHistory.apply(this, arguments);
         }
 
-        // Ставим таймер автоснятия
-        if (_lockTimerHandle) clearTimeout(_lockTimerHandle);
-        _lockTimerHandle = setTimeout(() => {
-            _lockUntil = 0;
-            _lockTimerHandle = null;
-            console.log('🔓 Блокировка скролла вниз снята (таймаут)');
-        }, LOCK_DURATION_MS + 50);
+        const all = historyState.allMessages;
+        const total = all.length;
 
-        console.log(`🔒 Скролл вниз заблокирован на ${LOCK_DURATION_MS}мс (anchor: ${anchorId})`);
+        if (total === 0) {
+            window._pendingJumpToMsgId = null;
+            return _origRenderHistory.apply(this, arguments);
+        }
+
+        const targetIdx = all.findIndex(m => String(m.id) === String(jumpTarget));
+
+        if (targetIdx === -1) {
+            window._pendingJumpToMsgId = null;
+            return _origRenderHistory.apply(this, arguments);
+        }
+
+        const CONTEXT_BEFORE = 10;
+        const start = Math.max(0, targetIdx - CONTEXT_BEFORE);
+        const end = total;
+
+        window._pendingJumpToMsgId = null;
+
+        // Переиспользуем renderHistoryExtended
+        const _savedInner = messagesInner;
+        // renderHistoryExtended сам всё сделает + скролл
+        renderHistoryExtended(start, end, String(jumpTarget));
     };
 
-    /**
-     * Досрочно снимает блокировку (используется для ручного скролла).
-     */
-    function releaseLockNow() {
-        if (Date.now() >= _lockUntil) return;
-        _lockUntil = 0;
-        _lockReleasedByUser = true;
-        if (_lockTimerHandle) {
-            clearTimeout(_lockTimerHandle);
-            _lockTimerHandle = null;
-        }
-        console.log('🔓 Блокировка скролла вниз снята вручную');
-    }
 
     // ═══════════════════════════════════════════════════════════════
-    //  ПЕРЕХВАТ РУЧНОГО СКРОЛЛА
-    //  Любое взаимодействие пальцем/колесом с контейнером снимает блокировку.
-    //  Но НЕ снимаем от программного scrollIntoView — для этого
-    //  используется флаг suppressNextUserScroll.
+    //  ЧАСТЬ 2. ГЛОБАЛЬНОЕ ОТКЛЮЧЕНИЕ АВТОСКРОЛЛОВ ВНИЗ
+    //  Всё, что дёргало чат вниз автоматически — отключено.
+    //  Работают: ручной скролл, кнопка «вниз», отправка, прыжок.
     // ═══════════════════════════════════════════════════════════════
 
-    let _suppressUserScrollRelease = false;
+    // ─── Флаг: разрешён ли скролл вниз прямо сейчас ───
+    let _allowScrollDown = false;
+    let _allowScrollDownTimer = null;
 
-    window.suppressNextUserScrollRelease = function() {
-        _suppressUserScrollRelease = true;
-        setTimeout(() => { _suppressUserScrollRelease = false; }, 800);
+    window.allowScrollDownOnce = function(durationMs = 800) {
+        _allowScrollDown = true;
+        if (_allowScrollDownTimer) clearTimeout(_allowScrollDownTimer);
+        _allowScrollDownTimer = setTimeout(() => {
+            _allowScrollDown = false;
+            _allowScrollDownTimer = null;
+        }, durationMs);
     };
 
-    function onUserInteraction() {
-        if (_suppressUserScrollRelease) return;
-        if (Date.now() < _lockUntil) {
-            releaseLockNow();
-        }
-    }
-
-    // Тап по экрану в области сообщений — тоже снимает (но не сразу,
-    // а если пользователь явно тянет вниз — точнее скажет scroll-событие)
-    messagesContainer.addEventListener('touchstart', onUserInteraction, { passive: true, capture: true });
-    messagesContainer.addEventListener('touchmove',  onUserInteraction, { passive: true, capture: true });
-    messagesContainer.addEventListener('wheel',      onUserInteraction, { passive: true, capture: true });
-    // mousedown для десктопа
-    messagesContainer.addEventListener('mousedown',  onUserInteraction, { passive: true, capture: true });
-
-    // ═══════════════════════════════════════════════════════════════
-    //  ПАТЧ 1: scrollToBottom — игнорируем вызовы во время блокировки
-    // ═══════════════════════════════════════════════════════════════
+    // ─── 1. Глушим scrollToBottom ───
     const _origScrollToBottom = window.scrollToBottom;
     window.scrollToBottom = function(force = false) {
-        if (window.isScrollDownLocked() && !force) return;
-        // force === true используется вручную — например, при отправке
-        // нового сообщения. Пусть тоже уважает блокировку, но с исключением
-        // для явных «я хочу вниз».
-        if (window.isScrollDownLocked() && force) {
-            // Разрешаем только если это НЕ автоматический вызов от loadAttachmentsIn
-            // Проверяем стек — если мы внутри прыжка к сообщению, пропускаем
-            const stack = new Error().stack || '';
-            if (stack.includes('ensureMessageVisible') ||
-                stack.includes('renderHistoryExtended') ||
-                stack.includes('loadAttachmentsIn')) {
-                return;
-            }
-        }
+        if (!_allowScrollDown) return;
+        if (galleryState && galleryState.isOpen) return;
+        if (typeof _isUserScrolling !== 'undefined' && _isUserScrolling) return;
+        if (typeof _loadingOlder !== 'undefined' && _loadingOlder) return;
         return _origScrollToBottom.apply(this, arguments);
     };
 
-    // ═══════════════════════════════════════════════════════════════
-    //  ПАТЧ 2: _scheduleBottomCatchup — не запускаем во время блокировки
-    // ═══════════════════════════════════════════════════════════════
+    // ─── 2. Глушим _scheduleBottomCatchup — «догоняющий» скролл ───
     if (typeof window._scheduleBottomCatchup === 'function') {
-        const _origScheduleBottomCatchup = window._scheduleBottomCatchup;
-        window._scheduleBottomCatchup = function() {
-            if (window.isScrollDownLocked()) {
-                return;
-            }
-            return _origScheduleBottomCatchup.apply(this, arguments);
-        };
+        window._scheduleBottomCatchup = function() { /* no-op */ };
+    }
+    if (typeof _bottomCatchupTimers !== 'undefined' && Array.isArray(_bottomCatchupTimers)) {
+        _bottomCatchupTimers.forEach(t => clearTimeout(t));
+        _bottomCatchupTimers.length = 0;
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    //  ПАТЧ 3: loadAttachmentsIn — не «догоняет вниз» во время блокировки
-    //  (там есть хвост с requestAnimationFrame, который дёргает вниз)
-    // ═══════════════════════════════════════════════════════════════
+    // ─── 3. Глушим installInitialLoadFreeze — 17.5-сек заморозку ───
+    window.activateInitialFreeze = function() {
+        console.log('⏭ activateInitialFreeze: пропущено (автоскроллы отключены)');
+    };
+    window.isInitialFreezeActive = function() { return false; };
+
+    // ─── 4. Глушим автоскролл в конце renderHistory ───
+    //       (он там есть в requestAnimationFrame — messagesContainer.scrollTop = ...)
+    //       Раз renderHistory мы уже переопределили выше — этот пункт покрыт.
+
+    // ─── 5. Гасим автоскролл после loadAttachmentsIn (хвост с rAF) ───
     if (typeof window.loadAttachmentsIn === 'function') {
-        const _origLoadAttachmentsInLock = window.loadAttachmentsIn;
+        const _origLoadAttachmentsIn = window.loadAttachmentsIn;
         window.loadAttachmentsIn = async function(root) {
-            // Запоминаем состояние блокировки на момент старта
-            const wasLocked = window.isScrollDownLocked();
-            const result = await _origLoadAttachmentsInLock.apply(this, arguments);
-            // Если блокировка была на старте — она всё ещё должна действовать
-            // (или уже снята таймером, но не даём никаких «догонялок»)
-            if (wasLocked) {
-                // Ещё раз принудительно сбрасываем таймеры догона, если они были созданы
-                if (typeof _bottomCatchupTimers !== 'undefined' && Array.isArray(_bottomCatchupTimers)) {
-                    _bottomCatchupTimers.forEach(t => clearTimeout(t));
-                    _bottomCatchupTimers.length = 0;
-                }
+            const result = await _origLoadAttachmentsIn.apply(this, arguments);
+            // Отменяем любые отложенные таймеры догона
+            if (typeof _bottomCatchupTimers !== 'undefined' && Array.isArray(_bottomCatchupTimers)) {
+                _bottomCatchupTimers.forEach(t => clearTimeout(t));
+                _bottomCatchupTimers.length = 0;
             }
             return result;
         };
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    //  ПАТЧ 4: ResizeObserver из installInitialLoadFreeze
-    //  Не даём ему тянуть вниз, пока блокировка активна.
-    //  Это делается через глобальный флаг window.isInitialFreezeActive —
-    //  но у него другая логика. Добавляем «страховочный» наблюдатель,
-    //  который жёстко держит позицию на anchor во время блокировки.
-    // ═══════════════════════════════════════════════════════════════
-
-    let _lockObserver = null;
-    let _lockAnchorEl = null;
-    let _lockAnchorVisualTop = 0;
-
-    function startLockObserver(anchorEl) {
-        stopLockObserver();
-        if (!anchorEl) return;
-
-        _lockAnchorEl = anchorEl;
-        const contRect = messagesContainer.getBoundingClientRect();
-        const elRect = anchorEl.getBoundingClientRect();
-        _lockAnchorVisualTop = elRect.top - contRect.top;
-
-        _lockObserver = new ResizeObserver(() => {
-            if (!window.isScrollDownLocked()) {
-                stopLockObserver();
-                return;
-            }
-            if (!_lockAnchorEl || !_lockAnchorEl.isConnected) return;
-
-            const contR = messagesContainer.getBoundingClientRect();
-            const elR = _lockAnchorEl.getBoundingClientRect();
-            const currentTop = elR.top - contR.top;
-            const diff = currentTop - _lockAnchorVisualTop;
-
-            // Если anchor сместился больше чем на 2px — компенсируем
-            if (Math.abs(diff) > 2) {
-                messagesContainer.scrollTop += diff;
-            }
-        });
-        _lockObserver.observe(messagesInner);
-    }
-
-    function stopLockObserver() {
-        if (_lockObserver) {
-            _lockObserver.disconnect();
-            _lockObserver = null;
-        }
-        _lockAnchorEl = null;
-    }
-
-    // Экспортируем для использования в ensureMessageVisible
-    window.startScrollLockObserver = startLockObserver;
-    window.stopScrollLockObserver = stopLockObserver;
-
-    // Автоматически останавливаем наблюдатель, когда блокировка кончается
-    setInterval(() => {
-        if (_lockObserver && !window.isScrollDownLocked()) {
-            stopLockObserver();
-        }
-    }, 500);
-
-    console.log('🛑 Система блокировки скролла вниз готова');
-})();
-
-
-// ═══════════════════════════════════════════════════════════════
-//  🔗 ИНТЕГРАЦИЯ БЛОКИРОВКИ С ensureMessageVisible
-//  Оборачиваем ensureMessageVisible, чтобы он:
-//  1. Активировал блокировку перед началом рендера.
-//  2. Отключал её, если пользователь сам начал скроллить.
-//  3. Держал anchor через observer, пока вложения грузятся.
-// ═══════════════════════════════════════════════════════════════
-
-(function integrateScrollLockWithJump() {
-    const _origEnsureMessageVisible = window.ensureMessageVisible;
-
-    window.ensureMessageVisible = async function(msgId, opts = {}) {
-        if (!msgId || typeof _origEnsureMessageVisible !== 'function') {
-            return false;
-        }
-
-        const targetIdStr = String(msgId);
-
-        // ─── Проверяем, есть ли уже в DOM ───
-        const alreadyInDom = messagesInner.querySelector(
-            `.message-wrapper[data-msg-id="${targetIdStr}"]`
+    // ─── 6. Перехватываем scrollTop: блокируем запись «до самого низа» ───
+    //       Это ловит даже тот код, который мы не видели или не патчили.
+    try {
+        const originalScrollTopDescriptor = Object.getOwnPropertyDescriptor(
+            Element.prototype, 'scrollTop'
         );
 
-        // Если уже в DOM — просто скроллим и подсвечиваем, без блокировки.
-        // Это обычный переход внутри видимой области — скинуть вниз
-        // его не может.
-        if (alreadyInDom) {
-            return _origEnsureMessageVisible.call(this, msgId, opts);
-        }
+        Object.defineProperty(messagesContainer, 'scrollTop', {
+            get() {
+                return originalScrollTopDescriptor.get.call(this);
+            },
+            set(value) {
+                const current = originalScrollTopDescriptor.get.call(this);
 
-        // ─── Сообщение вне DOM — активируем блокировку ───
-        window.lockScrollDown(targetIdStr);
+                // Если значение увеличивается (движение вниз)
+                // И не разрешено — блокируем только «доезд до самого низа»
+                if (value > current + 2 && !_allowScrollDown) {
+                    const distanceFromBottom =
+                        this.scrollHeight - value - this.clientHeight;
 
-        // Подавляем «пользовательский» релиз от программных событий
-        // (scrollIntoView может сгенерировать touchmove на некоторых браузерах)
-        if (typeof window.suppressNextUserScrollRelease === 'function') {
-            window.suppressNextUserScrollRelease();
-        }
-
-        try {
-            const result = await _origEnsureMessageVisible.call(this, msgId, opts);
-
-            // После рендера ищем anchor и вешаем на него observer,
-            // чтобы вложения не сдвинули позицию
-            if (result) {
-                setTimeout(() => {
-                    const anchorEl = messagesInner.querySelector(
-                        `.message-wrapper[data-msg-id="${targetIdStr}"]`
-                    );
-                    if (anchorEl && typeof window.startScrollLockObserver === 'function') {
-                        window.startScrollLockObserver(anchorEl);
+                    // Если пытаемся доехать до самого низа — игнорируем
+                    if (distanceFromBottom < 30) {
+                        return;
                     }
-                }, 100);
-            }
+                }
 
-            return result;
-        } catch (e) {
-            // При ошибке — снимаем блокировку, чтобы не мешать пользователю
-            window.lockScrollDown(0);
-            _lockUntil = 0;
-            throw e;
-        }
-    };
-
-    console.log('🔗 Блокировка скролла связана с ensureMessageVisible');
-})();
-
-
-// ═══════════════════════════════════════════════════════════════
-//  🆕 ДОПОЛНИТЕЛЬНО: подавляем «догоняющий вниз» скролл
-//  в хвосте функции loadAttachmentsIn (там есть requestAnimationFrame
-//  и setTimeout-цепочка в конце, которые проверяют scrollState.isAtBottom
-//  и, если true, тянут вниз)
-// ═══════════════════════════════════════════════════════════════
-
-(function hardenAttachmentLoadAgainstScrollDown() {
-    // Принудительно держим scrollState.isAtBottom = false, пока блокировка
-    // активна. Это не даёт внутренним проверкам решить, что мы внизу.
-    let _guardTimer = null;
-
-    function startGuard() {
-        if (_guardTimer) return;
-        _guardTimer = setInterval(() => {
-            if (window.isScrollDownLocked && window.isScrollDownLocked()) {
-                // Форсируем флаг, что мы НЕ у низа
-                scrollState.isAtBottom = false;
-            } else {
-                clearInterval(_guardTimer);
-                _guardTimer = null;
-            }
-        }, 100);
-    }
-
-    // Патчим lockScrollDown, чтобы он включал этот guard
-    const _origLockScrollDown = window.lockScrollDown;
-    window.lockScrollDown = function(anchorId) {
-        _origLockScrollDown.call(this, anchorId);
-        startGuard();
-    };
-
-    console.log('🛡️ Guard против скролла вниз активирован');
-})();
-
-
-// ═══════════════════════════════════════════════════════════════
-//  🆕 ПАТЧ: installInitialLoadFreeze не должен мешать нашей блокировке
-//  Он тянет вниз во время своей 17.5-секундной заморозки.
-//  Пока наша блокировка активна — приостанавливаем его действия.
-// ═══════════════════════════════════════════════════════════════
-
-(function patchInitialLoadFreezeForJump() {
-    // Перехватываем глобальный window.isInitialFreezeActive
-    // Так, чтобы он возвращал false, пока наша блокировка активна.
-    const _origIsInitialFreezeActive = window.isInitialFreezeActive;
-
-    if (typeof _origIsInitialFreezeActive === 'function') {
-        window.isInitialFreezeActive = function() {
-            // Если наша блокировка активна — говорим, что freeze не активен,
-            // чтобы installInitialLoadFreeze не тянул вниз.
-            if (window.isScrollDownLocked && window.isScrollDownLocked()) {
-                return false;
-            }
-            return _origIsInitialFreezeActive.call(this);
-        };
-        console.log('🧊 installInitialLoadFreeze уважает нашу блокировку');
-    }
-})();
-
-
-console.log('✅ Скролл-блокировка после прыжка активна: 3 секунды покоя');
-console.log('   • Все автоскроллы вниз игнорируются');
-console.log('   • Пользователь может сам скроллить — это снимает блокировку');
-console.log('   • Anchor-элемент жёстко удерживает позицию, пока вложения грузятся');
-// ═══════════════════════════════════════════════════════════════
-//  🛑 ПОЛНАЯ БЛОКИРОВКА СКРОЛЛА ВО ВРЕМЯ ПРЫЖКА К СООБЩЕНИЮ
-//  Ждём, пока все вложения загрузятся (или 8с), только потом
-//  отпускаем управление скроллом.
-// ═══════════════════════════════════════════════════════════════
-
-(function installJumpScrollGuard() {
-
-    // ─── Состояние ───
-    let _jumpInProgress = false;
-    let _jumpAnchorEl = null;
-    let _jumpAnchorVisualTop = 0;
-    let _jumpSafetyTimer = null;
-    let _jumpResizeObserver = null;
-    let _jumpForceIsAtBottomTimer = null;
-    let _jumpSuppressUserRelease = false;
-
-    const SAFETY_TIMEOUT_MS = 8000;      // максимум ждём 8 сек
-    const MIN_HOLD_MS = 400;             // минимум держим блокировку — чтобы точно ничего не дёрнулось
-
-    // Публичный флаг
-    window.isJumpScrollGuarded = () => _jumpInProgress;
-
-    // ─── Форсируем scrollState.isAtBottom = false на каждом тике ───
-    function startForceIsAtBottom() {
-        if (_jumpForceIsAtBottomTimer) return;
-        _jumpForceIsAtBottomTimer = setInterval(() => {
-            if (!_jumpInProgress) {
-                clearInterval(_jumpForceIsAtBottomTimer);
-                _jumpForceIsAtBottomTimer = null;
-                return;
-            }
-            // Жёстко фиксируем: мы НЕ у низа
-            scrollState.isAtBottom = false;
-        }, 60);
-    }
-
-    // ─── Anchor: держим визуальную позицию цели ───
-    function captureAnchor(el) {
-        if (!el) {
-            _jumpAnchorEl = null;
-            return;
-        }
-        _jumpAnchorEl = el;
-        const contRect = messagesContainer.getBoundingClientRect();
-        const elRect = el.getBoundingClientRect();
-        _jumpAnchorVisualTop = elRect.top - contRect.top;
-    }
-
-    function restoreAnchor() {
-        if (!_jumpInProgress) return;
-        if (!_jumpAnchorEl || !_jumpAnchorEl.isConnected) return;
-
-        const contRect = messagesContainer.getBoundingClientRect();
-        const elRect = _jumpAnchorEl.getBoundingClientRect();
-        const currentTop = elRect.top - contRect.top;
-        const diff = currentTop - _jumpAnchorVisualTop;
-
-        // Компенсируем: сдвигаем scrollTop на столько, на сколько
-        // уехал anchor. Формула: scrollTop += diff.
-        if (Math.abs(diff) > 0.5) {
-            messagesContainer.scrollTop += diff;
-        }
-    }
-
-    function startResizeObserver() {
-        stopResizeObserver();
-        if (!window.ResizeObserver) return;
-        _jumpResizeObserver = new ResizeObserver(() => {
-            if (!_jumpInProgress) return;
-            restoreAnchor();
-            // И ещё раз — на случай, если браузер уже успел перерисовать
-            requestAnimationFrame(restoreAnchor);
+                return originalScrollTopDescriptor.set.call(this, value);
+            },
+            configurable: true,
         });
-        _jumpResizeObserver.observe(messagesInner);
+
+        console.log('🛡️ Перехват scrollTop установлен');
+    } catch (e) {
+        console.warn('⚠️ Не удалось установить перехват scrollTop:', e);
     }
 
-    function stopResizeObserver() {
-        if (_jumpResizeObserver) {
-            _jumpResizeObserver.disconnect();
-            _jumpResizeObserver = null;
-        }
-    }
-
-    // ─── Проверка: все ли вложения загружены ───
-    function allAttachmentsLoaded() {
-        // Ищем плейсхолдеры БЕЗ data-loaded
-        const pending = messagesInner.querySelectorAll(
-            '[data-attach]:not([data-loaded]), ' +
-            '[data-video-attach]:not([data-loaded])'
-        );
-        return pending.length === 0;
-    }
-
-    // ─── Ожидание «пока всё успокоится» ───
-    function waitForSettled(anchorEl, onDone) {
-        const startTime = Date.now();
-        let lastHeight = messagesInner.scrollHeight;
-        let stableFrames = 0;
-
-        const tick = () => {
-            if (!_jumpInProgress) {
-                onDone();
-                return;
-            }
-
-            // Условия завершения:
-            const elapsed = Date.now() - startTime;
-            const heightNow = messagesInner.scrollHeight;
-            const heightStable = heightNow === lastHeight;
-            lastHeight = heightNow;
-
-            if (heightStable) stableFrames++;
-            else stableFrames = 0;
-
-            // Готово, если:
-            //  - Прошли MIN_HOLD_MS
-            //  - Все вложения [data-loaded]
-            //  - Высота не меняется 3 кадра подряд (примерно 150мс)
-            //  - ИЛИ истёк SAFETY_TIMEOUT_MS
-            const allLoaded = allAttachmentsLoaded();
-            const settled = heightStable && stableFrames >= 3;
-            const timedOut = elapsed > SAFETY_TIMEOUT_MS;
-
-            if ((allLoaded && settled && elapsed >= MIN_HOLD_MS) || timedOut) {
-                onDone();
-                return;
-            }
-
-            // Держим позицию
-            restoreAnchor();
-            setTimeout(tick, 50);
-        };
-        tick();
-    }
-
-    // ─── Публичный API: начать прыжок ───
-    window.startJumpGuard = function(anchorEl) {
-        // Если уже что-то прыгаем — перезапускаем
-        if (_jumpInProgress) {
-            window.endJumpGuard();
-        }
-
-        _jumpInProgress = true;
-        _jumpSuppressUserRelease = true;
-        scrollState.isAtBottom = false;
-
-        captureAnchor(anchorEl);
-        startResizeObserver();
-        startForceIsAtBottom();
-
-        // Подавляем релиз от пользовательских событий на 500мс
-        // (scrollIntoView может генерировать touch)
-        setTimeout(() => { _jumpSuppressUserRelease = false; }, 500);
-
-        // Safety-таймер
-        if (_jumpSafetyTimer) clearTimeout(_jumpSafetyTimer);
-        _jumpSafetyTimer = setTimeout(() => {
-            window.endJumpGuard();
-        }, SAFETY_TIMEOUT_MS + 500);
-
-        console.log(`🔒 JumpGuard: ON (anchor=${anchorEl?.dataset?.msgId || '?'})`);
-    };
-
-    // ─── Публичный API: завершить прыжок ───
-    window.endJumpGuard = function() {
-        if (!_jumpInProgress) return;
-        _jumpInProgress = false;
-
-        stopResizeObserver();
-        if (_jumpSafetyTimer) {
-            clearTimeout(_jumpSafetyTimer);
-            _jumpSafetyTimer = null;
-        }
-        if (_jumpForceIsAtBottomTimer) {
-            clearInterval(_jumpForceIsAtBottomTimer);
-            _jumpForceIsAtBottomTimer = null;
-        }
-        _jumpAnchorEl = null;
-
-        // Пересчитываем состояние скролла после отпускания
-        scrollState.isAtBottom = isNearBottom();
-
-        console.log('🔓 JumpGuard: OFF');
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    //  ПЕРЕХВАТ РУЧНОГО СКРОЛЛА
-    //  Если пользователь сам начал скроллить — снимаем guard.
-    // ═══════════════════════════════════════════════════════════════
-
-    function onUserScrollIntent() {
-        if (!_jumpInProgress) return;
-        if (_jumpSuppressUserRelease) return;
-        window.endJumpGuard();
-    }
-
-    messagesContainer.addEventListener('touchstart', onUserScrollIntent, { passive: true, capture: true });
-    messagesContainer.addEventListener('touchmove',  onUserScrollIntent, { passive: true, capture: true });
-    messagesContainer.addEventListener('wheel',      onUserScrollIntent, { passive: true, capture: true });
-    messagesContainer.addEventListener('mousedown',  onUserScrollIntent, { passive: true, capture: true });
-
-    // ═══════════════════════════════════════════════════════════════
-    //  ПАТЧ: scrollToBottom — игнорируем во время guard'а
-    // ═══════════════════════════════════════════════════════════════
-    const _origScrollToBottom = window.scrollToBottom;
-    window.scrollToBottom = function(force = false) {
-        if (_jumpInProgress) return;
-        return _origScrollToBottom.apply(this, arguments);
-    };
-
-    // ─── scrollToBottomNow тоже глушим ───
-    const _origScrollToBottomNow = window.scrollToBottomNow;
-    window.scrollToBottomNow = function() {
-        if (_jumpInProgress) return;
-        return _origScrollToBottomNow.apply(this, arguments);
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    //  ПАТЧ: _scheduleBottomCatchup — не запускаем во время guard'а
-    // ═══════════════════════════════════════════════════════════════
-    if (typeof window._scheduleBottomCatchup === 'function') {
-        const _origScheduleBottomCatchup = window._scheduleBottomCatchup;
-        window._scheduleBottomCatchup = function() {
-            if (_jumpInProgress) return;
-            return _origScheduleBottomCatchup.apply(this, arguments);
-        };
-    }
-
-    // ═══════════════════════════════════════════════════════════════
-    //  ПАТЧ: installInitialLoadFreeze не работает во время guard'а
-    // ═══════════════════════════════════════════════════════════════
-    if (typeof window.isInitialFreezeActive === 'function') {
-        const _origIsInitialFreezeActive = window.isInitialFreezeActive;
-        window.isInitialFreezeActive = function() {
-            if (_jumpInProgress) return false;
-            return _origIsInitialFreezeActive.call(this);
-        };
-    }
-
-    // ═══════════════════════════════════════════════════════════════
-    //  ПАТЧ: scroll-обработчик — не даём ему включить isAtBottom
-    //  пока guard активен
-    // ═══════════════════════════════════════════════════════════════
-    // (scrollState.isAtBottom уже форсится через startForceIsAtBottom)
-
-    // ═══════════════════════════════════════════════════════════════
-    //  ПАТЧ: installScrollFreezer — пусть не мешает
-    //  Его ResizeObserver проверяет userAtBottom и если true —
-    //  сбрасывает anchor. Нам это не нужно во время guard'а,
-    //  потому что наш собственный observer всё держит.
-    //  Просто форсим scrollState.isAtBottom = false через guard.
-    // ═══════════════════════════════════════════════════════════════
-    // (уже сделано через startForceIsAtBottom)
-
-    console.log('🛑 JumpGuard установлен');
-})();
-
-
-// ═══════════════════════════════════════════════════════════════
-//  🔗 ИНТЕГРАЦИЯ С ensureMessageVisible
-//  Обернём функцию так, чтобы:
-//  1. Перед рендером активировать JumpGuard.
-//  2. После рендера — найти anchor и ждать, пока всё успокоится.
-//  3. Только потом отпустить guard.
-// ═══════════════════════════════════════════════════════════════
-
-(function integrateJumpGuardWithJump() {
-    const _origEnsureMessageVisible = window.ensureMessageVisible;
-
-    window.ensureMessageVisible = async function(msgId, opts = {}) {
-        if (!msgId || typeof _origEnsureMessageVisible !== 'function') {
-            return false;
-        }
-
-        const targetIdStr = String(msgId);
-
-        // Если сообщение УЖЕ в DOM и не нужно перерисовывать —
-        // просто скроллим и подсвечиваем, guard не нужен
-        const alreadyInDom = messagesInner.querySelector(
-            `.message-wrapper[data-msg-id="${targetIdStr}"]`
-        );
-
-        // ═══ Случай 1: сообщение уже в DOM ═══
-        if (alreadyInDom) {
-            // Прокрутим и подсветим как раньше
-            messagesInner.querySelectorAll('.message-wrapper.highlight-flash')
-                .forEach(x => x.classList.remove('highlight-flash'));
-
-            alreadyInDom.scrollIntoView({ behavior: 'smooth', block: 'center' });
-
-            setTimeout(() => {
-                alreadyInDom.classList.add('highlight-flash');
-                setTimeout(() => alreadyInDom.classList.remove('highlight-flash'), 1400);
-            }, 250);
-
-            if (navigator.vibrate) navigator.vibrate(20);
-            return true;
-        }
-
-        // ═══ Случай 2: сообщение вне DOM — активируем guard ═══
-
-        // Начинаем guard без anchor (anchor будет после рендера)
-        window.startJumpGuard(null);
-
+    // ─── 7. sendMessage — разрешаем скролл вниз только при отправке ───
+    const _origSendMessageForScroll = window.sendMessage;
+    window.sendMessage = async function(...args) {
+        window.allowScrollDownOnce(1500);
         try {
-            // Запускаем оригинальную логику — она перерисует окно и скроллит
-            const result = await _origEnsureMessageVisible.call(this, msgId, opts);
+            return await _origSendMessageForScroll.apply(this, args);
+        } finally {
+            // снимется автоматически по таймеру
+        }
+    };
 
-            if (!result) {
-                // Сообщение не нашли — отпускаем guard сразу
-                window.endJumpGuard();
-                return false;
-            }
+    // ─── 8. ensureMessageVisible — разрешаем скролл на время прыжка ───
+    const _origEnsureForScroll = window.ensureMessageVisible;
+    window.ensureMessageVisible = async function(...args) {
+        window.allowScrollDownOnce(3000);
+        try {
+            return await _origEnsureForScroll.apply(this, args);
+        } finally {
+            setTimeout(() => { _allowScrollDown = false; }, 100);
+        }
+    };
 
-            // ═══ Ждём, пока anchor появится в DOM ═══
-            const anchorEl = await waitForAnchorInDom(targetIdStr);
-            if (!anchorEl) {
-                window.endJumpGuard();
-                return true;
-            }
+    // ─── 9. Кнопка «вниз» — работает всегда ───
+    const scrollDownBtnEl = document.getElementById('scrollDownBtn');
+    if (scrollDownBtnEl) {
+        // Клонируем, чтобы снять все прежние слушатели
+        const cloned = scrollDownBtnEl.cloneNode(true);
+        scrollDownBtnEl.parentNode.replaceChild(cloned, scrollDownBtnEl);
 
-            // Захватываем anchor в guard
-            if (typeof window.startJumpGuard === 'function') {
-                // Перезапускаем guard уже с anchor — чтобы observer заработал
-                window.startJumpGuard(anchorEl);
-            }
+        cloned.addEventListener('click', () => {
+            window.allowScrollDownOnce(500);
 
-            // ═══ Ждём, пока вложения подгрузятся и высота перестанет меняться ═══
-            await waitForDomSettle(anchorEl);
+            messagesContainer.scrollTo({
+                top: messagesContainer.scrollHeight,
+                behavior: 'smooth'
+            });
 
-            // ═══ Плавно скроллим к anchor — теперь, когда всё загружено ═══
-            anchorEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            scrollState.isAtBottom = true;
+            scrollState.unreadCount = 0;
+            updateScrollBadge();
 
-            // Подсветка
             setTimeout(() => {
-                anchorEl.classList.add('highlight-flash');
-                setTimeout(() => anchorEl.classList.remove('highlight-flash'), 1400);
+                cloned.classList.remove('show');
+                if (typeof updateScrollButton === 'function') updateScrollButton();
             }, 300);
 
-            if (navigator.vibrate) navigator.vibrate(20);
+            if (typeof soundManager !== 'undefined' && soundManager.play) {
+                soundManager.play('click');
+            }
+        });
+    }
 
-            // Ещё чуть подержим guard, чтобы smooth-scroll завершился
-            setTimeout(() => {
-                window.endJumpGuard();
-            }, 700);
-
-            return true;
-
-        } catch (e) {
-            console.error('ensureMessageVisible error:', e);
-            window.endJumpGuard();
-            throw e;
+    // ─── 10. Если пользователь сам скроллит — снимаем разрешение ───
+    messagesContainer.addEventListener('touchstart', () => {
+        _allowScrollDown = false;
+        if (_allowScrollDownTimer) {
+            clearTimeout(_allowScrollDownTimer);
+            _allowScrollDownTimer = null;
         }
-    };
+    }, { passive: true, capture: true });
 
-    // ─── Ждём появления anchor в DOM ───
-    function waitForAnchorInDom(msgId, maxWaitMs = 2000) {
-        return new Promise((resolve) => {
-            const start = Date.now();
-            const check = () => {
-                const el = messagesInner.querySelector(
-                    `.message-wrapper[data-msg-id="${msgId}"]`
-                );
-                if (el) return resolve(el);
-                if (Date.now() - start > maxWaitMs) return resolve(null);
-                requestAnimationFrame(check);
-            };
-            check();
-        });
-    }
+    messagesContainer.addEventListener('wheel', () => {
+        _allowScrollDown = false;
+        if (_allowScrollDownTimer) {
+            clearTimeout(_allowScrollDownTimer);
+            _allowScrollDownTimer = null;
+        }
+    }, { passive: true, capture: true });
 
-    // ─── Ждём, пока DOM «успокоится» ───
-    //  Условия выхода:
-    //   - все [data-attach] и [data-video-attach] получили data-loaded
-    //   - scrollHeight не меняется N кадров подряд
-    //   - истёк hard-таймаут (8 сек)
-    function waitForDomSettle(anchorEl, opts = {}) {
-        const HARD_TIMEOUT = opts.hardTimeout || 8000;
-        const STABLE_FRAMES = opts.stableFrames || 6;  // ~300 мс покоя
-        const MIN_HOLD = opts.minHold || 300;
+    messagesContainer.addEventListener('mousedown', () => {
+        _allowScrollDown = false;
+        if (_allowScrollDownTimer) {
+            clearTimeout(_allowScrollDownTimer);
+            _allowScrollDownTimer = null;
+        }
+    }, { passive: true, capture: true });
 
-        return new Promise((resolve) => {
-            const start = Date.now();
-            let lastHeight = messagesInner.scrollHeight;
-            let stableCount = 0;
-
-            const tick = () => {
-                const elapsed = Date.now() - start;
-
-                // Safety timeout
-                if (elapsed > HARD_TIMEOUT) {
-                    console.warn('⏱ waitForDomSettle: timeout');
-                    return resolve();
-                }
-
-                // 1. Проверка плейсхолдеров
-                const pending = messagesInner.querySelectorAll(
-                    '[data-attach]:not([data-loaded]), ' +
-                    '[data-video-attach]:not([data-loaded])'
-                );
-
-                // 2. Проверка стабильности высоты
-                const h = messagesInner.scrollHeight;
-                if (h === lastHeight) stableCount++;
-                else { stableCount = 0; lastHeight = h; }
-
-                const allLoaded = pending.length === 0;
-                const heightStable = stableCount >= STABLE_FRAMES;
-                const minElapsed = elapsed >= MIN_HOLD;
-
-                if (allLoaded && heightStable && minElapsed) {
-                    return resolve();
-                }
-
-                // Компенсируем смещение anchor, если он ещё виден
-                if (anchorEl && anchorEl.isConnected && elapsed < HARD_TIMEOUT) {
-                    // (anchor остаётся на месте за счёт guard'а — ResizeObserver)
-                }
-
-                requestAnimationFrame(tick);
-            };
-            tick();
-        });
-    }
-
-    console.log('🔗 JumpGuard связан с ensureMessageVisible');
-})();
-
-
-// ═══════════════════════════════════════════════════════════════
-//  🆕 ДОПОЛНИТЕЛЬНО: при входе в чат через jump-to-track
-//  (флаг _pendingJumpToMsgId) — тоже включаем guard
-// ═══════════════════════════════════════════════════════════════
-
-(function patchEnterChatForJumpGuard() {
-    const _origEnterChat = enterChat;
-
+    // ═══════════════════════════════════════════════════════════════
+    //  ЧАСТЬ 3. РАЗОВЫЙ АВТОСКРОЛЛ ПРИ ВХОДЕ В ЧАТ
+    //  Срабатывает только если не было прыжка к конкретному сообщению.
+    //  Работает через allowScrollDownOnce — пробивает наш перехват.
+    // ═══════════════════════════════════════════════════════════════
+    const _origEnterChatForScroll = enterChat;
     enterChat = async function(file, name, password) {
-        // Запоминаем, есть ли флаг прыжка
         const hasPendingJump = !!window._pendingJumpToMsgId;
+        const result = await _origEnterChatForScroll.apply(this, arguments);
 
-        if (hasPendingJump) {
-            // Активируем guard заранее — чтобы пока чат грузится,
-            // никакие автоскроллы не тянули вниз
-            window.startJumpGuard(null);
-        }
+        if (hasPendingJump) return result;
+        if (state.chatFile !== file) return result;
 
-        const result = await _origEnterChat.apply(this, arguments);
+        // Каскад попыток — догоняем асинхронные вложения
+        const tryScrollToBottom = () => {
+            if (typeof _isUserScrolling !== 'undefined' && _isUserScrolling) return;
+            if (state.chatFile !== file) return;
+            if (window._pendingJumpToMsgId) return;
 
-        // Если был флаг — оригинальный renderHistory уже отработал,
-        // guard сам снимется после того, как всё успокоится.
-        // Но на всякий случай страхуемся таймером.
-        if (hasPendingJump) {
-            // Даём renderHistory + loadAttachmentsIn + waitForDomSettle
-            // шанс сработать. Если что-то пойдёт не так — отпустим через 8 сек.
-            setTimeout(() => {
-                if (window.isJumpScrollGuarded && window.isJumpScrollGuarded()) {
-                    console.log('⏱ Аварийное снятие JumpGuard после входа в чат');
-                    window.endJumpGuard();
-                }
-            }, 8000);
-        }
-
-        return result;
-    };
-
-    console.log('🔗 enterChat интегрирован с JumpGuard');
-})();
-
-
-console.log('✅ JumpGuard: полная блокировка до загрузки вложений');
-console.log('   • Ждём пока все [data-attach] получат data-loaded');
-console.log('   • Ждём стабилизации высоты DOM (6 кадров подряд)');
-console.log('   • Safety-таймаут 8 сек');
-console.log('   • Пользователь может снять сам — touch/wheel/mousedown');
-
-// ═══════════════════════════════════════════════════════════════
-//  🎯 ГЛОБАЛЬНОЕ ОТКЛЮЧЕНИЕ АВТОСКРОЛЛОВ ВНИЗ
-//  Всё, что когда-либо дёргало чат вниз автоматически — отключено.
-//  Работают только:
-//    • Ручной скролл пальцем / колесом
-//    • Кнопка «вниз» (scrollDownBtn)
-//    • Отправка нового сообщения (чтобы увидеть свой пузырь)
-//    • Прыжок к сообщению (ensureMessageVisible)
-// ═══════════════════════════════════════════════════════════════
-
-(function disableAllAutoScrollsDown() {
-
-    console.log('🔧 Отключаем все автоскроллы вниз...');
-
-    // ─── Флаг: разрешён ли скролл вниз прямо сейчас ───
-    let _allowScrollDown = false;
-    let _allowScrollDownTimer = null;
-
-    /**
-     * Разрешить один-два скролла вниз на короткое время.
-     * Используется: при отправке сообщения, при прыжке к сообщению.
-     */
-    window.allowScrollDownOnce = function(durationMs = 800) {
-        _allowScrollDown = true;
-        if (_allowScrollDownTimer) clearTimeout(_allowScrollDownTimer);
-        _allowScrollDownTimer = setTimeout(() => {
-            _allowScrollDown = false;
-            _allowScrollDownTimer = null;
-        }, durationMs);
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    //  1. ГЛУШИМ scrollToBottom() — центральная функция всех автоскроллов
-    // ═══════════════════════════════════════════════════════════════
-    const _origScrollToBottom = window.scrollToBottom;
-    window.scrollToBottom = function(force = false) {
-        // Разрешаем только если явно включено
-        if (!_allowScrollDown) return;
-
-        // ─── Дополнительные исключения ───
-
-        // Если открыта галерея — не трогаем
-        if (galleryState && galleryState.isOpen) return;
-
-        // Если пользователь сейчас скроллит — не мешаем
-        if (typeof _isUserScrolling !== 'undefined' && _isUserScrolling) return;
-
-        // Если идёт подгрузка истории сверху — не мешаем
-        if (typeof _loadingOlder !== 'undefined' && _loadingOlder) return;
-
-        return _origScrollToBottom.apply(this, arguments);
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    //  2. ГЛУШИМ scrollToBottomNow() (используется кнопкой «вниз»)
-    //  ⚠️ НО оставляем публичный API для кнопки
-    // ═══════════════════════════════════════════════════════════════
-    // Оставляем как есть — кнопка должна работать.
-
-    // ═══════════════════════════════════════════════════════════════
-    //  3. ГЛУШИМ _scheduleBottomCatchup — «догоняющий» скролл
-    // ═══════════════════════════════════════════════════════════════
-    if (typeof window._scheduleBottomCatchup === 'function') {
-        window._scheduleBottomCatchup = function() {
-            // Полностью no-op
-            return;
-        };
-    }
-    // Также чистим уже запущенные таймеры, если они есть
-    if (typeof _bottomCatchupTimers !== 'undefined' && Array.isArray(_bottomCatchupTimers)) {
-        _bottomCatchupTimers.forEach(t => clearTimeout(t));
-        _bottomCatchupTimers.length = 0;
-    }
-
-    // ═══════════════════════════════════════════════════════════════
-    //  4. ГЛУШИМ installInitialLoadFreeze — 17.5-сек заморозка внизу
-    // ═══════════════════════════════════════════════════════════════
-    if (typeof window.activateInitialFreeze === 'function') {
-        window.activateInitialFreeze = function() {
-            // Полностью no-op
-            console.log('⏭ activateInitialFreeze: пропущено (автоскроллы отключены)');
-        };
-    }
-    if (typeof window.isInitialFreezeActive === 'function') {
-        window.isInitialFreezeActive = function() {
-            return false;
-        };
-    }
-
-    // ═══════════════════════════════════════════════════════════════
-    //  5. ГЛУШИМ installScrollFreezer (пассивный замораживатель)
-    //  Он компенсирует позицию через ResizeObserver, но у него логика:
-    //  «если userAtBottom = true, ничего не делаем» — что как раз
-    //  даёт уехать вниз. Просто отключаем.
-    // ═══════════════════════════════════════════════════════════════
-    // К сожалению, installScrollFreezer — IIFE без публичного API.
-    // Но мы можем отключить его косвенно: он проверяет scrollState.isAtBottom
-    // через messagesContainer. Проще всего — вмешаться в updateUserPosition
-    // через переопределение scrollState.
-
-    // НЕ ТРОГАЕМ scrollState — он нужен для других проверок.
-    // Вместо этого — идём по пути отключения самих триггеров:
-
-    // ═══════════════════════════════════════════════════════════════
-    //  6. ГЛУШИМ автоскролл в конце loadAttachmentsIn
-    //  Там есть:
-    //    if (scrollState.isAtBottom && !_isUserScrolling && ...) {
-    //        messagesContainer.scrollTop = messagesContainer.scrollHeight;
-    //    }
-    //  Мы не можем переписать саму функцию извне (она IIFE),
-    //  поэтому просто НЕ ДАЁМ scrollState.isAtBottom стать true
-    //  в неподходящий момент. Плюс — временно переопределяем
-    //  сам метод scrollToBottom в момент loadAttachmentsIn.
-    // ═══════════════════════════════════════════════════════════════
-
-    // ═══════════════════════════════════════════════════════════════
-    //  7. ПАТЧ renderHistory — убираем автоскролл вниз в конце
-    // ═══════════════════════════════════════════════════════════════
-    const _origRenderHistory = window.renderHistory;
-    window.renderHistory = function() {
-        const result = _origRenderHistory.apply(this, arguments);
-        // После рендера renderHistory делает requestAnimationFrame со скроллом вниз.
-        // Мы не можем его отменить извне — но можем сразу вернуть позицию наверх,
-        // если это был прыжок. Либо просто не трогаем — потому что наш
-        // ensureMessageVisible использует renderHistoryExtended, а не renderHistory.
-        return result;
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    //  8. ПАТЧ appendMessages — автоскролл при новых сообщениях
-    //  В pollUpdates и sendMessage есть:
-    //    if (wasAtBottom && stillAtBottom) scrollToBottom(true);
-    //  Это гасится через _allowScrollDown, потому что scrollToBottom
-    //  проверяет флаг.
-    // ═══════════════════════════════════════════════════════════════
-    // Дополнительно патчим appendMessages, чтобы после него не было
-    // скрытых скроллов
-    const _origAppendMessages = window.appendMessages;
-    window.appendMessages = function(newMsgs) {
-        const result = _origAppendMessages.apply(this, arguments);
-        // После вставки DOM — пытаемся сохранить позицию.
-        // Если пользователь не у низа, ничего не делаем.
-        // Если у низа — тоже не дёргаем, потому что auto-scroll отключен.
-        return result;
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    //  9. ПАТЧ pollUpdates — после получения новых сообщений
-    //  Строка: if (wasAtBottom && stillAtBottom) { scrollToBottom(true); ... }
-    //  Будет автоматически заглушена через scrollToBottom (флаг _allowScrollDown)
-    // ═══════════════════════════════════════════════════════════════
-    // Ничего дополнительно делать не нужно.
-
-    // ═══════════════════════════════════════════════════════════════
-    //  10. ПАТЧ sendMessage — разрешаем скролл вниз ТОЛЬКО при отправке
-    // ═══════════════════════════════════════════════════════════════
-    // Нам нужно перехватить момент отправки. Патчим appendMessages? Нет.
-    // Лучше — патчим сам sendMessage снаружи: разрешаем _allowScrollDown
-    // прямо перед вызовом.
-
-    const _origSendMessageForAutoScroll = window.sendMessage;
-    window.sendMessage = async function(...args) {
-        // Разрешаем 1 скролл вниз на время отправки
-        window.allowScrollDownOnce(1500);
-        try {
-            return await _origSendMessageForAutoScroll.apply(this, args);
-        } finally {
-            // Через 1.5 сек снимем разрешение автоматически (таймер внутри)
-        }
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    //  11. ПАТЧ ensureMessageVisible — разрешаем скролл для прыжка
-    // ═══════════════════════════════════════════════════════════════
-    const _origEnsureMessageVisible = window.ensureMessageVisible;
-    if (typeof _origEnsureMessageVisible === 'function') {
-        window.ensureMessageVisible = async function(...args) {
-            // Для прыжка — не разрешаем scrollToBottom, потому что
-            // ensureMessageVisible использует scrollIntoView (свой, не наш).
-            // НО разрешаем — на случай, если внутри что-то пойдёт через
-            // scrollToBottom.
-            window.allowScrollDownOnce(3000);
-            try {
-                return await _origEnsureMessageVisible.apply(this, args);
-            } finally {
-                // гарантируем, что после прыжка автоскролл выключен
-                setTimeout(() => {
-                    _allowScrollDown = false;
-                }, 100);
-            }
-        };
-    }
-
-    // ═══════════════════════════════════════════════════════════════
-    //  12. ПАТЧ scrollDownBtn — кнопка «вниз» должна работать всегда
-    // ═══════════════════════════════════════════════════════════════
-    const scrollDownBtnEl = document.getElementById('scrollDownBtn');
-    if (scrollDownBtnEl) {
-        // Клонируем кнопку, чтобы снять все прежние слушатели
-        const cloned = scrollDownBtnEl.cloneNode(true);
-        scrollDownBtnEl.parentNode.replaceChild(cloned, scrollDownBtnEl);
-
-        // Новый единственный обработчик
-        cloned.addEventListener('click', () => {
-            // Разрешаем скролл
-            window.allowScrollDownOnce(500);
-
-            // Мгновенный скролл вниз
-            messagesContainer.scrollTo({
-                top: messagesContainer.scrollHeight,
-                behavior: 'smooth'
-            });
-
-            // Сброс состояния
+            window.allowScrollDownOnce(400);
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
             scrollState.isAtBottom = true;
             scrollState.unreadCount = 0;
-            updateScrollBadge();
-            setTimeout(() => {
-                cloned.classList.remove('show');
-                if (typeof updateScrollButton === 'function') updateScrollButton();
-            }, 300);
+            if (typeof updateScrollBadge === 'function') updateScrollBadge();
+            if (typeof updateScrollButton === 'function') updateScrollButton();
 
-            if (typeof soundManager !== 'undefined' && soundManager.play) {
-                soundManager.play('click');
-            }
-        });
-    }
-
-    // ═══════════════════════════════════════════════════════════════
-    //  13. ПАТЧ: предотвращаем ВСЕ прямые записи в scrollTop вниз
-    //  На случай, если где-то остался код, который пишет напрямую
-    //  `messagesContainer.scrollTop = messagesContainer.scrollHeight`
-    //  без вызова scrollToBottom.
-    //
-    //  Перехватываем через defineProperty на scrollTop контейнера.
-    // ═══════════════════════════════════════════════════════════════
-
-    try {
-        const originalScrollTopDescriptor = Object.getOwnPropertyDescriptor(
-            Element.prototype, 'scrollTop'
-        );
-
-        Object.defineProperty(messagesContainer, 'scrollTop', {
-            get() {
-                return originalScrollTopDescriptor.get.call(this);
-            },
-            set(value) {
-                const current = originalScrollTopDescriptor.get.call(this);
-
-                // Если значение увеличивается (движение вниз)
-                // И не разрешено — блокируем
-                if (value > current + 2) {
-                    // Разрешаем если:
-                    //  • _allowScrollDown активен
-                    //  • пользователь сам скроллит (scrollState от browser-scroll)
-                    if (!_allowScrollDown) {
-                        // Дополнительная проверка: если это программный вызов из
-                        // ensureMessageVisible / renderHistoryExtended — тоже
-                        // разрешаем, но только не в направлении «вниз к низу»
-                        // контейнера.
-                        const distanceFromBottom =
-                            this.scrollHeight - value - this.clientHeight;
-
-                        // Если мы пытаемся доехать до самого низа — блокируем
-                        if (distanceFromBottom < 30) {
-                            return; // игнорируем
-                        }
-                        // Промежуточное значение — позволяем (это скролл к anchor)
-                    }
-                }
-
-                return originalScrollTopDescriptor.set.call(this, value);
-            },
-            configurable: true,
-        });
-
-        console.log('🛡️ Перехват scrollTop установлен');
-    } catch (e) {
-        console.warn('⚠️ Не удалось установить перехват scrollTop:', e);
-    }
-
-    // ═══════════════════════════════════════════════════════════════
-    //  14. ПАТЧ: убираем «догонялки» в хвосте loadAttachmentsIn
-    //  Там есть setTimeout-цепочка с syncInlineWithGlobal и
-    //  requestAnimationFrame, которые проверяют scrollState.isAtBottom
-    //  и тянут вниз. Чтобы окончательно всё убить — форсим
-    //  scrollState.isAtBottom = false постоянно.
-    // ═══════════════════════════════════════════════════════════════
-    // Только не постоянно, а когда не разрешён скролл вниз.
-    setInterval(() => {
-        if (!_allowScrollDown) {
-            // Форсим, что мы не у низа — тогда все проверки вида
-            // `if (scrollState.isAtBottom)` не сработают.
-            // НО это ломает updateScrollButton (кнопка «вниз» будет
-            // показываться всегда).
-            //
-            // Поэтому не трогаем scrollState.isAtBottom.
-            // Вместо этого — просто убеждаемся, что флаг _allowScrollDown
-            // снят, когда не нужно.
-        }
-    }, 1000);
-
-    // ═══════════════════════════════════════════════════════════════
-    //  15. ФИНАЛЬНЫЙ ХУК: если пользователь сам скроллит — снимаем
-    //  разрешение, чтобы не мешать.
-    // ═══════════════════════════════════════════════════════════════
-    messagesContainer.addEventListener('touchstart', () => {
-        _allowScrollDown = false;
-        if (_allowScrollDownTimer) {
-            clearTimeout(_allowScrollDownTimer);
-            _allowScrollDownTimer = null;
-        }
-    }, { passive: true, capture: true });
-
-    messagesContainer.addEventListener('wheel', () => {
-        _allowScrollDown = false;
-        if (_allowScrollDownTimer) {
-            clearTimeout(_allowScrollDownTimer);
-            _allowScrollDownTimer = null;
-        }
-    }, { passive: true, capture: true });
-
-    messagesContainer.addEventListener('mousedown', () => {
-        _allowScrollDown = false;
-        if (_allowScrollDownTimer) {
-            clearTimeout(_allowScrollDownTimer);
-            _allowScrollDownTimer = null;
-        }
-    }, { passive: true, capture: true });
-
-    console.log('✅ Все автоскроллы вниз отключены');
-    console.log('   • Работают: ручной скролл, кнопка «вниз», отправка, прыжок');
-    console.log('   • Не работают: автодогон, заморозки, автоскролл после загрузки вложений');
-// ═══════════════════════════════════════════════════════════════
-//  🎯 ГЛОБАЛЬНОЕ ОТКЛЮЧЕНИЕ АВТОСКРОЛЛОВ ВНИЗ
-//  Всё, что когда-либо дёргало чат вниз автоматически — отключено.
-//  Работают только:
-//    • Ручной скролл пальцем / колесом
-//    • Кнопка «вниз» (scrollDownBtn)
-//    • Отправка нового сообщения (чтобы увидеть свой пузырь)
-//    • Прыжок к сообщению (ensureMessageVisible)
-// ═══════════════════════════════════════════════════════════════
-
-(function disableAllAutoScrollsDown() {
-
-    console.log('🔧 Отключаем все автоскроллы вниз...');
-
-    // ─── Флаг: разрешён ли скролл вниз прямо сейчас ───
-    let _allowScrollDown = false;
-    let _allowScrollDownTimer = null;
-
-    /**
-     * Разрешить один-два скролла вниз на короткое время.
-     * Используется: при отправке сообщения, при прыжке к сообщению.
-     */
-    window.allowScrollDownOnce = function(durationMs = 800) {
-        _allowScrollDown = true;
-        if (_allowScrollDownTimer) clearTimeout(_allowScrollDownTimer);
-        _allowScrollDownTimer = setTimeout(() => {
-            _allowScrollDown = false;
-            _allowScrollDownTimer = null;
-        }, durationMs);
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    //  1. ГЛУШИМ scrollToBottom() — центральная функция всех автоскроллов
-    // ═══════════════════════════════════════════════════════════════
-    const _origScrollToBottom = window.scrollToBottom;
-    window.scrollToBottom = function(force = false) {
-        // Разрешаем только если явно включено
-        if (!_allowScrollDown) return;
-
-        // ─── Дополнительные исключения ───
-
-        // Если открыта галерея — не трогаем
-        if (galleryState && galleryState.isOpen) return;
-
-        // Если пользователь сейчас скроллит — не мешаем
-        if (typeof _isUserScrolling !== 'undefined' && _isUserScrolling) return;
-
-        // Если идёт подгрузка истории сверху — не мешаем
-        if (typeof _loadingOlder !== 'undefined' && _loadingOlder) return;
-
-        return _origScrollToBottom.apply(this, arguments);
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    //  2. ГЛУШИМ scrollToBottomNow() (используется кнопкой «вниз»)
-    //  ⚠️ НО оставляем публичный API для кнопки
-    // ═══════════════════════════════════════════════════════════════
-    // Оставляем как есть — кнопка должна работать.
-
-    // ═══════════════════════════════════════════════════════════════
-    //  3. ГЛУШИМ _scheduleBottomCatchup — «догоняющий» скролл
-    // ═══════════════════════════════════════════════════════════════
-    if (typeof window._scheduleBottomCatchup === 'function') {
-        window._scheduleBottomCatchup = function() {
-            // Полностью no-op
-            return;
+            const btn = document.getElementById('scrollDownBtn');
+            if (btn) btn.classList.remove('show');
         };
-    }
-    // Также чистим уже запущенные таймеры, если они есть
-    if (typeof _bottomCatchupTimers !== 'undefined' && Array.isArray(_bottomCatchupTimers)) {
-        _bottomCatchupTimers.forEach(t => clearTimeout(t));
-        _bottomCatchupTimers.length = 0;
-    }
 
-    // ═══════════════════════════════════════════════════════════════
-    //  4. ГЛУШИМ installInitialLoadFreeze — 17.5-сек заморозка внизу
-    // ═══════════════════════════════════════════════════════════════
-    if (typeof window.activateInitialFreeze === 'function') {
-        window.activateInitialFreeze = function() {
-            // Полностью no-op
-            console.log('⏭ activateInitialFreeze: пропущено (автоскроллы отключены)');
-        };
-    }
-    if (typeof window.isInitialFreezeActive === 'function') {
-        window.isInitialFreezeActive = function() {
-            return false;
-        };
-    }
+        setTimeout(tryScrollToBottom, 50);
+        setTimeout(tryScrollToBottom, 200);
+        setTimeout(tryScrollToBottom, 500);
+        setTimeout(tryScrollToBottom, 1000);
+        setTimeout(tryScrollToBottom, 2000);
 
-    // ═══════════════════════════════════════════════════════════════
-    //  5. ГЛУШИМ installScrollFreezer (пассивный замораживатель)
-    //  Он компенсирует позицию через ResizeObserver, но у него логика:
-    //  «если userAtBottom = true, ничего не делаем» — что как раз
-    //  даёт уехать вниз. Просто отключаем.
-    // ═══════════════════════════════════════════════════════════════
-    // К сожалению, installScrollFreezer — IIFE без публичного API.
-    // Но мы можем отключить его косвенно: он проверяет scrollState.isAtBottom
-    // через messagesContainer. Проще всего — вмешаться в updateUserPosition
-    // через переопределение scrollState.
-
-    // НЕ ТРОГАЕМ scrollState — он нужен для других проверок.
-    // Вместо этого — идём по пути отключения самих триггеров:
-
-    // ═══════════════════════════════════════════════════════════════
-    //  6. ГЛУШИМ автоскролл в конце loadAttachmentsIn
-    //  Там есть:
-    //    if (scrollState.isAtBottom && !_isUserScrolling && ...) {
-    //        messagesContainer.scrollTop = messagesContainer.scrollHeight;
-    //    }
-    //  Мы не можем переписать саму функцию извне (она IIFE),
-    //  поэтому просто НЕ ДАЁМ scrollState.isAtBottom стать true
-    //  в неподходящий момент. Плюс — временно переопределяем
-    //  сам метод scrollToBottom в момент loadAttachmentsIn.
-    // ═══════════════════════════════════════════════════════════════
-
-    // ═══════════════════════════════════════════════════════════════
-    //  7. ПАТЧ renderHistory — убираем автоскролл вниз в конце
-    // ═══════════════════════════════════════════════════════════════
-    const _origRenderHistory = window.renderHistory;
-    window.renderHistory = function() {
-        const result = _origRenderHistory.apply(this, arguments);
-        // После рендера renderHistory делает requestAnimationFrame со скроллом вниз.
-        // Мы не можем его отменить извне — но можем сразу вернуть позицию наверх,
-        // если это был прыжок. Либо просто не трогаем — потому что наш
-        // ensureMessageVisible использует renderHistoryExtended, а не renderHistory.
         return result;
     };
 
     // ═══════════════════════════════════════════════════════════════
-    //  8. ПАТЧ appendMessages — автоскролл при новых сообщениях
-    //  В pollUpdates и sendMessage есть:
-    //    if (wasAtBottom && stillAtBottom) scrollToBottom(true);
-    //  Это гасится через _allowScrollDown, потому что scrollToBottom
-    //  проверяет флаг.
+    //  ЧАСТЬ 4. НАДЁЖНАЯ КНОПКА «ВНИЗ»
+    //  Появляется всегда, когда пользователь не у низа — независимо
+    //  от scrollState.isAtBottom (который мог сломаться после патчей).
     // ═══════════════════════════════════════════════════════════════
-    // Дополнительно патчим appendMessages, чтобы после него не было
-    // скрытых скроллов
-    const _origAppendMessages = window.appendMessages;
-    window.appendMessages = function(newMsgs) {
-        const result = _origAppendMessages.apply(this, arguments);
-        // После вставки DOM — пытаемся сохранить позицию.
-        // Если пользователь не у низа, ничего не делаем.
-        // Если у низа — тоже не дёргаем, потому что auto-scroll отключен.
-        return result;
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    //  9. ПАТЧ pollUpdates — после получения новых сообщений
-    //  Строка: if (wasAtBottom && stillAtBottom) { scrollToBottom(true); ... }
-    //  Будет автоматически заглушена через scrollToBottom (флаг _allowScrollDown)
-    // ═══════════════════════════════════════════════════════════════
-    // Ничего дополнительно делать не нужно.
-
-    // ═══════════════════════════════════════════════════════════════
-    //  10. ПАТЧ sendMessage — разрешаем скролл вниз ТОЛЬКО при отправке
-    // ═══════════════════════════════════════════════════════════════
-    // Нам нужно перехватить момент отправки. Патчим appendMessages? Нет.
-    // Лучше — патчим сам sendMessage снаружи: разрешаем _allowScrollDown
-    // прямо перед вызовом.
-
-    const _origSendMessageForAutoScroll = window.sendMessage;
-    window.sendMessage = async function(...args) {
-        // Разрешаем 1 скролл вниз на время отправки
-        window.allowScrollDownOnce(1500);
-        try {
-            return await _origSendMessageForAutoScroll.apply(this, args);
-        } finally {
-            // Через 1.5 сек снимем разрешение автоматически (таймер внутри)
+    const btn = document.getElementById('scrollDownBtn');
+    if (btn) {
+        function computeDistanceFromBottom() {
+            return messagesContainer.scrollHeight
+                 - messagesContainer.scrollTop
+                 - messagesContainer.clientHeight;
         }
-    };
 
-    // ═══════════════════════════════════════════════════════════════
-    //  11. ПАТЧ ensureMessageVisible — разрешаем скролл для прыжка
-    // ═══════════════════════════════════════════════════════════════
-    const _origEnsureMessageVisible = window.ensureMessageVisible;
-    if (typeof _origEnsureMessageVisible === 'function') {
-        window.ensureMessageVisible = async function(...args) {
-            // Для прыжка — не разрешаем scrollToBottom, потому что
-            // ensureMessageVisible использует scrollIntoView (свой, не наш).
-            // НО разрешаем — на случай, если внутри что-то пойдёт через
-            // scrollToBottom.
-            window.allowScrollDownOnce(3000);
-            try {
-                return await _origEnsureMessageVisible.apply(this, args);
-            } finally {
-                // гарантируем, что после прыжка автоскролл выключен
-                setTimeout(() => {
-                    _allowScrollDown = false;
-                }, 100);
+        const SHOW_THRESHOLD = 100;
+
+        function refreshScrollButton() {
+            const dist = computeDistanceFromBottom();
+            const shouldShow = dist > SHOW_THRESHOLD;
+
+            if (shouldShow) {
+                btn.classList.add('show');
+            } else {
+                btn.classList.remove('show');
+                scrollState.unreadCount = 0;
+                if (typeof updateScrollBadge === 'function') updateScrollBadge();
             }
-        };
-    }
 
-    // ═══════════════════════════════════════════════════════════════
-    //  12. ПАТЧ scrollDownBtn — кнопка «вниз» должна работать всегда
-    // ═══════════════════════════════════════════════════════════════
-    const scrollDownBtnEl = document.getElementById('scrollDownBtn');
-    if (scrollDownBtnEl) {
-        // Клонируем кнопку, чтобы снять все прежние слушатели
-        const cloned = scrollDownBtnEl.cloneNode(true);
-        scrollDownBtnEl.parentNode.replaceChild(cloned, scrollDownBtnEl);
+            // Обновляем scrollState.isAtBottom для консистентности с остальным кодом
+            scrollState.isAtBottom = dist <= 80;
+        }
 
-        // Новый единственный обработчик
-        cloned.addEventListener('click', () => {
-            // Разрешаем скролл
-            window.allowScrollDownOnce(500);
-
-            // Мгновенный скролл вниз
-            messagesContainer.scrollTo({
-                top: messagesContainer.scrollHeight,
-                behavior: 'smooth'
+        // Слушатель на скролл через rAF
+        let _rafPending = false;
+        messagesContainer.addEventListener('scroll', () => {
+            if (_rafPending) return;
+            _rafPending = true;
+            requestAnimationFrame(() => {
+                _rafPending = false;
+                refreshScrollButton();
             });
+        }, { passive: true });
 
-            // Сброс состояния
-            scrollState.isAtBottom = true;
-            scrollState.unreadCount = 0;
-            updateScrollBadge();
-            setTimeout(() => {
-                cloned.classList.remove('show');
-                if (typeof updateScrollButton === 'function') updateScrollButton();
-            }, 300);
+        // ResizeObserver — когда вложения меняют высоту контейнера
+        if (window.ResizeObserver) {
+            const ro = new ResizeObserver(() => {
+                if (ro._timer) clearTimeout(ro._timer);
+                ro._timer = setTimeout(refreshScrollButton, 100);
+            });
+            ro.observe(messagesInner);
+        }
 
-            if (typeof soundManager !== 'undefined' && soundManager.play) {
-                soundManager.play('click');
-            }
-        });
+        // Пересчитываем при переключении чата
+        const _origRenderHistory2 = renderHistory;
+        renderHistory = function() {
+            const r = _origRenderHistory2.apply(this, arguments);
+            setTimeout(refreshScrollButton, 50);
+            setTimeout(refreshScrollButton, 300);
+            return r;
+        };
+
+        // Инициализация
+        setTimeout(refreshScrollButton, 500);
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    //  13. ПАТЧ: предотвращаем ВСЕ прямые записи в scrollTop вниз
-    //  На случай, если где-то остался код, который пишет напрямую
-    //  `messagesContainer.scrollTop = messagesContainer.scrollHeight`
-    //  без вызова scrollToBottom.
-    //
-    //  Перехватываем через defineProperty на scrollTop контейнера.
-    // ═══════════════════════════════════════════════════════════════
-
-    try {
-        const originalScrollTopDescriptor = Object.getOwnPropertyDescriptor(
-            Element.prototype, 'scrollTop'
-        );
-
-        Object.defineProperty(messagesContainer, 'scrollTop', {
-            get() {
-                return originalScrollTopDescriptor.get.call(this);
-            },
-            set(value) {
-                const current = originalScrollTopDescriptor.get.call(this);
-
-                // Если значение увеличивается (движение вниз)
-                // И не разрешено — блокируем
-                if (value > current + 2) {
-                    // Разрешаем если:
-                    //  • _allowScrollDown активен
-                    //  • пользователь сам скроллит (scrollState от browser-scroll)
-                    if (!_allowScrollDown) {
-                        // Дополнительная проверка: если это программный вызов из
-                        // ensureMessageVisible / renderHistoryExtended — тоже
-                        // разрешаем, но только не в направлении «вниз к низу»
-                        // контейнера.
-                        const distanceFromBottom =
-                            this.scrollHeight - value - this.clientHeight;
-
-                        // Если мы пытаемся доехать до самого низа — блокируем
-                        if (distanceFromBottom < 30) {
-                            return; // игнорируем
-                        }
-                        // Промежуточное значение — позволяем (это скролл к anchor)
-                    }
-                }
-
-                return originalScrollTopDescriptor.set.call(this, value);
-            },
-            configurable: true,
-        });
-
-        console.log('🛡️ Перехват scrollTop установлен');
-    } catch (e) {
-        console.warn('⚠️ Не удалось установить перехват scrollTop:', e);
-    }
-
-    // ═══════════════════════════════════════════════════════════════
-    //  14. ПАТЧ: убираем «догонялки» в хвосте loadAttachmentsIn
-    //  Там есть setTimeout-цепочка с syncInlineWithGlobal и
-    //  requestAnimationFrame, которые проверяют scrollState.isAtBottom
-    //  и тянут вниз. Чтобы окончательно всё убить — форсим
-    //  scrollState.isAtBottom = false постоянно.
-    // ═══════════════════════════════════════════════════════════════
-    // Только не постоянно, а когда не разрешён скролл вниз.
-    setInterval(() => {
-        if (!_allowScrollDown) {
-            // Форсим, что мы не у низа — тогда все проверки вида
-            // `if (scrollState.isAtBottom)` не сработают.
-            // НО это ломает updateScrollButton (кнопка «вниз» будет
-            // показываться всегда).
-            //
-            // Поэтому не трогаем scrollState.isAtBottom.
-            // Вместо этого — просто убеждаемся, что флаг _allowScrollDown
-            // снят, когда не нужно.
-        }
-    }, 1000);
-
-    // ═══════════════════════════════════════════════════════════════
-    //  15. ФИНАЛЬНЫЙ ХУК: если пользователь сам скроллит — снимаем
-    //  разрешение, чтобы не мешать.
-    // ═══════════════════════════════════════════════════════════════
-    messagesContainer.addEventListener('touchstart', () => {
-        _allowScrollDown = false;
-        if (_allowScrollDownTimer) {
-            clearTimeout(_allowScrollDownTimer);
-            _allowScrollDownTimer = null;
-        }
-    }, { passive: true, capture: true });
-
-    messagesContainer.addEventListener('wheel', () => {
-        _allowScrollDown = false;
-        if (_allowScrollDownTimer) {
-            clearTimeout(_allowScrollDownTimer);
-            _allowScrollDownTimer = null;
-        }
-    }, { passive: true, capture: true });
-
-    messagesContainer.addEventListener('mousedown', () => {
-        _allowScrollDown = false;
-        if (_allowScrollDownTimer) {
-            clearTimeout(_allowScrollDownTimer);
-            _allowScrollDownTimer = null;
-        }
-    }, { passive: true, capture: true });
-
-    console.log('✅ Все автоскроллы вниз отключены');
+    console.log('✅ Умный поиск + отключение автоскроллов установлены');
+    console.log('   • Прыжок к сообщению работает даже если оно за пределами DOM');
+    console.log('   • Автоскроллы вниз отключены (догон, заморозки, после вложений)');
     console.log('   • Работают: ручной скролл, кнопка «вниз», отправка, прыжок');
-    console.log('   • Не работают: автодогон, заморозки, автоскролл после загрузки вложений');
+    console.log('   • Разовый автоскролл при входе в чат (без прыжка)');
+})();
 
-})();
-})();
+
+
 </script>
 </body>
 </html>
