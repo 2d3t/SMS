@@ -18756,7 +18756,7 @@ showMessageMenu = function(x, y, msgId, isOwn) {
     let _lockReleasedByUser = false;
     let _lockTimerHandle = null;
 
-    const LOCK_DURATION_MS = 30000;       // 30 секунды
+    const LOCK_DURATION_MS = 3000;       // 3 секунды
 
     // Публичный флаг
     window.isScrollDownLocked = () => Date.now() < _lockUntil;
@@ -19093,6 +19093,482 @@ console.log('✅ Скролл-блокировка после прыжка ак�
 console.log('   • Все автоскроллы вниз игнорируются');
 console.log('   • Пользователь может сам скроллить — это снимает блокировку');
 console.log('   • Anchor-элемент жёстко удерживает позицию, пока вложения грузятся');
+// ═══════════════════════════════════════════════════════════════
+//  🛑 ПОЛНАЯ БЛОКИРОВКА СКРОЛЛА ВО ВРЕМЯ ПРЫЖКА К СООБЩЕНИЮ
+//  Ждём, пока все вложения загрузятся (или 8с), только потом
+//  отпускаем управление скроллом.
+// ═══════════════════════════════════════════════════════════════
+
+(function installJumpScrollGuard() {
+
+    // ─── Состояние ───
+    let _jumpInProgress = false;
+    let _jumpAnchorEl = null;
+    let _jumpAnchorVisualTop = 0;
+    let _jumpSafetyTimer = null;
+    let _jumpResizeObserver = null;
+    let _jumpForceIsAtBottomTimer = null;
+    let _jumpSuppressUserRelease = false;
+
+    const SAFETY_TIMEOUT_MS = 8000;      // максимум ждём 8 сек
+    const MIN_HOLD_MS = 400;             // минимум держим блокировку — чтобы точно ничего не дёрнулось
+
+    // Публичный флаг
+    window.isJumpScrollGuarded = () => _jumpInProgress;
+
+    // ─── Форсируем scrollState.isAtBottom = false на каждом тике ───
+    function startForceIsAtBottom() {
+        if (_jumpForceIsAtBottomTimer) return;
+        _jumpForceIsAtBottomTimer = setInterval(() => {
+            if (!_jumpInProgress) {
+                clearInterval(_jumpForceIsAtBottomTimer);
+                _jumpForceIsAtBottomTimer = null;
+                return;
+            }
+            // Жёстко фиксируем: мы НЕ у низа
+            scrollState.isAtBottom = false;
+        }, 60);
+    }
+
+    // ─── Anchor: держим визуальную позицию цели ───
+    function captureAnchor(el) {
+        if (!el) {
+            _jumpAnchorEl = null;
+            return;
+        }
+        _jumpAnchorEl = el;
+        const contRect = messagesContainer.getBoundingClientRect();
+        const elRect = el.getBoundingClientRect();
+        _jumpAnchorVisualTop = elRect.top - contRect.top;
+    }
+
+    function restoreAnchor() {
+        if (!_jumpInProgress) return;
+        if (!_jumpAnchorEl || !_jumpAnchorEl.isConnected) return;
+
+        const contRect = messagesContainer.getBoundingClientRect();
+        const elRect = _jumpAnchorEl.getBoundingClientRect();
+        const currentTop = elRect.top - contRect.top;
+        const diff = currentTop - _jumpAnchorVisualTop;
+
+        // Компенсируем: сдвигаем scrollTop на столько, на сколько
+        // уехал anchor. Формула: scrollTop += diff.
+        if (Math.abs(diff) > 0.5) {
+            messagesContainer.scrollTop += diff;
+        }
+    }
+
+    function startResizeObserver() {
+        stopResizeObserver();
+        if (!window.ResizeObserver) return;
+        _jumpResizeObserver = new ResizeObserver(() => {
+            if (!_jumpInProgress) return;
+            restoreAnchor();
+            // И ещё раз — на случай, если браузер уже успел перерисовать
+            requestAnimationFrame(restoreAnchor);
+        });
+        _jumpResizeObserver.observe(messagesInner);
+    }
+
+    function stopResizeObserver() {
+        if (_jumpResizeObserver) {
+            _jumpResizeObserver.disconnect();
+            _jumpResizeObserver = null;
+        }
+    }
+
+    // ─── Проверка: все ли вложения загружены ───
+    function allAttachmentsLoaded() {
+        // Ищем плейсхолдеры БЕЗ data-loaded
+        const pending = messagesInner.querySelectorAll(
+            '[data-attach]:not([data-loaded]), ' +
+            '[data-video-attach]:not([data-loaded])'
+        );
+        return pending.length === 0;
+    }
+
+    // ─── Ожидание «пока всё успокоится» ───
+    function waitForSettled(anchorEl, onDone) {
+        const startTime = Date.now();
+        let lastHeight = messagesInner.scrollHeight;
+        let stableFrames = 0;
+
+        const tick = () => {
+            if (!_jumpInProgress) {
+                onDone();
+                return;
+            }
+
+            // Условия завершения:
+            const elapsed = Date.now() - startTime;
+            const heightNow = messagesInner.scrollHeight;
+            const heightStable = heightNow === lastHeight;
+            lastHeight = heightNow;
+
+            if (heightStable) stableFrames++;
+            else stableFrames = 0;
+
+            // Готово, если:
+            //  - Прошли MIN_HOLD_MS
+            //  - Все вложения [data-loaded]
+            //  - Высота не меняется 3 кадра подряд (примерно 150мс)
+            //  - ИЛИ истёк SAFETY_TIMEOUT_MS
+            const allLoaded = allAttachmentsLoaded();
+            const settled = heightStable && stableFrames >= 3;
+            const timedOut = elapsed > SAFETY_TIMEOUT_MS;
+
+            if ((allLoaded && settled && elapsed >= MIN_HOLD_MS) || timedOut) {
+                onDone();
+                return;
+            }
+
+            // Держим позицию
+            restoreAnchor();
+            setTimeout(tick, 50);
+        };
+        tick();
+    }
+
+    // ─── Публичный API: начать прыжок ───
+    window.startJumpGuard = function(anchorEl) {
+        // Если уже что-то прыгаем — перезапускаем
+        if (_jumpInProgress) {
+            window.endJumpGuard();
+        }
+
+        _jumpInProgress = true;
+        _jumpSuppressUserRelease = true;
+        scrollState.isAtBottom = false;
+
+        captureAnchor(anchorEl);
+        startResizeObserver();
+        startForceIsAtBottom();
+
+        // Подавляем релиз от пользовательских событий на 500мс
+        // (scrollIntoView может генерировать touch)
+        setTimeout(() => { _jumpSuppressUserRelease = false; }, 500);
+
+        // Safety-таймер
+        if (_jumpSafetyTimer) clearTimeout(_jumpSafetyTimer);
+        _jumpSafetyTimer = setTimeout(() => {
+            window.endJumpGuard();
+        }, SAFETY_TIMEOUT_MS + 500);
+
+        console.log(`🔒 JumpGuard: ON (anchor=${anchorEl?.dataset?.msgId || '?'})`);
+    };
+
+    // ─── Публичный API: завершить прыжок ───
+    window.endJumpGuard = function() {
+        if (!_jumpInProgress) return;
+        _jumpInProgress = false;
+
+        stopResizeObserver();
+        if (_jumpSafetyTimer) {
+            clearTimeout(_jumpSafetyTimer);
+            _jumpSafetyTimer = null;
+        }
+        if (_jumpForceIsAtBottomTimer) {
+            clearInterval(_jumpForceIsAtBottomTimer);
+            _jumpForceIsAtBottomTimer = null;
+        }
+        _jumpAnchorEl = null;
+
+        // Пересчитываем состояние скролла после отпускания
+        scrollState.isAtBottom = isNearBottom();
+
+        console.log('🔓 JumpGuard: OFF');
+    };
+
+    // ═══════════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ РУЧНОГО СКРОЛЛА
+    //  Если пользователь сам начал скроллить — снимаем guard.
+    // ═══════════════════════════════════════════════════════════════
+
+    function onUserScrollIntent() {
+        if (!_jumpInProgress) return;
+        if (_jumpSuppressUserRelease) return;
+        window.endJumpGuard();
+    }
+
+    messagesContainer.addEventListener('touchstart', onUserScrollIntent, { passive: true, capture: true });
+    messagesContainer.addEventListener('touchmove',  onUserScrollIntent, { passive: true, capture: true });
+    messagesContainer.addEventListener('wheel',      onUserScrollIntent, { passive: true, capture: true });
+    messagesContainer.addEventListener('mousedown',  onUserScrollIntent, { passive: true, capture: true });
+
+    // ═══════════════════════════════════════════════════════════════
+    //  ПАТЧ: scrollToBottom — игнорируем во время guard'а
+    // ═══════════════════════════════════════════════════════════════
+    const _origScrollToBottom = window.scrollToBottom;
+    window.scrollToBottom = function(force = false) {
+        if (_jumpInProgress) return;
+        return _origScrollToBottom.apply(this, arguments);
+    };
+
+    // ─── scrollToBottomNow тоже глушим ───
+    const _origScrollToBottomNow = window.scrollToBottomNow;
+    window.scrollToBottomNow = function() {
+        if (_jumpInProgress) return;
+        return _origScrollToBottomNow.apply(this, arguments);
+    };
+
+    // ═══════════════════════════════════════════════════════════════
+    //  ПАТЧ: _scheduleBottomCatchup — не запускаем во время guard'а
+    // ═══════════════════════════════════════════════════════════════
+    if (typeof window._scheduleBottomCatchup === 'function') {
+        const _origScheduleBottomCatchup = window._scheduleBottomCatchup;
+        window._scheduleBottomCatchup = function() {
+            if (_jumpInProgress) return;
+            return _origScheduleBottomCatchup.apply(this, arguments);
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  ПАТЧ: installInitialLoadFreeze не работает во время guard'а
+    // ═══════════════════════════════════════════════════════════════
+    if (typeof window.isInitialFreezeActive === 'function') {
+        const _origIsInitialFreezeActive = window.isInitialFreezeActive;
+        window.isInitialFreezeActive = function() {
+            if (_jumpInProgress) return false;
+            return _origIsInitialFreezeActive.call(this);
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  ПАТЧ: scroll-обработчик — не даём ему включить isAtBottom
+    //  пока guard активен
+    // ═══════════════════════════════════════════════════════════════
+    // (scrollState.isAtBottom уже форсится через startForceIsAtBottom)
+
+    // ═══════════════════════════════════════════════════════════════
+    //  ПАТЧ: installScrollFreezer — пусть не мешает
+    //  Его ResizeObserver проверяет userAtBottom и если true —
+    //  сбрасывает anchor. Нам это не нужно во время guard'а,
+    //  потому что наш собственный observer всё держит.
+    //  Просто форсим scrollState.isAtBottom = false через guard.
+    // ═══════════════════════════════════════════════════════════════
+    // (уже сделано через startForceIsAtBottom)
+
+    console.log('🛑 JumpGuard установлен');
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🔗 ИНТЕГРАЦИЯ С ensureMessageVisible
+//  Обернём функцию так, чтобы:
+//  1. Перед рендером активировать JumpGuard.
+//  2. После рендера — найти anchor и ждать, пока всё успокоится.
+//  3. Только потом отпустить guard.
+// ═══════════════════════════════════════════════════════════════
+
+(function integrateJumpGuardWithJump() {
+    const _origEnsureMessageVisible = window.ensureMessageVisible;
+
+    window.ensureMessageVisible = async function(msgId, opts = {}) {
+        if (!msgId || typeof _origEnsureMessageVisible !== 'function') {
+            return false;
+        }
+
+        const targetIdStr = String(msgId);
+
+        // Если сообщение УЖЕ в DOM и не нужно перерисовывать —
+        // просто скроллим и подсвечиваем, guard не нужен
+        const alreadyInDom = messagesInner.querySelector(
+            `.message-wrapper[data-msg-id="${targetIdStr}"]`
+        );
+
+        // ═══ Случай 1: сообщение уже в DOM ═══
+        if (alreadyInDom) {
+            // Прокрутим и подсветим как раньше
+            messagesInner.querySelectorAll('.message-wrapper.highlight-flash')
+                .forEach(x => x.classList.remove('highlight-flash'));
+
+            alreadyInDom.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+            setTimeout(() => {
+                alreadyInDom.classList.add('highlight-flash');
+                setTimeout(() => alreadyInDom.classList.remove('highlight-flash'), 1400);
+            }, 250);
+
+            if (navigator.vibrate) navigator.vibrate(20);
+            return true;
+        }
+
+        // ═══ Случай 2: сообщение вне DOM — активируем guard ═══
+
+        // Начинаем guard без anchor (anchor будет после рендера)
+        window.startJumpGuard(null);
+
+        try {
+            // Запускаем оригинальную логику — она перерисует окно и скроллит
+            const result = await _origEnsureMessageVisible.call(this, msgId, opts);
+
+            if (!result) {
+                // Сообщение не нашли — отпускаем guard сразу
+                window.endJumpGuard();
+                return false;
+            }
+
+            // ═══ Ждём, пока anchor появится в DOM ═══
+            const anchorEl = await waitForAnchorInDom(targetIdStr);
+            if (!anchorEl) {
+                window.endJumpGuard();
+                return true;
+            }
+
+            // Захватываем anchor в guard
+            if (typeof window.startJumpGuard === 'function') {
+                // Перезапускаем guard уже с anchor — чтобы observer заработал
+                window.startJumpGuard(anchorEl);
+            }
+
+            // ═══ Ждём, пока вложения подгрузятся и высота перестанет меняться ═══
+            await waitForDomSettle(anchorEl);
+
+            // ═══ Плавно скроллим к anchor — теперь, когда всё загружено ═══
+            anchorEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+            // Подсветка
+            setTimeout(() => {
+                anchorEl.classList.add('highlight-flash');
+                setTimeout(() => anchorEl.classList.remove('highlight-flash'), 1400);
+            }, 300);
+
+            if (navigator.vibrate) navigator.vibrate(20);
+
+            // Ещё чуть подержим guard, чтобы smooth-scroll завершился
+            setTimeout(() => {
+                window.endJumpGuard();
+            }, 700);
+
+            return true;
+
+        } catch (e) {
+            console.error('ensureMessageVisible error:', e);
+            window.endJumpGuard();
+            throw e;
+        }
+    };
+
+    // ─── Ждём появления anchor в DOM ───
+    function waitForAnchorInDom(msgId, maxWaitMs = 2000) {
+        return new Promise((resolve) => {
+            const start = Date.now();
+            const check = () => {
+                const el = messagesInner.querySelector(
+                    `.message-wrapper[data-msg-id="${msgId}"]`
+                );
+                if (el) return resolve(el);
+                if (Date.now() - start > maxWaitMs) return resolve(null);
+                requestAnimationFrame(check);
+            };
+            check();
+        });
+    }
+
+    // ─── Ждём, пока DOM «успокоится» ───
+    //  Условия выхода:
+    //   - все [data-attach] и [data-video-attach] получили data-loaded
+    //   - scrollHeight не меняется N кадров подряд
+    //   - истёк hard-таймаут (8 сек)
+    function waitForDomSettle(anchorEl, opts = {}) {
+        const HARD_TIMEOUT = opts.hardTimeout || 8000;
+        const STABLE_FRAMES = opts.stableFrames || 6;  // ~300 мс покоя
+        const MIN_HOLD = opts.minHold || 300;
+
+        return new Promise((resolve) => {
+            const start = Date.now();
+            let lastHeight = messagesInner.scrollHeight;
+            let stableCount = 0;
+
+            const tick = () => {
+                const elapsed = Date.now() - start;
+
+                // Safety timeout
+                if (elapsed > HARD_TIMEOUT) {
+                    console.warn('⏱ waitForDomSettle: timeout');
+                    return resolve();
+                }
+
+                // 1. Проверка плейсхолдеров
+                const pending = messagesInner.querySelectorAll(
+                    '[data-attach]:not([data-loaded]), ' +
+                    '[data-video-attach]:not([data-loaded])'
+                );
+
+                // 2. Проверка стабильности высоты
+                const h = messagesInner.scrollHeight;
+                if (h === lastHeight) stableCount++;
+                else { stableCount = 0; lastHeight = h; }
+
+                const allLoaded = pending.length === 0;
+                const heightStable = stableCount >= STABLE_FRAMES;
+                const minElapsed = elapsed >= MIN_HOLD;
+
+                if (allLoaded && heightStable && minElapsed) {
+                    return resolve();
+                }
+
+                // Компенсируем смещение anchor, если он ещё виден
+                if (anchorEl && anchorEl.isConnected && elapsed < HARD_TIMEOUT) {
+                    // (anchor остаётся на месте за счёт guard'а — ResizeObserver)
+                }
+
+                requestAnimationFrame(tick);
+            };
+            tick();
+        });
+    }
+
+    console.log('🔗 JumpGuard связан с ensureMessageVisible');
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🆕 ДОПОЛНИТЕЛЬНО: при входе в чат через jump-to-track
+//  (флаг _pendingJumpToMsgId) — тоже включаем guard
+// ═══════════════════════════════════════════════════════════════
+
+(function patchEnterChatForJumpGuard() {
+    const _origEnterChat = enterChat;
+
+    enterChat = async function(file, name, password) {
+        // Запоминаем, есть ли флаг прыжка
+        const hasPendingJump = !!window._pendingJumpToMsgId;
+
+        if (hasPendingJump) {
+            // Активируем guard заранее — чтобы пока чат грузится,
+            // никакие автоскроллы не тянули вниз
+            window.startJumpGuard(null);
+        }
+
+        const result = await _origEnterChat.apply(this, arguments);
+
+        // Если был флаг — оригинальный renderHistory уже отработал,
+        // guard сам снимется после того, как всё успокоится.
+        // Но на всякий случай страхуемся таймером.
+        if (hasPendingJump) {
+            // Даём renderHistory + loadAttachmentsIn + waitForDomSettle
+            // шанс сработать. Если что-то пойдёт не так — отпустим через 8 сек.
+            setTimeout(() => {
+                if (window.isJumpScrollGuarded && window.isJumpScrollGuarded()) {
+                    console.log('⏱ Аварийное снятие JumpGuard после входа в чат');
+                    window.endJumpGuard();
+                }
+            }, 8000);
+        }
+
+        return result;
+    };
+
+    console.log('🔗 enterChat интегрирован с JumpGuard');
+})();
+
+
+console.log('✅ JumpGuard: полная блокировка до загрузки вложений');
+console.log('   • Ждём пока все [data-attach] получат data-loaded');
+console.log('   • Ждём стабилизации высоты DOM (6 кадров подряд)');
+console.log('   • Safety-таймаут 8 сек');
+console.log('   • Пользователь может снять сам — touch/wheel/mousedown');
 </script>
 </body>
 </html>
