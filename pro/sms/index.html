@@ -18520,72 +18520,350 @@ showMessageMenu = function(x, y, msgId, isOwn) {
     console.log('🎯 Мгновенный прыжок к треку из другого чата активен');
 })();
 
-
 // ═══════════════════════════════════════════════════════════════
-//  🎯 УМНЫЙ ПОИСК + ГЛОБАЛЬНОЕ ОТКЛЮЧЕНИЕ АВТОСКРОЛЛОВ ВНИЗ
-//  Финальный патч: гарантирует прыжок к сообщению, если оно было
-//  найдено через поиск, но находится за пределами DOM (пагинация).
+//  🎯 ЕДИНЫЙ ПАТЧ: СКРОЛЛ + БЕЙДЖ + ПРЫЖОК К СООБЩЕНИЮ
+//  Самодостаточный. Больше никаких других патчей не требуется.
 //
 //  Что делает:
-//   1. ensureMessageVisible(msgId) — если сообщение уже в DOM,
-//      скроллит и подсвечивает его. Если нет — перерисовывает
-//      историю с расширенным окном вокруг цели и скроллит к ней.
-//   2. Гасит ВСЕ автоскроллы вниз (догон после вложений, заморозки,
-//      автоскролл в renderHistory, appendMessages, pollUpdates).
-//   3. Работают только: ручной скролл, кнопка «вниз», отправка
-//      сообщения и сам прыжок.
+//   1. Сообщение из поиска/reply/jump-to-track всегда открывается,
+//      даже если оно за пределами DOM (пагинация).
+//   2. Автоскроллы вниз отключены (догон, заморозки, после вложений).
+//   3. Работают: ручной скролл, кнопка «вниз», отправка, прыжок.
+//   4. Бейдж непрочитанных на кнопке «вниз» работает корректно.
+//   5. Разовый автоскролл при входе в чат (если не было прыжка).
 // ═══════════════════════════════════════════════════════════════
 
-(function installSmartJumpAndDisableAutoScrollsDown() {
+(function installEverything() {
 
-    console.log('🔧 Устанавливаем умный поиск + отключаем автоскроллы...');
+    console.log('🎯 Устанавливаем единый патч скролла, бейджа и прыжка...');
 
     // ═══════════════════════════════════════════════════════════════
-    //  ЧАСТЬ 1. УНИВЕРСАЛЬНЫЙ ПРЫЖОК К СООБЩЕНИЮ
+    //  СОСТОЯНИЕ ПАТЧА
+    // ═══════════════════════════════════════════════════════════════
+    const P = {
+        // Разрешение на автоскролл вниз (сбрасывается через allowScrollDownOnce)
+        allowScrollDown: false,
+        allowScrollDownTimer: null,
+
+        // Счётчик непрочитанных (наш собственный, независимый от scrollState)
+        unreadCount: 0,
+
+        // Флаг: сейчас выполняется программный прыжок/скролл — игнорируем как «пользовательский»
+        isProgrammatic: false,
+
+        // Флаг: пользователь сейчас активно скроллит пальцем
+        isUserScrolling: false,
+        userScrollTimer: null,
+
+        // Флаг: сейчас идёт прыжок к сообщению
+        isJumpInProgress: false,
+    };
+
+    // ═══════════════════════════════════════════════════════════════
+    //  РАЗРЕШЕНИЕ АВТОСКРОЛЛА
+    // ═══════════════════════════════════════════════════════════════
+    function allowScrollDownOnce(ms = 800) {
+        P.allowScrollDown = true;
+        if (P.allowScrollDownTimer) clearTimeout(P.allowScrollDownTimer);
+        P.allowScrollDownTimer = setTimeout(() => {
+            P.allowScrollDown = false;
+            P.allowScrollDownTimer = null;
+        }, ms);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  ОТСЛЕЖИВАНИЕ ЖЕСТА СКРОЛЛА
+    // ═══════════════════════════════════════════════════════════════
+    function markScrollStart() {
+        P.isUserScrolling = true;
+        if (P.userScrollTimer) {
+            clearTimeout(P.userScrollTimer);
+            P.userScrollTimer = null;
+        }
+    }
+
+    function markScrollEnd() {
+        if (P.userScrollTimer) clearTimeout(P.userScrollTimer);
+        P.userScrollTimer = setTimeout(() => {
+            P.isUserScrolling = false;
+            P.userScrollTimer = null;
+        }, 150);
+    }
+
+    messagesContainer.addEventListener('touchstart', markScrollStart, { passive: true, capture: true });
+    messagesContainer.addEventListener('touchend',   markScrollEnd,   { passive: true, capture: true });
+    messagesContainer.addEventListener('touchcancel', markScrollEnd,  { passive: true, capture: true });
+    messagesContainer.addEventListener('wheel', () => {
+        markScrollStart();
+        markScrollEnd();
+    }, { passive: true, capture: true });
+
+    // ═══════════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ scrollTop — блокируем запись «до низа», если не разрешено
+    // ═══════════════════════════════════════════════════════════════
+    try {
+        const scrollTopDescriptor = Object.getOwnPropertyDescriptor(
+            Element.prototype, 'scrollTop'
+        );
+        Object.defineProperty(messagesContainer, 'scrollTop', {
+            get() {
+                return scrollTopDescriptor.get.call(this);
+            },
+            set(value) {
+                const current = scrollTopDescriptor.get.call(this);
+
+                // Движение вниз?
+                if (value > current + 2) {
+                    // Есть разрешение на программный скролл?
+                    if (P.allowScrollDown) {
+                        return scrollTopDescriptor.set.call(this, value);
+                    }
+                    // Пользователь сам скроллит? (тач-жест или wheel)
+                    if (P.isUserScrolling) {
+                        return scrollTopDescriptor.set.call(this, value);
+                    }
+                    // Программный прыжок к якорю (не до самого низа)?
+                    const distanceFromBottom = this.scrollHeight - value - this.clientHeight;
+                    if (distanceFromBottom < 30) {
+                        // Пытаемся доехать до самого низа без разрешения — блокируем
+                        return;
+                    }
+                }
+
+                return scrollTopDescriptor.set.call(this, value);
+            },
+            configurable: true,
+        });
+        console.log('🛡️ Перехват scrollTop установлен');
+    } catch (e) {
+        console.warn('⚠️ Перехват scrollTop не удался:', e);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  УТИЛИТЫ: расстояние до низа, «у низа ли»
+    // ═══════════════════════════════════════════════════════════════
+    function distanceFromBottom() {
+        return messagesContainer.scrollHeight
+             - messagesContainer.scrollTop
+             - messagesContainer.clientHeight;
+    }
+
+    function isAtBottom() {
+        return distanceFromBottom() <= 80;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  БЕЙДЖ НЕПРОЧИТАННЫХ
+    // ═══════════════════════════════════════════════════════════════
+    function renderBadge() {
+        if (P.unreadCount > 0) {
+            scrollBadge.textContent = P.unreadCount > 99 ? '99+' : P.unreadCount;
+            scrollBadge.classList.add('show');
+            scrollDownBtn.classList.add('show');
+        } else {
+            scrollBadge.classList.remove('show');
+            // Кнопка видимости зависит от скролла — не трогаем здесь
+        }
+    }
+
+    function incrementUnread(n = 1) {
+        P.unreadCount += n;
+        renderBadge();
+        // Синхронизируем со старым scrollState (на случай, если что-то ещё его читает)
+        scrollState.unreadCount = P.unreadCount;
+    }
+
+    function resetUnread() {
+        P.unreadCount = 0;
+        scrollState.unreadCount = 0;
+        renderBadge();
+    }
+
+    // Экспортируем для отладки
+    window.__resetUnread = resetUnread;
+    window.__getUnread = () => P.unreadCount;
+
+    // ═══════════════════════════════════════════════════════════════
+    //  УПРАВЛЕНИЕ КНОПКОЙ «ВНИЗ»
+    // ═══════════════════════════════════════════════════════════════
+    const SHOW_BTN_THRESHOLD = 100;
+
+    function updateButtonVisibility() {
+        const dist = distanceFromBottom();
+        if (dist > SHOW_BTN_THRESHOLD || P.unreadCount > 0) {
+            scrollDownBtn.classList.add('show');
+        } else {
+            scrollDownBtn.classList.remove('show');
+        }
+    }
+
+    // Патчим updateScrollButton, чтобы не обнулял счётчик
+    window.updateScrollButton = function() {
+        updateButtonVisibility();
+    };
+
+    // Патчим updateScrollBadge — пересобираем на нашем состоянии
+    window.updateScrollBadge = function() {
+        renderBadge();
+    };
+
+    // ═══════════════════════════════════════════════════════════════
+    //  СЛУШАТЕЛЬ СКРОЛЛА: обновляем видимость кнопки и сбрасываем бейдж
+    // ═══════════════════════════════════════════════════════════════
+    let _scrollRafPending = false;
+    messagesContainer.addEventListener('scroll', () => {
+        if (_scrollRafPending) return;
+        _scrollRafPending = true;
+        requestAnimationFrame(() => {
+            _scrollRafPending = false;
+
+            const dist = distanceFromBottom();
+
+            // Достигли низа — обнуляем бейдж
+            if (dist <= 30) {
+                if (P.unreadCount > 0) resetUnread();
+            }
+
+            updateButtonVisibility();
+        });
+    }, { passive: true });
+
+    // Также проверяем через ResizeObserver (когда меняется высота)
+    if (window.ResizeObserver) {
+        const ro = new ResizeObserver(() => {
+            if (ro._t) clearTimeout(ro._t);
+            ro._t = setTimeout(() => {
+                updateButtonVisibility();
+                if (distanceFromBottom() <= 30 && P.unreadCount > 0) resetUnread();
+            }, 100);
+        });
+        ro.observe(messagesInner);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  КНОПКА «ВНИЗ» — пересоздаём обработчик
+    // ═══════════════════════════════════════════════════════════════
+    const _btn = document.getElementById('scrollDownBtn');
+    if (_btn) {
+        // Клонируем чтобы снять все прежние слушатели
+        const cloned = _btn.cloneNode(true);
+        _btn.parentNode.replaceChild(cloned, _btn);
+
+        cloned.addEventListener('click', () => {
+            allowScrollDownOnce(600);
+            resetUnread();
+            messagesContainer.scrollTo({
+                top: messagesContainer.scrollHeight,
+                behavior: 'smooth'
+            });
+            setTimeout(() => {
+                cloned.classList.remove('show');
+                updateButtonVisibility();
+            }, 400);
+            if (typeof soundManager !== 'undefined' && soundManager.play) {
+                soundManager.play('click');
+            }
+        });
+
+        // Обновляем ссылку на кнопку в нашем коде
+        // (в остальных функциях используется старая переменная scrollDownBtn,
+        //  но она указывает на тот же DOM-элемент — клон имеет тот же id)
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  SCROLLTobottom — разрешён только программно
+    // ═══════════════════════════════════════════════════════════════
+    window.scrollToBottom = function(force = false) {
+        // Полностью блокируем — все автоскроллы вниз теперь запрещены.
+        // Если нужно — вызывайте allowScrollDownOnce() + scrollTop.
+        return;
+    };
+
+    window.scrollToBottomNow = function() {
+        allowScrollDownOnce(600);
+        resetUnread();
+        messagesContainer.scrollTo({
+            top: messagesContainer.scrollHeight,
+            behavior: 'smooth'
+        });
+        setTimeout(updateButtonVisibility, 400);
+    };
+
+    // ═══════════════════════════════════════════════════════════════
+    //  ГЛУШИМ ДОГОНЯЮЩИЙ СКРОЛЛ
+    // ═══════════════════════════════════════════════════════════════
+    if (typeof window._scheduleBottomCatchup === 'function') {
+        window._scheduleBottomCatchup = function() { /* no-op */ };
+    }
+    if (typeof _bottomCatchupTimers !== 'undefined' && Array.isArray(_bottomCatchupTimers)) {
+        _bottomCatchupTimers.forEach(t => clearTimeout(t));
+        _bottomCatchupTimers.length = 0;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  ГЛУШИМ ЗАМОРОЗКИ (если где-то остались)
+    // ═══════════════════════════════════════════════════════════════
+    window.activateInitialFreeze = function() { /* no-op */ };
+    window.isInitialFreezeActive = function() { return false; };
+
+    // ═══════════════════════════════════════════════════════════════
+    //  ХВОСТ loadAttachmentsIn — гасим отложенные догоны
+    // ═══════════════════════════════════════════════════════════════
+    if (typeof window.loadAttachmentsIn === 'function') {
+        const _orig = window.loadAttachmentsIn;
+        window.loadAttachmentsIn = async function(root) {
+            const r = await _orig.apply(this, arguments);
+            if (typeof _bottomCatchupTimers !== 'undefined' && Array.isArray(_bottomCatchupTimers)) {
+                _bottomCatchupTimers.forEach(t => clearTimeout(t));
+                _bottomCatchupTimers.length = 0;
+            }
+            return r;
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  УМНЫЙ ПРЫЖОК К СООБЩЕНИЮ
     // ═══════════════════════════════════════════════════════════════
 
     /**
-     * Делает сообщение видимым в DOM.
-     * 1. Если уже в DOM — скроллит и подсвечивает.
-     * 2. Если нет — перерисовывает историю с расширенным окном.
-     * Возвращает true если удалось, false если сообщения нет в истории.
+     * Делает сообщение видимым. Если его нет в DOM — перерисовывает
+     * окно истории вокруг него.
      */
     window.ensureMessageVisible = async function(msgId, opts = {}) {
         if (!msgId) return false;
         const targetId = String(msgId);
 
-        // ─── 1. Проверяем наличие в истории ───
-        const targetIdx = historyState.allMessages.findIndex(
+        // Ищем в истории
+        const idx = historyState.allMessages.findIndex(
             m => String(m.id) === targetId
         );
-        if (targetIdx === -1) return false;
+        if (idx === -1) return false;
 
-        // ─── 2. Уже в DOM? ───
+        // Уже в DOM?
         const existing = messagesInner.querySelector(
             `.message-wrapper[data-msg-id="${targetId}"]`
         );
         if (existing) {
-            scrollAndFlashToMessage(existing, opts);
+            scrollAndFlash(existing, opts);
             return true;
         }
 
-        // ─── 3. Нет в DOM — перерисовываем окно вокруг цели ───
-        const CONTEXT_BEFORE = 15;
-        const CONTEXT_AFTER  = 15;
+        // Нет в DOM — перерисовываем окно вокруг
+        const BEFORE = 15;
+        const AFTER = 15;
         const total = historyState.allMessages.length;
+        const start = Math.max(0, idx - BEFORE);
+        const end = Math.min(total, idx + AFTER + 1);
 
-        const start = Math.max(0, targetIdx - CONTEXT_BEFORE);
-        const end   = Math.min(total, targetIdx + CONTEXT_AFTER + 1);
-
-        renderHistoryExtended(start, end, targetId);
+        renderWindow(start, end, targetId);
         return true;
     };
 
     /**
-     * Расширенный рендер: диапазон [start, end) + автопрыжок к anchorId.
+     * Рендерит диапазон [start, end) и скроллит к anchorId.
      */
-    function renderHistoryExtended(start, end, anchorId) {
-        // Останавливаем текущие аудио-плееры
+    function renderWindow(start, end, anchorId) {
+        // Останавливаем аудио
         Object.keys(audioPlayers).forEach(id => {
             try { audioPlayers[id].audio.pause(); } catch (e) {}
             delete audioPlayers[id];
@@ -18597,12 +18875,11 @@ showMessageMenu = function(x, y, msgId, isOwn) {
         const all = historyState.allMessages;
         let html = '';
 
-        // Sentinel сверху — если есть что грузить выше
         if (start > 0) {
             html += `<div class="history-sentinel" id="historySentinel">↑ Потяните вверх, чтобы загрузить ещё</div>`;
         }
 
-        // Определяем первое непрочитанное для подсветки
+        // Непрочитанные
         const lastReadId = state.chatFile ? getLastReadId(state.chatFile) : null;
         let firstUnreadIdx = -1;
         if (!state._chatEntered) {
@@ -18613,7 +18890,6 @@ showMessageMenu = function(x, y, msgId, isOwn) {
             }
         }
 
-        // Рендер
         let lastDate = '';
         for (let i = start; i < end; i++) {
             const msg = all[i];
@@ -18634,25 +18910,28 @@ showMessageMenu = function(x, y, msgId, isOwn) {
         messagesInner.dataset.lastDate = lastDate;
         loadAttachmentsIn(messagesInner);
 
-        // Скролл + подсветка
+        // Скролл к anchor + подсветка
+        P.isProgrammatic = true;
         requestAnimationFrame(() => {
             const el = messagesInner.querySelector(
                 `.message-wrapper[data-msg-id="${anchorId}"]`
             );
             if (el) {
-                // Сначала «мгновенно» — чтобы не было видимого пролёта
                 el.scrollIntoView({ behavior: 'auto', block: 'center' });
-                // Затем плавная доводка и подсветка
-                setTimeout(() => scrollAndFlashToMessage(el), 80);
+                setTimeout(() => {
+                    scrollAndFlash(el);
+                    P.isProgrammatic = false;
+                }, 80);
+            } else {
+                P.isProgrammatic = false;
             }
         });
     }
 
     /**
-     * Скроллит и подсвечивает уже существующий элемент.
+     * Скроллит и подсвечивает существующий элемент.
      */
-    function scrollAndFlashToMessage(el, opts = {}) {
-        // Убираем старые подсветки
+    function scrollAndFlash(el, opts = {}) {
         messagesInner.querySelectorAll('.message-wrapper.highlight-flash')
             .forEach(x => x.classList.remove('highlight-flash'));
 
@@ -18669,21 +18948,14 @@ showMessageMenu = function(x, y, msgId, isOwn) {
         if (navigator.vibrate && !opts.silentVibrate) navigator.vibrate(20);
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    //  Переопределяем scrollToMessage — теперь с автодогрузкой.
-    //  Это чинит: поиск по чату, ответы на сообщения (reply-quote).
-    // ═══════════════════════════════════════════════════════════════
+    // Переопределяем scrollToMessage (используется в поиске и reply)
     window.scrollToMessage = async function(msgId) {
         if (!msgId) return;
-        const found = await window.ensureMessageVisible(msgId);
-        if (!found) {
-            showToast('⚠️ Сообщение не найдено в истории', 2000);
-        }
+        const ok = await window.ensureMessageVisible(msgId);
+        if (!ok) showToast('⚠️ Сообщение не найдено в истории', 2000);
     };
 
-    // ═══════════════════════════════════════════════════════════════
-    //  Переопределяем jumpToPlayingTrack — теперь через ensureMessageVisible.
-    // ═══════════════════════════════════════════════════════════════
+    // Переопределяем jumpToPlayingTrack (клик по иконке плеера)
     window.jumpToPlayingTrack = async function() {
         if (typeof GlobalPlayer === 'undefined') return;
 
@@ -18695,46 +18967,43 @@ showMessageMenu = function(x, y, msgId, isOwn) {
             return;
         }
 
-        // Закрываем галерею, если открыта
-        if (galleryState && galleryState.isOpen) {
-            closeImageModal();
-        }
+        if (galleryState && galleryState.isOpen) closeImageModal();
 
-        // ─── Мы в том же чате? ───
         if (state.chatFile === targetChat) {
             const ok = await window.ensureMessageVisible(targetMsgId);
             if (!ok) showToast('⚠️ Трек не найден в истории', 2000);
             return;
         }
 
-        // ─── Переходим в другой чат ───
         const chat = state.chats.find(c => c.file === targetChat);
         if (!chat) {
-            showToast('❌ Чат-источник не найден в списке', 2500);
+            showToast('❌ Чат-источник не найден', 2500);
             return;
         }
         const password = state.savedPasswords[targetChat];
         if (!password) {
-            showToast('🔐 Нужен пароль чата для перехода', 2500);
+            showToast('🔐 Нужен пароль чата', 2500);
             return;
         }
 
-        // Устанавливаем флаг — renderHistory отрисует окно с целью
+        // Ставим флаг для renderHistory в новом чате
         window._pendingJumpToMsgId = String(targetMsgId);
+        P.isJumpInProgress = true;
 
         showToast(`🎵 Переход в «${chat.name || targetChat}»…`, 1500);
 
         try {
             await enterChat(targetChat, chat.name || targetChat, password);
         } catch (e) {
-            console.error('jumpToPlayingTrack enterChat error:', e);
+            console.error(e);
             window._pendingJumpToMsgId = null;
+            P.isJumpInProgress = false;
             showToast('❌ Не удалось открыть чат: ' + e.message, 2500);
         }
     };
 
     // ═══════════════════════════════════════════════════════════════
-    //  Патч renderHistory — поддержка флага _pendingJumpToMsgId
+    //  ПАТЧ renderHistory — поддержка _pendingJumpToMsgId
     //  (используется при переходе в чат через jump-to-track)
     // ═══════════════════════════════════════════════════════════════
     window._pendingJumpToMsgId = null;
@@ -18752,6 +19021,7 @@ showMessageMenu = function(x, y, msgId, isOwn) {
 
         if (total === 0) {
             window._pendingJumpToMsgId = null;
+            P.isJumpInProgress = false;
             return _origRenderHistory.apply(this, arguments);
         }
 
@@ -18759,475 +19029,132 @@ showMessageMenu = function(x, y, msgId, isOwn) {
 
         if (targetIdx === -1) {
             window._pendingJumpToMsgId = null;
+            P.isJumpInProgress = false;
             return _origRenderHistory.apply(this, arguments);
         }
 
-        const CONTEXT_BEFORE = 10;
-        const start = Math.max(0, targetIdx - CONTEXT_BEFORE);
+        const BEFORE = 10;
+        const start = Math.max(0, targetIdx - BEFORE);
         const end = total;
 
         window._pendingJumpToMsgId = null;
 
-        // Переиспользуем renderHistoryExtended
-        const _savedInner = messagesInner;
-        // renderHistoryExtended сам всё сделает + скролл
-        renderHistoryExtended(start, end, String(jumpTarget));
-    };
+        P.isProgrammatic = true;
+        renderWindow(start, end, String(jumpTarget));
 
+        // Снимем флаг прыжка чуть позже
+        setTimeout(() => {
+            P.isJumpInProgress = false;
+        }, 800);
+    };
 
     // ═══════════════════════════════════════════════════════════════
-    //  ЧАСТЬ 2. ГЛОБАЛЬНОЕ ОТКЛЮЧЕНИЕ АВТОСКРОЛЛОВ ВНИЗ
-    //  Всё, что дёргало чат вниз автоматически — отключено.
-    //  Работают: ручной скролл, кнопка «вниз», отправка, прыжок.
+    //  ПОЛУЧЕНИЕ НОВЫХ СООБЩЕНИЙ — счётчик бейджа
+    //  Патчим appendMessages: если мы не у низа (или не в чате),
+    //  увеличиваем счётчик непрочитанных на количество новых сообщений.
     // ═══════════════════════════════════════════════════════════════
+    const _origAppendMessages = window.appendMessages;
+    window.appendMessages = function(newMsgs) {
+        const wasAtBottom = isAtBottom();
+        const result = _origAppendMessages.apply(this, arguments);
 
-    // ─── Флаг: разрешён ли скролл вниз прямо сейчас ───
-    let _allowScrollDown = false;
-    let _allowScrollDownTimer = null;
+        if (!newMsgs || newMsgs.length === 0) return result;
 
-    window.allowScrollDownOnce = function(durationMs = 800) {
-        _allowScrollDown = true;
-        if (_allowScrollDownTimer) clearTimeout(_allowScrollDownTimer);
-        _allowScrollDownTimer = setTimeout(() => {
-            _allowScrollDown = false;
-            _allowScrollDownTimer = null;
-        }, durationMs);
-    };
-
-    // ─── 1. Глушим scrollToBottom ───
-    const _origScrollToBottom = window.scrollToBottom;
-    window.scrollToBottom = function(force = false) {
-        if (!_allowScrollDown) return;
-        if (galleryState && galleryState.isOpen) return;
-        if (typeof _isUserScrolling !== 'undefined' && _isUserScrolling) return;
-        if (typeof _loadingOlder !== 'undefined' && _loadingOlder) return;
-        return _origScrollToBottom.apply(this, arguments);
-    };
-
-    // ─── 2. Глушим _scheduleBottomCatchup — «догоняющий» скролл ───
-    if (typeof window._scheduleBottomCatchup === 'function') {
-        window._scheduleBottomCatchup = function() { /* no-op */ };
-    }
-    if (typeof _bottomCatchupTimers !== 'undefined' && Array.isArray(_bottomCatchupTimers)) {
-        _bottomCatchupTimers.forEach(t => clearTimeout(t));
-        _bottomCatchupTimers.length = 0;
-    }
-
-    // ─── 3. Глушим installInitialLoadFreeze — 17.5-сек заморозку ───
-    window.activateInitialFreeze = function() {
-        console.log('⏭ activateInitialFreeze: пропущено (автоскроллы отключены)');
-    };
-    window.isInitialFreezeActive = function() { return false; };
-
-    // ─── 4. Глушим автоскролл в конце renderHistory ───
-    //       (он там есть в requestAnimationFrame — messagesContainer.scrollTop = ...)
-    //       Раз renderHistory мы уже переопределили выше — этот пункт покрыт.
-
-    // ─── 5. Гасим автоскролл после loadAttachmentsIn (хвост с rAF) ───
-    if (typeof window.loadAttachmentsIn === 'function') {
-        const _origLoadAttachmentsIn = window.loadAttachmentsIn;
-        window.loadAttachmentsIn = async function(root) {
-            const result = await _origLoadAttachmentsIn.apply(this, arguments);
-            // Отменяем любые отложенные таймеры догона
-            if (typeof _bottomCatchupTimers !== 'undefined' && Array.isArray(_bottomCatchupTimers)) {
-                _bottomCatchupTimers.forEach(t => clearTimeout(t));
-                _bottomCatchupTimers.length = 0;
+        // Если мы не у низа — увеличиваем счётчик
+        if (!wasAtBottom) {
+            // Отфильтровываем свои сообщения (свои видны всегда)
+            const incoming = newMsgs.filter(m => m.username !== state.username);
+            if (incoming.length > 0) {
+                incrementUnread(incoming.length);
             }
-            return result;
-        };
-    }
-
-    // ─── 6. Перехватываем scrollTop: блокируем запись «до самого низа» ───
-    //       Это ловит даже тот код, который мы не видели или не патчили.
-    try {
-        const originalScrollTopDescriptor = Object.getOwnPropertyDescriptor(
-            Element.prototype, 'scrollTop'
-        );
-
-        Object.defineProperty(messagesContainer, 'scrollTop', {
-            get() {
-                return originalScrollTopDescriptor.get.call(this);
-            },
-            set(value) {
-                const current = originalScrollTopDescriptor.get.call(this);
-
-                // Если значение увеличивается (движение вниз)
-                // И не разрешено — блокируем только «доезд до самого низа»
-                if (value > current + 2 && !_allowScrollDown) {
-                    const distanceFromBottom =
-                        this.scrollHeight - value - this.clientHeight;
-
-                    // Если пытаемся доехать до самого низа — игнорируем
-                    if (distanceFromBottom < 30) {
-                        return;
-                    }
-                }
-
-                return originalScrollTopDescriptor.set.call(this, value);
-            },
-            configurable: true,
-        });
-
-        console.log('🛡️ Перехват scrollTop установлен');
-    } catch (e) {
-        console.warn('⚠️ Не удалось установить перехват scrollTop:', e);
-    }
-
-    // ─── 7. sendMessage — разрешаем скролл вниз только при отправке ───
-    const _origSendMessageForScroll = window.sendMessage;
-    window.sendMessage = async function(...args) {
-        window.allowScrollDownOnce(1500);
-        try {
-            return await _origSendMessageForScroll.apply(this, args);
-        } finally {
-            // снимется автоматически по таймеру
         }
+
+        return result;
     };
 
-    // ─── 8. ensureMessageVisible — разрешаем скролл на время прыжка ───
-    const _origEnsureForScroll = window.ensureMessageVisible;
-    window.ensureMessageVisible = async function(...args) {
-        window.allowScrollDownOnce(3000);
-        try {
-            return await _origEnsureForScroll.apply(this, args);
-        } finally {
-            setTimeout(() => { _allowScrollDown = false; }, 100);
+    // MutationObserver — страховка на случай, если сообщения вставились
+    // в DOM в обход appendMessages (например, через renderWindow)
+    const _badgeObserver = new MutationObserver(() => {
+        // Не у низа и есть непрочитанные — показываем кнопку
+        if (P.unreadCount > 0) {
+            scrollDownBtn.classList.add('show');
+            renderBadge();
         }
-    };
-
-    // ─── 9. Кнопка «вниз» — работает всегда ───
-    const scrollDownBtnEl = document.getElementById('scrollDownBtn');
-    if (scrollDownBtnEl) {
-        // Клонируем, чтобы снять все прежние слушатели
-        const cloned = scrollDownBtnEl.cloneNode(true);
-        scrollDownBtnEl.parentNode.replaceChild(cloned, scrollDownBtnEl);
-
-        cloned.addEventListener('click', () => {
-            window.allowScrollDownOnce(500);
-
-            messagesContainer.scrollTo({
-                top: messagesContainer.scrollHeight,
-                behavior: 'smooth'
-            });
-
-            scrollState.isAtBottom = true;
-            scrollState.unreadCount = 0;
-            updateScrollBadge();
-
-            setTimeout(() => {
-                cloned.classList.remove('show');
-                if (typeof updateScrollButton === 'function') updateScrollButton();
-            }, 300);
-
-            if (typeof soundManager !== 'undefined' && soundManager.play) {
-                soundManager.play('click');
-            }
-        });
-    }
-
-    // ─── 10. Если пользователь сам скроллит — снимаем разрешение ───
-    messagesContainer.addEventListener('touchstart', () => {
-        _allowScrollDown = false;
-        if (_allowScrollDownTimer) {
-            clearTimeout(_allowScrollDownTimer);
-            _allowScrollDownTimer = null;
-        }
-    }, { passive: true, capture: true });
-
-    messagesContainer.addEventListener('wheel', () => {
-        _allowScrollDown = false;
-        if (_allowScrollDownTimer) {
-            clearTimeout(_allowScrollDownTimer);
-            _allowScrollDownTimer = null;
-        }
-    }, { passive: true, capture: true });
-
-    messagesContainer.addEventListener('mousedown', () => {
-        _allowScrollDown = false;
-        if (_allowScrollDownTimer) {
-            clearTimeout(_allowScrollDownTimer);
-            _allowScrollDownTimer = null;
-        }
-    }, { passive: true, capture: true });
+    });
+    _badgeObserver.observe(messagesInner, { childList: true, subtree: false });
 
     // ═══════════════════════════════════════════════════════════════
-    //  ЧАСТЬ 3. РАЗОВЫЙ АВТОСКРОЛЛ ПРИ ВХОДЕ В ЧАТ
-    //  Срабатывает только если не было прыжка к конкретному сообщению.
-    //  Работает через allowScrollDownOnce — пробивает наш перехват.
+    //  УВЕДОМЛЕНИЕ ПРИ НОВОМ СООБЩЕНИИ ВНЕ ЧАТА
+    //  (когда пользователь в списке чатов — не трогаем бейдж кнопки,
+    //  он и так скрыт, там работает другой механизм через chat.unreadCount)
     // ═══════════════════════════════════════════════════════════════
-    const _origEnterChatForScroll = enterChat;
+    // Здесь ничего дополнительно не делаем — этим занимается pollUpdates
+    // и renderChatsList в исходном коде.
+
+    // ═══════════════════════════════════════════════════════════════
+    //  ENTERCHAT — разовый автоскролл вниз (если не было прыжка)
+    // ═══════════════════════════════════════════════════════════════
+    const _origEnterChat = enterChat;
     enterChat = async function(file, name, password) {
         const hasPendingJump = !!window._pendingJumpToMsgId;
-        const result = await _origEnterChatForScroll.apply(this, arguments);
+        const result = await _origEnterChat.apply(this, arguments);
 
-        if (hasPendingJump) return result;
+        // Сброс бейджа при входе
+        resetUnread();
+
+        if (hasPendingJump) {
+            // Был прыжок — не трогаем позицию
+            return result;
+        }
         if (state.chatFile !== file) return result;
 
-        // Каскад попыток — догоняем асинхронные вложения
-        const tryScrollToBottom = () => {
-            if (typeof _isUserScrolling !== 'undefined' && _isUserScrolling) return;
+        // Каскад попыток «доехать до низа» после подгрузки вложений
+        const tryScrollBottom = () => {
+            if (P.isUserScrolling) return;
+            if (P.isJumpInProgress) return;
             if (state.chatFile !== file) return;
             if (window._pendingJumpToMsgId) return;
 
-            window.allowScrollDownOnce(400);
+            allowScrollDownOnce(400);
             messagesContainer.scrollTop = messagesContainer.scrollHeight;
-            scrollState.isAtBottom = true;
-            scrollState.unreadCount = 0;
-            if (typeof updateScrollBadge === 'function') updateScrollBadge();
-            if (typeof updateScrollButton === 'function') updateScrollButton();
-
-            const btn = document.getElementById('scrollDownBtn');
-            if (btn) btn.classList.remove('show');
+            updateButtonVisibility();
         };
 
-        setTimeout(tryScrollToBottom, 50);
-        setTimeout(tryScrollToBottom, 200);
-        setTimeout(tryScrollToBottom, 500);
-        setTimeout(tryScrollToBottom, 1000);
-        setTimeout(tryScrollToBottom, 2000);
+        setTimeout(tryScrollBottom, 50);
+        setTimeout(tryScrollBottom, 250);
+        setTimeout(tryScrollBottom, 600);
+        setTimeout(tryScrollBottom, 1200);
+        setTimeout(tryScrollBottom, 2000);
 
         return result;
     };
 
     // ═══════════════════════════════════════════════════════════════
-    //  ЧАСТЬ 4. НАДЁЖНАЯ КНОПКА «ВНИЗ»
-    //  Появляется всегда, когда пользователь не у низа — независимо
-    //  от scrollState.isAtBottom (который мог сломаться после патчей).
+    //  SENDMESSAGE — разрешаем автоскролл при отправке
     // ═══════════════════════════════════════════════════════════════
-    const btn = document.getElementById('scrollDownBtn');
-    if (btn) {
-        function computeDistanceFromBottom() {
-            return messagesContainer.scrollHeight
-                 - messagesContainer.scrollTop
-                 - messagesContainer.clientHeight;
+    const _origSendMessage = window.sendMessage;
+    window.sendMessage = async function(...args) {
+        allowScrollDownOnce(2000);
+        try {
+            return await _origSendMessage.apply(this, args);
+        } finally {
+            // снимется по таймеру
         }
+    };
 
-        const SHOW_THRESHOLD = 100;
+    // ═══════════════════════════════════════════════════════════════
+    //  НАЧАЛЬНОЕ СОСТОЯНИЕ
+    // ═══════════════════════════════════════════════════════════════
+    updateButtonVisibility();
+    renderBadge();
 
-        function refreshScrollButton() {
-            const dist = computeDistanceFromBottom();
-            const shouldShow = dist > SHOW_THRESHOLD;
+    console.log('✅ Единый патч установлен');
+    console.log('   • Прыжок к сообщению: работает даже если оно вне DOM');
+    console.log('   • Автоскроллы вниз: отключены (кроме кнопки, отправки, прыжка)');
+    console.log('   • Бейдж непрочитанных: работает через MutationObserver + appendMessages');
+    console.log('   • Разовый автоскролл при входе в чат');
 
-            if (shouldShow) {
-                btn.classList.add('show');
-            } else {
-                btn.classList.remove('show');
-                scrollState.unreadCount = 0;
-                if (typeof updateScrollBadge === 'function') updateScrollBadge();
-            }
-
-            // Обновляем scrollState.isAtBottom для консистентности с остальным кодом
-            scrollState.isAtBottom = dist <= 80;
-        }
-
-        // Слушатель на скролл через rAF
-        let _rafPending = false;
-        messagesContainer.addEventListener('scroll', () => {
-            if (_rafPending) return;
-            _rafPending = true;
-            requestAnimationFrame(() => {
-                _rafPending = false;
-                refreshScrollButton();
-            });
-        }, { passive: true });
-
-        // ResizeObserver — когда вложения меняют высоту контейнера
-        if (window.ResizeObserver) {
-            const ro = new ResizeObserver(() => {
-                if (ro._timer) clearTimeout(ro._timer);
-                ro._timer = setTimeout(refreshScrollButton, 100);
-            });
-            ro.observe(messagesInner);
-        }
-
-        // Пересчитываем при переключении чата
-        const _origRenderHistory2 = renderHistory;
-        renderHistory = function() {
-            const r = _origRenderHistory2.apply(this, arguments);
-            setTimeout(refreshScrollButton, 50);
-            setTimeout(refreshScrollButton, 300);
-            return r;
-        };
-
-        // Инициализация
-        setTimeout(refreshScrollButton, 500);
-    }
-
-    console.log('✅ Умный поиск + отключение автоскроллов установлены');
-    console.log('   • Прыжок к сообщению работает даже если оно за пределами DOM');
-    console.log('   • Автоскроллы вниз отключены (догон, заморозки, после вложений)');
-    console.log('   • Работают: ручной скролл, кнопка «вниз», отправка, прыжок');
-    console.log('   • Разовый автоскролл при входе в чат (без прыжка)');
 })();
-
-// ═══════════════════════════════════════════════════════════════
-//  🔢 ФИКС: счётчик непрочитанных на кнопке «вниз»
-//  Кнопка появляется при новом сообщении и показывает циферку.
-//  Счётчик сбрасывается только когда пользователь реально у низа
-//  или сам нажал «вниз».
-// ═══════════════════════════════════════════════════════════════
-
-(function fixUnreadBadge() {
-
-    // ─── 1. Патчим updateScrollButton — не сбрасываем unreadCount, ───
-    //       если есть непрочитанные. Сбрасываем только если у низа И
-    //       счётчик уже был показан «по делу».
-    const _origUpdateScrollButton = window.updateScrollButton;
-    window.updateScrollButton = function() {
-        const diff = messagesContainer.scrollHeight
-                   - messagesContainer.scrollTop
-                   - messagesContainer.clientHeight;
-
-        const SHOW_THRESHOLD = 100;   // как в нашем патче
-
-        if (diff > SHOW_THRESHOLD) {
-            // Не у низа — показываем кнопку, счётчик НЕ трогаем
-            scrollDownBtn.classList.add('show');
-            updateScrollBadge();
-        } else {
-            // У низа — можно скрыть и обнулить
-            scrollDownBtn.classList.remove('show');
-            scrollState.unreadCount = 0;
-            updateScrollBadge();
-        }
-    };
-
-    // ─── 2. Патчим refreshScrollButton (наш новый) — не обнулять счётчик ───
-    //       Он уже определён внутри IIFE, но мы перезапишем его поведение
-    //       через собственный обработчик на скролл в capture-фазе.
-    //       Проще: перехватываем момент, когда новый скролл-листенер
-    //       вызывается и обнуляет счётчик — не даём ему это сделать.
-    //
-    //       Делаем это так: оборачиваем scrollState.unreadCount в
-    //       defineProperty на объекте scrollState — не даём обнулить,
-    //       если это не «настоящее» обнуление (кнопка «вниз» или прибытие к низу).
-
-    let _realReset = false;   // ставим в true когда ХОТИМ сбросить
-
-    // Экспортируем функцию для явного сброса
-    window.reallyResetUnreadCount = function() {
-        _realReset = true;
-        scrollState.unreadCount = 0;
-        _realReset = false;
-        updateScrollBadge();
-    };
-
-    // Переопределяем scrollState.unreadCount через defineProperty
-    let _rawUnreadCount = 0;
-    try {
-        Object.defineProperty(scrollState, 'unreadCount', {
-            get() {
-                return _rawUnreadCount;
-            },
-            set(v) {
-                // Если кто-то пытается обнулить счётчик, но у нас есть
-                // непрочитанные и пользователь не у низа — блокируем
-                if (v === 0 && _rawUnreadCount > 0 && !_realReset) {
-                    const diff = messagesContainer.scrollHeight
-                               - messagesContainer.scrollTop
-                               - messagesContainer.clientHeight;
-                    // Если мы не у низа — не даём обнулить
-                    if (diff > 100) return;
-                }
-                _rawUnreadCount = v;
-            },
-            configurable: true,
-        });
-    } catch (e) {
-        console.warn('Не удалось переопределить unreadCount:', e);
-    }
-
-    // ─── 3. Явно обнуляем счётчик при: ───
-    //   • Клике по кнопке «вниз»
-    //   • Реальном достижении низа
-    //   • Ручном скролле в самый низ
-
-    // Клик по кнопке «вниз» — уже обрабатывается в нашем патче через
-    // scrollState.unreadCount = 0, но теперь это заблокируется. Ставим
-    // явный сброс:
-    const _btn = document.getElementById('scrollDownBtn');
-    if (_btn) {
-        _btn.addEventListener('click', () => {
-            setTimeout(() => window.reallyResetUnreadCount(), 50);
-        });
-    }
-
-    // При скролле: если пользователь доехал до низа — обнуляем
-    messagesContainer.addEventListener('scroll', () => {
-        const diff = messagesContainer.scrollHeight
-                   - messagesContainer.scrollTop
-                   - messagesContainer.clientHeight;
-        if (diff < 30) {
-            // У низа — можно обнулить
-            _realReset = true;
-            scrollState.unreadCount = 0;
-            _realReset = false;
-            updateScrollBadge();
-        }
-    }, { passive: true });
-
-    // ─── 4. Патчим pollUpdates — при новом сообщении гарантированно ───
-    //       увеличиваем счётчик и показываем кнопку с бейджем.
-    //       Перехватываем сразу после того как пришли сообщения.
-    const _origAppendMessagesForBadge = window.appendMessages;
-    window.appendMessages = function(newMsgs) {
-        const wasAtBottom = isNearBottom();
-        const result = _origAppendMessagesForBadge.apply(this, arguments);
-
-        // Если мы НЕ у низа (или только что перестали быть) — крутим счётчик
-        if (newMsgs && newMsgs.length > 0 && !wasAtBottom) {
-            // Не увеличиваем здесь — pollUpdates уже увеличивает.
-            // Просто гарантируем что кнопка покажется с бейджем.
-            scrollDownBtn.classList.add('show');
-            updateScrollBadge();
-        }
-
-        return result;
-    };
-
-    // ─── 5. Форсим показ кнопки, когда пришло новое сообщение и мы не внизу ───
-    //       Патчим appendMessages внутри pollUpdates — но проще перехватить
-    //       саму функцию pollUpdates и после неё проверить состояние.
-    //
-    //       Альтернатива: MutationObserver на messagesInner — если появились
-    //       новые .message-wrapper и мы не у низа — показать кнопку.
-    const observer = new MutationObserver((mutations) => {
-        // Проверяем: были добавления?
-        let hasAdditions = false;
-        for (const m of mutations) {
-            if (m.type === 'childList' && m.addedNodes.length > 0) {
-                // Пропускаем системные сообщения (дата) — они тоже добавляются
-                for (const node of m.addedNodes) {
-                    if (node.nodeType === 1 && (
-                        node.classList?.contains('message-wrapper') ||
-                        node.querySelector?.('.message-wrapper')
-                    )) {
-                        hasAdditions = true;
-                        break;
-                    }
-                }
-            }
-            if (hasAdditions) break;
-        }
-
-        if (!hasAdditions) return;
-
-        // Не у низа? Показываем кнопку с бейджем
-        const diff = messagesContainer.scrollHeight
-                   - messagesContainer.scrollTop
-                   - messagesContainer.clientHeight;
-
-        if (diff > 100) {
-            scrollDownBtn.classList.add('show');
-            updateScrollBadge();
-        }
-    });
-
-    observer.observe(messagesInner, { childList: true, subtree: false });
-
-    console.log('🔢 Фикс бейджа непрочитанных на кнопке «вниз» установлен');
-})();
-
 </script>
 </body>
 </html>
