@@ -18519,7 +18519,228 @@ showMessageMenu = function(x, y, msgId, isOwn) {
 
     console.log('🎯 Мгновенный прыжок к треку из другого чата активен');
 })();
+// ═══════════════════════════════════════════════════════════════
+//  🎯 УНИВЕРСАЛЬНЫЙ ПРЫЖОК К СООБЩЕНИЮ ПО ID
+//  Если сообщение вне DOM (обрезано pagination) — перерисовывает
+//  историю с расширенным окном вокруг цели и скроллит к ней.
+//  Работает и для поиска, и для ответов, и для jump-to-track.
+// ═══════════════════════════════════════════════════════════════
 
+(function installEnsureMessageVisible() {
+
+    /**
+     * Делает сообщение видимым в DOM.
+     * 1. Если уже в DOM — скроллит и подсвечивает.
+     * 2. Если нет — перерисовывает историю с окном вокруг цели.
+     * Возвращает true если удалось, false если сообщения нет в истории.
+     */
+    window.ensureMessageVisible = async function(msgId, opts = {}) {
+        if (!msgId) return false;
+        const targetId = String(msgId);
+
+        // ─── 1. Проверяем наличие в истории ───
+        const targetIdx = historyState.allMessages.findIndex(
+            m => String(m.id) === targetId
+        );
+        if (targetIdx === -1) {
+            return false;
+        }
+
+        // ─── 2. Уже в DOM? ───
+        const existing = messagesInner.querySelector(
+            `.message-wrapper[data-msg-id="${targetId}"]`
+        );
+        if (existing) {
+            scrollAndFlashToMessage(existing, opts);
+            return true;
+        }
+
+        // ─── 3. Нет в DOM — перерисовываем окно вокруг цели ───
+        const CONTEXT_BEFORE = 15;   // сколько сообщений до цели
+        const CONTEXT_AFTER  = 15;   // и после — чтобы контекст был живой
+        const total = historyState.allMessages.length;
+
+        const start = Math.max(0, targetIdx - CONTEXT_BEFORE);
+        const end   = Math.min(total, targetIdx + CONTEXT_AFTER + 1);
+
+        // Ставим флаг — renderHistoryExtended сам всё сделает
+        window._pendingJumpToMsgId = targetId;
+        renderHistoryExtended(start, end, targetId);
+
+        return true;
+    };
+
+    /**
+     * Расширенный рендер: диапазон [start, end) + автопрыжок к anchorId.
+     * Не ломает существующий renderHistory — просто временный режим.
+     */
+    function renderHistoryExtended(start, end, anchorId) {
+        // Останавливаем текущие аудио-плееры
+        Object.keys(audioPlayers).forEach(id => {
+            try { audioPlayers[id].audio.pause(); } catch (e) {}
+            delete audioPlayers[id];
+        });
+
+        historyState.startIndex = start;
+        historyState.renderedCount = end - start;
+        window._pendingJumpToMsgId = null;
+
+        const all = historyState.allMessages;
+        let html = '';
+
+        // Sentinel сверху — если есть что грузить выше
+        if (start > 0) {
+            html += `<div class="history-sentinel" id="historySentinel">↑ Потяните вверх, чтобы загрузить ещё</div>`;
+        }
+
+        // Определяем первое непрочитанное для подсветки
+        const lastReadId = state.chatFile ? getLastReadId(state.chatFile) : null;
+        let firstUnreadIdx = -1;
+        if (!state._chatEntered) {
+            for (let i = start; i < end; i++) {
+                const m = all[i];
+                if (m.username === state.username) continue;
+                if (!lastReadId || m.id > lastReadId) { firstUnreadIdx = i; break; }
+            }
+        }
+
+        // Рендер
+        let lastDate = '';
+        for (let i = start; i < end; i++) {
+            const msg = all[i];
+            if (i === firstUnreadIdx && i > start) {
+                html += `<div class="unread-divider">Новые сообщения</div>`;
+            }
+            const msgDate = formatDate(msg.time);
+            if (msgDate !== lastDate) {
+                html += `<div class="message system">${msgDate}</div>`;
+                lastDate = msgDate;
+            }
+            const isUnread = firstUnreadIdx >= 0 && i >= firstUnreadIdx
+                && msg.username !== state.username;
+            html += buildMessageHTML(msg, { isUnread });
+        }
+
+        messagesInner.innerHTML = html;
+        messagesInner.dataset.lastDate = lastDate;
+        loadAttachmentsIn(messagesInner);
+
+        // Скролл + подсветка
+        requestAnimationFrame(() => {
+            const el = messagesInner.querySelector(
+                `.message-wrapper[data-msg-id="${anchorId}"]`
+            );
+            if (el) {
+                // Сначала «мгновенно» — чтобы не было видимого пролёта
+                el.scrollIntoView({ behavior: 'auto', block: 'center' });
+                // Затем плавная доводка и подсветка
+                setTimeout(() => scrollAndFlashToMessage(el), 80);
+            }
+
+            // Если история большая и у нас ещё есть старше — подстрахуемся
+            // обновлением sentinel в observer
+            setTimeout(() => {
+                if (typeof observeHistorySentinel === 'function') {
+                    observeHistorySentinel();
+                }
+            }, 300);
+        });
+    }
+
+    /**
+     * Скроллит и подсвечивает уже существующий элемент.
+     */
+    function scrollAndFlashToMessage(el, opts = {}) {
+        // Убираем старые подсветки
+        messagesInner.querySelectorAll('.message-wrapper.highlight-flash')
+            .forEach(x => x.classList.remove('highlight-flash'));
+
+        el.scrollIntoView({
+            behavior: opts.instant ? 'auto' : 'smooth',
+            block: 'center',
+        });
+
+        setTimeout(() => {
+            el.classList.add('highlight-flash');
+            setTimeout(() => el.classList.remove('highlight-flash'), 1400);
+        }, opts.instant ? 50 : 250);
+
+        if (navigator.vibrate && !opts.silentVibrate) navigator.vibrate(20);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  ПЕРЕОПРЕДЕЛЯЕМ scrollToMessage — теперь с автодогрузкой
+    //  Это чинит: поиск по чату, ответы на сообщения (reply-quote)
+    // ═══════════════════════════════════════════════════════════════
+    const _origScrollToMessage = window.scrollToMessage;
+    window.scrollToMessage = async function(msgId) {
+        if (!msgId) return;
+
+        const found = await ensureMessageVisible(msgId);
+
+        if (!found) {
+            showToast('⚠️ Сообщение не найдено в истории', 2000);
+        }
+    };
+
+
+    // ═══════════════════════════════════════════════════════════════
+    //  ПЕРЕОПРЕДЕЛЯЕМ jumpToPlayingTrack — теперь через ensureMessageVisible
+    // ═══════════════════════════════════════════════════════════════
+    const _origJumpToPlayingTrack2 = window.jumpToPlayingTrack;
+    window.jumpToPlayingTrack = async function() {
+        if (typeof GlobalPlayer === 'undefined') return;
+
+        const targetChat = GlobalPlayer.currentChatFile;
+        const targetMsgId = GlobalPlayer.currentMsgId;
+
+        if (!targetChat || !targetMsgId) {
+            showToast('ℹ️ Нет играющего трека', 1500);
+            return;
+        }
+
+        // Закрываем галерею, если открыта
+        if (galleryState && galleryState.isOpen) {
+            closeImageModal();
+        }
+
+        // ─── Мы в том же чате? ───
+        if (state.chatFile === targetChat) {
+            const ok = await ensureMessageVisible(targetMsgId);
+            if (!ok) showToast('⚠️ Трек не найден в истории', 2000);
+            return;
+        }
+
+        // ─── Переходим в другой чат ───
+        const chat = state.chats.find(c => c.file === targetChat);
+        if (!chat) {
+            showToast('❌ Чат-источник не найден в списке', 2500);
+            return;
+        }
+        const password = state.savedPasswords[targetChat];
+        if (!password) {
+            showToast('🔐 Нужен пароль чата для перехода', 2500);
+            return;
+        }
+
+        // Устанавливаем флаг — renderHistory увидит его и отрисует окно с целью
+        window._pendingJumpToMsgId = String(targetMsgId);
+
+        showToast(`🎵 Переход в «${chat.name || targetChat}»…`, 1500);
+
+        try {
+            await enterChat(targetChat, chat.name || targetChat, password);
+        } catch (e) {
+            console.error('jumpToPlayingTrack enterChat error:', e);
+            window._pendingJumpToMsgId = null;
+            showToast('❌ Не удалось открыть чат: ' + e.message, 2500);
+        }
+    };
+
+    console.log('🎯 ensureMessageVisible: универсальный прыжок к сообщению');
+    console.log('   • Работает для поиска, ответов и jump-to-track');
+    console.log('   • Автоматически перерисовывает окно, если сообщение за пределами DOM');
+})();
 </script>
 </body>
 </html>
