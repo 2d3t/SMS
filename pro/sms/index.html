@@ -1141,6 +1141,19 @@ body.player-active .gallery-actions {
             transition: transform 0.2s ease, opacity 0.2s ease;
             animation: fadeInBtn 0.25s ease;
         }
+
+/* 🆕 Кнопка «вниз» поднимается, когда плеер активен */
+body.player-active .scroll-down-btn {
+    bottom: 165px;
+}
+
+/* 🆕 И для мобилы тоже */
+@media (max-width: 480px) {
+    body.player-active .scroll-down-btn {
+        bottom: 145px;
+    }
+}
+
         .scroll-down-btn.show { display: flex; }
         .scroll-down-btn:active { transform: scale(0.88); }
         @keyframes fadeInBtn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
@@ -3087,6 +3100,91 @@ body.player-active .messages-container { padding-bottom: 68px; }
     overflow-anchor: none !important;
     scroll-behavior: auto !important;
     overscroll-behavior: contain;
+}
+
+/* ═══ 🆕 Индикатор загрузки в глобальном плеере ═══ */
+#globalPlayerBar .gp-loading {
+    position: absolute;
+    inset: 0;
+    background: rgba(26, 26, 46, 0.92);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    gap: 10px;
+    z-index: 10;
+    border-radius: 16px;
+    animation: gpLoadingFadeIn 0.2s ease;
+}
+#globalPlayerBar.loading .gp-loading {
+    display: flex;
+}
+@keyframes gpLoadingFadeIn {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+}
+
+#globalPlayerBar .gp-loading .gp-spinner {
+    width: 32px;
+    height: 32px;
+    border: 3px solid rgba(108, 92, 231, 0.2);
+    border-top-color: #6c5ce7;
+    border-right-color: #00b894;
+    border-radius: 50%;
+    animation: gpSpin 0.9s linear infinite;
+}
+@keyframes gpSpin {
+    to { transform: rotate(360deg); }
+}
+
+#globalPlayerBar .gp-loading .gp-loading-text {
+    font-size: 12px;
+    color: #a78bfa;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+    text-align: center;
+    padding: 0 12px;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+#globalPlayerBar .gp-loading .gp-loading-sub {
+    font-size: 10px;
+    color: #666;
+    margin-top: -4px;
+}
+
+/* Полоска прогресса сверху плеера в режиме загрузки — уже есть gp-progress,
+   но сделаем её анимированной */
+#globalPlayerBar.loading .gp-progress-fill {
+    width: 30% !important;
+    background: linear-gradient(90deg, #6c5ce7, #00b894, #6c5ce7);
+    background-size: 200% 100%;
+    animation: gpProgressSlide 1.4s linear infinite;
+}
+@keyframes gpProgressSlide {
+    0%   { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+}
+
+/* Для свёрнутого (шарик) — не показываем индикатор,
+   иначе он перекроет аватарку */
+#globalPlayerBar.minimized .gp-loading {
+    display: none !important;
+}
+/* А для свёрнутого — пульсирующий спиннер прямо в шарике */
+#globalPlayerBar.minimized.loading .gp-thumb::before {
+    content: '';
+    position: absolute;
+    inset: 4px;
+    border-radius: 50%;
+    border: 2px solid transparent;
+    border-top-color: #fff;
+    animation: gpSpin 0.8s linear infinite;
+    z-index: 3;
 }
     </style>
 </head>
@@ -18825,6 +18923,504 @@ showMessageMenu = function(x, y, msgId, isOwn) {
     console.log('🎯 Мгновенный прыжок к треку из другого чата активен');
 })();
 
+// ═══════════════════════════════════════════════════════════════
+//  🎵 ИНДИКАТОР ЗАГРУЗКИ В ГЛОБАЛЬНОМ ПЛЕЕРЕ
+//  Показывается, пока идёт загрузка трека (fetch + decrypt).
+//  Скрывается, как только audio начинает реально играть.
+// ═══════════════════════════════════════════════════════════════
+
+(function installPlayerLoadingIndicator() {
+
+    // ═══ 1. Добавляем разметку индикатора в бар, когда он создаётся ═══
+    function injectLoadingUI(bar) {
+        if (!bar || bar.querySelector('.gp-loading')) return;
+        const loader = document.createElement('div');
+        loader.className = 'gp-loading';
+        loader.innerHTML = `
+            <div class="gp-spinner"></div>
+            <div class="gp-loading-text" id="gpLoadingText">Загрузка трека…</div>
+            <div class="gp-loading-sub" id="gpLoadingSub">Подготовка</div>
+        `;
+        bar.appendChild(loader);
+    }
+
+    // Следим за появлением плеера в DOM
+    const observer = new MutationObserver((mutations) => {
+        for (const mut of mutations) {
+            for (const node of mut.addedNodes) {
+                if (node.nodeType !== 1) continue;
+                if (node.id === 'globalPlayerBar') {
+                    injectLoadingUI(node);
+                } else if (node.querySelector && node.querySelector('#globalPlayerBar')) {
+                    injectLoadingUI(node.querySelector('#globalPlayerBar'));
+                }
+            }
+        }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    // Если плеер уже есть — добавим сразу
+    const existing = document.getElementById('globalPlayerBar');
+    if (existing) injectLoadingUI(existing);
+
+    // ═══ 2. Функции управления индикатором ═══
+    function getBar() {
+        return document.getElementById('globalPlayerBar');
+    }
+
+    /**
+     * Показать индикатор загрузки.
+     * @param {string} text — основная строка («Загрузка трека…»)
+     * @param {string} sub  — подпись (например, «1 из 3»)
+     */
+    function showLoading(text = 'Загрузка трека…', sub = '') {
+        const bar = getBar();
+        if (!bar) return;
+        injectLoadingUI(bar);
+
+        const textEl = bar.querySelector('#gpLoadingText');
+        const subEl = bar.querySelector('#gpLoadingSub');
+        if (textEl) textEl.textContent = text;
+        if (subEl) subEl.textContent = sub || 'Подготовка';
+
+        bar.classList.add('loading');
+        bar.classList.add('show');   // сразу показываем плеер
+    }
+
+    /**
+     * Спрятать индикатор загрузки.
+     * Вызывать при play(), pause(), error(), stop().
+     */
+    function hideLoading() {
+        const bar = getBar();
+        if (!bar) return;
+        bar.classList.remove('loading');
+    }
+
+    // ═══ 3. Слушаем события audio глобального плеера — прячем индикатор ═══
+    function attachAudioListeners() {
+        if (typeof GlobalPlayer === 'undefined') {
+            setTimeout(attachAudioListeners, 300);
+            return;
+        }
+        const audio = GlobalPlayer.audioEl;
+        if (!audio) {
+            setTimeout(attachAudioListeners, 300);
+            return;
+        }
+        if (audio._loadingIndicatorAttached) return;
+        audio._loadingIndicatorAttached = true;
+
+        // Как только плеер начал играть — прячем индикатор
+        audio.addEventListener('play',            () => hideLoading());
+        audio.addEventListener('playing',         () => hideLoading());
+        audio.addEventListener('pause',           () => hideLoading());
+        audio.addEventListener('ended',           () => hideLoading());
+        audio.addEventListener('error',           () => hideLoading());
+        audio.addEventListener('loadedmetadata',  () => hideLoading());
+
+        // ═══ 🆕 Таймаут-страховка: если за 15 сек ничего не произошло — прячем
+        //     (вдруг сеть зависла, а плеер так и не запустился)
+        //     Ставим один раз на каждый play(), в самом playTrack
+    }
+    attachAudioListeners();
+
+    // ═══ 4. Патчим playAudioFromMessage — наш «входной» метод, который грузит трек ═══
+    //    Именно тут происходит загрузка blob'ов, поэтому тут и показываем индикатор.
+
+    const _origPlayAudioFromMessage = window.playAudioFromMessage;
+
+    window.playAudioFromMessage = async function(msgId) {
+        // Сразу показываем плеер с индикатором — мгновенный отклик для юзера
+        showLoading('Загрузка трека…', 'Подготовка');
+
+        try {
+            // Вызываем оригинал
+            const result = await _origPlayAudioFromMessage.call(this, msgId);
+
+            // 🆕 Если после вызова плеер не начал играть — значит что-то пошло не так.
+            //    Но hideLoading() всё равно отработает по событиям audio.
+            //    Оставляем на всякий случай страховочный таймер:
+            setTimeout(() => {
+                const audio = GlobalPlayer?.audioEl;
+                if (audio && !audio.paused) {
+                    hideLoading();
+                }
+            }, 500);
+
+            return result;
+        } catch (e) {
+            console.error('playAudioFromMessage error:', e);
+            hideLoading();
+            throw e;
+        }
+    };
+
+    // ═══ 5. Страховка: если audio висит в "loading" дольше 20 сек — прячем ═══
+    //     Это решает проблему, когда сеть медленная, а пользователь смотрит на спиннер.
+    //     Пользователь может тапнуть play — там уже своя логика.
+    setInterval(() => {
+        const bar = getBar();
+        if (!bar || !bar.classList.contains('loading')) return;
+
+        // Если audio уже что-то играет — прячем
+        const audio = (typeof GlobalPlayer !== 'undefined') ? GlobalPlayer.audioEl : null;
+        if (audio && !audio.paused) {
+            hideLoading();
+        }
+    }, 500);
+
+    console.log('🎵 Индикатор загрузки в плеере активен');
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🎵 СПИННЕР НА КНОПКЕ ТРЕКА (мгновенный отклик)
+//  Юзер тапает по аудио → на кнопке play сразу появляется спиннер,
+//  ещё ДО того, как начнётся загрузка blob'ов с GitHub.
+// ═══════════════════════════════════════════════════════════════
+
+(function installTrackPlaySpinner() {
+
+    // ═══ 1. Стили ═══
+    if (!document.getElementById('trackSpinnerStyles')) {
+        const style = document.createElement('style');
+        style.id = 'trackSpinnerStyles';
+        style.textContent = `
+            /* Спиннер вместо ▶ на кнопке play */
+            .audio-play-btn.loading,
+            .audio-cover-play.loading {
+                color: transparent !important;
+                position: relative;
+                pointer-events: none;
+            }
+            .audio-play-btn.loading::after,
+            .audio-cover-play.loading::after {
+                content: '';
+                position: absolute;
+                top: 50%; left: 50%;
+                width: 60%;
+                height: 60%;
+                margin-left: -30%;
+                margin-top: -30%;
+                border-radius: 50%;
+                border: 2px solid rgba(255, 255, 255, 0.3);
+                border-top-color: #fff;
+                animation: trackSpin 0.7s linear infinite;
+            }
+            .audio-cover-play.loading::after {
+                border-width: 1.5px;
+            }
+            @keyframes trackSpin {
+                to { transform: rotate(360deg); }
+            }
+
+            /* Тонкая полоска под треком — «идёт работа» */
+            .audio-container.loading {
+                position: relative;
+                overflow: hidden;
+            }
+            .audio-container.loading::after {
+                content: '';
+                position: absolute;
+                left: 0; right: 0; bottom: 0;
+                height: 2px;
+                background: linear-gradient(
+                    90deg,
+                    transparent 0%,
+                    rgba(108,92,231,0.4) 20%,
+                    #00b894 50%,
+                    rgba(108,92,231,0.4) 80%,
+                    transparent 100%
+                );
+                background-size: 60% 100%;
+                background-repeat: no-repeat;
+                animation: trackBarSlide 1.2s ease-in-out infinite;
+                pointer-events: none;
+            }
+            @keyframes trackBarSlide {
+                0%   { background-position: -60% 0; }
+                100% { background-position: 160% 0; }
+            }
+
+            /* Лёгкое приглушение */
+.audio-container.loading {
+    opacity: 0.85;
+}
+
+            /* Аварийная защита: если что-то зависло > 30 сек — снимаем */
+            .audio-play-btn.stuck,
+            .audio-cover-play.stuck {
+                color: #ff6b6b !important;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══ 2. Хелперы ═══
+    function getMsgId(msgId) {
+        return String(msgId);
+    }
+
+    /**
+     * Найти все элементы, относящиеся к конкретному сообщению:
+     *   - .audio-container[data-audio-id]
+     *   - .audio-play-btn внутри
+     *   - .audio-cover-play внутри
+     */
+    function getElementsForMsg(msgId) {
+        const container = document.querySelector(
+            `.audio-container[data-audio-id="${msgId}"]`
+        );
+        if (!container) return null;
+        return {
+            container,
+            playBtn: container.querySelector('.audio-play-btn'),
+            coverBtn: container.querySelector('.audio-cover-play'),
+        };
+    }
+
+    // ═══ 3. Показать спиннер ═══
+    function showSpinner(msgId) {
+        const els = getElementsForMsg(msgId);
+        if (!els) return;
+
+        els.container.classList.add('loading');
+        if (els.playBtn) {
+            els.playBtn.classList.add('loading');
+            els.playBtn.textContent = ''; // ⏳ убираем ▶
+        }
+        if (els.coverBtn) {
+            els.coverBtn.classList.add('loading');
+            els.coverBtn.textContent = ''; // убираем ▶
+        }
+
+        // 🆕 Страховочный таймер: если за 30 сек ничего не произошло — снимаем спиннер
+        //    (защита от зависания при плохой сети)
+        if (els.container._spinnerTimeout) {
+            clearTimeout(els.container._spinnerTimeout);
+        }
+        els.container._spinnerTimeout = setTimeout(() => {
+            hideSpinner(msgId);
+            els.container.classList.add('stuck');
+            if (els.playBtn) els.playBtn.classList.add('stuck');
+            if (els.coverBtn) els.coverBtn.classList.add('stuck');
+            showToast('⚠️ Загрузка заняла слишком много времени', 2500);
+        }, 30000);
+    }
+
+    // ═══ 4. Скрыть спиннер ═══
+    function hideSpinner(msgId) {
+        const els = getElementsForMsg(msgId);
+        if (!els) return;
+
+        els.container.classList.remove('loading');
+        if (els.container._spinnerTimeout) {
+            clearTimeout(els.container._spinnerTimeout);
+            els.container._spinnerTimeout = null;
+        }
+
+        if (els.playBtn) {
+            els.playBtn.classList.remove('loading');
+            // Восстанавливаем иконку — но только если трек сейчас не играет
+            if (typeof GlobalPlayer !== 'undefined') {
+                const globalId = GlobalPlayer.getCurrentMsgId();
+                const isCurrent = String(globalId) === String(msgId);
+                const isPlaying = isCurrent && !GlobalPlayer.audioEl.paused;
+                els.playBtn.textContent = isPlaying ? '⏸' : '▶';
+            } else {
+                els.playBtn.textContent = '▶';
+            }
+        }
+        if (els.coverBtn) {
+            els.coverBtn.classList.remove('loading');
+            if (typeof GlobalPlayer !== 'undefined') {
+                const globalId = GlobalPlayer.getCurrentMsgId();
+                const isCurrent = String(globalId) === String(msgId);
+                const isPlaying = isCurrent && !GlobalPlayer.audioEl.paused;
+                els.coverBtn.textContent = isPlaying ? '⏸' : '▶';
+                els.coverBtn.classList.toggle('playing', isPlaying);
+            } else {
+                els.coverBtn.textContent = '▶';
+            }
+        }
+    }
+
+    // ═══ 5. ПЕРЕХВАТ toggleAudioPlayback ═══
+    //    Именно эту функцию вызывает клик по ▶ на сообщении.
+    //    Обернём её: до загрузки покажем спиннер, после — скроем.
+    const _origToggle = window.toggleAudioPlayback;
+
+    window.toggleAudioPlayback = function(msgId) {
+        // 🆕 Если этот трек уже играет (или на паузе) в глобальном плеере — это toggle
+        if (typeof GlobalPlayer !== 'undefined') {
+            const globalId = GlobalPlayer.getCurrentMsgId();
+            if (String(globalId) === String(msgId)) {
+                // Просто переключаем, спиннер не нужен
+                GlobalPlayer.toggle();
+                if (typeof syncInlineWithGlobal === 'function') {
+                    syncInlineWithGlobal();
+                }
+                return;
+            }
+        }
+
+        // ═══ Мгновенный отклик: спиннер сразу ═══
+        showSpinner(msgId);
+
+        // ═══ Запускаем оригинальную логику ═══
+        try {
+            const result = _origToggle.call(this, msgId);
+
+            // Если вернулся Promise — привяжем скрытие спиннера к его завершению
+            if (result && typeof result.then === 'function') {
+                result
+                    .then(() => {
+                        // 🆕 НЕ скрываем сразу — ждём, пока audio реально начнёт играть
+                        //    (скрытие произойдёт через событие 'play'/'playing' ниже)
+                        //    Но на всякий случай — страховочный таймер на 3 сек
+                        setTimeout(() => {
+                            const audio = (typeof GlobalPlayer !== 'undefined')
+                                ? GlobalPlayer.audioEl
+                                : null;
+                            if (audio && !audio.paused) {
+                                hideSpinner(msgId);
+                            }
+                        }, 3000);
+                    })
+                    .catch(() => {
+                        // Ошибка — снимаем спиннер через мгновение
+                        setTimeout(() => hideSpinner(msgId), 300);
+                    });
+            }
+        } catch (e) {
+            console.error('toggleAudioPlayback error:', e);
+            setTimeout(() => hideSpinner(msgId), 300);
+        }
+    };
+
+    // ═══ 6. ПЕРЕХВАТ playAudioFromMessage — тоже может вызываться напрямую ═══
+    const _origPlay = window.playAudioFromMessage;
+
+    window.playAudioFromMessage = async function(msgId) {
+        // Показываем спиннер для случая, если функцию вызвали в обход toggleAudioPlayback
+        // (например, из другого места кода)
+        showSpinner(msgId);
+
+        try {
+            return await _origPlay.call(this, msgId);
+        } catch (e) {
+            console.error('playAudioFromMessage error:', e);
+            hideSpinner(msgId);
+            throw e;
+        }
+    };
+
+    // ═══ 7. Слушаем события глобального audio — скрываем спиннер ═══
+    function attachGlobalAudioListeners() {
+        if (typeof GlobalPlayer === 'undefined') {
+            setTimeout(attachGlobalAudioListeners, 300);
+            return;
+        }
+        const audio = GlobalPlayer.audioEl;
+        if (!audio) {
+            setTimeout(attachGlobalAudioListeners, 300);
+            return;
+        }
+        if (audio._trackSpinnerAttached) return;
+        audio._trackSpinnerAttached = true;
+
+        // Как только audio пошёл — прячем спиннер у текущего трека
+        const onPlay = () => {
+            const id = GlobalPlayer.getCurrentMsgId();
+            if (id) hideSpinner(id);
+        };
+
+        audio.addEventListener('play', onPlay);
+        audio.addEventListener('playing', onPlay);
+        audio.addEventListener('loadedmetadata', onPlay);
+
+        // Ошибка — тоже прячем
+        audio.addEventListener('error', () => {
+            const id = GlobalPlayer.getCurrentMsgId();
+            if (id) hideSpinner(id);
+        });
+
+        // Пауза — прячем, т.к. на паузе спиннер тоже не нужен
+        audio.addEventListener('pause', () => {
+            const id = GlobalPlayer.getCurrentMsgId();
+            if (id) hideSpinner(id);
+        });
+    }
+    attachGlobalAudioListeners();
+
+    // ═══ 8. Патч syncInlineWithGlobal — не даём сбросить спиннер ═══
+    //    Она перезаписывает textContent у кнопок, что может сбить наш спиннер.
+    //    Оборачиваем её, чтобы она не трогала кнопки с классом .loading.
+    if (typeof syncInlineWithGlobal === 'function') {
+        const _origSync = syncInlineWithGlobal;
+        window.syncInlineWithGlobal = function() {
+            const containersInLoading = document.querySelectorAll(
+                '.audio-container.loading[data-audio-id]'
+            );
+            const loadingIds = new Set();
+            containersInLoading.forEach(c => loadingIds.add(c.dataset.audioId));
+
+            _origSync.apply(this, arguments);
+
+            // Восстанавливаем спиннеры (оригинал мог их сбросить)
+            loadingIds.forEach(id => {
+                const els = getElementsForMsg(id);
+                if (!els) return;
+                if (els.playBtn) {
+                    els.playBtn.classList.add('loading');
+                    els.playBtn.textContent = '';
+                }
+                if (els.coverBtn) {
+                    els.coverBtn.classList.add('loading');
+                    els.coverBtn.textContent = '';
+                }
+            });
+        };
+    }
+
+    // ═══ 9. Страховка: если пользователь тапнул по ДРУГОМУ треку,
+    //    пока предыдущий ещё грузится — снимаем спиннер у предыдущего.
+    //    Делается через патч уже описанного toggleAudioPlayback:
+    //    перед показом нового спиннера снимем все старые.
+    const _origShowSpinner = showSpinner;
+    window._showSpinnerClearOthers = function(msgId) {
+        document.querySelectorAll('.audio-container.loading[data-audio-id]').forEach(c => {
+            if (c.dataset.audioId !== String(msgId)) {
+                hideSpinner(c.dataset.audioId);
+            }
+        });
+        _origShowSpinner(msgId);
+    };
+    showSpinner = function(msgId) {
+        document.querySelectorAll('.audio-container.loading[data-audio-id]').forEach(c => {
+            if (c.dataset.audioId !== String(msgId)) {
+                hideSpinner(c.dataset.audioId);
+            }
+        });
+        _origShowSpinner(msgId);
+    };
+    // ⚠️ Т.к. showSpinner внутри замыкания, перезапись через переменную
+    //    не влияет на уже зарегистрированные обработчики. Поэтому дополнительно
+    //    патчим toggleAudioPlayback ещё раз — уже с «умным» showSpinner.
+    const _origToggleWithClear = window.toggleAudioPlayback;
+    window.toggleAudioPlayback = function(msgId) {
+        // Снять спиннеры у всех, кроме текущего
+        document.querySelectorAll('.audio-container.loading[data-audio-id]').forEach(c => {
+            if (c.dataset.audioId !== String(msgId)) {
+                hideSpinner(c.dataset.audioId);
+            }
+        });
+        return _origToggleWithClear.apply(this, arguments);
+    };
+
+    console.log('🎵 Спиннер на кнопке трека активен');
+})();
 </script>
 </body>
 </html>
