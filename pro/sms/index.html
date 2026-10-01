@@ -1141,17 +1141,6 @@ body.player-active .gallery-actions {
             transition: transform 0.2s ease, opacity 0.2s ease;
             animation: fadeInBtn 0.25s ease;
         }
-/* 🆕 Кнопка «вниз» поднимается, когда плеер активен */
-body.player-active .scroll-down-btn {
-    bottom: 165px;
-}
-
-/* 🆕 И для мобилы тоже */
-@media (max-width: 480px) {
-    body.player-active .scroll-down-btn {
-        bottom: 145px;
-    }
-}
         .scroll-down-btn.show { display: flex; }
         .scroll-down-btn:active { transform: scale(0.88); }
         @keyframes fadeInBtn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
@@ -9811,6 +9800,7 @@ if (imageUrl) {
     const mime = (_shareToChat.mime || blob.type || '').toLowerCase();
     let icon = '📎';   // дефолт — файл
 
+
     if (mime.startsWith('audio/') || /\.(mp3|ogg|wav|m4a|aac|flac|opus|webm)$/i.test(name)) {
         icon = '🎵';   // аудио
     } else if (mime.startsWith('video/') || /\.(mp4|mov|avi|mkv|webm|m4v|3gp)$/i.test(name)) {
@@ -9828,6 +9818,7 @@ if (imageUrl) {
     } else if (/\.smschat$/i.test(name)) {
         icon = '💌';   // приглашение в чат
     }
+
 
     thumb.innerHTML = icon;
 }
@@ -13189,29 +13180,45 @@ async function playAudioFromMessage(msgId) {
     const queue = buildAudioQueueFromHistory();
     if (queue.length === 0) return;
 
+
     const startIndex = queue.findIndex(x => String(x.id) === String(msgId));
     if (startIndex === -1) return;
 
+
+    // 🆕 Фиксируем чат-источник — даже если пользователь выйдет из чата,
+    //     обложки всё равно загрузятся из правильного места
     const sourceChatFile = queue[0]._chatFile || state.chatFile;
 
-    // ═══ 1. Загружаем ТОЛЬКО текущий трек + 1 сосед (для быстрого next) ═══
-    const loadOne = async (idx) => {
+
+    const load = async (idx) => {
         if (idx < 0 || idx >= queue.length) return;
         const item = queue[idx];
-        if (item.src) return;
-        try {
-            item.src = await loadAttachment(sourceChatFile, item._msg.audio);
-        } catch (e) {
-            console.warn('failed to load audio', item.id, e);
+
+
+        // Аудио
+        if (!item.src) {
+            try {
+                item.src = await loadAttachment(sourceChatFile, item._msg.audio);
+            } catch (e) {
+                console.warn('failed to load audio', item.id, e);
+                item.src = null;
+            }
+        }
+
+
+        // 🆕 Обложка — через sourceChatFile, а не state.chatFile
+        if (item._coverName && !item.coverUrl) {
+            try {
+                item.coverUrl = await loadAttachment(sourceChatFile, item._coverName);
+            } catch (e) {
+                console.warn('failed to load cover', item.id, e);
+            }
         }
     };
 
-    // Грузим сам трек и его "соседа" — параллельно
-    await Promise.all([
-        loadOne(startIndex),
-        loadOne(startIndex + 1),
-        loadOne(startIndex - 1),
-    ]);
+
+    await Promise.all(queue.map((_, i) => load(i)));
+
 
     const playable = queue.filter(x => x.src);
     if (playable.length === 0) {
@@ -13219,47 +13226,7 @@ async function playAudioFromMessage(msgId) {
         return;
     }
     const realStart = playable.findIndex(x => String(x.id) === String(msgId));
-
-    // ═══ 2. СРАЗУ играем ═══
     GlobalPlayer.playQueue(playable, realStart >= 0 ? realStart : 0, sourceChatFile);
-
-    // ═══ 3. Остальные треки + обложки — грузим В ФОНЕ ═══
-    (async () => {
-        for (let i = 0; i < queue.length; i++) {
-            // Прерываемся, если пользователь уже вышел из чата
-            if (state.chatFile !== sourceChatFile && GlobalPlayer.currentChatFile !== sourceChatFile) {
-                break;
-            }
-            const item = queue[i];
-
-            // Аудио
-            if (!item.src) {
-                try {
-                    item.src = await loadAttachment(sourceChatFile, item._msg.audio);
-                    // Обновляем src в глобальном плеере, чтобы next() работал
-                    const globalTrack = GlobalPlayer.queue.find(t => String(t.id) === String(item.id));
-                    if (globalTrack) globalTrack.src = item.src;
-                } catch (e) {
-                    console.warn('bg audio load failed', item.id, e);
-                }
-            }
-
-            // Обложка — тоже в фоне
-            if (item._coverName && !item.coverUrl) {
-                try {
-                    item.coverUrl = await loadAttachment(sourceChatFile, item._coverName);
-                    const globalTrack = GlobalPlayer.queue.find(t => String(t.id) === String(item.id));
-                    if (globalTrack) globalTrack.coverUrl = item.coverUrl;
-                } catch (e) {
-                    console.warn('bg cover load failed', item.id, e);
-                }
-            }
-
-            // Небольшая пауза, чтобы не забивать сеть
-            await new Promise(r => setTimeout(r, 100));
-        }
-        console.log('🎵 Фоновая загрузка плейлиста завершена');
-    })();
 }
 // ═══ Перехват toggleAudioPlayback — теперь через GlobalPlayer ═══
 
