@@ -13551,74 +13551,100 @@ $('replyCancelBtn').addEventListener('click', cancelReply);
 function scrollToMessage(msgId) {
     if (!msgId || !state.chatFile) return;
 
-    // ═══ 1. Если уже в DOM — скролл + каскадное подтверждение ═══
+    // ═══ 1. Если уже в DOM — скролл + подсветка + заморозка ═══
     const existing = messagesInner.querySelector(
         `.message-wrapper[data-msg-id="${msgId}"]`
     );
     if (existing) {
         doScrollAndFlash(existing, msgId);
-        // 🆕 ФИКСАЦИЯ СКРОЛЛА, чтобы асинхронная подгрузка или опрос
-        // не скинули позицию вниз. Как в патче «умного поиска».
-        ScrollLock.lock(12000);
-        cascadeScrollToElement(existing, msgId);
+        lockScrollToElement(existing, msgId);
         return;
     }
 
-    // ═══ 2. Не в DOM — ставим флаг и вызываем renderHistory ═══
+    // ═══ 2. Не в DOM — ставим флаг и рендерим историю ═══
     window._pendingJumpToMsgId = msgId;
     renderHistory();
-    // 🆕 Фиксацию тут не ставим — она активируется в renderHistory
-    // после того, как элемент будет отрисован и найден.
+
+    // ═══ 3. После рендера — скроллим и подсвечиваем ═══
+    requestAnimationFrame(() => {
+        const el = messagesInner.querySelector(
+            `.message-wrapper[data-msg-id="${msgId}"]`
+        );
+        if (el) {
+            doScrollAndFlash(el, msgId);
+            lockScrollToElement(el, msgId);
+        }
+    });
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  🔄 КАСКАДНЫЙ СКРОЛЛ К СООБЩЕНИЮ
-//  Повторяет прокрутку несколько раз, пока грузятся вложения
-//  и меняется высота контейнера. Именно это решает проблему
-//  «первого промаха», когда DOM ещё не устоялся.
+//  🔒 ЗАМОРОЗКА + КАСКАДНАЯ ПОДСВЕТКА
+//  Держит позицию ~1.9 сек, пока грузятся вложения,
+//  и повторно подсвечивает сообщение после каждой каскадной прокрутки.
 // ═══════════════════════════════════════════════════════════════
-function cascadeScrollToElement(el, msgId) {
+function lockScrollToElement(el, msgId) {
     if (!el || !el.isConnected) return;
 
-    // Запоминаем «якорь» — считаем куда нужно вернуться
-    const scrollToAnchor = () => {
-        // Если элемент уже не в DOM (перерисовали) — ищем заново
-        let target = el;
-        if (!target.isConnected) {
-            target = messagesInner.querySelector(
-                `.message-wrapper[data-msg-id="${msgId}"]`
-            );
-            if (!target) return;
-        }
+    const DURATION = 1500;          // сколько держать позицию
+    const FLASH_DURATION = 1200;    // длительность одной вспышки
+    const CASCADE_DELAYS = [0, 150, 400, 800, 1400]; // когда пересчитывать
 
-        // Считаем, где элемент сейчас относительно контейнера
+    // Замораживаем позицию (используем глобальный ScrollLock)
+    if (typeof ScrollLock !== 'undefined' && ScrollLock.lock) {
+        ScrollLock.lock(DURATION + 400);
+    }
+
+    // Находим элемент заново (DOM может перерисоваться)
+    const findEl = () => {
+        if (el.isConnected) return el;
+        return messagesInner.querySelector(
+            `.message-wrapper[data-msg-id="${msgId}"]`
+        );
+    };
+
+    // Пересчёт позиции — держим в центре видимой области
+    const recenter = () => {
+        const target = findEl();
+        if (!target) return;
+
         const contRect = messagesContainer.getBoundingClientRect();
         const elRect = target.getBoundingClientRect();
         const elTopInContainer = elRect.top - contRect.top;
         const contH = messagesContainer.clientHeight;
-        const targetTop = (contH - elRect.height) / 2;   // центр
+        const targetTop = (contH - elRect.height) / 2;
         const delta = elTopInContainer - targetTop;
 
-        // Если элемент сместился больше чем на 20% высоты экрана —
-        // жёстко возвращаем scrollTop (без smooth — чтобы быстро)
-        if (Math.abs(delta) > contH * 0.2) {
+        // Мгновенный скролл — без smooth (он конфликтует с ScrollLock)
+        if (Math.abs(delta) > 4) {
             messagesContainer.scrollTop += delta;
         }
     };
 
-    // Каскад: сразу + через 100, 300, 600, 1000, 1800, 3000 мс
-    // Этого хватает, чтобы все вложения (картинки/видео/аудио) загрузились
-    // и высота контейнера устоялась.
-    scrollToAnchor();
-
-    const delays = [100, 300, 600, 1000, 1800, 3000];
-    delays.forEach(d => {
+    // Подсветка
+    const flash = () => {
+        const target = findEl();
+        if (!target) return;
+        target.classList.remove('highlight-flash');
+        void target.offsetWidth;   // force reflow — перезапуск CSS-анимации
+        target.classList.add('highlight-flash');
         setTimeout(() => {
-            // Прерываемся, если пользователь сам начал скроллить
-            if (_isUserScrolling) return;
-            scrollToAnchor();
-        }, d);
+            target.classList.remove('highlight-flash');
+        }, FLASH_DURATION);
+    };
+
+    // ═══ Каскад: пересчёт позиции + подсветка ═══
+    CASCADE_DELAYS.forEach((delay, i) => {
+        setTimeout(() => {
+            if (_isUserScrolling) return;   // юзер сам скроллит — не мешаем
+            recenter();
+            // Подсвечиваем на последних 3 итерациях, чтобы попасть
+            // в момент, когда вложения уже догрузились
+            if (i >= CASCADE_DELAYS.length - 3) flash();
+        }, delay);
     });
+
+    // ═══ Первая подсветка — сразу ═══
+    flash();
 }
 
 
@@ -14578,19 +14604,27 @@ async function jumpToPlayingTrack() {
     setTimeout(tryLoadUntilFound, 400);
 }
 
-// Вспомогалка — скролл + подсветка
+// Вспомогалка — мгновенный скролл к центру + подсветка
 function doScrollAndFlash(el, msgId) {
+    if (!el || !el.isConnected) return;
+
     // Снимаем все старые подсветки
     messagesInner.querySelectorAll('.message-wrapper.highlight-flash')
         .forEach(x => x.classList.remove('highlight-flash'));
 
-    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    // ⚡ МГНОВЕННЫЙ скролл — без smooth.
+    // Плавный скролл конфликтует с ScrollLock: пока идёт анимация,
+    // заморозка уже «держит» старую позицию → дёрганье.
+    const contRect = messagesContainer.getBoundingClientRect();
+    const elRect = el.getBoundingClientRect();
+    const elTopInContainer = elRect.top - contRect.top;
+    const contH = messagesContainer.clientHeight;
+    const targetTop = (contH - elRect.height) / 2;
+    messagesContainer.scrollTop += (elTopInContainer - targetTop);
 
-    // Небольшая задержка — чтобы скролл начался
-    setTimeout(() => {
-        el.classList.add('highlight-flash');
-        setTimeout(() => el.classList.remove('highlight-flash'), 1300);
-    }, 200);
+    // Подсветка
+    el.classList.add('highlight-flash');
+    setTimeout(() => el.classList.remove('highlight-flash'), 1300);
 
     if (navigator.vibrate) navigator.vibrate(20);
 }
