@@ -20494,6 +20494,137 @@ showMessageMenu = function(x, y, msgId, isOwn) {
 
     console.log('🎵 Спиннер на кнопке трека активен');
 })();
+
+// ═══════════════════════════════════════════════════════════════
+//  🔧 ПАТЧ: Свайп вправо = ВСЕГДА ответ, а не комментарий
+//  Комментарии к фото/аудио/файлу остаются доступны через 
+//  кнопку «Комментировать» под сообщением.
+// ═══════════════════════════════════════════════════════════════
+(function patchSwipeAlwaysReply() {
+    // Переопределяем canCommentOn — но ТОЛЬКО для свайпа.
+    // Сама функция используется в buildMessageHTML для показа
+    // кнопки «Комментировать», поэтому её трогать нельзя.
+    //
+    // Вместо этого — подменяем поведение initSwipeReply через 
+    // глобальную переменную-флаг.
+    
+    window.__swipeAlwaysReply = true;
+
+    // Патчим обработчик touchmove в initSwipeReply.
+    // Так как initSwipeReply — это IIFE и его внутренности недоступны,
+    // перехватываем создание подсказки и присвоение swipeMode
+    // через MutationObserver — нет, это дорого.
+    //
+    // Более чистый путь: добавляем свой capture-обработчик touchend,
+    // который срабатывает РАНЬШЕ и меняет поведение.
+    
+    // Перехватываем touchstart на messagesInner в capture-фазе,
+    // чтобы установить флаг «этот свайп — reply»
+    const swipeState = {
+        active: false,
+        mode: null,       // 'reply' | 'comment'
+        targetMsgId: null,
+        startX: 0, startY: 0,
+        currentDx: 0,
+    };
+
+    messagesInner.addEventListener('touchstart', (e) => {
+        if (e.touches.length !== 1) return;
+        const wrapper = e.target.closest('.message-wrapper[data-msg-id]');
+        if (!wrapper) return;
+        if (e.target.closest('a, button, audio, video, input, textarea')) return;
+
+        swipeState.active = true;
+        swipeState.startX = e.touches[0].clientX;
+        swipeState.startY = e.touches[0].clientY;
+        swipeState.targetMsgId = parseInt(wrapper.dataset.msgId);
+        swipeState.currentDx = 0;
+        swipeState.mode = null;
+    }, { passive: true, capture: true });
+
+    messagesInner.addEventListener('touchmove', (e) => {
+        if (!swipeState.active) return;
+        if (e.touches.length !== 1) return;
+        const dx = e.touches[0].clientX - swipeState.startX;
+        const dy = e.touches[0].clientY - swipeState.startY;
+        swipeState.currentDx = dx;
+
+        // Определяем, что это свайп вправо (горизонтальный)
+        if (!swipeState.mode && Math.abs(dx) > 12 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+            // 🆕 ВСЕГДА reply — независимо от типа сообщения
+            swipeState.mode = 'reply';
+
+            // 🆕 Принудительно снимаем .swiping-comment если он был добавлен
+            const wrapper = swipeState.targetMsgId
+                ? messagesInner.querySelector(`.message-wrapper[data-msg-id="${swipeState.targetMsgId}"]`)
+                : null;
+            if (wrapper) {
+                // Убираем «комментарийную» подсказку, если оригинал её поставил
+                wrapper.classList.remove('swiping-comment');
+                const commentHint = wrapper.querySelector('.swipe-comment-hint');
+                if (commentHint) commentHint.remove();
+
+                // Ставим «ответную» подсказку
+                if (!wrapper.classList.contains('swiping-reply')) {
+                    wrapper.classList.add('swiping-reply');
+                }
+                if (!wrapper.querySelector('.swipe-reply-hint')) {
+                    const hint = document.createElement('div');
+                    hint.className = 'swipe-reply-hint';
+                    hint.textContent = '↩';
+                    wrapper.appendChild(hint);
+                }
+            }
+        }
+    }, { passive: true, capture: true });
+
+    messagesInner.addEventListener('touchend', (e) => {
+        if (!swipeState.active) return;
+
+        const wasReply = swipeState.mode === 'reply';
+        const dx = swipeState.currentDx;
+        const msgId = swipeState.targetMsgId;
+
+        // Сбрасываем состояние
+        swipeState.active = false;
+        swipeState.mode = null;
+        swipeState.targetMsgId = null;
+        swipeState.currentDx = 0;
+
+        if (!wasReply || dx <= 60 || !msgId) return;
+
+        // 🆕 Оригинальный обработчик touchend (из initSwipeReply) 
+        //    уже мог вызвать startComment — надо отменить его эффект.
+        //    Но т.к. оба слушателя сработали синхронно, «последний» побеждает
+        //    на уровне класса .swiping-comment (мы его уже сняли в touchmove).
+        //    
+        //    Проблема: оригинал вызывает startComment сразу на touchend.
+        //    Наш обработчик в capture-фазе вызвать не может (event propagation).
+        //    Значит надо отменить его последствия: если открылась панель комментария — закрыть.
+
+        // Проверяем: открылась ли панель комментария?
+        const commentBar = document.getElementById('commentPreviewBar');
+        if (commentBar && commentBar.classList.contains('show')) {
+            // Да — отменяем комментарий и вызываем ответ
+            if (typeof cancelComment === 'function') cancelComment();
+        }
+
+        // Теперь вызываем startReply (заменяя собой поведение оригинала)
+        // Но чтобы не сработало ДВА раза — нам нужно понять,
+        // вызвал ли оригинал startReply уже (для обычных сообщений).
+        //
+        // Хак: оригинальный startReply выставляет _replyTo.
+        // Если _replyTo уже установлен для этого msgId — не дублируем.
+        const alreadyReplied = (typeof _replyTo !== 'undefined' && _replyTo && _replyTo.id === msgId);
+
+        if (!alreadyReplied && typeof startReply === 'function') {
+            startReply(msgId);
+        }
+    }, { passive: true, capture: false }); // capture:false — срабатывает ПОСЛЕ оригинала
+})();
+
+console.log('🔧 Патч активен: свайп вправо = ВСЕГДА ответ (комментарии — только через кнопку)');
+
 </script>
 </body>
 </html>
