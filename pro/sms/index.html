@@ -20645,393 +20645,368 @@ showMessageMenu = function(x, y, msgId, isOwn) {
 
 console.log('🔧 Патч активен: свайп вправо = ВСЕГДА ответ (комментарии — только через кнопку)');
 
-</script>
-<script>
 // ═══════════════════════════════════════════════════════════════
-//  ⬆️ НАВИГАЦИЯ ПО НЕПРОЧИТАННЫМ КОММЕНТАРИЯМ (v2.0)
-//  Единый патч со всеми исправлениями:
-//    • Игнор СВОИХ комментариев (по автору, а не по автору сообщения)
-//    • Точный счётчик непрочитанных (без вечных "1")
-//    • Счётчик хранится в localStorage (быстро, без расшифровки)
+//  💬 ПАТЧ v2: ГЛОБАЛЬНЫЙ ИНДИКАТОР НОВЫХ КОММЕНТАРИЕВ
+//  Работает и в списке чатов, и внутри чата.
 // ═══════════════════════════════════════════════════════════════
-try {
-    console.log('🚀 Внедрение системы навигации по комментариям v2.0...');
+(function installGlobalCommentsNotifier() {
+    const STORAGE_KEY = 'chathub_read_comments';
 
-    // ═══════════════════════════════════════════════════════════════
-    //  БЛОК 1: ЯДРО СИСТЕМЫ (хранилище, состояние, кнопка)
-    // ═══════════════════════════════════════════════════════════════
-    (function installCommentNavigatorCore() {
-
-        // --- 1.1. Хранилище для lastReadCommentId + счётчика непрочитанных ---
-        window.CommentReadState = {
-            get: (chatFile) => {
-                if (!chatFile) return null;
-                const rs = JSON.parse(localStorage.getItem('chathub_read_state') || '{}');
-                return rs[chatFile + '__c'] || null;
-            },
-            set: (chatFile, commentId) => {
-                if (!chatFile || !commentId) return;
-                const rs = JSON.parse(localStorage.getItem('chathub_read_state') || '{}');
-                rs[chatFile + '__c'] = commentId;
-                localStorage.setItem('chathub_read_state', JSON.stringify(rs));
-            },
-            clear: (chatFile) => {
-                if (!chatFile) return;
-                const rs = JSON.parse(localStorage.getItem('chathub_read_state') || '{}');
-                delete rs[chatFile + '__c'];
-                delete rs[chatFile + '__ccount'];
-                localStorage.setItem('chathub_read_state', JSON.stringify(rs));
-            },
-            // 🆕 Счётчик непрочитанных комментариев (точный)
-            getCount: (chatFile) => {
-                if (!chatFile) return 0;
-                const rs = JSON.parse(localStorage.getItem('chathub_read_state') || '{}');
-                return rs[chatFile + '__ccount'] || 0;
-            },
-            setCount: (chatFile, count) => {
-                if (!chatFile) return;
-                const rs = JSON.parse(localStorage.getItem('chathub_read_state') || '{}');
-                if (count > 0) {
-                    rs[chatFile + '__ccount'] = count;
-                } else {
-                    delete rs[chatFile + '__ccount'];
-                }
-                localStorage.setItem('chathub_read_state', JSON.stringify(rs));
+    // --- 1. Хранилище прочитанных (то же самое) ---
+    const ReadComments = {
+        _data: null,
+        load() {
+            if (this._data) return this._data;
+            try {
+                const raw = localStorage.getItem(STORAGE_KEY);
+                this._data = raw ? JSON.parse(raw) : {};
+            } catch (e) { this._data = {}; }
+            return this._data;
+        },
+        save() {
+            try { localStorage.setItem(STORAGE_KEY, JSON.stringify(this._data || {})); }
+            catch (e) { console.warn('Failed to save read comments state:', e); }
+        },
+        getReadSet(chatFile) {
+            this.load();
+            return new Set(this._data[chatFile] || []);
+        },
+        markAsRead(chatFile, messageId) {
+            if (!chatFile || !messageId) return;
+            this.load();
+            if (!this._data[chatFile]) this._data[chatFile] = [];
+            const readArray = new Set(this._data[chatFile]);
+            if (!readArray.has(messageId)) {
+                readArray.add(messageId);
+                this._data[chatFile] = Array.from(readArray);
+                this.save();
             }
-        };
-
-        // --- 1.2. Глобальное состояние для навигации ---
-        window._unreadComments = {
-            list: [], // [{ msgId, commentId }] — отсортировано от НОВЫХ к СТАРЫМ
-            currentIndex: -1,
-        };
-
-        // --- 1.3. DOM-элемент для стрелки ---
-        const navBtn = document.createElement('button');
-        navBtn.className = 'scroll-up-btn';
-        navBtn.id = 'scrollUpCommentsBtn';
-        navBtn.title = 'К непрочитанным комментариям';
-        navBtn.innerHTML = `↑ <span class="scroll-badge" id="unreadCommentsBadge"></span>`;
-        document.body.appendChild(navBtn);
-        const unreadCommentsBadge = document.getElementById('unreadCommentsBadge');
-
-        // --- 1.4. Стили для стрелки ---
-        const style = document.createElement('style');
-        style.textContent = `
-            .scroll-up-btn {
-                position: fixed; left: 20px; bottom: 100px;
-                width: 48px; height: 48px; border-radius: 50%; border: none;
-                background: linear-gradient(135deg, #feca57, #ff9f43);
-                color: #1a1a2e; font-size: 22px; font-weight: 700; cursor: pointer;
-                display: none; align-items: center; justify-content: center;
-                box-shadow: 0 6px 24px rgba(254, 202, 87, 0.45);
-                z-index: 60;
-                transition: transform 0.2s ease, opacity 0.2s ease;
-                animation: fadeInBtn 0.25s ease;
-            }
-            .scroll-up-btn.show { display: flex; }
-            .scroll-up-btn:active { transform: scale(0.88); }
-            .scroll-down-btn.shifted-left { right: 80px; }
-            @media (max-width: 480px) {
-                .scroll-up-btn { left: 14px; bottom: 84px; width: 44px; height: 44px; font-size: 20px; }
-                .scroll-down-btn.shifted-left { right: 72px; }
-            }
-            body.player-active .scroll-up-btn { bottom: 165px; }
-            @media (max-width: 480px) {
-                body.player-active .scroll-up-btn { bottom: 145px; }
-            }
-        `;
-        document.head.appendChild(style);
-
-        // --- 1.5. Функция обновления стрелки ---
-        function updateCommentsNavigatorUI() {
-            const { list, currentIndex } = window._unreadComments;
-            if (!navBtn || !unreadCommentsBadge) return;
-
-            const unreadCount = list.length - (currentIndex + 1);
-
-            if (unreadCount > 0) {
-                navBtn.classList.add('show');
-                unreadCommentsBadge.textContent = unreadCount > 99 ? '99+' : unreadCount;
-                unreadCommentsBadge.classList.add('show');
-            } else {
-                navBtn.classList.remove('show');
-                unreadCommentsBadge.classList.remove('show');
-            }
-
-            // Сдвигаем кнопку "вниз" если обе видны
-            const scrollDownBtn = document.getElementById('scrollDownBtn');
-            if (scrollDownBtn) {
-                const bothVisible = scrollDownBtn.classList.contains('show') && navBtn.classList.contains('show');
-                scrollDownBtn.classList.toggle('shifted-left', bothVisible);
+        },
+        clear(chatFile) {
+            this.load();
+            if (this._data[chatFile]) {
+                delete this._data[chatFile];
+                this.save();
             }
         }
-        window.updateCommentsNavigatorUI = updateCommentsNavigatorUI;
+    };
 
-        // --- 1.6. Обработчик клика по стрелке ---
-        navBtn.addEventListener('click', () => {
-            const { list, currentIndex } = window._unreadComments;
-            const nextIndex = currentIndex + 1;
-            if (nextIndex >= list.length) {
-                // Дошли до самого верхнего — сбрасываем счётчик в списке чатов
-                if (state.chatFile) {
-                    window.CommentReadState.setCount(state.chatFile, 0);
+    // --- 2. Глобальное состояние ---
+    // { chatFile: [msgId1, msgId2, ...] } — сообщения с непрочитанными комментами
+    let _unreadByChat = {};
+
+    // --- 3. Функция "просканировать все чаты" (аналог checkUnreadForAllChats) ---
+    // Работает ТОЛЬКО при наличии сохранённых паролей и требует сеть.
+    // Возвращает { chatFile: [msgIds] }.
+    async function scanAllChatsForNewComments() {
+        const result = {};
+
+        // Проверяем только те чаты, у которых сохранён пароль
+        // (без пароля мы не сможем расшифровать комментарии)
+        const chatsToScan = state.chats.filter(c => state.savedPasswords[c.file]);
+        if (chatsToScan.length === 0) return result;
+
+        await Promise.all(chatsToScan.map(async (chat) => {
+            const file = chat.file;
+            try {
+                // Быстрая проверка через meta — не изменился ли файл?
+                const metaRes = await fetchMetaFast(file, state._metaEtagsByFile[file] || null);
+                
+                if (metaRes.notModified) {
+                    // Ничего нового — сохраняем прошлое состояние, если было
+                    if (_unreadByChat[file]?.length) result[file] = _unreadByChat[file];
+                    return;
                 }
-                updateCommentsNavigatorUI();
-                return;
+                if (metaRes.etag) state._metaEtagsByFile[file] = metaRes.etag;
+                if (!metaRes.exists) return;
+
+                // Файл изменился — читаем содержимое
+                const path = getChatPath(file);
+                const res = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
+                if (!res.exists) return;
+
+                const content = res.content;
+                if (!content || content.v !== CRYPTO.VERSION) return;
+
+                const encMessages = content.messages || [];
+                if (encMessages.length === 0) return;
+
+                // Расшифровываем ключом ЭТОГО чата
+                const key = await deriveKey(state.savedPasswords[file], content.salt);
+                const readSet = ReadComments.getReadSet(file);
+                const unreadIds = [];
+
+                // Проходим по сообщениям
+                for (const enc of encMessages) {
+                    let plain;
+                    try {
+                        const payload = await decryptObject(enc.iv, enc.data, key);
+                        plain = { id: enc.id, username: payload.username, comments: payload.comments };
+                    } catch (e) {
+                        continue; // пропускаем битые
+                    }
+                    if (plain.username !== state.username) continue;
+                    if (!Array.isArray(plain.comments) || plain.comments.length === 0) continue;
+
+                    const hasUnreadFromOthers = plain.comments.some(c =>
+                        c.username !== state.username && !readSet.has(enc.id)
+                    );
+                    if (hasUnreadFromOthers) unreadIds.push(enc.id);
+                }
+
+                if (unreadIds.length > 0) result[file] = unreadIds;
+
+            } catch (e) {
+                console.warn('scan comments failed for', file, e.message);
             }
+        }));
 
-            const target = list[nextIndex];
-            const messageEl = document.querySelector(`.message-wrapper[data-msg-id="${target.msgId}"]`);
+        return result;
+    }
 
-            if (messageEl) {
-                messageEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                messageEl.classList.add('highlight-flash');
-                setTimeout(() => messageEl.classList.remove('highlight-flash'), 1300);
+    // --- 4. Обновление бейджа на карточке в списке чатов ---
+    // Патчим renderChatsList — добавляем 💬 рядом с бейджем непрочитанных
+    const _origRenderChatsList = renderChatsList;
+    renderChatsList = function() {
+        const result = _origRenderChatsList.apply(this, arguments);
 
-                // Отмечаем как прочитанный
-                window.CommentReadState.set(state.chatFile, target.msgId);
-                window._unreadComments.currentIndex = nextIndex;
+        // Проходим по отрендеренным карточкам и вешаем индикатор
+        const container = document.getElementById('chatsList');
+        if (!container) return result;
 
-                // 🆕 Обновляем счётчик в localStorage
-                const remaining = list.length - (nextIndex + 1);
-                window.CommentReadState.setCount(state.chatFile, remaining);
+        container.querySelectorAll('.chat-list-item').forEach(item => {
+            const file = item.dataset.file;
+            if (!file) return;
 
-                updateCommentsNavigatorUI();
-            } else {
-                // Сообщение не в DOM — пропускаем, но обновляем состояние
-                window._unreadComments.currentIndex = nextIndex;
-                const remaining = list.length - (nextIndex + 1);
-                window.CommentReadState.setCount(state.chatFile, remaining);
-                updateCommentsNavigatorUI();
-                setTimeout(() => navBtn.click(), 100);
+            const nameRow = item.querySelector('.chat-name-row');
+            if (!nameRow) return;
+
+            const unreadComments = _unreadByChat[file] || [];
+            const existing = nameRow.querySelector('.comments-badge');
+
+            if (unreadComments.length > 0) {
+                if (existing) {
+                    existing.textContent = unreadComments.length > 9 ? '9+' : unreadComments.length;
+                } else {
+                    const badge = document.createElement('span');
+                    badge.className = 'comments-badge chat-playing-badge'; // используем стиль
+                    badge.title = 'Новые комментарии к вашим сообщениям';
+                    badge.dataset.chatFile = file;
+                    badge.textContent = unreadComments.length > 9 ? '9+' : unreadComments.length;
+                    badge.style.background = 'linear-gradient(135deg, rgba(0,184,148,0.3), rgba(108,92,231,0.3))';
+                    badge.style.borderColor = 'rgba(0,184,148,0.6)';
+                    badge.style.color = '#00b894';
+                    badge.style.cursor = 'pointer';
+                    badge.style.pointerEvents = 'auto';
+                    badge.style.animation = 'playingPulse 1.4s ease-in-out infinite';
+
+                    // Клик по бейджу → открыть чат
+                    badge.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        e.preventDefault();
+                        openChatFlow(file);
+                    });
+
+                    nameRow.appendChild(badge);
+                }
+            } else if (existing) {
+                existing.remove();
             }
         });
 
-    })();
-    console.log('  ✅ Блок 1: Ядро системы навигации установлено.');
+        return result;
+    };
 
-    // ═══════════════════════════════════════════════════════════════
-    //  БЛОК 2: СБОР НЕПРОЧИТАННЫХ ПРИ ВХОДЕ В ЧАТ
-    //  ⚠️ Игнорируем СВОИ комментарии по автору комментария.
-    //  ⚠️ Сохраняем точный счётчик в localStorage.
-    // ═══════════════════════════════════════════════════════════════
-    (function installUnreadCommentsCollector() {
-        const originalEnterChat = enterChat;
+    // --- 5. Кнопка в шапке открытого чата (только для ЭТОГО чата) ---
+    let _btnInHeader = null;
+    function getHeaderBtn() {
+        if (_btnInHeader) return _btnInHeader;
+        const btn = document.createElement('button');
+        btn.className = 'exit-btn';
+        btn.id = 'newCommentsBtn';
+        btn.title = 'Новые комментарии';
+        btn.style.display = 'none';
+        btn.style.position = 'relative';
 
-        enterChat = async function(file, name, password) {
-            const result = await originalEnterChat.call(this, file, name, password);
+        const badge = document.createElement('span');
+        badge.className = 'unread-badge';
+        badge.style.position = 'absolute';
+        badge.style.top = '-6px';
+        badge.style.right = '-6px';
+        badge.style.pointerEvents = 'none';
+        badge.style.display = 'none';
+        btn.appendChild(document.createTextNode('💬'));
+        btn.appendChild(badge);
 
-            if (state.chatFile !== file) {
-                return result;
+        btn.addEventListener('click', () => {
+            const ids = (_unreadByChat[state.chatFile] || []).slice().sort((a, b) => a - b);
+            if (ids.length > 0) scrollToMessage(ids[0]);
+        });
+
+        const searchBtn = document.getElementById('searchChatBtn');
+        if (searchBtn && searchBtn.parentNode) {
+            searchBtn.parentNode.insertBefore(btn, searchBtn);
+        }
+        _btnInHeader = btn;
+        return btn;
+    }
+
+    function updateHeaderBtn() {
+        if (state.currentScreen !== 'chat' || !state.chatFile) {
+            if (_btnInHeader) _btnInHeader.style.display = 'none';
+            return;
+        }
+        const ids = _unreadByChat[state.chatFile] || [];
+        const btn = getHeaderBtn();
+        if (ids.length > 0) {
+            btn.style.display = 'flex';
+            const badge = btn.querySelector('.unread-badge');
+            if (badge) {
+                badge.style.display = 'flex';
+                badge.textContent = ids.length > 9 ? '9+' : ids.length;
             }
-            
-            try {
-                const lastReadMsgId = window.CommentReadState.get(file);
-                const unreadList = [];
-                const allMessages = historyState.allMessages;
-                
-                // Идем от НОВЫХ к СТАРЫМ
-                for (let i = allMessages.length - 1; i >= 0; i--) {
-                    const msg = allMessages[i];
-                    if (!msg.comments || msg.comments.length === 0) continue;
+        } else {
+            btn.style.display = 'none';
+        }
+    }
 
-                    for (let j = msg.comments.length - 1; j >= 0; j--) {
-                        const comment = msg.comments[j];
-                        
-                        // 🆕 ФИКС: игнорируем СВОИ комментарии по автору
-                        if (comment.username === state.username) continue;
-                        
-                        // Уже прочитан
-                        if (lastReadMsgId && comment.id <= lastReadMsgId) continue;
-                        
-                        unreadList.push({ msgId: msg.id, commentId: comment.id });
-                    }
+    // --- 6. Главная функция обновления ---
+    async function refreshCommentsBadges() {
+        if (!state.isAuthorized) return;
+        if (!navigator.onLine || !networkState.isOnline) return;
+
+        const unread = await scanAllChatsForNewComments();
+        _unreadByChat = unread;
+
+        // Обновляем UI
+        if (state.currentScreen === 'chats') {
+            renderChatsList();
+        } else if (state.currentScreen === 'chat') {
+            updateHeaderBtn();
+        }
+
+        // Общий счётчик по всем чатам
+        const totalUnreadComments = Object.values(_unreadByChat)
+            .reduce((sum, ids) => sum + ids.length, 0);
+        // (опционально) можно учитывать в общем бейдже
+        window._totalUnreadComments = totalUnreadComments;
+    }
+
+    // --- 7. Обработка прочтения комментариев ---
+    // Патчим scrollToMessage: как только пользователь перешёл к сообщению —
+    // помечаем его комментарии прочитанными (для текущего чата).
+    const _origScrollToMessage = scrollToMessage;
+    scrollToMessage = function(msgId) {
+        if (state.chatFile) {
+            const ids = _unreadByChat[state.chatFile] || [];
+            if (ids.includes(msgId)) {
+                ReadComments.markAsRead(state.chatFile, msgId);
+                _unreadByChat[state.chatFile] = ids.filter(id => id !== msgId);
+                if (_unreadByChat[state.chatFile].length === 0) {
+                    delete _unreadByChat[state.chatFile];
                 }
-                
-                window._unreadComments.list = unreadList;
-                window._unreadComments.currentIndex = -1;
-
-                // 🆕 Сохраняем точный счётчик
-                window.CommentReadState.setCount(file, unreadList.length);
-
-                window.updateCommentsNavigatorUI();
-
-            } catch (e) {
-                console.error("Ошибка при сборе непрочитанных комментариев:", e);
+                updateHeaderBtn();
+                // Обновляем и общий бейдж
+                window._totalUnreadComments = Object.values(_unreadByChat)
+                    .reduce((sum, a) => sum + a.length, 0);
             }
-            
-            return result;
-        };
-    })();
-    console.log('  ✅ Блок 2: Сбор непрочитанных комментариев установлен.');
+        }
+        return _origScrollToMessage.apply(this, arguments);
+    };
 
-    // ═══════════════════════════════════════════════════════════════
-    //  БЛОК 3: ОТОБРАЖЕНИЕ СЧЁТЧИКА В СПИСКЕ ЧАТОВ
-    //  Используем точный счётчик из localStorage — без "вечных 1".
-    // ═══════════════════════════════════════════════════════════════
-    (function installCommentsBadgeInChatList() {
-        const originalRenderChatsList = renderChatsList;
+    // --- 8. Интеграция с переходами между экранами ---
+    const _origShowChatsScreen = showChatsScreen;
+    showChatsScreen = function() {
+        const result = _origShowChatsScreen.apply(this, arguments);
+        // При входе в список — обновляем бейджи
+        setTimeout(refreshCommentsBadges, 200);
+        return result;
+    };
 
-        renderChatsList = function() {
-            originalRenderChatsList.apply(this, arguments);
+    const _origShowChatScreen = showChatScreen;
+    showChatScreen = function() {
+        const result = _origShowChatScreen.apply(this, arguments);
+        // При входе в чат — показываем кнопку, если есть непрочитанные
+        setTimeout(updateHeaderBtn, 100);
+        return result;
+    };
 
-            try {
-                const container = document.getElementById('chatsList');
-                if (!container || state.chats.length === 0) return;
+    const _origEnterChat = enterChat;
+    enterChat = async function(...args) {
+        const result = await _origEnterChat.apply(this, args);
+        // После входа в чат — обновим кнопку в шапке
+        setTimeout(updateHeaderBtn, 500);
+        return result;
+    };
 
-                state.chats.forEach(chat => {
-                    // 🆕 Берём ТОЧНЫЙ счётчик из localStorage
-                    const unreadCommentsCount = window.CommentReadState.getCount(chat.file);
+    // --- 9. Автополлинг (в дополнение к существующему) ---
+    // Раз в 10 секунд, если мы в списке чатов, проверяем новые комментарии
+    setInterval(() => {
+        if (state.currentScreen === 'chats' && state.isAuthorized) {
+            refreshCommentsBadges();
+        }
+    }, 10000);
 
-                    const chatItem = container.querySelector(`.chat-list-item[data-file="${chat.file}"]`);
-                    if (!chatItem) return;
+    // Также при выходе из чата в список — обновляем
+    const _origBackToChats = backToChats;
+    backToChats = function() {
+        const result = _origBackToChats.apply(this, arguments);
+        if (_btnInHeader) _btnInHeader.style.display = 'none';
+        setTimeout(refreshCommentsBadges, 300);
+        return result;
+    };
 
-                    const nameRow = chatItem.querySelector('.chat-name-row');
-                    if (!nameRow) return;
+    // --- 10. Запуск при старте ---
+    // Как только пользователь авторизовался и попал в список чатов — сканируем
+    const _origLogin = login;
+    login = async function() {
+        const result = await _origLogin.apply(this, arguments);
+        if (state.isAuthorized) {
+            setTimeout(refreshCommentsBadges, 1000);
+        }
+        return result;
+    };
 
-                    // Суммируем: непрочитанные сообщения + непрочитанные комментарии
-                    const totalUnread = (chat.unreadCount || 0) + unreadCommentsCount;
-
-                    // Ищем существующий бейдж
-                    let badge = nameRow.querySelector('.unread-badge');
-
-                    if (totalUnread > 0) {
-                        if (!badge) {
-                            badge = document.createElement('span');
-                            badge.className = 'unread-badge';
-                            nameRow.appendChild(badge);
-                        }
-                        badge.textContent = totalUnread > 99 ? '99+' : totalUnread;
-                        // Помечаем, что в бейдже есть вклад комментариев (для отладки)
-                        badge.dataset.commentsPart = unreadCommentsCount;
-                    } else if (badge) {
-                        badge.remove();
-                    }
-
-                    // Также обновим класс has-unread на карточке
-                    if (totalUnread > 0) {
-                        chatItem.classList.add('has-unread');
-                    } else if (!chat.hasUnread) {
-                        // has-unread управляется и оригинальным renderChatsList,
-                        // поэтому снимаем только если и там ничего нет
-                        const origHasUnread = chatItem.classList.contains('has-unread');
-                        if (origHasUnread && !chat.hasUnread) {
-                            chatItem.classList.remove('has-unread');
-                        }
-                    }
-                });
-            } catch (e) {
-                console.error("Ошибка при обновлении бейджей комментариев в списке чатов:", e);
+    // --- 11. Стили (всё наследуем от существующих классов, минимум своих) ---
+    if (!document.getElementById('commentsNotifierStyles')) {
+        const style = document.createElement('style');
+        style.id = 'commentsNotifierStyles';
+        style.textContent = `
+            /* Бейдж комментариев в списке чатов */
+            .comments-badge {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                min-width: 22px;
+                height: 22px;
+                padding: 0 6px;
+                border-radius: 11px;
+                font-size: 11px;
+                font-weight: 700;
+                margin-left: 6px;
+                flex-shrink: 0;
+                user-select: none;
+                transition: transform 0.15s;
             }
-        };
-    })();
-    console.log('  ✅ Блок 3: Отображение счётчика в списке чатов установлено.');
-
-    // ═══════════════════════════════════════════════════════════════
-    //  БЛОК 4: ОБНОВЛЕНИЕ meta.json ПРИ ДОБАВЛЕНИИ КОММЕНТАРИЯ
-    //  Патчим persistComments.
-    // ═══════════════════════════════════════════════════════════════
-    (function installMetaUpdateOnComment() {
-        const originalPersistComments = persistComments;
-        persistComments = async function(msgId, comments) {
-            await originalPersistComments.call(this, msgId, comments);
-
-            try {
-                const newVersion = Date.now();
-                await updateMeta(state.chatFile, newVersion, state.lastMessageCount);
-                state._lastMetaVersion = newVersion;
-                state._metaEtag = null;
-                state._metaEtagsByFile[state.chatFile] = null;
-                console.log('  📌 meta.json обновлён после добавления комментария.');
-            } catch (e) {
-                console.warn("Не удалось обновить meta.json после добавления комментария:", e);
+            .comments-badge:active {
+                transform: scale(0.85);
             }
-        };
-    })();
-    console.log('  ✅ Блок 4: Обновление meta.json при добавлении комментария установлено.');
-
-    // ═══════════════════════════════════════════════════════════════
-    //  БЛОК 5: СБРОС НЕПРОЧИТАННЫХ КОММЕНТАРИЕВ ПО КНОПКЕ "✓"
-    //  Патчим clearAllUnread — сбрасываем и lastReadCommentId, и счётчик.
-    // ═══════════════════════════════════════════════════════════════
-    (function installClearAllCommentsUnread() {
-        const originalClearAllUnread = clearAllUnread;
-        clearAllUnread = async function() {
-            const result = await originalClearAllUnread.call(this);
-
-            try {
-                for (const chat of state.chats) {
-                    // Ставим lastRead = текущая версия meta (сбрасывает все непрочитанные)
-                    try {
-                        const metaRes = await fetchMetaFast(chat.file, null);
-                        if (metaRes.exists && metaRes.content && metaRes.content.version) {
-                            window.CommentReadState.set(chat.file, metaRes.content.version);
-                        } else {
-                            window.CommentReadState.clear(chat.file);
-                            continue;
-                        }
-                    } catch (e) {
-                        window.CommentReadState.clear(chat.file);
-                        continue;
-                    }
-                    // 🆕 Обнуляем точный счётчик
-                    window.CommentReadState.setCount(chat.file, 0);
-                }
-                // Обновляем UI
-                if (state.chatFile) {
-                    window._unreadComments.list = [];
-                    window._unreadComments.currentIndex = -1;
-                    window.updateCommentsNavigatorUI();
-                }
-                console.log('✅ Все непрочитанные комментарии сброшены.');
-            } catch (e) {
-                console.warn("Не удалось сбросить все непрочитанные комментарии:", e);
+            /* Кнопка в шапке чата */
+            #newCommentsBtn {
+                background: rgba(0,184,148,0.12) !important;
+                color: #00b894 !important;
             }
-            return result;
-        };
-    })();
-    console.log('  ✅ Блок 5: Сброс непрочитанных комментариев по кнопке "✓" установлен.');
-
-    // ═══════════════════════════════════════════════════════════════
-    //  БЛОК 6: АВТООЧИСТКА "ПРИЗРАЧНЫХ" СЧЁТЧИКОВ
-    //  Если чат открыт и все комментарии прочитаны — счётчик должен быть 0.
-    //  Это ловит случаи, когда счётчик остался от предыдущих версий патча.
-    // ═══════════════════════════════════════════════════════════════
-    (function installGhostCounterCleanup() {
-        // Однократная очистка при запуске: для всех чатов проверяем,
-        // что если счётчик есть, но lastReadCommentId новее meta — сбрасываем.
-        // Делаем с задержкой, чтобы не мешать загрузке.
-        setTimeout(async () => {
-            try {
-                const rs = JSON.parse(localStorage.getItem('chathub_read_state') || '{}');
-                let cleaned = 0;
-                for (const chat of state.chats) {
-                    const countKey = chat.file + '__ccount';
-                    const lastReadKey = chat.file + '__c';
-                    // Если счётчик есть, но нет lastRead — это "призрак", чистим
-                    if (rs[countKey] && !rs[lastReadKey]) {
-                        delete rs[countKey];
-                        cleaned++;
-                    }
-                }
-                if (cleaned > 0) {
-                    localStorage.setItem('chathub_read_state', JSON.stringify(rs));
-                    console.log(`🧹 Очищено ${cleaned} "призрачных" счётчиков комментариев.`);
-                    if (state.currentScreen === 'chats') {
-                        renderChatsList();
-                    }
-                }
-            } catch (e) {
-                console.warn('Ghost cleanup failed:', e);
+            #newCommentsBtn:active {
+                background: rgba(0,184,148,0.25) !important;
             }
-        }, 2000);
-    })();
-    console.log('  ✅ Блок 6: Автоочистка призрачных счётчиков установлена.');
+        `;
+        document.head.appendChild(style);
+    }
 
-} catch (e) {
-    console.error('❌ КРИТИЧЕСКАЯ ОШИБКА при установке навигации по комментариям:', e);
-}
+    console.log('💬 Глобальный индикатор новых комментариев активен.');
+})();
+
+
 </script>
 </body>
 </html>
