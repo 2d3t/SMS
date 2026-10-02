@@ -7212,15 +7212,38 @@ if (hasFile) {
         state._lastActivityAt = Date.now();
 
         messageInput.value = '';
-        messageInput.style.height = 'auto';
-        scrollState.isAtBottom = true;
+messageInput.style.height = 'auto';
+scrollState.isAtBottom = true;
 
-        appendMessages([plainMsg]);
+
+appendMessages([plainMsg]);
+
+
+// 🆕 Скролл вниз ПОСЛЕ того, как вложения отрендерятся.
+//    Ждём два кадра анимации — DOM уже обновлён, высота контейнера актуальна.
+requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
         scrollToBottom(true);
-        markChatAsRead();
-        soundManager.play('click');
-        soundManager.play('send');
-        showToast('✅ Отправлено!', 1000);
+    });
+});
+// 🆕 «Догоняющий» скролл — на случай, если картинка/видео 
+//    подгрузились чуть позже и увеличили высоту контейнера.
+setTimeout(() => {
+    if (scrollState.isAtBottom && !_isUserScrolling) {
+        scrollToBottom(true);
+    }
+}, 400);
+setTimeout(() => {
+    if (scrollState.isAtBottom && !_isUserScrolling) {
+        scrollToBottom(true);
+    }
+}, 1000);
+
+
+markChatAsRead();
+soundManager.play('click');
+soundManager.play('send');
+showToast('✅ Отправлено!', 1000);
     } catch (error) {
         console.error('Ошибка:', error);
         if (error.message === 'ABORTED') {
@@ -7444,14 +7467,35 @@ async function handleMultipleImageUpload(files) {
         state._lastSentMessageId = lastId;
 
         messageInput.value = '';
-        messageInput.style.height = 'auto';
-        scrollState.isAtBottom = true;
+messageInput.style.height = 'auto';
+scrollState.isAtBottom = true;
 
-        appendMessages(newPlainMessages);
+
+appendMessages(newPlainMessages);
+
+
+// 🆕 Скролл после рендера вложений
+requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
         scrollToBottom(true);
-        markChatAsRead();
+    });
+});
+setTimeout(() => {
+    if (scrollState.isAtBottom && !_isUserScrolling) {
+        scrollToBottom(true);
+    }
+}, 400);
+setTimeout(() => {
+    if (scrollState.isAtBottom && !_isUserScrolling) {
+        scrollToBottom(true);
+    }
+}, 1000);
 
-        BatchUploadIndicator.finish();
+
+markChatAsRead();
+
+
+BatchUploadIndicator.finish();
         soundManager.play('click');
         soundManager.play('send');
 
@@ -10195,11 +10239,28 @@ async function doShareToChat(targetFile, targetPassword, blob, fileName, mime, m
                 ...payload,
             };
             state.messages.push(plainMsg);
-            state.sha = saved.blobSha;
-            state._lastCommitSha = saved.commitSha;
-            state.lastMessageCount = fileContent.messages.length;
-            appendMessages([plainMsg]);
-            scrollToBottom(true);
+state.sha = saved.blobSha;
+state._lastCommitSha = saved.commitSha;
+state.lastMessageCount = fileContent.messages.length;
+appendMessages([plainMsg]);
+
+
+// 🆕 Скролл после рендера вложений
+requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+        scrollToBottom(true);
+    });
+});
+setTimeout(() => {
+    if (scrollState.isAtBottom && !_isUserScrolling) {
+        scrollToBottom(true);
+    }
+}, 400);
+setTimeout(() => {
+    if (scrollState.isAtBottom && !_isUserScrolling) {
+        scrollToBottom(true);
+    }
+}, 1000);
         } else {
             const c = state.chats.find(x => x.file === targetFile);
             if (c) { c.hasUnread = true; c.unreadCount = (c.unreadCount || 0) + 1; saveChatsList(); }
