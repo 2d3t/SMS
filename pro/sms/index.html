@@ -12164,6 +12164,17 @@ const ScrollLock = (() => {
 //  • Порядок сохраняется в localStorage
 // ═══════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════
+//  ⋯ ЕДИНОЕ МЕНЮ ДЕЙСТВИЙ НА КАРТОЧКЕ ЧАТА + ПЕРЕМЕЩЕНИЕ
+//  ─────────────────────────────────────────────────────────────
+//  • Одна кнопка «⋯» вместо 💾 ✏️ ☆ ✕
+//  • Тап → выплывающее меню со всеми действиями
+//  • «Переместить» → режим выбора позиции
+//  • Бейдж «⚡» на карточке автовходного чата
+//  • Порядок сохраняется в localStorage
+//  • 🆕 Пункт «Сменить аватарку» прямо в меню
+// ═══════════════════════════════════════════════════════════════
+
 (function installUnifiedChatSystem() {
     const ORDER_STORAGE_KEY = 'chathub_chat_order';
     const LONG_PRESS_MS = 600;
@@ -12628,8 +12639,12 @@ const ScrollLock = (() => {
         const isFirst = chatIdx === 0;
         const isLast = chatIdx === state.chats.length - 1;
 
-        const avatarData = (typeof getChatAvatar === 'function')
-            ? getChatAvatar(chatFile) : null;
+        // 🆕 Проверяем, есть ли уже кастомная аватарка (безопасно)
+        const hasCustomAvatar = (typeof getChatAvatar === 'function')
+            ? !!getChatAvatar(chatFile)
+            : false;
+
+        const avatarData = hasCustomAvatar ? getChatAvatar(chatFile) : null;
         const letter = (chat.name || chat.file).charAt(0).toUpperCase();
         const avatarHtml = avatarData
             ? `<img src="${avatarData}" alt="">`
@@ -12669,6 +12684,17 @@ const ScrollLock = (() => {
         }
 
         items.push('<div class="ucm-divider"></div>');
+
+        // 🆕 НОВЫЙ ПУНКТ: Сменить аватарку
+        items.push(`
+            <div class="ucm-item" data-action="avatar">
+                <span class="ucm-icon">🖼️</span>
+                <span class="ucm-label">
+                    <div>${hasCustomAvatar ? 'Сменить аватарку' : 'Установить аватарку'}</div>
+                    <div class="ucm-hint">Видна только вам</div>
+                </span>
+            </div>
+        `);
 
         items.push(`
             <div class="ucm-item" data-action="rename">
@@ -12788,8 +12814,13 @@ const ScrollLock = (() => {
         switch (action) {
             case 'cancel':
                 break;
+            // 🆕 НОВОЕ ДЕЙСТВИЕ: смена аватарки
+            case 'avatar':
+                if (typeof pickAvatarForChat === 'function') {
+                    pickAvatarForChat(chatFile);
+                }
+                break;
             case 'move':
-                // ⚡ Мгновенно входим в режим перемещения (внутренняя функция)
                 enterReorderMode(chatFile);
                 break;
             case 'move-top':
@@ -12842,7 +12873,6 @@ const ScrollLock = (() => {
 
     function enterReorderMode(sourceFile) {
         if (_reorderSourceFile) {
-            // Уже в режиме — просто переключаем цель? Нет, сбрасываем и ставим новую.
             exitReorderMode();
         }
         _reorderSourceFile = sourceFile;
@@ -12895,14 +12925,9 @@ const ScrollLock = (() => {
         const movedFile = _reorderSourceFile;
         const [chat] = state.chats.splice(sourceIdx, 1);
 
-        // Пересчитываем индекс цели после удаления
         let newTargetIdx = state.chats.findIndex(c => c.file === targetFile);
         if (newTargetIdx < 0) newTargetIdx = state.chats.length;
 
-        // 🔑 Вставляем ПЕРЕД целевым.
-        // Логика: если тащим сверху вниз — цель «уезжает» на 1 позицию вверх,
-        // поэтому вставляем ПОСЛЕ сдвига (по факту — в позицию нового индекса).
-        // Если тащим снизу вверх — индекс цели уже посчитан корректно.
         state.chats.splice(newTargetIdx, 0, chat);
 
         saveChatOrder();
@@ -12983,7 +13008,6 @@ const ScrollLock = (() => {
 
         container.addEventListener('click', (e) => {
             if (!_reorderSourceFile) return;
-            // Игнорируем клики по кнопке «⋯» (её мы приглушили, но на всякий)
             if (e.target.closest('.chat-more-btn')) return;
             e.stopImmediatePropagation();
             e.preventDefault();
@@ -13010,12 +13034,10 @@ const ScrollLock = (() => {
             ? getAutorunChat() : null;
 
         container.querySelectorAll('.chat-list-item').forEach(item => {
-            // Убираем старые кнопки
             item.querySelectorAll(
                 '.chat-delete-btn, .rename-btn, .share-btn, .autorun-btn'
             ).forEach(btn => btn.remove());
 
-            // Добавляем кнопку «⋯» — один раз
             if (!item.querySelector('.chat-more-btn')) {
                 const moreBtn = document.createElement('button');
                 moreBtn.className = 'chat-more-btn';
@@ -13026,7 +13048,6 @@ const ScrollLock = (() => {
                 item.appendChild(moreBtn);
             }
 
-            // 🆕 Бейдж автовхода
             const file = item.dataset.file;
             const nameRow = item.querySelector('.chat-name-row');
             if (!nameRow) return;
@@ -13039,7 +13060,6 @@ const ScrollLock = (() => {
                 badge.className = 'chat-autorun-badge';
                 badge.title = 'Этот чат откроется при запуске';
                 badge.innerHTML = `<span class="cab-icon">⚡</span>Автовход`;
-                // Вставляем после имени, но перед unread-badge / playing-badge
                 const nameEl = nameRow.querySelector('.chat-name');
                 if (nameEl) {
                     nameEl.insertAdjacentElement('afterend', badge);
@@ -13051,7 +13071,6 @@ const ScrollLock = (() => {
             }
         });
 
-        // Возвращаем подсветку в режиме перемещения
         if (_reorderSourceFile) {
             requestAnimationFrame(() => {
                 const el = document.querySelector(
@@ -13079,8 +13098,6 @@ const ScrollLock = (() => {
     const _origToggleAutorun = toggleAutorun;
     toggleAutorun = function(file) {
         const result = _origToggleAutorun.apply(this, arguments);
-        // renderChatsList уже вызывается внутри toggleAutorun,
-        // но подстрахуемся — если вдруг нет:
         setTimeout(() => {
             if (typeof renderChatsList === 'function') renderChatsList();
         }, 50);
@@ -13166,7 +13183,10 @@ const ScrollLock = (() => {
     console.log('   • «В начало» / «В конец» — быстрый перенос');
     console.log('   • Бейдж «⚡ Автовход» виден на карточке');
     console.log('   • Порядок сохраняется в localStorage');
+    console.log('   • 🖼️ «Сменить аватарку» — теперь в этом же меню');
 })();
+
+
 console.log('✅ SMS Чат собран!');
 console.log('🔐 AES-256-GCM + PBKDF2 (200k)');
 console.log('📷 Множественная отправка фото (до 20 за раз) с batch-индикатором');
