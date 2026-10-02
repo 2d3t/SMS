@@ -12154,7 +12154,1019 @@ const ScrollLock = (() => {
 
     console.log('🔁 Автоповтор прыжка к треку активен');
 })();
+// ═══════════════════════════════════════════════════════════════
+//  ⋯ ЕДИНОЕ МЕНЮ ДЕЙСТВИЙ НА КАРТОЧКЕ ЧАТА + ПЕРЕМЕЩЕНИЕ
+//  ─────────────────────────────────────────────────────────────
+//  • Одна кнопка «⋯» вместо 💾 ✏️ ☆ ✕
+//  • Тап → выплывающее меню со всеми действиями
+//  • «Переместить» → режим выбора позиции
+//  • Бейдж «⚡» на карточке автовходного чата
+//  • Порядок сохраняется в localStorage
+// ═══════════════════════════════════════════════════════════════
 
+(function installUnifiedChatSystem() {
+    const ORDER_STORAGE_KEY = 'chathub_chat_order';
+    const LONG_PRESS_MS = 600;
+
+    // ─── Состояние ───
+    let _menuEl = null;
+    let _menuBackdropEl = null;
+    let _currentFile = null;
+    let _currentBtnEl = null;
+
+    let _reorderSourceFile = null;
+    let _hintBarEl = null;
+
+    // ═══════════════════════════════════════════════════════════════
+    //  СТИЛИ
+    // ═══════════════════════════════════════════════════════════════
+    if (!document.getElementById('unifiedChatSystemStyles')) {
+        const style = document.createElement('style');
+        style.id = 'unifiedChatSystemStyles';
+        style.textContent = `
+            /* ═══ Кнопка «⋯» на карточке ═══ */
+            .chat-list-item .chat-more-btn {
+                width: 38px;
+                height: 38px;
+                border-radius: 50%;
+                border: 1px solid rgba(255,255,255,0.08);
+                background: rgba(255,255,255,0.05);
+                color: #aaa;
+                font-size: 20px;
+                font-weight: 700;
+                cursor: pointer;
+                flex-shrink: 0;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                transition: all 0.18s ease;
+                padding: 0 0 6px 0;
+                line-height: 1;
+                -webkit-tap-highlight-color: transparent;
+                font-family: inherit;
+                letter-spacing: 1px;
+            }
+            .chat-list-item .chat-more-btn:hover {
+                background: rgba(108,92,231,0.2);
+                border-color: rgba(108,92,231,0.45);
+                color: #fff;
+            }
+            .chat-list-item .chat-more-btn:active {
+                transform: scale(0.88);
+                background: rgba(108,92,231,0.35);
+            }
+            .chat-list-item .chat-more-btn.active {
+                background: linear-gradient(135deg, rgba(108,92,231,0.35), rgba(0,184,148,0.25));
+                border-color: rgba(108,92,231,0.6);
+                color: #fff;
+                box-shadow: 0 0 0 3px rgba(108,92,231,0.15);
+            }
+
+            /* Скрываем старые кнопки */
+            .chat-list-item .chat-delete-btn,
+            .chat-list-item .rename-btn,
+            .chat-list-item .share-btn,
+            .chat-list-item .autorun-btn {
+                display: none !important;
+            }
+
+            /* ═══ Бейдж «⚡ Автовход» на карточке ═══ */
+            .chat-autorun-badge {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                height: 18px;
+                padding: 0 7px;
+                border-radius: 9px;
+                background: linear-gradient(135deg, rgba(254,202,87,0.25), rgba(255,159,67,0.18));
+                border: 1px solid rgba(254,202,87,0.5);
+                color: #feca57;
+                font-size: 10px;
+                font-weight: 700;
+                letter-spacing: 0.3px;
+                margin-left: 6px;
+                flex-shrink: 0;
+                animation: autorunBadgeGlow 2.4s ease-in-out infinite;
+            }
+            .chat-autorun-badge .cab-icon {
+                font-size: 11px;
+                margin-right: 2px;
+            }
+            @keyframes autorunBadgeGlow {
+                0%, 100% { box-shadow: 0 0 4px rgba(254,202,87,0.3); }
+                50%      { box-shadow: 0 0 10px rgba(254,202,87,0.7); }
+            }
+
+            /* ═══ Меню действий ═══ */
+            #unifiedChatMenu {
+                position: fixed;
+                z-index: 4600;
+                background: #1a1a2e;
+                border: 1px solid rgba(255,255,255,0.12);
+                border-radius: 16px;
+                padding: 6px;
+                display: none;
+                flex-direction: column;
+                gap: 2px;
+                box-shadow: 0 16px 48px rgba(0,0,0,0.7);
+                backdrop-filter: blur(24px);
+                -webkit-backdrop-filter: blur(24px);
+                min-width: 240px;
+                max-width: calc(100vw - 24px);
+                max-height: calc(100vh - 40px);
+                overflow-y: auto;
+                animation: unifiedMenuPop 0.18s cubic-bezier(0.22, 0.61, 0.36, 1);
+            }
+            #unifiedChatMenu.show { display: flex; }
+            @keyframes unifiedMenuPop {
+                from { opacity: 0; transform: scale(0.92) translateY(-4px); }
+                to   { opacity: 1; transform: scale(1) translateY(0); }
+            }
+            #unifiedChatMenu::-webkit-scrollbar { width: 3px; }
+            #unifiedChatMenu::-webkit-scrollbar-thumb {
+                background: rgba(255,255,255,0.15); border-radius: 2px;
+            }
+
+            /* Заголовок меню */
+            #unifiedChatMenu .ucm-header {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                padding: 10px 12px 8px;
+                border-bottom: 1px solid rgba(255,255,255,0.06);
+                margin-bottom: 4px;
+                flex-shrink: 0;
+            }
+            #unifiedChatMenu .ucm-avatar {
+                width: 34px; height: 34px;
+                border-radius: 50%;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                display: flex; align-items: center; justify-content: center;
+                font-weight: 700; color: #fff; font-size: 13px;
+                flex-shrink: 0; overflow: hidden; position: relative;
+            }
+            #unifiedChatMenu .ucm-avatar img {
+                width: 100%; height: 100%; object-fit: cover;
+                border-radius: 50%; display: block;
+            }
+            #unifiedChatMenu .ucm-title { flex: 1; min-width: 0; }
+            #unifiedChatMenu .ucm-name {
+                font-size: 14px; font-weight: 700; color: #fff;
+                white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+            }
+            #unifiedChatMenu .ucm-id {
+                font-size: 10px; color: #666; margin-top: 1px;
+                white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+            }
+
+            /* Пункты */
+            #unifiedChatMenu .ucm-item {
+                display: flex; align-items: center; gap: 12px;
+                padding: 10px 14px;
+                border-radius: 10px; cursor: pointer;
+                color: #e0e0e0; font-size: 14px; font-weight: 500;
+                transition: background 0.15s, transform 0.1s;
+                user-select: none;
+                -webkit-tap-highlight-color: transparent;
+                flex-shrink: 0;
+            }
+            #unifiedChatMenu .ucm-item:hover { background: rgba(108,92,231,0.2); }
+            #unifiedChatMenu .ucm-item:active {
+                background: rgba(108,92,231,0.35);
+                transform: scale(0.98);
+            }
+            #unifiedChatMenu .ucm-item .ucm-icon {
+                width: 24px; height: 24px;
+                display: flex; align-items: center; justify-content: center;
+                font-size: 17px; flex-shrink: 0;
+            }
+            #unifiedChatMenu .ucm-item .ucm-label { flex: 1; min-width: 0; }
+            #unifiedChatMenu .ucm-item .ucm-hint {
+                font-size: 11px; color: #666; margin-top: 1px;
+            }
+            #unifiedChatMenu .ucm-item.active {
+                background: linear-gradient(135deg, rgba(254,202,87,0.15), rgba(255,159,67,0.1));
+                color: #feca57;
+            }
+            #unifiedChatMenu .ucm-item.active::after {
+                content: '✓';
+                color: #feca57; font-weight: 700; font-size: 14px;
+                margin-left: 4px;
+            }
+            #unifiedChatMenu .ucm-item.danger { color: #ff6b6b; }
+            #unifiedChatMenu .ucm-item.danger:hover { background: rgba(255,107,107,0.15); }
+            #unifiedChatMenu .ucm-item.danger:active { background: rgba(255,107,107,0.25); }
+
+            #unifiedChatMenu .ucm-divider {
+                height: 1px;
+                background: linear-gradient(90deg, transparent, rgba(255,255,255,0.08) 20%, rgba(255,255,255,0.08) 80%, transparent);
+                margin: 4px 8px;
+                flex-shrink: 0;
+            }
+
+            #unifiedChatMenu .ucm-cancel {
+                display: flex; align-items: center; justify-content: center; gap: 6px;
+                padding: 10px 14px; margin-top: 2px;
+                border-radius: 10px;
+                background: rgba(255,255,255,0.04);
+                border: 1px solid rgba(255,255,255,0.06);
+                color: #888; font-size: 13px; font-weight: 600;
+                cursor: pointer;
+                transition: all 0.15s;
+                user-select: none;
+                -webkit-tap-highlight-color: transparent;
+                flex-shrink: 0;
+            }
+            #unifiedChatMenu .ucm-cancel:hover {
+                background: rgba(255,255,255,0.08);
+                color: #ccc;
+                border-color: rgba(255,255,255,0.12);
+            }
+            #unifiedChatMenu .ucm-cancel:active {
+                transform: scale(0.97);
+                background: rgba(255,255,255,0.12);
+            }
+
+            /* Backdrop */
+            #unifiedChatMenuBackdrop {
+                position: fixed; inset: 0;
+                background: rgba(0,0,0,0.4);
+                backdrop-filter: blur(3px);
+                -webkit-backdrop-filter: blur(3px);
+                z-index: 4500;
+                display: none;
+                opacity: 0;
+                transition: opacity 0.2s ease;
+            }
+            #unifiedChatMenuBackdrop.show { display: block; opacity: 1; }
+
+            /* На мобиле — снизу, как bottom-sheet */
+            @media (max-width: 600px) {
+                #unifiedChatMenu {
+                    left: 12px !important;
+                    right: 12px !important;
+                    bottom: 12px !important;
+                    top: auto !important;
+                    width: auto !important;
+                    min-width: 0;
+                    max-width: none;
+                    padding-bottom: calc(6px + env(safe-area-inset-bottom, 0px));
+                    animation: unifiedMenuSlideUp 0.25s cubic-bezier(0.22, 0.61, 0.36, 1);
+                }
+                @keyframes unifiedMenuSlideUp {
+                    from { opacity: 0; transform: translateY(20px); }
+                    to   { opacity: 1; transform: translateY(0); }
+                }
+                #unifiedChatMenu .ucm-item { padding: 12px 14px; font-size: 15px; }
+                #unifiedChatMenu .ucm-item .ucm-icon { font-size: 19px; width: 26px; height: 26px; }
+            }
+
+            /* ═══ Режим перемещения ═══ */
+            body.chat-reorder-mode .chat-list-item {
+                transition: transform 0.15s, box-shadow 0.2s, opacity 0.2s;
+                cursor: pointer;
+            }
+            body.chat-reorder-mode .chat-list-item .chat-more-btn,
+            body.chat-reorder-mode .chat-list-item .chat-delete-btn,
+            body.chat-reorder-mode .chat-list-item .rename-btn,
+            body.chat-reorder-mode .chat-list-item .share-btn,
+            body.chat-reorder-mode .chat-list-item .autorun-btn,
+            body.chat-reorder-mode .chat-list-item .chat-playing-badge {
+                pointer-events: none;
+                opacity: 0.3;
+            }
+            body.chat-reorder-mode .chat-list-item:active {
+                transform: scale(0.98);
+            }
+            body.chat-reorder-mode .chat-list-item.reorder-source {
+                box-shadow: 0 0 0 2px #a78bfa, 0 6px 24px rgba(108,92,231,0.45);
+                background: rgba(108,92,231,0.12);
+                position: relative;
+                z-index: 2;
+                pointer-events: none;
+                opacity: 0.95;
+            }
+            body.chat-reorder-mode .chat-list-item.reorder-source::after {
+                content: '↕ Перемещаю…';
+                position: absolute;
+                top: -10px; left: 50%;
+                transform: translateX(-50%);
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                color: #fff;
+                font-size: 10px; font-weight: 700;
+                letter-spacing: 0.5px;
+                padding: 3px 10px;
+                border-radius: 10px;
+                white-space: nowrap;
+                box-shadow: 0 2px 8px rgba(108,92,231,0.6);
+                animation: reorderBadgePulse 1.4s ease-in-out infinite;
+            }
+            @keyframes reorderBadgePulse {
+                0%, 100% { box-shadow: 0 2px 8px rgba(108,92,231,0.6); }
+                50%      { box-shadow: 0 2px 14px rgba(108,92,231,0.95); }
+            }
+            body.chat-reorder-mode .chat-list-item:not(.reorder-source) {
+                opacity: 0.75;
+                border-color: rgba(108,92,231,0.3);
+            }
+            body.chat-reorder-mode .chat-list-item:not(.reorder-source):active {
+                background: rgba(108,92,231,0.15);
+                border-color: rgba(108,92,231,0.6);
+            }
+
+            /* Подсказка сверху */
+            #reorderHintBar {
+                position: fixed;
+                top: 0; left: 0; right: 0;
+                background: linear-gradient(135deg, rgba(26,26,46,0.98), rgba(20,20,35,0.98));
+                backdrop-filter: blur(20px);
+                -webkit-backdrop-filter: blur(20px);
+                border-bottom: 1px solid rgba(108,92,231,0.4);
+                padding: 12px 16px;
+                padding-top: calc(12px + env(safe-area-inset-top, 0px));
+                display: flex;
+                align-items: center;
+                gap: 12px;
+                z-index: 4400;
+                transform: translateY(-100%);
+                transition: transform 0.25s cubic-bezier(0.22, 0.61, 0.36, 1);
+                box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+            }
+            #reorderHintBar.show { transform: translateY(0); }
+            #reorderHintBar .rh-icon {
+                width: 36px; height: 36px;
+                border-radius: 50%;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                display: flex; align-items: center; justify-content: center;
+                font-size: 18px; flex-shrink: 0;
+                box-shadow: 0 4px 12px rgba(108,92,231,0.4);
+            }
+            #reorderHintBar .rh-text { flex: 1; min-width: 0; }
+            #reorderHintBar .rh-title {
+                font-size: 14px; font-weight: 700; color: #fff;
+                margin-bottom: 2px;
+            }
+            #reorderHintBar .rh-sub {
+                font-size: 11px; color: #a78bfa;
+                white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+            }
+            #reorderHintBar .rh-cancel {
+                height: 34px; padding: 0 14px;
+                border-radius: 17px;
+                border: 1px solid rgba(255,107,107,0.4);
+                background: rgba(255,107,107,0.15);
+                color: #ff6b6b;
+                font-size: 12px; font-weight: 600;
+                cursor: pointer; flex-shrink: 0;
+                font-family: inherit;
+                transition: all 0.15s;
+            }
+            #reorderHintBar .rh-cancel:active {
+                transform: scale(0.94);
+                background: rgba(255,107,107,0.25);
+            }
+
+            /* Анимация «перемещено» */
+            .chat-list-item.just-moved {
+                animation: chatJustMoved 0.6s ease-out;
+            }
+            @keyframes chatJustMoved {
+                0%   { transform: scale(0.96); background: rgba(0,184,148,0.25); }
+                60%  { transform: scale(1.02); }
+                100% { transform: scale(1); background: transparent; }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  СОХРАНЕНИЕ / ВОССТАНОВЛЕНИЕ ПОРЯДКА
+    // ═══════════════════════════════════════════════════════════════
+    function saveChatOrder() {
+        try {
+            const order = state.chats.map(c => c.file);
+            localStorage.setItem(ORDER_STORAGE_KEY, JSON.stringify(order));
+        } catch (e) {
+            console.warn('saveChatOrder failed:', e);
+        }
+    }
+
+    function restoreChatOrder() {
+        try {
+            const raw = localStorage.getItem(ORDER_STORAGE_KEY);
+            if (!raw) return;
+            const order = JSON.parse(raw);
+            if (!Array.isArray(order) || order.length === 0) return;
+
+            const map = new Map(state.chats.map(c => [c.file, c]));
+            const sorted = [];
+            for (const file of order) {
+                if (map.has(file)) {
+                    sorted.push(map.get(file));
+                    map.delete(file);
+                }
+            }
+            for (const c of map.values()) sorted.push(c);
+            state.chats = sorted;
+        } catch (e) {
+            console.warn('restoreChatOrder failed:', e);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  ЗАКРЫТИЕ МЕНЮ
+    // ═══════════════════════════════════════════════════════════════
+    function closeUnifiedMenu() {
+        if (_menuEl) {
+            const el = _menuEl;
+            el.classList.remove('show');
+            setTimeout(() => { try { el.remove(); } catch (e) {} }, 200);
+            _menuEl = null;
+        }
+        if (_menuBackdropEl) _menuBackdropEl.classList.remove('show');
+        if (_currentBtnEl) _currentBtnEl.classList.remove('active');
+        _currentBtnEl = null;
+        _currentFile = null;
+        document.removeEventListener('keydown', onMenuKeyDown, true);
+        window.removeEventListener('resize', closeUnifiedMenu);
+    }
+
+    function onMenuKeyDown(e) {
+        if (e.key === 'Escape') {
+            e.preventDefault();
+            e.stopPropagation();
+            closeUnifiedMenu();
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  ОТКРЫТИЕ МЕНЮ
+    // ═══════════════════════════════════════════════════════════════
+    function openUnifiedMenu(chatFile, buttonEl) {
+        if (_menuEl) {
+            if (_currentFile === chatFile) {
+                closeUnifiedMenu();
+                return;
+            }
+            closeUnifiedMenu();
+        }
+
+        const chat = state.chats.find(c => c.file === chatFile);
+        if (!chat) {
+            showToast('❌ Чат не найден', 1500);
+            return;
+        }
+
+        _currentFile = chatFile;
+        _currentBtnEl = buttonEl;
+        if (buttonEl) buttonEl.classList.add('active');
+
+        const isAutorun = (typeof getAutorunChat === 'function')
+            ? getAutorunChat() === chatFile
+            : false;
+        const chatIdx = state.chats.findIndex(c => c.file === chatFile);
+        const isFirst = chatIdx === 0;
+        const isLast = chatIdx === state.chats.length - 1;
+
+        const avatarData = (typeof getChatAvatar === 'function')
+            ? getChatAvatar(chatFile) : null;
+        const letter = (chat.name || chat.file).charAt(0).toUpperCase();
+        const avatarHtml = avatarData
+            ? `<img src="${avatarData}" alt="">`
+            : letter;
+
+        const escapedName = escapeHtml(chat.name || chat.file);
+        const escapedId = escapeHtml(chat.file);
+
+        const items = [];
+
+        if (state.chats.length > 1) {
+            items.push(`
+                <div class="ucm-item" data-action="move">
+                    <span class="ucm-icon">↕️</span>
+                    <span class="ucm-label">
+                        <div>Переместить</div>
+                        <div class="ucm-hint">Выбрать новую позицию</div>
+                    </span>
+                </div>
+            `);
+        }
+        if (!isFirst) {
+            items.push(`
+                <div class="ucm-item" data-action="move-top">
+                    <span class="ucm-icon">⬆️</span>
+                    <span class="ucm-label">В начало</span>
+                </div>
+            `);
+        }
+        if (!isLast) {
+            items.push(`
+                <div class="ucm-item" data-action="move-bottom">
+                    <span class="ucm-icon">⬇️</span>
+                    <span class="ucm-label">В конец</span>
+                </div>
+            `);
+        }
+
+        items.push('<div class="ucm-divider"></div>');
+
+        items.push(`
+            <div class="ucm-item" data-action="rename">
+                <span class="ucm-icon">✏️</span>
+                <span class="ucm-label">Переименовать</span>
+            </div>
+        `);
+
+        items.push(`
+            <div class="ucm-item" data-action="share">
+                <span class="ucm-icon">💾</span>
+                <span class="ucm-label">Поделиться файлом чата</span>
+            </div>
+        `);
+
+        items.push(`
+            <div class="ucm-item ${isAutorun ? 'active' : ''}" data-action="autorun">
+                <span class="ucm-icon">${isAutorun ? '⚡' : '☆'}</span>
+                <span class="ucm-label">
+                    <div>${isAutorun ? 'Автовход включён' : 'Открывать при запуске'}</div>
+                    <div class="ucm-hint">${isAutorun ? 'Нажмите, чтобы выключить' : 'Только если пароль сохранён'}</div>
+                </span>
+            </div>
+        `);
+
+        items.push('<div class="ucm-divider"></div>');
+
+        items.push(`
+            <div class="ucm-item danger" data-action="remove">
+                <span class="ucm-icon">🗑️</span>
+                <span class="ucm-label">Убрать из списка</span>
+            </div>
+        `);
+
+        const menu = document.createElement('div');
+        menu.id = 'unifiedChatMenu';
+        menu.innerHTML = `
+            <div class="ucm-header">
+                <div class="ucm-avatar">${avatarHtml}</div>
+                <div class="ucm-title">
+                    <div class="ucm-name">${escapedName}</div>
+                    <div class="ucm-id">${escapedId}</div>
+                </div>
+            </div>
+            ${items.join('')}
+            <div class="ucm-cancel" data-action="cancel">✕ Отмена</div>
+        `;
+
+        document.body.appendChild(menu);
+
+        // Backdrop
+        if (!_menuBackdropEl) {
+            _menuBackdropEl = document.createElement('div');
+            _menuBackdropEl.id = 'unifiedChatMenuBackdrop';
+            document.body.appendChild(_menuBackdropEl);
+            const closeHandler = (e) => {
+                e.preventDefault();
+                closeUnifiedMenu();
+            };
+            _menuBackdropEl.addEventListener('click', closeHandler);
+            _menuBackdropEl.addEventListener('touchstart', closeHandler, { passive: false });
+        }
+        _menuBackdropEl.classList.add('show');
+
+        // Позиционирование
+        const isMobile = window.innerWidth <= 600;
+        if (!isMobile && buttonEl) {
+            const btnRect = buttonEl.getBoundingClientRect();
+            const menuRect = menu.getBoundingClientRect();
+            const margin = 10;
+
+            let left = btnRect.left - menuRect.width - 8;
+            if (left < margin) {
+                left = Math.min(
+                    btnRect.right + 8,
+                    window.innerWidth - menuRect.width - margin
+                );
+            }
+            left = Math.max(margin, left);
+
+            let top = btnRect.top;
+            if (top + menuRect.height > window.innerHeight - margin) {
+                top = window.innerHeight - menuRect.height - margin;
+            }
+            top = Math.max(margin, top);
+
+            menu.style.left = left + 'px';
+            menu.style.top = top + 'px';
+        }
+
+        requestAnimationFrame(() => menu.classList.add('show'));
+
+        // Обработчики
+        menu.querySelectorAll('.ucm-item, .ucm-cancel').forEach(el => {
+            el.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const action = el.dataset.action;
+                const file = _currentFile;
+                closeUnifiedMenu();
+                handleUnifiedAction(action, file);
+            });
+        });
+
+        _menuEl = menu;
+        document.addEventListener('keydown', onMenuKeyDown, true);
+        window.addEventListener('resize', closeUnifiedMenu);
+
+        if (navigator.vibrate) navigator.vibrate(12);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  ОБРАБОТКА ДЕЙСТВИЙ
+    // ═══════════════════════════════════════════════════════════════
+    function handleUnifiedAction(action, chatFile) {
+        if (!chatFile) return;
+
+        switch (action) {
+            case 'cancel':
+                break;
+            case 'move':
+                // ⚡ Мгновенно входим в режим перемещения (внутренняя функция)
+                enterReorderMode(chatFile);
+                break;
+            case 'move-top':
+                moveToEdge(chatFile, 'top');
+                break;
+            case 'move-bottom':
+                moveToEdge(chatFile, 'bottom');
+                break;
+            case 'rename':
+                if (typeof openRenameChatModal === 'function')
+                    openRenameChatModal(chatFile);
+                break;
+            case 'share':
+                if (typeof openShareChatModal === 'function')
+                    openShareChatModal(chatFile);
+                break;
+            case 'autorun':
+                if (typeof toggleAutorun === 'function')
+                    toggleAutorun(chatFile);
+                break;
+            case 'remove':
+                if (typeof removeChatFromList === 'function')
+                    removeChatFromList(chatFile);
+                break;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  ПЕРЕМЕЩЕНИЕ — режим выбора позиции
+    // ═══════════════════════════════════════════════════════════════
+    function buildReorderHintBar() {
+        if (_hintBarEl) return;
+        const bar = document.createElement('div');
+        bar.id = 'reorderHintBar';
+        bar.innerHTML = `
+            <div class="rh-icon">↕️</div>
+            <div class="rh-text">
+                <div class="rh-title">Перемещение чата</div>
+                <div class="rh-sub" id="reorderHintSub">Тапните по чату — вставим перед ним</div>
+            </div>
+            <button class="rh-cancel" id="reorderCancelBtn">Отмена</button>
+        `;
+        document.body.appendChild(bar);
+        _hintBarEl = bar;
+        bar.querySelector('#reorderCancelBtn').addEventListener('click', (e) => {
+            e.stopPropagation();
+            exitReorderMode();
+        });
+    }
+
+    function enterReorderMode(sourceFile) {
+        if (_reorderSourceFile) {
+            // Уже в режиме — просто переключаем цель? Нет, сбрасываем и ставим новую.
+            exitReorderMode();
+        }
+        _reorderSourceFile = sourceFile;
+
+        document.body.classList.add('chat-reorder-mode');
+        buildReorderHintBar();
+        void _hintBarEl.offsetWidth;
+        _hintBarEl.classList.add('show');
+
+        requestAnimationFrame(() => {
+            const el = document.querySelector(
+                `.chat-list-item[data-file="${sourceFile}"]`
+            );
+            if (el) el.classList.add('reorder-source');
+        });
+
+        const chat = state.chats.find(c => c.file === sourceFile);
+        const name = chat ? (chat.name || chat.file) : sourceFile;
+        const subEl = document.getElementById('reorderHintSub');
+        if (subEl) subEl.textContent = `«${name}» — тапните, куда вставить`;
+
+        if (navigator.vibrate) navigator.vibrate([20, 40, 20]);
+        showToast('↕️ Выберите, куда переместить', 2000);
+        soundManager.play('click');
+    }
+
+    function exitReorderMode() {
+        if (!_reorderSourceFile) return;
+        _reorderSourceFile = null;
+        document.body.classList.remove('chat-reorder-mode');
+        if (_hintBarEl) _hintBarEl.classList.remove('show');
+        document.querySelectorAll('.chat-list-item.reorder-source')
+            .forEach(el => el.classList.remove('reorder-source'));
+    }
+
+    function handleReorderTap(targetFile) {
+        if (!_reorderSourceFile) return;
+        if (targetFile === _reorderSourceFile) {
+            showToast('ℹ️ Это тот же чат', 1200);
+            return;
+        }
+
+        const sourceIdx = state.chats.findIndex(c => c.file === _reorderSourceFile);
+        const targetIdxBefore = state.chats.findIndex(c => c.file === targetFile);
+        if (sourceIdx < 0 || targetIdxBefore < 0) {
+            exitReorderMode();
+            return;
+        }
+
+        const movedFile = _reorderSourceFile;
+        const [chat] = state.chats.splice(sourceIdx, 1);
+
+        // Пересчитываем индекс цели после удаления
+        let newTargetIdx = state.chats.findIndex(c => c.file === targetFile);
+        if (newTargetIdx < 0) newTargetIdx = state.chats.length;
+
+        // 🔑 Вставляем ПЕРЕД целевым.
+        // Логика: если тащим сверху вниз — цель «уезжает» на 1 позицию вверх,
+        // поэтому вставляем ПОСЛЕ сдвига (по факту — в позицию нового индекса).
+        // Если тащим снизу вверх — индекс цели уже посчитан корректно.
+        state.chats.splice(newTargetIdx, 0, chat);
+
+        saveChatOrder();
+        if (typeof saveChatsList === 'function') saveChatsList();
+
+        exitReorderMode();
+
+        if (typeof renderChatsList === 'function') {
+            renderChatsList();
+            requestAnimationFrame(() => {
+                const el = document.querySelector(
+                    `.chat-list-item[data-file="${movedFile}"]`
+                );
+                if (el) {
+                    el.classList.add('just-moved');
+                    setTimeout(() => el.classList.remove('just-moved'), 700);
+                }
+            });
+        }
+
+        showToast('✅ Перемещено', 1300);
+        soundManager.play('send');
+    }
+
+    function moveToEdge(chatFile, edge) {
+        const idx = state.chats.findIndex(c => c.file === chatFile);
+        if (idx < 0) return;
+        const [chat] = state.chats.splice(idx, 1);
+        if (edge === 'top') state.chats.unshift(chat);
+        else state.chats.push(chat);
+
+        saveChatOrder();
+        if (typeof saveChatsList === 'function') saveChatsList();
+
+        if (typeof renderChatsList === 'function') {
+            renderChatsList();
+            requestAnimationFrame(() => {
+                const el = document.querySelector(
+                    `.chat-list-item[data-file="${chatFile}"]`
+                );
+                if (el) {
+                    el.classList.add('just-moved');
+                    setTimeout(() => el.classList.remove('just-moved'), 700);
+                }
+            });
+        }
+        showToast(edge === 'top' ? '⬆️ Перемещено в начало' : '⬇️ Перемещено в конец', 1500);
+        soundManager.play('click');
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТЧИКИ КЛИКОВ
+    // ═══════════════════════════════════════════════════════════════
+
+    // ─── Кнопка «⋯» ───
+    document.addEventListener('click', (e) => {
+        const moreBtn = e.target.closest('.chat-more-btn');
+        if (!moreBtn) return;
+        e.stopPropagation();
+        e.preventDefault();
+        const chatItem = moreBtn.closest('.chat-list-item');
+        if (!chatItem) return;
+        const file = chatItem.dataset.file;
+        if (!file) return;
+        openUnifiedMenu(file, moreBtn);
+    }, true);
+
+    // Контекстное меню по «⋯» не нужно
+    document.addEventListener('contextmenu', (e) => {
+        if (e.target.closest('.chat-more-btn')) e.preventDefault();
+    });
+
+    // ─── Тап по чату в режиме перемещения ───
+    function installReorderTapHandler() {
+        const container = document.getElementById('chatsList');
+        if (!container || container._reorderTapInstalled) return;
+        container._reorderTapInstalled = true;
+
+        container.addEventListener('click', (e) => {
+            if (!_reorderSourceFile) return;
+            // Игнорируем клики по кнопке «⋯» (её мы приглушили, но на всякий)
+            if (e.target.closest('.chat-more-btn')) return;
+            e.stopImmediatePropagation();
+            e.preventDefault();
+            const item = e.target.closest('.chat-list-item');
+            if (!item) return;
+            const targetFile = item.dataset.file;
+            if (targetFile) handleReorderTap(targetFile);
+        }, true);
+    }
+    installReorderTapHandler();
+
+    // ═══════════════════════════════════════════════════════════════
+    //  ПАТЧ renderChatsList — заменяем старые кнопки и рисуем бейдж автовхода
+    // ═══════════════════════════════════════════════════════════════
+    const _origRenderChatsList = renderChatsList;
+
+    renderChatsList = function() {
+        const result = _origRenderChatsList.apply(this, arguments);
+
+        const container = document.getElementById('chatsList');
+        if (!container) return result;
+
+        const autorunFile = (typeof getAutorunChat === 'function')
+            ? getAutorunChat() : null;
+
+        container.querySelectorAll('.chat-list-item').forEach(item => {
+            // Убираем старые кнопки
+            item.querySelectorAll(
+                '.chat-delete-btn, .rename-btn, .share-btn, .autorun-btn'
+            ).forEach(btn => btn.remove());
+
+            // Добавляем кнопку «⋯» — один раз
+            if (!item.querySelector('.chat-more-btn')) {
+                const moreBtn = document.createElement('button');
+                moreBtn.className = 'chat-more-btn';
+                moreBtn.type = 'button';
+                moreBtn.title = 'Действия с чатом';
+                moreBtn.setAttribute('aria-label', 'Действия');
+                moreBtn.innerHTML = '⋯';
+                item.appendChild(moreBtn);
+            }
+
+            // 🆕 Бейдж автовхода
+            const file = item.dataset.file;
+            const nameRow = item.querySelector('.chat-name-row');
+            if (!nameRow) return;
+
+            const existingBadge = nameRow.querySelector('.chat-autorun-badge');
+            const shouldShow = autorunFile && file === autorunFile;
+
+            if (shouldShow && !existingBadge) {
+                const badge = document.createElement('span');
+                badge.className = 'chat-autorun-badge';
+                badge.title = 'Этот чат откроется при запуске';
+                badge.innerHTML = `<span class="cab-icon">⚡</span>Автовход`;
+                // Вставляем после имени, но перед unread-badge / playing-badge
+                const nameEl = nameRow.querySelector('.chat-name');
+                if (nameEl) {
+                    nameEl.insertAdjacentElement('afterend', badge);
+                } else {
+                    nameRow.prepend(badge);
+                }
+            } else if (!shouldShow && existingBadge) {
+                existingBadge.remove();
+            }
+        });
+
+        // Возвращаем подсветку в режиме перемещения
+        if (_reorderSourceFile) {
+            requestAnimationFrame(() => {
+                const el = document.querySelector(
+                    `.chat-list-item[data-file="${_reorderSourceFile}"]`
+                );
+                if (el) el.classList.add('reorder-source');
+            });
+        }
+
+        return result;
+    };
+
+    // ═══════════════════════════════════════════════════════════════
+    //  ПАТЧ loadChatsList — восстанавливаем порядок
+    // ═══════════════════════════════════════════════════════════════
+    const _origLoadChatsList = loadChatsList;
+    loadChatsList = function() {
+        _origLoadChatsList.apply(this, arguments);
+        restoreChatOrder();
+    };
+
+    // ═══════════════════════════════════════════════════════════════
+    //  ПАТЧ toggleAutorun — после переключения обновляем бейдж на карточке
+    // ═══════════════════════════════════════════════════════════════
+    const _origToggleAutorun = toggleAutorun;
+    toggleAutorun = function(file) {
+        const result = _origToggleAutorun.apply(this, arguments);
+        // renderChatsList уже вызывается внутри toggleAutorun,
+        // но подстрахуемся — если вдруг нет:
+        setTimeout(() => {
+            if (typeof renderChatsList === 'function') renderChatsList();
+        }, 50);
+        return result;
+    };
+
+    // ═══════════════════════════════════════════════════════════════
+    //  ИНТЕГРАЦИЯ
+    // ═══════════════════════════════════════════════════════════════
+    const _origShowChatScreen = showChatScreen;
+    showChatScreen = function() {
+        closeUnifiedMenu();
+        exitReorderMode();
+        return _origShowChatScreen.apply(this, arguments);
+    };
+
+    const _origShowAuthScreen = showAuthScreen;
+    showAuthScreen = function() {
+        closeUnifiedMenu();
+        exitReorderMode();
+        return _origShowAuthScreen.apply(this, arguments);
+    };
+
+    const _origLogout = logout;
+    logout = function() {
+        closeUnifiedMenu();
+        exitReorderMode();
+        return _origLogout.apply(this, arguments);
+    };
+
+    const _origBackToChats = backToChats;
+    backToChats = function() {
+        closeUnifiedMenu();
+        exitReorderMode();
+        return _origBackToChats.apply(this, arguments);
+    };
+
+    // Esc — закрыть всё
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') {
+            if (_reorderSourceFile) {
+                e.preventDefault();
+                exitReorderMode();
+                showToast('↩️ Перемещение отменено', 1200);
+                return;
+            }
+            if (_menuEl) {
+                e.preventDefault();
+                closeUnifiedMenu();
+            }
+        }
+    }, true);
+
+    // Закрытие при скролле списка
+    const chatsListEl = document.getElementById('chatsList');
+    if (chatsListEl) {
+        chatsListEl.addEventListener('scroll', () => {
+            if (_menuEl) closeUnifiedMenu();
+        }, { passive: true });
+    }
+
+    // Восстановить порядок сразу при старте (если чаты уже загружены)
+    try {
+        if (typeof state !== 'undefined' && state.chats && state.chats.length > 0) {
+            restoreChatOrder();
+        }
+    } catch (e) { /* ignore */ }
+
+    // Экспортируем для возможного внешнего использования
+    window._unifiedChatSystem = {
+        openMenu: openUnifiedMenu,
+        closeMenu: closeUnifiedMenu,
+        enterReorderMode,
+        exitReorderMode,
+        moveToEdge,
+        saveChatOrder,
+        restoreChatOrder,
+    };
+
+    console.log('⋯ Единая система управления чатами активна:');
+    console.log('   • Кнопка «⋯» → меню со всеми действиями');
+    console.log('   • «Переместить» → тапните по чату-цели');
+    console.log('   • «В начало» / «В конец» — быстрый перенос');
+    console.log('   • Бейдж «⚡ Автовход» виден на карточке');
+    console.log('   • Порядок сохраняется в localStorage');
+})();
 console.log('✅ SMS Чат собран!');
 console.log('🔐 AES-256-GCM + PBKDF2 (200k)');
 console.log('📷 Множественная отправка фото (до 20 за раз) с batch-индикатором');
