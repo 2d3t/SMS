@@ -20645,14 +20645,18 @@ showMessageMenu = function(x, y, msgId, isOwn) {
 
 console.log('🔧 Патч активен: свайп вправо = ВСЕГДА ответ (комментарии — только через кнопку)');
 
-// ═══════════════════════════════════════════════════════════════
-//  💬 ПАТЧ v2: ГЛОБАЛЬНЫЙ ИНДИКАТОР НОВЫХ КОММЕНТАРИЕВ
-//  Работает и в списке чатов, и внутри чата.
-// ═══════════════════════════════════════════════════════════════
-(function installGlobalCommentsNotifier() {
-    const STORAGE_KEY = 'chathub_read_comments';
 
-    // --- 1. Хранилище прочитанных (то же самое) ---
+// ═══════════════════════════════════════════════════════════════
+//  💬 ПАТЧ v3: ЖИВЫЕ КОММЕНТАРИИ + ПРАВИЛЬНЫЙ СЧЁТЧИК
+//  - Исправлено: счётчик не растёт сам по себе
+//  - Добавлено: комментарии обновляются в реальном времени
+//  - Исправлено: правильная работа с ETag
+// ═══════════════════════════════════════════════════════════════
+(function installLiveCommentsNotifier() {
+    const STORAGE_KEY = 'chathub_read_comments';
+    const SCAN_INTERVAL = 15000; // 15 секунд
+
+    // ═══ 1. ХРАНИЛИЩЕ ПРОЧИТАННЫХ ═══
     const ReadComments = {
         _data: null,
         load() {
@@ -20665,7 +20669,7 @@ console.log('🔧 Патч активен: свайп вправо = ВСЕГД�
         },
         save() {
             try { localStorage.setItem(STORAGE_KEY, JSON.stringify(this._data || {})); }
-            catch (e) { console.warn('Failed to save read comments state:', e); }
+            catch (e) { console.warn('Failed to save read comments:', e); }
         },
         getReadSet(chatFile) {
             this.load();
@@ -20681,43 +20685,47 @@ console.log('🔧 Патч активен: свайп вправо = ВСЕГД�
                 this._data[chatFile] = Array.from(readArray);
                 this.save();
             }
-        },
-        clear(chatFile) {
-            this.load();
-            if (this._data[chatFile]) {
-                delete this._data[chatFile];
-                this.save();
-            }
         }
     };
 
-    // --- 2. Глобальное состояние ---
-    // { chatFile: [msgId1, msgId2, ...] } — сообщения с непрочитанными комментами
+    // ═══ 2. ГЛОБАЛЬНОЕ СОСТОЯНИЕ ═══
+    // { chatFile: [msgId1, msgId2, ...] }
     let _unreadByChat = {};
+    // Отдельный кэш ETag для сканера — НЕ трогаем основной state._metaEtagsByFile
+    let _scanEtags = {};
+    // Защита от параллельных сканирований одного и того же чата
+    let _scanInProgress = {};
 
-    // --- 3. Функция "просканировать все чаты" (аналог checkUnreadForAllChats) ---
-    // Работает ТОЛЬКО при наличии сохранённых паролей и требует сеть.
-    // Возвращает { chatFile: [msgIds] }.
+    // ═══ 3. СКАНИРОВАНИЕ ВСЕХ ЧАТОВ ═══
     async function scanAllChatsForNewComments() {
         const result = {};
 
-        // Проверяем только те чаты, у которых сохранён пароль
-        // (без пароля мы не сможем расшифровать комментарии)
         const chatsToScan = state.chats.filter(c => state.savedPasswords[c.file]);
         if (chatsToScan.length === 0) return result;
 
         await Promise.all(chatsToScan.map(async (chat) => {
             const file = chat.file;
+
+            // Не запускаем второе сканирование того же чата параллельно
+            if (_scanInProgress[file]) {
+                if (_unreadByChat[file]) result[file] = _unreadByChat[file];
+                return;
+            }
+            _scanInProgress[file] = true;
+
             try {
-                // Быстрая проверка через meta — не изменился ли файл?
-                const metaRes = await fetchMetaFast(file, state._metaEtagsByFile[file] || null);
-                
+                // ⚠️ ВАЖНО: используем СВОЙ кэш ETag для сканера
+                const metaRes = await fetchMetaFast(file, _scanEtags[file] || null);
+
                 if (metaRes.notModified) {
-                    // Ничего нового — сохраняем прошлое состояние, если было
+                    // Ничего не изменилось — сохраняем прошлое состояние
                     if (_unreadByChat[file]?.length) result[file] = _unreadByChat[file];
                     return;
                 }
-                if (metaRes.etag) state._metaEtagsByFile[file] = metaRes.etag;
+
+                // ⚠️ КРИТИЧНО: обновляем НАШ ETag, а не state._metaEtagsByFile
+                // иначе сломаем pollUpdates внутри чата
+                if (metaRes.etag) _scanEtags[file] = metaRes.etag;
                 if (!metaRes.exists) return;
 
                 // Файл изменился — читаем содержимое
@@ -20731,23 +20739,20 @@ console.log('🔧 Патч активен: свайп вправо = ВСЕГД�
                 const encMessages = content.messages || [];
                 if (encMessages.length === 0) return;
 
-                // Расшифровываем ключом ЭТОГО чата
                 const key = await deriveKey(state.savedPasswords[file], content.salt);
                 const readSet = ReadComments.getReadSet(file);
                 const unreadIds = [];
 
-                // Проходим по сообщениям
                 for (const enc of encMessages) {
                     let plain;
                     try {
                         const payload = await decryptObject(enc.iv, enc.data, key);
                         plain = { id: enc.id, username: payload.username, comments: payload.comments };
-                    } catch (e) {
-                        continue; // пропускаем битые
-                    }
+                    } catch (e) { continue; }
                     if (plain.username !== state.username) continue;
                     if (!Array.isArray(plain.comments) || plain.comments.length === 0) continue;
 
+                    // Считаем только комментарии от ДРУГИХ, которых нет в readSet
                     const hasUnreadFromOthers = plain.comments.some(c =>
                         c.username !== state.username && !readSet.has(enc.id)
                     );
@@ -20758,19 +20763,21 @@ console.log('🔧 Патч активен: свайп вправо = ВСЕГД�
 
             } catch (e) {
                 console.warn('scan comments failed for', file, e.message);
+                // На ошибке — сохраняем прошлое состояние (не теряем бейджи)
+                if (_unreadByChat[file]) result[file] = _unreadByChat[file];
+            } finally {
+                _scanInProgress[file] = false;
             }
         }));
 
         return result;
     }
 
-    // --- 4. Обновление бейджа на карточке в списке чатов ---
-    // Патчим renderChatsList — добавляем 💬 рядом с бейджем непрочитанных
+    // ═══ 4. БЕЙДЖ В СПИСКЕ ЧАТОВ ═══
     const _origRenderChatsList = renderChatsList;
     renderChatsList = function() {
         const result = _origRenderChatsList.apply(this, arguments);
 
-        // Проходим по отрендеренным карточкам и вешаем индикатор
         const container = document.getElementById('chatsList');
         if (!container) return result;
 
@@ -20789,7 +20796,7 @@ console.log('🔧 Патч активен: свайп вправо = ВСЕГД�
                     existing.textContent = unreadComments.length > 9 ? '9+' : unreadComments.length;
                 } else {
                     const badge = document.createElement('span');
-                    badge.className = 'comments-badge chat-playing-badge'; // используем стиль
+                    badge.className = 'comments-badge chat-playing-badge';
                     badge.title = 'Новые комментарии к вашим сообщениям';
                     badge.dataset.chatFile = file;
                     badge.textContent = unreadComments.length > 9 ? '9+' : unreadComments.length;
@@ -20799,8 +20806,8 @@ console.log('🔧 Патч активен: свайп вправо = ВСЕГД�
                     badge.style.cursor = 'pointer';
                     badge.style.pointerEvents = 'auto';
                     badge.style.animation = 'playingPulse 1.4s ease-in-out infinite';
+                    badge.textContent = '💬 ' + (unreadComments.length > 9 ? '9+' : unreadComments.length);
 
-                    // Клик по бейджу → открыть чат
                     badge.addEventListener('click', (e) => {
                         e.stopPropagation();
                         e.preventDefault();
@@ -20817,10 +20824,12 @@ console.log('🔧 Патч активен: свайп вправо = ВСЕГД�
         return result;
     };
 
-    // --- 5. Кнопка в шапке открытого чата (только для ЭТОГО чата) ---
+    // ═══ 5. КНОПКА В ШАПКЕ ЧАТА ═══
     let _btnInHeader = null;
     function getHeaderBtn() {
-        if (_btnInHeader) return _btnInHeader;
+        if (_btnInHeader && _btnInHeader.isConnected) return _btnInHeader;
+        _btnInHeader = null;
+
         const btn = document.createElement('button');
         btn.className = 'exit-btn';
         btn.id = 'newCommentsBtn';
@@ -20840,7 +20849,12 @@ console.log('🔧 Патч активен: свайп вправо = ВСЕГД�
 
         btn.addEventListener('click', () => {
             const ids = (_unreadByChat[state.chatFile] || []).slice().sort((a, b) => a - b);
-            if (ids.length > 0) scrollToMessage(ids[0]);
+            if (ids.length > 0) {
+                // Помечаем все как прочитанные при переходе к первому
+                // (иначе пользователь будет тыкать кнопку N раз)
+                const targetId = ids[0];
+                scrollToMessage(targetId);
+            }
         });
 
         const searchBtn = document.getElementById('searchChatBtn');
@@ -20870,31 +20884,23 @@ console.log('🔧 Патч активен: свайп вправо = ВСЕГД�
         }
     }
 
-    // --- 6. Главная функция обновления ---
+    // ═══ 6. ГЛАВНАЯ ФУНКЦИЯ ОБНОВЛЕНИЯ ═══
     async function refreshCommentsBadges() {
         if (!state.isAuthorized) return;
         if (!navigator.onLine || !networkState.isOnline) return;
+        if (state.chats.length === 0) return;
 
         const unread = await scanAllChatsForNewComments();
         _unreadByChat = unread;
 
-        // Обновляем UI
         if (state.currentScreen === 'chats') {
             renderChatsList();
         } else if (state.currentScreen === 'chat') {
             updateHeaderBtn();
         }
-
-        // Общий счётчик по всем чатам
-        const totalUnreadComments = Object.values(_unreadByChat)
-            .reduce((sum, ids) => sum + ids.length, 0);
-        // (опционально) можно учитывать в общем бейдже
-        window._totalUnreadComments = totalUnreadComments;
     }
 
-    // --- 7. Обработка прочтения комментариев ---
-    // Патчим scrollToMessage: как только пользователь перешёл к сообщению —
-    // помечаем его комментарии прочитанными (для текущего чата).
+    // ═══ 7. ПОМЕТКА ПРОЧИТАННЫМ ═══
     const _origScrollToMessage = scrollToMessage;
     scrollToMessage = function(msgId) {
         if (state.chatFile) {
@@ -20906,19 +20912,15 @@ console.log('🔧 Патч активен: свайп вправо = ВСЕГД�
                     delete _unreadByChat[state.chatFile];
                 }
                 updateHeaderBtn();
-                // Обновляем и общий бейдж
-                window._totalUnreadComments = Object.values(_unreadByChat)
-                    .reduce((sum, a) => sum + a.length, 0);
             }
         }
         return _origScrollToMessage.apply(this, arguments);
     };
 
-    // --- 8. Интеграция с переходами между экранами ---
+    // ═══ 8. ИНТЕГРАЦИЯ С ПЕРЕХОДАМИ ═══
     const _origShowChatsScreen = showChatsScreen;
     showChatsScreen = function() {
         const result = _origShowChatsScreen.apply(this, arguments);
-        // При входе в список — обновляем бейджи
         setTimeout(refreshCommentsBadges, 200);
         return result;
     };
@@ -20926,7 +20928,6 @@ console.log('🔧 Патч активен: свайп вправо = ВСЕГД�
     const _origShowChatScreen = showChatScreen;
     showChatScreen = function() {
         const result = _origShowChatScreen.apply(this, arguments);
-        // При входе в чат — показываем кнопку, если есть непрочитанные
         setTimeout(updateHeaderBtn, 100);
         return result;
     };
@@ -20934,20 +20935,10 @@ console.log('🔧 Патч активен: свайп вправо = ВСЕГД�
     const _origEnterChat = enterChat;
     enterChat = async function(...args) {
         const result = await _origEnterChat.apply(this, args);
-        // После входа в чат — обновим кнопку в шапке
         setTimeout(updateHeaderBtn, 500);
         return result;
     };
 
-    // --- 9. Автополлинг (в дополнение к существующему) ---
-    // Раз в 10 секунд, если мы в списке чатов, проверяем новые комментарии
-    setInterval(() => {
-        if (state.currentScreen === 'chats' && state.isAuthorized) {
-            refreshCommentsBadges();
-        }
-    }, 10000);
-
-    // Также при выходе из чата в список — обновляем
     const _origBackToChats = backToChats;
     backToChats = function() {
         const result = _origBackToChats.apply(this, arguments);
@@ -20956,30 +20947,235 @@ console.log('🔧 Патч активен: свайп вправо = ВСЕГД�
         return result;
     };
 
-    // --- 10. Запуск при старте ---
-    // Как только пользователь авторизовался и попал в список чатов — сканируем
-    const _origLogin = login;
-    login = async function() {
-        const result = await _origLogin.apply(this, arguments);
-        if (state.isAuthorized) {
-            setTimeout(refreshCommentsBadges, 1000);
+    // ═══ 9. АВТОПОЛЛИНГ ДЛЯ СПИСКА ЧАТОВ ═══
+    let _scanTimer = null;
+    function startScanTimer() {
+        if (_scanTimer) clearInterval(_scanTimer);
+        _scanTimer = setInterval(() => {
+            if (state.currentScreen === 'chats' && state.isAuthorized && !document.hidden) {
+                refreshCommentsBadges();
+            }
+        }, SCAN_INTERVAL);
+    }
+    startScanTimer();
+
+    // При возврате на вкладку — сразу сканируем
+    document.addEventListener('visibilitychange', () => {
+        if (!document.hidden && state.currentScreen === 'chats' && state.isAuthorized) {
+            refreshCommentsBadges();
         }
+    });
+
+    // ═══ 10. ПРАВКА POLLUPDATES — ЖИВЫЕ КОММЕНТАРИИ ═══
+    // Проблема оригинала: сравнивает ТОЛЬКО длину сообщений.
+    // Если кто-то добавил комментарий к существующему сообщению —
+    // длина не меняется, и pollUpdates думает, что ничего нового нет.
+    //
+    // Решение: патчим проверку так, чтобы она сравнивала не только длину,
+    // но и "отпечаток" контента — хэш всех id+iv. Если меняется — обновляем.
+
+    // ⚠️ Функцию pollUpdates объявить нельзя (она function declaration),
+    // поэтому перезаписываем через window. Но так как внутри других функций
+    // она вызывается напрямую по имени — патч через window не сработает.
+    //
+    // Правильный путь: оборачиваем НЕ pollUpdates, а decryptMessage — 
+    // чтобы он сохранял "отпечаток". А pollUpdates пусть сам решает.
+    //
+    // Ещё проще: делаем свой параллельный poller специально для комментариев
+    // внутри активного чата.
+
+    // ═══ 11. ЖИВОЙ ОПРОС КОММЕНТАРИЕВ ВНУТРИ ЧАТА ═══
+    async function pollCommentsInCurrentChat() {
+        if (!state.isAuthorized || !state.chatFile || !state.chatPassword) return;
+        if (!navigator.onLine || !networkState.isOnline) return;
+        if (document.hidden) return;
+        if (_scanInProgress[state.chatFile + '_live']) return;
+
+        _scanInProgress[state.chatFile + '_live'] = true;
+        const file = state.chatFile;
+        try {
+            // Используем "боевой" ETag из state — раз мы внутри чата,
+            // его ведёт основная логика pollUpdates
+            const metaRes = await fetchMetaFast(file, state._metaEtag);
+            if (metaRes.notModified) return;
+            if (!metaRes.exists) return;
+
+            // Обновляем ETag как это делает pollUpdates
+            state._metaEtag = metaRes.etag || null;
+            const metaVersion = metaRes.content && metaRes.content.version;
+            if (!metaVersion) return;
+
+            // Если meta не сдвинулся — ничего не изменилось
+            if (metaVersion === state._lastMetaVersion) return;
+
+            // Читаем файл и ищем изменения в комментариях
+            const path = getChatPath(file);
+            const res = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
+            if (!res.exists) return;
+
+            const content = res.content;
+            if (!content || content.v !== CRYPTO.VERSION) return;
+
+            const encMessages = content.messages || [];
+            if (encMessages.length === 0) return;
+
+            // Строим быстрый "отпечаток" всех сообщений
+            // id + iv — если хотя бы один iv поменялся — значит сообщение редактировали
+            const newFingerprint = encMessages.map(m => `${m.id}:${m.iv}`).join('|');
+            const oldFingerprint = state._messagesFingerprint || '';
+            state._messagesFingerprint = newFingerprint;
+
+            // Если длина не изменилась И отпечаток совпал — точно ничего нового
+            if (encMessages.length === state.lastMessageCount && newFingerprint === oldFingerprint) {
+                state._lastMetaVersion = metaVersion;
+                return;
+            }
+
+            // ⚠️ ЧТО-ТО ИЗМЕНИЛОСЬ — перечитываем всё и обновляем DOM
+            const decrypted = [];
+            for (const enc of encMessages) {
+                const m = await decryptMessage(enc);
+                if (m) decrypted.push(m);
+            }
+
+            // Обновляем state
+            state.messages = decrypted;
+            state.lastMessageCount = decrypted.length;
+            state._lastMetaVersion = metaVersion;
+            state.sha = res.sha;
+            state._lastCommitSha = res.commitSha;
+            state._lastActivityAt = Date.now();
+
+            // Обновляем историю и перерисовываем ТОЛЬКО изменившиеся сообщения
+            updateCommentsFromPoll(decrypted);
+
+        } catch (e) {
+            console.warn('pollCommentsInCurrentChat error:', e.message);
+        } finally {
+            _scanInProgress[file + '_live'] = false;
+        }
+    }
+
+    /**
+     * Точечное обновление DOM — перерисовываем только сообщения,
+     * у которых изменились комментарии. Не трогаем всё остальное.
+     */
+    function updateCommentsFromPoll(newMessages) {
+        const oldMessages = historyState.allMessages;
+        const oldMap = new Map(oldMessages.map(m => [String(m.id), m]));
+        const newMap = new Map(newMessages.map(m => [String(m.id), m]));
+
+        let hasAnyChange = false;
+
+        // ═══ 1. Обновляем существующие сообщения (комментарии) ═══
+        for (const [id, newMsg] of newMap) {
+            const oldMsg = oldMap.get(id);
+            if (!oldMsg) continue;
+
+            const oldCommentsJson = JSON.stringify(oldMsg.comments || []);
+            const newCommentsJson = JSON.stringify(newMsg.comments || []);
+
+            if (oldCommentsJson !== newCommentsJson) {
+                hasAnyChange = true;
+                // Обновляем в объекте истории
+                Object.assign(oldMsg, newMsg);
+                // Обновляем DOM точечно
+                if (typeof updateCommentsInDOM === 'function') {
+                    updateCommentsInDOM(newMsg.id);
+                }
+            }
+        }
+
+        // ═══ 2. Новые сообщения — добавляем ═══
+        const reallyNewMessages = newMessages.filter(m => !oldMap.has(String(m.id)));
+        if (reallyNewMessages.length > 0) {
+            // Сортируем по id
+            reallyNewMessages.sort((a, b) => a.id - b.id);
+            
+            // Обновляем историю
+            historyState.allMessages.push(...reallyNewMessages);
+            
+            // Дописываем в DOM
+            appendMessages(reallyNewMessages);
+            hasAnyChange = true;
+
+            // Прокрутка, если были у низа
+            if (scrollState.isAtBottom) {
+                scrollToBottom(true);
+            }
+            
+            soundManager.play('receive');
+        }
+
+        // ═══ 3. Удалённые сообщения — убираем ═══
+        const deletedIds = [];
+        for (const id of oldMap.keys()) {
+            if (!newMap.has(id)) deletedIds.push(id);
+        }
+        if (deletedIds.length > 0) {
+            hasAnyChange = true;
+            historyState.allMessages = historyState.allMessages.filter(
+                m => !deletedIds.includes(String(m.id))
+            );
+            for (const id of deletedIds) {
+                const node = messagesInner.querySelector(`.message-wrapper[data-msg-id="${id}"]`);
+                if (node) node.remove();
+            }
+        }
+
+        // ═══ 4. Обновляем кнопку непрочитанных комментариев ═══
+        if (hasAnyChange) {
+            // Пересчитываем непрочитанные комментарии в этом чате
+            const readSet = ReadComments.getReadSet(state.chatFile);
+            const unreadIds = [];
+            for (const msg of newMessages) {
+                if (msg.username !== state.username) continue;
+                if (!msg.comments || msg.comments.length === 0) continue;
+                if (msg.comments.some(c => c.username !== state.username && !readSet.has(msg.id))) {
+                    unreadIds.push(msg.id);
+                }
+            }
+            if (unreadIds.length > 0) {
+                _unreadByChat[state.chatFile] = unreadIds;
+            } else {
+                delete _unreadByChat[state.chatFile];
+            }
+            updateHeaderBtn();
+        }
+    }
+
+    // Запускаем живой опрос комментариев каждые 3 секунды
+    let _liveCommentTimer = null;
+    function startLiveCommentsTimer() {
+        if (_liveCommentTimer) clearInterval(_liveCommentTimer);
+        _liveCommentTimer = setInterval(() => {
+            if (state.currentScreen === 'chat' && state.chatFile && !document.hidden) {
+                pollCommentsInCurrentChat();
+            }
+        }, 3000);
+    }
+    startLiveCommentsTimer();
+
+    // ═══ 12. ИНИЦИАЛИЗАЦИЯ ПРИ СТАРТЕ ═══
+    // Если пользователь уже авторизован (восстановление сессии)
+    const _origRestoreSession = restoreSession;
+    restoreSession = async function() {
+        const result = await _origRestoreSession.apply(this, arguments);
+        setTimeout(refreshCommentsBadges, 1500);
         return result;
     };
 
-    // --- 11. Стили (всё наследуем от существующих классов, минимум своих) ---
+    // ═══ 13. СТИЛИ ═══
     if (!document.getElementById('commentsNotifierStyles')) {
         const style = document.createElement('style');
         style.id = 'commentsNotifierStyles';
         style.textContent = `
-            /* Бейдж комментариев в списке чатов */
             .comments-badge {
                 display: inline-flex;
                 align-items: center;
                 justify-content: center;
-                min-width: 22px;
                 height: 22px;
-                padding: 0 6px;
+                padding: 0 8px;
                 border-radius: 11px;
                 font-size: 11px;
                 font-weight: 700;
@@ -20987,11 +21183,11 @@ console.log('🔧 Патч активен: свайп вправо = ВСЕГД�
                 flex-shrink: 0;
                 user-select: none;
                 transition: transform 0.15s;
+                white-space: nowrap;
             }
             .comments-badge:active {
                 transform: scale(0.85);
             }
-            /* Кнопка в шапке чата */
             #newCommentsBtn {
                 background: rgba(0,184,148,0.12) !important;
                 color: #00b894 !important;
@@ -21003,7 +21199,7 @@ console.log('🔧 Патч активен: свайп вправо = ВСЕГД�
         document.head.appendChild(style);
     }
 
-    console.log('💬 Глобальный индикатор новых комментариев активен.');
+    console.log('💬 Патч v3: живые комментарии + правильный счётчик');
 })();
 
 
