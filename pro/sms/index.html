@@ -214,9 +214,10 @@
         }
         .chat-header .info { min-width: 0; }
         .chat-header .info h2 {
-            font-size: 17px; font-weight: 600;
-            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-        }
+    font-size: 16px; font-weight: 600;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    line-height: 1.2;
+}
 
         .exit-btn {
             background: rgba(255,255,255,0.06); border: none; color: #888;
@@ -3269,7 +3270,6 @@ body.player-active .messages-container { padding-bottom: 68px; }
             
 <button class="exit-btn" id="inviteToChatBtn" title="Пригласить в чат" style="margin-right:8px;">💌</button>
 <button class="exit-btn" id="forgetBtn" title="Забыть пароль этого чата" style="margin-right:8px;">🔓</button>
-            <button class="exit-btn" id="exitBtn" title="Выйти">✕</button>
         </div>
     </div>
 
@@ -4582,7 +4582,6 @@ const fileBtn = $('fileBtn');
 const micBtn = $('micBtn');
 const recordingIndicator = $('recordingIndicator');
 const recordingTime = $('recordingTime');
-const exitBtn = $('exitBtn');
 const forgetBtn = $('forgetBtn');
 const userAvatar = $('userAvatar');
 const chatTitle = $('chatTitle');
@@ -10752,9 +10751,9 @@ function confirmRenameChat() {
     chat.name = newName;
     saveChatsList();
     if (state.chatFile === file) {
-        state.chatName = newName;
-        chatTitle.textContent = `Чат: ${newName}`;
-    }
+    state.chatName = newName;
+    chatTitle.textContent = newName;
+}
     $('renameChatModal').classList.remove('active');
     _pendingRenameFile = null;
     renderChatsList();
@@ -10877,7 +10876,7 @@ resetHistoryState();
     state.chatPassword = password;
     state._lastActivityAt = Date.now();
 
-    chatTitle.textContent = `Чат: ${name}`;
+    chatTitle.textContent = name;
     userAvatar.textContent = getInitials(state.username);
 
     messagesInner.dataset.lastDate = '';
@@ -11152,23 +11151,7 @@ function logout() {
     showToast('👋 Вы вышли', 1500);
 }
 
-function lockChatUI(reason) {
-    state.isAuthorized = false;
-    state.messages = []; state.sha = null; state.lastMessageCount = 0;
-    state._lastCommitSha = null;
-    state._metaEtag = null;
-    state._chatEntered = false;
-    CRYPTO._key = null;
-    stopPolling();
-    messagesInner.innerHTML = `<div class="message system locked">🔒 ${reason || 'Доступ закрыт'}</div>`;
-    messageInput.disabled = true;
-    sendBtn.disabled = true;
-    fileBtn.disabled = true;
-    micBtn.disabled = true;
-    hideInputBar();
-    floatingKeyboardBtn.classList.remove('show');
-    hideScrollDownBtn();
-}
+
 
 
 
@@ -11327,7 +11310,6 @@ document.addEventListener('click', (e) => {
 });
 
 micBtn.addEventListener('click', handleMicClick);
-exitBtn.addEventListener('click', logout);
 $('backToChatsBtn').addEventListener('click', backToChats);
 forgetBtn.addEventListener('click', () => {
     if (!state.chatFile) return;
@@ -20645,6 +20627,106 @@ showMessageMenu = function(x, y, msgId, isOwn) {
 
 console.log('🔧 Патч активен: свайп вправо = ВСЕГДА ответ (комментарии — только через кнопку)');
 
+
+
+// ═══════════════════════════════════════════════════════════════
+//  📱 КНОПКА «НАЗАД» ANDROID — выход из чата в список чатов
+// ═══════════════════════════════════════════════════════════════
+
+(function installAndroidBackButton() {
+    let _chatHistoryPushed = false;
+    let _chatsHistoryPushed = false;
+
+    // ─── Хук на открытие чата ───
+    const _origShowChatScreen = showChatScreen;
+    showChatScreen = function() {
+        const result = _origShowChatScreen.apply(this, arguments);
+
+        // Пушим состояние «мы в чате»
+        if (!_chatHistoryPushed) {
+            try {
+                history.pushState({ screen: 'chat' }, '', location.href);
+                _chatHistoryPushed = true;
+                _chatsHistoryPushed = false;
+            } catch (e) { /* ignore */ }
+        }
+        return result;
+    };
+
+    // ─── Хук на показ списка чатов ───
+    const _origShowChatsScreen = showChatsScreen;
+    showChatsScreen = function() {
+        const result = _origShowChatsScreen.apply(this, arguments);
+
+        // Пушим состояние «мы в списке чатов»
+        if (!_chatsHistoryPushed) {
+            try {
+                history.pushState({ screen: 'chats' }, '', location.href);
+                _chatsHistoryPushed = true;
+                _chatHistoryPushed = false;
+            } catch (e) { /* ignore */ }
+        }
+        return result;
+    };
+
+    // ─── Хук на logout — очищаем state ───
+    const _origLogoutBack = logout;
+    logout = function() {
+        _chatHistoryPushed = false;
+        _chatsHistoryPushed = false;
+        return _origLogoutBack.apply(this, arguments);
+    };
+
+    // ─── Обработчик popstate (срабатывает при нажатии «Назад») ───
+    window.addEventListener('popstate', (e) => {
+        // Если мы на экране ЧАТА — возвращаемся в список чатов
+        if (state.currentScreen === 'chat' && state.chatFile) {
+            // Возвращаем «замороженное» состояние обратно — чтобы
+            // пользователь мог ещё раз нажать «Назад» и уже выйти из приложения
+            history.pushState({ screen: 'chats' }, '', location.href);
+            _chatsHistoryPushed = true;
+            _chatHistoryPushed = false;
+
+            // Закрываем модалки, если открыты
+            if (typeof closeImageModal === 'function') closeImageModal();
+            if (typeof closeVideoModal === 'function') closeVideoModal();
+            document.querySelectorAll('.image-modal.active').forEach(m => m.classList.remove('active'));
+
+            // И вызываем backToChats() — как если бы юзер нажал ← в шапке
+            backToChats();
+            if (navigator.vibrate) navigator.vibrate(15);
+            return;
+        }
+
+        // Если мы в списке чатов — тут два варианта:
+        // либо выходим из приложения (если это последний шаг),
+        // либо остаёмся. По умолчанию — даём браузеру обработать.
+        if (state.currentScreen === 'chats') {
+            // Закрываем открытые модалки
+            const anyModalOpen = document.querySelector('.image-modal.active');
+            if (anyModalOpen) {
+                e.preventDefault();
+                anyModalOpen.classList.remove('active');
+                history.pushState({ screen: 'chats' }, '', location.href);
+                _chatsHistoryPushed = true;
+                return;
+            }
+            // Иначе — пусть выходит из приложения
+        }
+
+        // На экране авторизации — ничего не делаем
+    });
+
+    // ─── Первый push при загрузке — чтобы «Назад» не выходил сразу ───
+    window.addEventListener('load', () => {
+        try {
+            history.pushState({ screen: 'auth' }, '', location.href);
+        } catch (e) { /* ignore */ }
+    });
+
+})();
+
+console.log('📱 Кнопка «Назад» Android: чат → список чатов');
 </script>
 
 <script>
