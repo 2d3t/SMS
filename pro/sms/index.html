@@ -20646,5 +20646,1595 @@ showMessageMenu = function(x, y, msgId, isOwn) {
 console.log('🔧 Патч активен: свайп вправо = ВСЕГДА ответ (комментарии — только через кнопку)');
 
 </script>
+
+<script>
+(function installEventRadar() {
+    'use strict';
+
+    const RADAR_CONFIG = {
+        scanIntervalMs: 30000,
+        maxEventsKept: 300,
+        maxEventsShown: 100,
+        seenStorageKey: 'chathub_radar_seen_v1',
+        enabledStorageKey: 'chathub_radar_enabled_v1',
+        stateStorageKey: 'chathub_radar_state_v1',
+        firstRunDoneKey: 'chathub_radar_firstrun_done_v1',   // 🆕
+        stateMaxAgeDays: 14,
+        stateMaxEntries: 500,
+        freshnessWindowMs: 48 * 60 * 60 * 1000,             // 🆕 48 часов
+        autoCleanupIntervalMs: 5 * 60 * 1000,               // 🆕 автоочистка раз в 5 мин
+    };
+
+    const radar = {
+        enabled: localStorage.getItem(RADAR_CONFIG.enabledStorageKey) !== '0',
+        scanning: false,
+        scanTimer: null,
+        cleanupTimer: null,                 // 🆕
+        events: [],
+        seen: loadSeen(),
+        state: loadRadarState(),
+        overlayOpen: false,
+        etags: {},
+        metaVersions: {},
+        progress: {
+            total: 0,
+            done: 0,
+            current: '',
+            startedAt: 0,
+            phase: 'idle',
+            changedCount: 0,
+        },
+    };
+
+    // ═══════════════════════════════════════════════════
+    //  SEEN
+    // ═══════════════════════════════════════════════════
+    function loadSeen() {
+        try {
+            const raw = localStorage.getItem(RADAR_CONFIG.seenStorageKey);
+            const arr = raw ? JSON.parse(raw) : [];
+            return new Set(Array.isArray(arr) ? arr : []);
+        } catch (e) { return new Set(); }
+    }
+    function saveSeen() {
+        try {
+            const arr = Array.from(radar.seen).slice(-2000);
+            localStorage.setItem(RADAR_CONFIG.seenStorageKey, JSON.stringify(arr));
+        } catch (e) {}
+    }
+    function markSeen(key) {
+        radar.seen.add(key);
+        saveSeen();
+    }
+
+    // ═══════════════════════════════════════════════════
+    //  STATE
+    // ═══════════════════════════════════════════════════
+    function loadRadarState() {
+        try {
+            const raw = localStorage.getItem(RADAR_CONFIG.stateStorageKey);
+            if (!raw) return {};
+            const parsed = JSON.parse(raw);
+            return (parsed && typeof parsed === 'object') ? parsed : {};
+        } catch (e) {
+            console.warn('radar.state load failed:', e);
+            return {};
+        }
+    }
+
+    let _stateSaveTimer = null;
+    function saveRadarState(immediate = false) {
+        if (_stateSaveTimer) {
+            clearTimeout(_stateSaveTimer);
+            _stateSaveTimer = null;
+        }
+
+        const doSave = () => {
+            try {
+                pruneRadarState();
+                localStorage.setItem(RADAR_CONFIG.stateStorageKey, JSON.stringify(radar.state));
+            } catch (e) {
+                if (e.name === 'QuotaExceededError') {
+                    console.warn('radar.state quota exceeded, emergency prune');
+                    emergencyPruneState();
+                    try {
+                        localStorage.setItem(RADAR_CONFIG.stateStorageKey, JSON.stringify(radar.state));
+                    } catch (e2) {
+                        console.warn('radar.state still too big');
+                    }
+                } else {
+                    console.warn('radar.state save failed:', e);
+                }
+            }
+        };
+
+        if (immediate) doSave();
+        else _stateSaveTimer = setTimeout(doSave, 800);
+    }
+
+    function pruneRadarState() {
+        const now = Date.now();
+        const maxAgeMs = RADAR_CONFIG.stateMaxAgeDays * 24 * 60 * 60 * 1000;
+        const entries = Object.entries(radar.state);
+
+        const fresh = entries.filter(([, v]) => {
+            const ts = v.lastSeenAt || v.savedAt || 0;
+            return (now - ts) < maxAgeMs;
+        });
+
+        fresh.sort((a, b) => {
+            const ta = a[1].lastSeenAt || a[1].savedAt || 0;
+            const tb = b[1].lastSeenAt || b[1].savedAt || 0;
+            return tb - ta;
+        });
+
+        const trimmed = fresh.slice(0, RADAR_CONFIG.stateMaxEntries);
+
+        const newState = {};
+        for (const [k, v] of trimmed) newState[k] = v;
+        radar.state = newState;
+    }
+
+    function emergencyPruneState() {
+        const entries = Object.entries(radar.state);
+        entries.sort((a, b) => {
+            const ta = a[1].lastSeenAt || a[1].savedAt || 0;
+            const tb = b[1].lastSeenAt || b[1].savedAt || 0;
+            return tb - ta;
+        });
+        const trimmed = entries.slice(0, 100);
+        const newState = {};
+        for (const [k, v] of trimmed) newState[k] = v;
+        radar.state = newState;
+    }
+
+    // ═══════════════════════════════════════════════════
+    //  🆕 FIRST RUN — защита от заливки старьём на новом устройстве
+    // ═══════════════════════════════════════════════════
+    function isFirstRunEver() {
+        return !localStorage.getItem(RADAR_CONFIG.firstRunDoneKey);
+    }
+    function markFirstRunDone() {
+        localStorage.setItem(RADAR_CONFIG.firstRunDoneKey, '1');
+    }
+
+    // ═══════════════════════════════════════════════════
+    //  🆕 СВЕЖЕСТЬ — фильтр событий по 48 часам
+    // ═══════════════════════════════════════════════════
+    function isFresh(ts) {
+        if (!ts) return false;
+        const age = Date.now() - ts;
+        return age >= 0 && age < RADAR_CONFIG.freshnessWindowMs;
+    }
+
+    /**
+     * Очищает radar.events от событий старше 48 часов.
+     * Старые события остаются в radar.state (для будущих сравнений),
+     * но из UI (events) удаляются.
+     */
+    function cleanupOldEvents() {
+        const before = radar.events.length;
+        const cutoff = Date.now() - RADAR_CONFIG.freshnessWindowMs;
+        radar.events = radar.events.filter(e => e.ts >= cutoff);
+        const removed = before - radar.events.length;
+
+        // Чистим seen от ключей, которых уже нет в events и state
+        // (чтобы не разрасталось бесконечно)
+        const keepKeys = new Set(radar.events.map(e => e.key));
+        // Также оставляем ключи, которые могут понадобиться для
+        // дедупликации в будущем (из state они не вытаскиваются напрямую,
+        // но нам важно, чтобы seen не рос вечно)
+        // Поэтому обрезаем seen до 2000 последних — уже сделано в saveSeen.
+
+        if (removed > 0) {
+            console.log(`[RADAR] Автоочистка: удалено событий старше 48ч: ${removed}`);
+            if (radar.overlayOpen) renderRadarList();
+            updateRadarBadge();
+        }
+    }
+
+    // ── Стили ──
+    if (!document.getElementById('eventRadarStyles')) {
+        const style = document.createElement('style');
+        style.id = 'eventRadarStyles';
+        style.textContent = `
+            #radarToggleBtn { position: relative; }
+            #radarToggleBtn .radar-badge {
+                position: absolute; top: -4px; right: -4px;
+                min-width: 18px; height: 18px; padding: 0 5px;
+                border-radius: 9px;
+                background: linear-gradient(135deg, #00b894, #00a884);
+                color: #fff; font-size: 10px; font-weight: 700;
+                display: none; align-items: center; justify-content: center;
+                box-shadow: 0 2px 8px rgba(0,184,148,0.55);
+                border: 2px solid #0a0a0f; line-height: 1;
+            }
+            #radarToggleBtn .radar-badge.show { display: flex; }
+
+            #radarToggleBtnChats.scanning,
+            #radarToggleBtnChat.scanning {
+                animation: radarBtnPulse 1.5s ease-in-out infinite;
+            }
+            @keyframes radarBtnPulse {
+                0%, 100% {
+                    background: rgba(255,255,255,0.06);
+                    transform: scale(1);
+                }
+                50% {
+                    background: rgba(108,92,231,0.25);
+                    transform: scale(1.06);
+                }
+            }
+
+            #radarOverlay {
+                position: fixed; inset: 0;
+                background: linear-gradient(135deg, #0a0a0f 0%, #1a1a2e 100%);
+                z-index: 4800; display: none; flex-direction: column;
+                animation: radarFadeIn 0.25s ease;
+            }
+            #radarOverlay.show { display: flex; }
+            @keyframes radarFadeIn { from { opacity: 0; } to { opacity: 1; } }
+            .radar-header {
+                display: flex; align-items: center; gap: 12px;
+                padding: 14px 16px;
+                padding-top: calc(14px + env(safe-area-inset-top, 0px));
+                background: rgba(255,255,255,0.04);
+                backdrop-filter: blur(20px);
+                -webkit-backdrop-filter: blur(20px);
+                border-bottom: 1px solid rgba(255,255,255,0.06);
+                flex-shrink: 0;
+            }
+            .radar-header .radar-title {
+                flex: 1; min-width: 0;
+                display: flex; flex-direction: column; gap: 2px;
+            }
+            .radar-header .radar-title h2 {
+                font-size: 17px; font-weight: 700; color: #fff;
+                display: flex; align-items: center; gap: 8px;
+            }
+            .radar-header .radar-title h2 .radar-live-dot {
+                width: 8px; height: 8px; border-radius: 50%;
+                background: #555;
+                box-shadow: 0 0 4px rgba(100,100,100,0.4);
+                transition: background 0.3s, box-shadow 0.3s;
+            }
+            .radar-header .radar-title h2 .radar-live-dot.active {
+                background: #00b894;
+                box-shadow: 0 0 8px rgba(0,184,148,0.8);
+                animation: radarLivePulse 1.6s ease-in-out infinite;
+            }
+            @keyframes radarLivePulse {
+                0%, 100% { opacity: 1; transform: scale(1); }
+                50% { opacity: 0.6; transform: scale(0.85); }
+            }
+            .radar-header .radar-title .radar-sub {
+                font-size: 11px; color: #888;
+                font-variant-numeric: tabular-nums;
+            }
+            .radar-header .radar-btn {
+                width: 38px; height: 38px; border-radius: 50%;
+                background: rgba(255,255,255,0.06); border: none;
+                color: #888; font-size: 17px; cursor: pointer;
+                display: flex; align-items: center; justify-content: center;
+                flex-shrink: 0; transition: all 0.15s;
+            }
+            .radar-header .radar-btn:hover { background: rgba(255,255,255,0.12); color: #fff; }
+            .radar-header .radar-btn:active { transform: scale(0.9); }
+            .radar-header .radar-btn.on {
+                background: linear-gradient(135deg, rgba(108,92,231,0.35), rgba(0,184,148,0.25));
+                color: #fff;
+            }
+
+            .radar-progress {
+                padding: 10px 16px 12px;
+                background: rgba(108,92,231,0.08);
+                border-bottom: 1px solid rgba(108,92,231,0.2);
+                flex-shrink: 0;
+                display: none;
+            }
+            .radar-progress.show { display: block; }
+            .radar-progress .rp-line {
+                display: flex; align-items: center; justify-content: space-between;
+                gap: 10px; margin-bottom: 8px; font-size: 12px;
+            }
+            .radar-progress .rp-label {
+                flex: 1; min-width: 0; color: #a78bfa; font-weight: 600;
+                white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+                display: flex; align-items: center; gap: 8px;
+            }
+            .radar-progress .rp-label .rp-spinner {
+                width: 12px; height: 12px;
+                border: 2px solid rgba(167,139,250,0.25);
+                border-top-color: #a78bfa;
+                border-radius: 50%;
+                animation: radarSpin 0.7s linear infinite;
+                flex-shrink: 0;
+            }
+            @keyframes radarSpin { to { transform: rotate(360deg); } }
+            .radar-progress .rp-counter {
+                color: #fff; font-weight: 700;
+                font-variant-numeric: tabular-nums; flex-shrink: 0; font-size: 12px;
+            }
+            .radar-progress .rp-counter .rp-dim { color: #666; font-weight: 400; }
+            .radar-progress .rp-bar {
+                width: 100%; height: 4px;
+                background: rgba(255,255,255,0.08);
+                border-radius: 2px; overflow: hidden; position: relative;
+            }
+            .radar-progress .rp-fill {
+                height: 100%; width: 0%;
+                background: linear-gradient(90deg, #6c5ce7, #00b894);
+                border-radius: 2px;
+                transition: width 0.3s cubic-bezier(0.22, 0.61, 0.36, 1);
+                position: relative;
+            }
+            .radar-progress .rp-fill::after {
+                content: ''; position: absolute; inset: 0;
+                background: linear-gradient(90deg, transparent, rgba(255,255,255,0.35), transparent);
+                animation: radarProgressShine 1.5s infinite;
+            }
+            @keyframes radarProgressShine {
+                0% { transform: translateX(-100%); }
+                100% { transform: translateX(100%); }
+            }
+            .radar-progress.done {
+                background: rgba(0,184,148,0.08);
+                border-bottom-color: rgba(0,184,148,0.25);
+            }
+            .radar-progress.done .rp-label { color: #00b894; }
+            .radar-progress.done .rp-fill { background: linear-gradient(90deg, #00b894, #00b894); }
+            .radar-progress.done .rp-fill::after { display: none; }
+            .radar-progress.done .rp-label .rp-spinner { display: none; }
+
+            .radar-body {
+                flex: 1; overflow-y: auto;
+                padding: 12px 12px 40px;
+                -webkit-overflow-scrolling: touch;
+            }
+            .radar-empty { text-align: center; padding: 60px 20px; color: #666; }
+            .radar-empty .re-icon { font-size: 56px; margin-bottom: 12px; line-height: 1; opacity: 0.7; }
+            .radar-empty .re-title { font-size: 15px; color: #aaa; margin-bottom: 4px; font-weight: 600; }
+            .radar-empty .re-sub { font-size: 12px; color: #666; line-height: 1.5; }
+            .radar-chat-group { margin-bottom: 18px; }
+            .radar-chat-group-header {
+                display: flex; align-items: center; gap: 8px;
+                padding: 6px 4px 10px;
+                font-size: 12px; color: #a78bfa; font-weight: 700;
+                text-transform: uppercase; letter-spacing: 0.4px;
+                position: sticky; top: 0;
+                background: linear-gradient(180deg, #0f0f18 0%, rgba(15,15,24,0.95) 100%);
+                z-index: 2; margin: -4px -4px 0;
+            }
+            .radar-chat-group-header .rcgh-avatar {
+                width: 22px; height: 22px; border-radius: 50%;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                display: flex; align-items: center; justify-content: center;
+                font-weight: 700; color: #fff; font-size: 11px; flex-shrink: 0;
+            }
+            .radar-chat-group-header .rcgh-name {
+                flex: 1; min-width: 0;
+                white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+                color: #fff; text-transform: none; letter-spacing: 0; font-size: 13px;
+            }
+            .radar-event {
+                display: flex; gap: 10px; padding: 12px 14px; margin-bottom: 8px;
+                background: rgba(255,255,255,0.04);
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 14px; cursor: pointer;
+                transition: all 0.18s ease; position: relative;
+                animation: radarEventIn 0.3s ease;
+                -webkit-tap-highlight-color: transparent; overflow: hidden;
+            }
+            @keyframes radarEventIn {
+                from { opacity: 0; transform: translateY(-6px); }
+                to { opacity: 1; transform: translateY(0); }
+            }
+
+            .radar-event:not(.seen-old) {
+                border-left: 3px solid #00b894;
+                background: linear-gradient(90deg, rgba(0,184,148,0.06) 0%, rgba(255,255,255,0.04) 40%);
+            }
+            .radar-event:not(.seen-old):hover {
+                background: linear-gradient(90deg, rgba(0,184,148,0.12) 0%, rgba(108,92,231,0.12) 100%);
+                border-color: rgba(0,184,148,0.4);
+                transform: translateY(-1px);
+                box-shadow: 0 4px 18px rgba(0,184,148,0.2);
+            }
+
+            .radar-event.on-mine {
+                border-color: rgba(254,202,87,0.5) !important;
+                background: linear-gradient(135deg,
+                    rgba(254,202,87,0.08) 0%,
+                    rgba(255,159,67,0.04) 100%) !important;
+                box-shadow: 0 0 0 1px rgba(254,202,87,0.15),
+                            0 4px 16px rgba(254,202,87,0.15);
+            }
+            .radar-event.on-mine:not(.seen-old) {
+                border-left: 3px solid #feca57 !important;
+            }
+            .radar-event.on-mine:hover {
+                background: linear-gradient(135deg,
+                    rgba(254,202,87,0.18) 0%,
+                    rgba(255,159,67,0.08) 100%) !important;
+                border-color: rgba(254,202,87,0.7) !important;
+                box-shadow: 0 0 0 1px rgba(254,202,87,0.3),
+                            0 6px 22px rgba(254,202,87,0.3);
+            }
+            .radar-event.on-mine .re-kind {
+                background: linear-gradient(135deg, rgba(254,202,87,0.35), rgba(255,159,67,0.25)) !important;
+                color: #feca57 !important;
+            }
+
+            .radar-event.seen-old {
+                opacity: 0.55;
+                background: rgba(255,255,255,0.02);
+                border-color: rgba(255,255,255,0.04);
+                border-left-color: rgba(255,255,255,0.08);
+                filter: grayscale(0.4);
+            }
+            .radar-event.seen-old:hover {
+                opacity: 0.9;
+                background: rgba(108,92,231,0.08);
+                border-color: rgba(108,92,231,0.25);
+                filter: grayscale(0);
+                transform: translateY(-1px);
+            }
+            .radar-event.seen-old .re-kind {
+                filter: grayscale(0.7);
+                opacity: 0.8;
+            }
+            .radar-event.seen-old.on-mine {
+                filter: grayscale(0.2);
+                opacity: 0.7;
+            }
+            .radar-event.seen-old.on-mine:hover {
+                filter: grayscale(0);
+                opacity: 1;
+            }
+
+            .radar-event .re-my-badge {
+                display: inline-flex; align-items: center; gap: 3px;
+                padding: 2px 7px;
+                background: linear-gradient(135deg, rgba(254,202,87,0.3), rgba(255,159,67,0.2));
+                border: 1px solid rgba(254,202,87,0.5);
+                border-radius: 8px;
+                font-size: 9px; font-weight: 700; color: #feca57;
+                text-transform: uppercase; letter-spacing: 0.4px;
+                margin-left: 4px; flex-shrink: 0;
+                animation: myBadgePulse 2s ease-in-out infinite;
+            }
+            @keyframes myBadgePulse {
+                0%, 100% { box-shadow: 0 0 0 0 rgba(254,202,87,0.4); }
+                50% { box-shadow: 0 0 0 4px rgba(254,202,87,0); }
+            }
+
+            .radar-event .re-kind {
+                width: 42px; height: 42px; border-radius: 12px;
+                display: flex; align-items: center; justify-content: center;
+                font-size: 20px; flex-shrink: 0; position: relative;
+            }
+            .radar-event.kind-reaction .re-kind {
+                background: linear-gradient(135deg, rgba(255,107,107,0.25), rgba(238,82,83,0.15));
+                color: #ff8a8a;
+            }
+            .radar-event.kind-comment .re-kind {
+                background: linear-gradient(135deg, rgba(108,92,231,0.28), rgba(167,139,250,0.18));
+                color: #a78bfa;
+            }
+            .radar-event .re-kind .re-kind-badge {
+                position: absolute; right: -3px; bottom: -3px;
+                min-width: 18px; height: 18px; padding: 0 5px;
+                border-radius: 9px;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                color: #fff; font-size: 10px; font-weight: 700;
+                display: flex; align-items: center; justify-content: center;
+                border: 2px solid #0a0a0f; line-height: 1;
+            }
+            .radar-event .re-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+            .radar-event .re-head {
+                display: flex; align-items: center; gap: 6px;
+                font-size: 11px; color: #888; margin-bottom: 2px;
+                flex-wrap: wrap;
+            }
+            .radar-event .re-head .re-from {
+                font-weight: 700; color: #a78bfa;
+                white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+                max-width: 45%;
+            }
+            .radar-event .re-head .re-time {
+                color: #666; font-variant-numeric: tabular-nums; white-space: nowrap;
+            }
+            .radar-event .re-head .re-dot { color: #444; }
+            .radar-event .re-attach-preview {
+                display: inline-flex; align-items: center; gap: 6px;
+                padding: 3px 8px; background: rgba(0,0,0,0.25);
+                border: 1px solid rgba(255,255,255,0.06);
+                border-radius: 8px; font-size: 11px; color: #bbb;
+                margin-top: 2px; max-width: 100%; width: fit-content;
+                overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+            }
+            .radar-event .re-attach-preview .re-attach-icon { font-size: 13px; }
+            .radar-event .re-reaction {
+                display: inline-flex; align-items: center; gap: 6px;
+                padding: 4px 10px;
+                background: linear-gradient(135deg, rgba(108,92,231,0.28), rgba(0,184,148,0.18));
+                border: 1px solid rgba(108,92,231,0.5);
+                border-radius: 12px; font-size: 15px; line-height: 1;
+                width: fit-content; margin-top: 2px; color: #fff;
+            }
+            .radar-event .re-reaction .re-reaction-count {
+                font-size: 12px; font-weight: 700; color: #fff;
+            }
+            .radar-event .re-comment-bubble {
+                background: rgba(0,0,0,0.28);
+                border-left: 3px solid #a78bfa;
+                border-radius: 8px; padding: 6px 10px;
+                font-size: 12px; color: #ddd; line-height: 1.35;
+                margin-top: 2px; word-break: break-word; white-space: pre-wrap;
+                max-height: 4.2em; overflow: hidden;
+                display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+            }
+            .radar-header .radar-btn.radar-clear { font-size: 15px; }
+            .radar-header .radar-btn.radar-clear:hover {
+                background: rgba(255,107,107,0.2); color: #ff6b6b;
+            }
+            .radar-header .radar-btn.radar-reset:hover {
+                background: rgba(108,92,231,0.25); color: #a78bfa;
+            }
+            .radar-divider {
+                display: flex; align-items: center; gap: 10px;
+                padding: 16px 4px 10px; color: #555;
+                font-size: 11px; text-transform: uppercase;
+                letter-spacing: 0.5px; font-weight: 700;
+            }
+            .radar-divider::before, .radar-divider::after {
+                content: ''; flex: 1; height: 1px;
+                background: linear-gradient(90deg, transparent, rgba(255,255,255,0.08), transparent);
+            }
+            @media (max-width: 480px) {
+                .radar-header .radar-title h2 { font-size: 15px; }
+                .radar-event { padding: 10px 12px; }
+                .radar-event .re-kind { width: 38px; height: 38px; font-size: 18px; }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ── Утилиты ──
+    function escapeHtml(s) {
+        if (typeof window.escapeHtml === 'function') return window.escapeHtml(s);
+        const div = document.createElement('div');
+        div.textContent = s == null ? '' : String(s);
+        return div.innerHTML;
+    }
+    function showToastSafe(msg, dur = 2000) {
+        if (typeof showToast === 'function') showToast(msg, dur);
+    }
+
+    // ── Кнопки ──
+    let _installingButtons = false;
+    function installRadarButtons() {
+        if (_installingButtons) return;
+        _installingButtons = true;
+        try {
+            const chatsHeader = document.querySelector('#chatsScreen .auth-header');
+            if (chatsHeader && !document.getElementById('radarToggleBtnChats')) {
+                const rightBlock = chatsHeader.querySelector('div[style*="display:flex"]');
+                if (rightBlock) {
+                    const btn = document.createElement('button');
+                    btn.className = 'exit-btn';
+                    btn.id = 'radarToggleBtnChats';
+                    btn.title = 'События';
+                    btn.innerHTML = `🔔<span class="radar-badge" id="radarBadgeChats">0</span>`;
+                    btn.style.position = 'relative';
+                    rightBlock.insertBefore(btn, rightBlock.firstChild);
+                    btn.addEventListener('click', openRadarOverlay);
+                }
+            }
+
+            const chatHeader = document.querySelector('#chatScreen .chat-header');
+            if (chatHeader && !document.getElementById('radarToggleBtnChat')) {
+                const searchBtn = document.getElementById('searchChatBtn');
+                if (searchBtn && searchBtn.parentNode) {
+                    const btn = document.createElement('button');
+                    btn.className = 'exit-btn';
+                    btn.id = 'radarToggleBtnChat';
+                    btn.title = 'События';
+                    btn.innerHTML = `🔔<span class="radar-badge" id="radarBadgeChat">0</span>`;
+                    btn.style.position = 'relative';
+                    btn.style.marginRight = '8px';
+                    searchBtn.parentNode.insertBefore(btn, searchBtn);
+                    btn.addEventListener('click', openRadarOverlay);
+                }
+            }
+        } finally {
+            _installingButtons = false;
+        }
+    }
+
+    let _btnObserverTimer = null;
+    const _btnObserver = new MutationObserver(() => {
+        if (_btnObserverTimer) return;
+        _btnObserverTimer = setTimeout(() => {
+            _btnObserverTimer = null;
+            installRadarButtons();
+            updateRadarBadge();
+        }, 200);
+    });
+    _btnObserver.observe(document.body, { childList: true, subtree: true });
+
+    installRadarButtons();
+
+    function updateRadarBadge() {
+        const unread = radar.events.filter(e => !e.seen).length;
+        const onMineUnread = radar.events.filter(e => !e.seen && e.isOnMyMessage).length;
+
+        ['radarBadgeChats', 'radarBadgeChat'].forEach(id => {
+            const el = document.getElementById(id);
+            if (!el) return;
+            if (unread > 0) {
+                el.textContent = unread > 99 ? '99+' : String(unread);
+                el.classList.add('show');
+                if (onMineUnread > 0) {
+                    el.style.background = 'linear-gradient(135deg, #feca57, #ff9f43)';
+                    el.style.boxShadow = '0 2px 8px rgba(254,202,87,0.65)';
+                } else {
+                    el.style.background = '';
+                    el.style.boxShadow = '';
+                }
+            } else {
+                el.classList.remove('show');
+                el.style.background = '';
+                el.style.boxShadow = '';
+            }
+        });
+    }
+
+    function hideRadarBadgesNow() {
+        ['radarBadgeChats', 'radarBadgeChat'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) {
+                el.textContent = '0';
+                el.classList.remove('show');
+            }
+        });
+    }
+
+    function setScanningVisual(active) {
+        ['radarToggleBtnChats', 'radarToggleBtnChat'].forEach(id => {
+            const btn = document.getElementById(id);
+            if (btn) btn.classList.toggle('scanning', active);
+        });
+        const liveDot = document.querySelector('.radar-live-dot');
+        if (liveDot) liveDot.classList.toggle('active', active);
+    }
+
+    // ── Прогресс ──
+    function updateRadarProgress() {
+        const box = document.getElementById('radarProgress');
+        const labelText = document.getElementById('rpLabelText');
+        const done = document.getElementById('rpDone');
+        const total = document.getElementById('rpTotal');
+        const fill = document.getElementById('rpFill');
+        if (!box || !fill) return;
+
+        const p = radar.progress;
+
+        if (p.phase === 'scanning') {
+            box.classList.add('show');
+            box.classList.remove('done');
+            labelText.textContent = p.current
+                ? `Сканирую: ${p.current}`
+                : 'Сканирую чаты…';
+            done.textContent = p.done;
+            total.textContent = p.total;
+            const pct = p.total > 0 ? (p.done / p.total) * 100 : 0;
+            fill.style.width = pct + '%';
+        } else if (p.phase === 'done') {
+            box.classList.add('show', 'done');
+            if (p.changedCount > 0) {
+                labelText.textContent = `Готово · обновлено чатов: ${p.changedCount}`;
+            } else {
+                labelText.textContent = 'Готово · изменений нет';
+            }
+            done.textContent = p.total;
+            total.textContent = p.total;
+            fill.style.width = '100%';
+        } else {
+            box.classList.remove('show', 'done');
+        }
+    }
+
+    function hideRadarProgressAfter(ms = 1800) {
+        setTimeout(() => {
+            if (radar.progress.phase === 'done' && !radar.scanning) {
+                const box = document.getElementById('radarProgress');
+                if (box) box.classList.remove('show', 'done');
+                radar.progress.phase = 'idle';
+            }
+        }, ms);
+    }
+
+    // ── Оверлей ──
+    function ensureOverlay() {
+        let ov = document.getElementById('radarOverlay');
+        if (ov) return ov;
+
+        ov = document.createElement('div');
+        ov.id = 'radarOverlay';
+        ov.innerHTML = `
+            <div class="radar-header">
+                <div class="radar-title">
+                    <h2>
+                        <span class="radar-live-dot"></span>
+                        <span>События</span>
+                    </h2>
+                    <div class="radar-sub" id="radarSub">Готов</div>
+                </div>
+                <button class="radar-btn on" id="radarOnOffBtn" title="Вкл/выкл">⏸</button>
+                <button class="radar-btn radar-reset" id="radarResetStateBtn" title="Забыть всё (показать заново)">🔄</button>
+                <button class="radar-btn radar-clear" id="radarClearBtn" title="Очистить историю">🗑</button>
+                <button class="radar-btn" id="radarCloseBtn" title="Закрыть">✕</button>
+            </div>
+            <div class="radar-progress" id="radarProgress">
+                <div class="rp-line">
+                    <div class="rp-label" id="rpLabel">
+                        <span class="rp-spinner"></span>
+                        <span id="rpLabelText">Сканирую…</span>
+                    </div>
+                    <div class="rp-counter" id="rpCounter">
+                        <span id="rpDone">0</span><span class="rp-dim"> / <span id="rpTotal">0</span></span>
+                    </div>
+                </div>
+                <div class="rp-bar"><div class="rp-fill" id="rpFill"></div></div>
+            </div>
+            <div class="radar-body" id="radarBody"></div>
+        `;
+        document.body.appendChild(ov);
+
+        ov.querySelector('#radarCloseBtn').addEventListener('click', closeRadarOverlay);
+
+        ov.querySelector('#radarClearBtn').addEventListener('click', () => {
+            if (!confirm('Очистить историю событий? Список показанных событий тоже будет сброшен.')) return;
+            radar.events = [];
+            radar.seen.clear();
+            saveSeen();
+            renderRadarList();
+            updateRadarBadge();
+            showToastSafe('🗑️ История событий очищена');
+        });
+
+        ov.querySelector('#radarResetStateBtn').addEventListener('click', () => {
+            if (!confirm('Забыть, что вы видели?\n\nСобытия покажутся заново — даже те, что вы уже просмотрели.')) return;
+            radar.events = [];
+            radar.seen.clear();
+            radar.state = {};
+            saveSeen();
+            saveRadarState(true);
+            renderRadarList();
+            updateRadarBadge();
+            showToastSafe('🔄 Состояние сброшено');
+        });
+
+        ov.querySelector('#radarOnOffBtn').addEventListener('click', toggleRadarEnabled);
+
+        return ov;
+    }
+
+    function openRadarOverlay() {
+        ensureOverlay();
+        const ov = document.getElementById('radarOverlay');
+        ov.classList.add('show');
+        radar.overlayOpen = true;
+        document.body.style.overflow = 'hidden';
+
+        hideRadarBadgesNow();
+
+        if (radar.enabled && !radar.scanning) {
+            const lastScan = radar._lastScanTs || 0;
+            if (Date.now() - lastScan > 5000) {
+                scanAllChats();
+            }
+        }
+        renderRadarList();
+        updateRadarHeaderState();
+        updateRadarProgress();
+    }
+
+    function closeRadarOverlay() {
+        const ov = document.getElementById('radarOverlay');
+        if (!ov) return;
+        ov.classList.remove('show');
+        radar.overlayOpen = false;
+        document.body.style.overflow = '';
+
+        const visibleKeys = new Set();
+        ov.querySelectorAll('.radar-event').forEach(el => {
+            const key = el.dataset.key;
+            if (key) visibleKeys.add(key);
+        });
+        let changed = false;
+        radar.events.forEach(e => {
+            if (visibleKeys.has(e.key) && !e.seen) {
+                e.seen = true;
+                radar.seen.add(e.key);
+                changed = true;
+            }
+        });
+        if (changed) saveSeen();
+
+        hideRadarBadgesNow();
+        updateRadarBadge();
+    }
+
+    function toggleRadarEnabled() {
+        radar.enabled = !radar.enabled;
+        localStorage.setItem(RADAR_CONFIG.enabledStorageKey, radar.enabled ? '1' : '0');
+        updateRadarHeaderState();
+
+        if (radar.enabled) {
+            showToastSafe('🔔 События включены');
+            startRadarLoop();
+        } else {
+            showToastSafe('⏸ Отслеживание выключено');
+            stopRadarLoop();
+        }
+    }
+
+    function updateRadarHeaderState() {
+        const btn = document.getElementById('radarOnOffBtn');
+        if (!btn) return;
+        btn.textContent = radar.enabled ? '⏸' : '▶';
+        btn.classList.toggle('on', radar.enabled);
+        btn.title = radar.enabled ? 'Поставить на паузу' : 'Возобновить';
+    }
+
+    // ── Рендер ──
+    function renderRadarList() {
+        const body = document.getElementById('radarBody');
+        const sub = document.getElementById('radarSub');
+        if (!body) return;
+
+        const total = radar.events.length;
+        const freshCount = radar.events.filter(e => !e.seen).length;
+
+        if (sub) {
+            if (radar.scanning) {
+                sub.textContent = `🔔 Сканирую… ${radar.progress.done}/${radar.progress.total}`;
+            } else {
+                const lastScan = radar._lastScanTs;
+                const ago = lastScan ? Math.round((Date.now() - lastScan) / 1000) : null;
+                const agoStr = ago !== null
+                    ? (ago < 5 ? 'только что'
+                        : ago < 60 ? `${ago} сек назад`
+                        : `${Math.round(ago / 60)} мин назад`)
+                    : '';
+
+                const onMine = radar.events.filter(e => !e.seen && e.isOnMyMessage).length;
+                const onMineStr = onMine > 0 ? `⭐ ${onMine} на ваших · ` : '';
+
+                sub.textContent = freshCount > 0
+                    ? `${onMineStr}Новых: ${freshCount} · Всего: ${total}` + (agoStr ? ` · ${agoStr}` : '')
+                    : `Всего: ${total}` + (agoStr ? ` · скан ${agoStr}` : '');
+            }
+        }
+
+        if (total === 0) {
+            body.innerHTML = `
+                <div class="radar-empty">
+                    <div class="re-icon">🔔</div>
+                    <div class="re-title">${radar.enabled ? 'Пока ничего нового' : 'Отслеживание выключено'}</div>
+                    <div class="re-sub">
+                        ${radar.enabled
+                            ? 'Как только кто-то поставит реакцию или оставит комментарий — появится здесь. События старше 48 часов не показываются.'
+                            : 'Включите кнопкой ▶ в шапке.'}
+                    </div>
+                </div>
+            `;
+            return;
+        }
+
+        const sorted = radar.events.slice().sort((a, b) => {
+            if (a.seen !== b.seen) return a.seen ? 1 : -1;
+            if (!a.seen && !b.seen) {
+                if (a.isOnMyMessage !== b.isOnMyMessage) {
+                    return a.isOnMyMessage ? -1 : 1;
+                }
+            }
+            return b.ts - a.ts;
+        });
+
+        const freshList = sorted.filter(e => !e.seen);
+        const older = sorted.filter(e => e.seen);
+
+        let html = '';
+
+        if (freshList.length > 0) {
+            html += renderGroup(freshList);
+        }
+
+        if (older.length > 0) {
+            html += `<div class="radar-divider">История</div>`;
+            html += renderGroup(older.slice(0, RADAR_CONFIG.maxEventsShown));
+        }
+
+        body.innerHTML = html;
+
+        body.querySelectorAll('.radar-event').forEach(el => {
+            el.addEventListener('click', () => {
+                const chatFile = el.dataset.chatFile;
+                const msgId = parseInt(el.dataset.msgId);
+                const key = el.dataset.key;
+
+                const ev = radar.events.find(x => x.key === key);
+                if (ev && !ev.seen) {
+                    ev.seen = true;
+                    markSeen(key);
+                    updateRadarBadge();
+                }
+
+                jumpToRadarEvent(chatFile, msgId);
+            });
+        });
+    }
+
+    function renderGroup(events) {
+        const byChat = new Map();
+        for (const e of events) {
+            if (!byChat.has(e.chatFile)) byChat.set(e.chatFile, []);
+            byChat.get(e.chatFile).push(e);
+        }
+
+        let html = '';
+        for (const [chatFile, items] of byChat) {
+            const chat = state.chats.find(c => c.file === chatFile);
+            const chatName = chat ? (chat.name || chat.file) : chatFile;
+            const letter = (chatName || '?').charAt(0).toUpperCase();
+
+            html += `<div class="radar-chat-group">`;
+            html += `<div class="radar-chat-group-header">
+                        <div class="rcgh-avatar">${escapeHtml(letter)}</div>
+                        <div class="rcgh-name">${escapeHtml(chatName)}</div>
+                        <div style="font-size:11px;color:#666;font-weight:500;">${items.length}</div>
+                     </div>`;
+
+            for (const e of items) {
+                html += renderEventCard(e);
+            }
+            html += `</div>`;
+        }
+        return html;
+    }
+
+    function renderEventCard(e) {
+        const isReaction = e.kind === 'reaction';
+        const kindCls = isReaction ? 'kind-reaction' : 'kind-comment';
+        const kindIcon = isReaction ? '❤️' : '💬';
+        const onMineCls = e.isOnMyMessage ? ' on-mine' : '';
+        const seenCls = e.seen ? ' seen-old' : '';
+        const timeStr = formatRadarTime(e.ts);
+
+        let bodyHtml = '';
+
+        if (e.attachPreview) {
+            bodyHtml += `<div class="re-attach-preview">
+                            <span class="re-attach-icon">${e.attachPreview.icon}</span>
+                            <span>${escapeHtml(e.attachPreview.text)}</span>
+                         </div>`;
+        }
+
+        if (isReaction) {
+            const emoji = e.payload.emoji || '❤️';
+            const count = e.payload.users?.length || 1;
+            bodyHtml += `<div class="re-reaction">
+                            <span>${escapeHtml(emoji)}</span>
+                            <span class="re-reaction-count">${count}</span>
+                         </div>`;
+        } else {
+            const text = e.payload.text || '';
+            const emojiInfo = (typeof analyzeEmojiOnly === 'function')
+                ? analyzeEmojiOnly(text)
+                : null;
+            const textCls = emojiInfo ? 're-comment-bubble emoji-only' : 're-comment-bubble';
+            bodyHtml += `<div class="${textCls}">${renderRadarTextWithLinks(text)}</div>`;
+        }
+
+        const fromName = e.payload.from === state.username ? 'Вы' : (e.payload.from || '—');
+        const fromSafe = escapeHtml(fromName);
+
+        const myBadge = e.isOnMyMessage
+            ? `<span class="re-my-badge">⭐ на ваше</span>`
+            : '';
+
+        return `
+            <div class="radar-event ${kindCls}${onMineCls}${seenCls}"
+                 data-chat-file="${escapeHtml(e.chatFile)}"
+                 data-msg-id="${e.msgId}"
+                 data-key="${escapeHtml(e.key)}">
+                <div class="re-kind">${kindIcon}
+                    ${isReaction && e.payload.users?.length > 1
+                        ? `<span class="re-kind-badge">${e.payload.users.length}</span>`
+                        : ''}
+                </div>
+                <div class="re-body">
+                    <div class="re-head">
+                        <span class="re-from">${isReaction ? 'Реакция от' : 'Комментарий от'} ${fromSafe}</span>
+                        ${myBadge}
+                        <span class="re-dot">·</span>
+                        <span class="re-time">${escapeHtml(timeStr)}</span>
+                    </div>
+                    ${bodyHtml}
+                </div>
+            </div>
+        `;
+    }
+
+    function renderRadarTextWithLinks(text) {
+        if (!text) return '';
+        if (typeof renderTextWithLinks === 'function') {
+            return renderTextWithLinks(text);
+        }
+        return escapeHtml(text);
+    }
+
+    function formatRadarTime(ts) {
+        const d = new Date(ts);
+        const now = new Date();
+        const diff = now - d;
+        if (diff < 60 * 1000) return 'только что';
+        if (diff < 60 * 60 * 1000) return `${Math.floor(diff / 60000)} мин назад`;
+        if (diff < 24 * 60 * 60 * 1000) {
+            return d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+        }
+        return d.toLocaleDateString('ru-RU', { day: 'numeric', month: 'short' })
+            + ' ' + d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+    }
+
+    // ── Переход ──
+    async function jumpToRadarEvent(chatFile, msgId) {
+        closeRadarOverlay();
+
+        if (state.chatFile === chatFile) {
+            const el = document.querySelector(
+                `.message-wrapper[data-msg-id="${msgId}"]`
+            );
+            if (el) {
+                el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                el.classList.remove('highlight-flash');
+                void el.offsetWidth;
+                el.classList.add('highlight-flash');
+                setTimeout(() => el.classList.remove('highlight-flash'), 1400);
+            } else {
+                window._pendingJumpToMsgId = msgId;
+                if (typeof renderHistory === 'function') renderHistory();
+            }
+            return;
+        }
+
+        const chat = state.chats.find(c => c.file === chatFile);
+        if (!chat) {
+            showToastSafe('❌ Чат не найден в списке', 2000);
+            return;
+        }
+        const password = state.savedPasswords[chatFile];
+        if (!password) {
+            showToastSafe('🔐 Нужен пароль чата для перехода', 2500);
+            return;
+        }
+
+        window._pendingJumpToMsgId = msgId;
+
+        try {
+            if (typeof enterChat === 'function') {
+                await enterChat(chatFile, chat.name || chatFile, password);
+            } else {
+                showToastSafe('❌ enterChat недоступен', 2000);
+            }
+        } catch (e) {
+            console.error('radar jump error:', e);
+            window._pendingJumpToMsgId = null;
+            showToastSafe('❌ Не удалось открыть чат: ' + e.message, 2500);
+        }
+    }
+
+    // ── Сканирование ──
+    async function scanAllChats() {
+        if (!state.token || !state.isAuthorized) return;
+        if (radar.scanning) return;
+
+        if (state.chats.length === 0) {
+            radar.scanning = false;
+            radar.progress.phase = 'idle';
+            updateRadarProgress();
+            renderRadarList();
+            return;
+        }
+
+        radar.scanning = true;
+        radar._lastScanTs = Date.now();
+        setScanningVisual(true);
+
+        radar.progress = {
+            total: state.chats.length,
+            done: 0,
+            current: state.chats[0]?.name || '',
+            startedAt: Date.now(),
+            phase: 'scanning',
+            changedCount: 0,
+        };
+        updateRadarProgress();
+
+        const sub = document.getElementById('radarSub');
+        if (sub && radar.overlayOpen) {
+            sub.textContent = `🔔 Сканирую… 0/${radar.progress.total}`;
+        }
+
+        try {
+            for (const chat of state.chats) {
+                if (!radar.enabled) break;
+                radar.progress.current = chat.name || chat.file;
+                updateRadarProgress();
+
+                if (sub && radar.overlayOpen) {
+                    sub.textContent = `🔔 Сканирую… ${radar.progress.done}/${radar.progress.total}`;
+                }
+
+                try {
+                    await scanOneChat(chat);
+                } catch (e) {
+                    console.warn('scan chat failed', chat.file, e.message);
+                }
+
+                radar.progress.done++;
+                updateRadarProgress();
+            }
+
+            // 🆕 Автоочистка старых событий
+            cleanupOldEvents();
+
+            radar.progress.phase = 'done';
+            updateRadarProgress();
+            hideRadarProgressAfter(1800);
+
+            if (radar.overlayOpen) renderRadarList();
+            updateRadarBadge();
+        } catch (e) {
+            console.warn('radar scan error:', e);
+            radar.progress.phase = 'idle';
+            updateRadarProgress();
+        } finally {
+            radar.scanning = false;
+            setScanningVisual(false);
+            if (sub && radar.overlayOpen) renderRadarList();
+        }
+    }
+
+    async function scanOneChat(chat) {
+        const file = chat.file;
+        try {
+            const cachedEtag = radar.etags[file] || null;
+            let metaRes;
+            try {
+                metaRes = await fetchRadarMeta(file, cachedEtag);
+            } catch (e) {
+                return;
+            }
+            if (!metaRes || metaRes.notModified) return;
+            if (!metaRes.exists) {
+                radar.etags[file] = null;
+                return;
+            }
+            radar.etags[file] = metaRes.etag || null;
+
+            const metaVersion = metaRes.content && metaRes.content.version;
+            if (!metaVersion) return;
+
+            if (radar.metaVersions[file] === metaVersion) return;
+
+            const prevVersion = radar.metaVersions[file];
+            radar.metaVersions[file] = metaVersion;
+
+            // 🆕 Первый скан в ЭТОЙ сессии — просто запоминаем версию
+            if (prevVersion === undefined) return;
+
+            if (prevVersion !== metaVersion) {
+                radar.progress.changedCount++;
+            }
+
+            const password = state.savedPasswords[file];
+            if (!password) return;
+
+            const path = `chats/${file}.json`;
+            const res = await fetchRadarFile(path);
+            if (!res || !res.exists) return;
+
+            const content = res.content;
+            if (!content || content.v !== 2 || !content.salt) return;
+
+            const key = await deriveKeyRadar(password, content.salt);
+            const decrypted = [];
+            for (const enc of (content.messages || [])) {
+                const msg = await decryptRadarMessage(enc, key);
+                if (msg) decrypted.push(msg);
+            }
+
+            // 🆕 Проверяем: это первый запуск радара НА ЭТОМ УСТРОЙСТВЕ вообще?
+            const isFirstRun = isFirstRunEver();
+
+            const now = Date.now();
+            const processedMsgIds = new Set();
+            let eventsAdded = 0;
+
+            for (const msg of decrypted) {
+                const stateKey = `${file}|${msg.id}`;
+                processedMsgIds.add(stateKey);
+
+                const saved = radar.state[stateKey];
+                const reactionsNow = msg.reactions || {};
+                const commentsNow = Array.isArray(msg.comments) ? msg.comments : [];
+                const reactionsPrev = saved?.reactions || {};
+                const commentsPrev = saved?.comments || [];
+                const isFirstTime = !saved;
+
+                // ═══ РЕАКЦИИ ═══
+                for (const [emoji, users] of Object.entries(reactionsNow)) {
+                    const usersArr = Array.isArray(users) ? users : [];
+                    const prevArr = Array.isArray(reactionsPrev[emoji]) ? reactionsPrev[emoji] : [];
+                    const added = isFirstTime
+                        ? usersArr
+                        : usersArr.filter(u => !prevArr.includes(u));
+
+                    for (const u of added) {
+                        // 🆕 На первом запуске вообще не генерируем события —
+                        //     просто запоминаем состояние
+                        if (isFirstRun) break;
+
+                        const eventKey = `${file}|${msg.id}|reaction|${emoji}|${u}`;
+                        if (radar.seen.has(eventKey)) continue;
+                        if (radar.events.find(x => x.key === eventKey)) continue;
+
+                        const evTs = now;   // у реакций своей даты нет — только момент обнаружения
+                        if (!isFresh(evTs)) continue;   // 🆕 фильтр 48 часов
+
+                        radar.events.push({
+                            key: eventKey,
+                            chatFile: file,
+                            msgId: msg.id,
+                            ts: evTs,
+                            seen: false,
+                            kind: 'reaction',
+                            isOnMyMessage: msg.username === state.username,
+                            payload: {
+                                emoji,
+                                users: usersArr,
+                                from: u,
+                                author: msg.username,
+                            },
+                            attachPreview: buildAttachPreview(msg),
+                        });
+                        eventsAdded++;
+                    }
+                }
+
+                // ═══ КОММЕНТАРИИ ═══
+                const prevIds = new Set(commentsPrev.map(c => c.id));
+                for (const c of commentsNow) {
+                    if (prevIds.has(c.id)) continue;
+
+                    if (isFirstRun) continue;   // 🆕 на первом запуске — только снимок
+
+                    const eventKey = `${file}|${msg.id}|comment|${c.id}`;
+                    if (radar.seen.has(eventKey)) continue;
+                    if (radar.events.find(x => x.key === eventKey)) continue;
+
+                    // 🆕 У комментариев ЕСТЬ дата — используем её для фильтра
+                    const commentTs = new Date(c.time).getTime() || now;
+                    if (!isFresh(commentTs)) continue;
+
+                    radar.events.push({
+                        key: eventKey,
+                        chatFile: file,
+                        msgId: msg.id,
+                        ts: commentTs,
+                        seen: false,
+                        kind: 'comment',
+                        isOnMyMessage: msg.username === state.username,
+                        payload: {
+                            text: c.text || '',
+                            from: c.username,
+                            author: msg.username,
+                        },
+                        attachPreview: buildAttachPreview(msg),
+                    });
+                    eventsAdded++;
+                }
+
+                // ═══ ОБНОВЛЯЕМ СНИМОК ═══
+                radar.state[stateKey] = {
+                    reactions: { ...reactionsNow },
+                    comments: commentsNow.map(c => ({ id: c.id, username: c.username })),
+                    savedAt: saved?.savedAt || now,
+                    lastSeenAt: now,
+                };
+            }
+
+            // Чистим снимки удалённых сообщений
+            const prefix = `${file}|`;
+            for (const stateKey of Object.keys(radar.state)) {
+                if (!stateKey.startsWith(prefix)) continue;
+                if (!processedMsgIds.has(stateKey)) {
+                    delete radar.state[stateKey];
+                }
+            }
+
+            saveRadarState();
+
+            if (isFirstRun) {
+                console.log('[RADAR] Первый запуск — состояние сохранено без показа событий');
+            } else if (eventsAdded > 0) {
+                console.log(`[RADAR] ${file}: добавлено событий: ${eventsAdded}`);
+            }
+
+            if (radar.events.length > RADAR_CONFIG.maxEventsKept) {
+                radar.events = radar.events.slice(-RADAR_CONFIG.maxEventsKept);
+            }
+
+        } catch (e) {
+            console.warn('radar scanOneChat error', file, e.message);
+        }
+    }
+
+    function buildAttachPreview(msg) {
+        if (msg.image) return { icon: '📷', text: 'Фото' };
+        if (msg.videoNote) return { icon: '🎥', text: 'Видео-кружочек' };
+        if (msg.video) return { icon: '🎬', text: msg.videoName || 'Видео' };
+        if (msg.audio) {
+            const hasName = !!(msg.audioName && msg.audioName.trim());
+            return {
+                icon: hasName ? '🎵' : '🎤',
+                text: hasName ? msg.audioName : 'Голосовое',
+            };
+        }
+        if (msg.file) return { icon: '📎', text: msg.fileName || 'Файл' };
+        return null;
+    }
+
+    async function fetchRadarMeta(file, etag) {
+        const path = `chats/${file}.meta.json`;
+        const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${path}`;
+        const headers = {
+            'Authorization': `token ${state.token}`,
+            'Accept': 'application/vnd.github.v3+json',
+        };
+        if (etag) headers['If-None-Match'] = etag;
+
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 10000);
+        try {
+            const res = await fetch(url, { headers, signal: controller.signal, cache: 'no-store' });
+            clearTimeout(timeoutId);
+            if (res.status === 304) return { notModified: true, etag };
+            if (res.status === 404) return { exists: false };
+            if (!res.ok) return null;
+            const data = await res.json();
+            const content = JSON.parse(base64ToUtf8((data.content || '').replace(/\n/g, '')));
+            const newEtag = res.headers.get('ETag') || res.headers.get('etag');
+            return { exists: true, content, etag: newEtag };
+        } catch (e) {
+            clearTimeout(timeoutId);
+            return null;
+        }
+    }
+
+    async function fetchRadarFile(path) {
+        const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${path}`;
+        try {
+            const res = await fetch(url, { headers: getHeaders(state.token), cache: 'no-store' });
+            if (!res.ok) return null;
+            const data = await res.json();
+            const content = JSON.parse(base64ToUtf8((data.content || '').replace(/\n/g, '')));
+            return { exists: true, content };
+        } catch (e) {
+            return null;
+        }
+    }
+
+    async function deriveKeyRadar(password, saltBase64) {
+        const enc = new TextEncoder();
+        const salt = new Uint8Array(base64ToArrayBuffer(saltBase64));
+        const baseKey = await crypto.subtle.importKey(
+            'raw', enc.encode(password),
+            { name: 'PBKDF2' }, false, ['deriveKey']
+        );
+        return crypto.subtle.deriveKey(
+            { name: 'PBKDF2', salt, iterations: 200000, hash: 'SHA-256' },
+            baseKey,
+            { name: 'AES-GCM', length: 256 },
+            false, ['decrypt']
+        );
+    }
+
+    async function decryptRadarMessage(encMsg, key) {
+        try {
+            const payload = await decryptObjectRadar(encMsg.iv, encMsg.data, key);
+            const msg = {
+                id: encMsg.id,
+                time: encMsg.time,
+                username: payload.username,
+                text: payload.text || '',
+            };
+            if (payload.reactions) msg.reactions = payload.reactions;
+            if (Array.isArray(payload.comments)) msg.comments = payload.comments;
+            if (payload.image) msg.image = payload.image;
+            if (payload.audio) {
+                msg.audio = payload.audio;
+                msg.audioDuration = payload.audioDuration || 0;
+                msg.audioMime = payload.audioMime || 'audio/webm';
+                msg.audioName = payload.audioName || '';
+                msg.audioCover = payload.audioCover || '';
+            }
+            if (payload.file) {
+                msg.file = payload.file;
+                msg.fileName = payload.fileName || 'file.bin';
+                msg.fileMime = payload.fileMime || 'application/octet-stream';
+                msg.fileSize = payload.fileSize || 0;
+            }
+            if (payload.video) {
+                msg.video = payload.video;
+                msg.videoDuration = payload.videoDuration || 0;
+                msg.videoMime = payload.videoMime || 'video/mp4';
+                msg.videoName = payload.videoName || '';
+                msg.videoSize = payload.videoSize || 0;
+            }
+            if (payload.videoNote) {
+                msg.videoNote = payload.videoNote;
+                msg.videoDuration = payload.videoDuration || 0;
+                msg.videoMime = payload.videoMime || 'video/webm';
+            }
+            return msg;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    async function decryptObjectRadar(ivBase64, dataBase64, key) {
+        const iv = new Uint8Array(base64ToArrayBuffer(ivBase64));
+        const ciphertext = base64ToArrayBuffer(dataBase64);
+        const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
+        return JSON.parse(new TextDecoder().decode(plaintext));
+    }
+
+    // ── Цикл ──
+    function startRadarLoop() {
+        stopRadarLoop();
+        if (!radar.enabled) return;
+
+        // Скан раз в 30 сек
+        radar.scanTimer = setTimeout(() => {
+            scanAllChats();
+            radar.scanTimer = setInterval(() => {
+                if (!radar.enabled) return;
+                if (!state.isAuthorized) return;
+                scanAllChats();
+            }, RADAR_CONFIG.scanIntervalMs);
+        }, 5000);
+
+        // 🆕 Автоочистка раз в 5 минут (на случай, если скан давно не запускался)
+        radar.cleanupTimer = setInterval(() => {
+            cleanupOldEvents();
+        }, RADAR_CONFIG.autoCleanupIntervalMs);
+    }
+
+    function stopRadarLoop() {
+        if (radar.scanTimer) {
+            clearTimeout(radar.scanTimer);
+            clearInterval(radar.scanTimer);
+            radar.scanTimer = null;
+        }
+        if (radar.cleanupTimer) {
+            clearInterval(radar.cleanupTimer);
+            radar.cleanupTimer = null;
+        }
+        setScanningVisual(false);
+    }
+
+    // ── Интеграция ──
+    const _origLogoutRadar = window.logout;
+    if (typeof _origLogoutRadar === 'function') {
+        window.logout = function() {
+            stopRadarLoop();
+            radar.etags = {};
+            radar.metaVersions = {};
+            if (radar.overlayOpen) closeRadarOverlay();
+            return _origLogoutRadar.apply(this, arguments);
+        };
+    }
+
+    document.addEventListener('visibilitychange', () => {
+        if (!document.hidden && state.isAuthorized && radar.enabled) {
+            if (Date.now() - (radar._lastScanTs || 0) > RADAR_CONFIG.scanIntervalMs) {
+                scanAllChats();
+            }
+        }
+    });
+
+    // ── Старт ──
+    setTimeout(() => {
+        installRadarButtons();
+        // 🆕 Если первый запуск — отметим после первого скана
+        if (state.isAuthorized && radar.enabled) {
+            startRadarLoop();
+
+            // Через 15 сек после первого скана — помечаем как "первый запуск завершён"
+            setTimeout(() => {
+                if (isFirstRunEver()) {
+                    markFirstRunDone();
+                    console.log('[RADAR] Первый запуск завершён, дальше только свежие события');
+                }
+            }, 20000);
+        }
+    }, 3000);
+
+    // ── API ──
+    window.EventRadar = {
+        scan: scanAllChats,
+        open: openRadarOverlay,
+        close: closeRadarOverlay,
+        enable: () => { if (!radar.enabled) toggleRadarEnabled(); },
+        disable: () => { if (radar.enabled) toggleRadarEnabled(); },
+        getEvents: () => radar.events.slice(),
+        clearHistory: () => {
+            radar.events = [];
+            radar.seen.clear();
+            saveSeen();
+            renderRadarList();
+            updateRadarBadge();
+        },
+        resetState: () => {
+            radar.events = [];
+            radar.seen.clear();
+            radar.state = {};
+            saveSeen();
+            saveRadarState(true);
+            renderRadarList();
+            updateRadarBadge();
+            showToastSafe('🔄 Состояние сброшено');
+        },
+        resetFirstRun: () => {
+            // Сбросить флаг первого запуска — радар снова "тихо" запомнит всё
+            localStorage.removeItem(RADAR_CONFIG.firstRunDoneKey);
+            showToastSafe('🔄 Первый запуск сброшен');
+        },
+        getStateSize: () => {
+            const json = JSON.stringify(radar.state);
+            return {
+                entries: Object.keys(radar.state).length,
+                bytes: json.length,
+                kb: (json.length / 1024).toFixed(1),
+            };
+        },
+        pruneState: () => {
+            pruneRadarState();
+            saveRadarState(true);
+            return window.EventRadar.getStateSize();
+        },
+        cleanupOld: cleanupOldEvents,
+        _radar: radar,
+    };
+
+    console.log('🔔 Event Radar активен');
+    console.log('   Скан: раз в 30 сек (тихо)');
+    console.log('   Окно свежести: 48 часов');
+    console.log('   Первый запуск на устройстве: события НЕ показываются, только запоминаются');
+    console.log('   API:');
+    console.log('     EventRadar.scan()         — скан вручную');
+    console.log('     EventRadar.open()         — открыть оверлей');
+    console.log('     EventRadar.resetFirstRun()— сбросить первый запуск');
+    console.log('     EventRadar.cleanupOld()   — очистить события старше 48ч');
+
+})();
+</script>
+
+
 </body>
 </html>
