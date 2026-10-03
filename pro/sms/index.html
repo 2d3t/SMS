@@ -3341,6 +3341,11 @@ body.player-active .messages-container { padding-bottom: 68px; }
         <span class="ucm-icon">📥</span>
         <span class="ucm-label">Импорт профиля</span>
     </div>
+    <div class="ucm-divider"></div>
+    <div class="ucm-item" data-action="language">
+        <span class="ucm-icon">🌐</span>
+        <span class="ucm-label">Язык</span>
+    </div>
 </div>
 
 
@@ -8680,8 +8685,8 @@ else if (msg.file) {
     return `
         <div class="message-wrapper ${isOwn ? 'own' : 'other'}${isUnread ? ' unread' : ''}${batchClass}${opts.noFade ? ' no-fade' : ''}" data-msg-id="${msg.id}" ${isBatch ? `data-batch="${msg.batchId}"` : ''}>
             <div class="message">
-                ${isFirstInBatch ? `<div class="batch-label">📷 ${msg.batchTotal} фото</div>` : ''}
-                ${(!isBatch || isFirstInBatch) ? `<span class="sender">${isOwn ? 'Вы' : escapeHtml(senderName)}</span>` : ''}
+                ${isFirstInBatch ? `<div class="batch-label">📷 ${msg.batchTotal} ${i18n.t('фото')}</div>` : ''}
+                ${(!isBatch || isFirstInBatch) ? `<span class="sender">${isOwn ? i18n.t('Вы') : escapeHtml(senderName)}</span>` : ''}
                
 
 
@@ -11797,11 +11802,18 @@ async function restoreSession() {
 
 
         switch (action) {
-            case 'create-chat': trigger('createChatBtn'); break;
-            case 'join-chat':   trigger('joinChatBtn');   break;
-            case 'export':      trigger('exportProfileBtn'); break;
-            case 'import':      trigger('importProfileBtn'); break;
+    case 'create-chat': trigger('createChatBtn'); break;
+    case 'join-chat':   trigger('joinChatBtn');   break;
+    case 'export':      trigger('exportProfileBtn'); break;
+    case 'import':      trigger('importProfileBtn'); break;
+    case 'language':
+        if (window.i18n && typeof window.i18n.open === 'function') {
+            setTimeout(() => window.i18n.open(), 100);
+        } else {
+            showToast('⚠️ i18n не загружен', 2000);
         }
+        break;
+}
     });
 
 
@@ -12096,9 +12108,9 @@ function buildCommentsHTML(msg) {
                 <div class="comment-avatar">${getInitials(c.username)}</div>
                 <div class="comment-body">
                     <div class="comment-author">
-                        ${isOwn ? 'Вы' : escapeHtml(c.username)}
-                        <span class="comment-time">${formatFullTime(c.time)}</span>
-                    </div>
+    ${isOwn ? i18n.t('Вы') : escapeHtml(c.username)}
+    <span class="comment-time">${formatFullTime(c.time)}</span>
+</div>
                     <div class="comment-text">${renderTextWithLinks(c.text)}</div>
                 </div>
                 ${del}
@@ -13698,7 +13710,7 @@ if (msg.image) {
     };
 
     const bar = $('replyPreviewBar');
-    $('replyPreviewName').textContent = '↩ ' + (msg.username === state.username ? 'Вы' : msg.username);
+    $('replyPreviewName').textContent = '↩ ' + (msg.username === state.username ? i18n.t('Вы') : msg.username);
     $('replyPreviewText').textContent = previewText;
     bar.classList.add('show');
     inputBar.insertBefore(bar, inputBar.firstChild);
@@ -14004,7 +14016,7 @@ matches.reverse();
 
     const safePreview = highlightMatch(escapeHtml(preview), query);
     const isOwn = m.username === state.username;
-    const author = isOwn ? 'Вы' : escapeHtml(m.username || 'Аноним');
+    const author = isOwn ? i18n.t('Вы') : escapeHtml(m.username || i18n.t('Аноним'));
     const time = formatFullTime(m.time);
 
                 return `<div class="search-result-item" data-msg-id="${m.id}">
@@ -14398,7 +14410,7 @@ if ('mediaSession' in navigator) {
 
         navigator.mediaSession.metadata = new MediaMetadata({
             title: track.name || 'Аудио',
-            artist: track.username === state.username ? 'Вы' : (track.username || 'Аноним'),
+            artist: track.username === state.username ? i18n.t('Вы') : (track.username || i18n.t('Аноним')),
             album: state.chatName || 'SMS Чат',
             artwork,   // 🆕 вот это добавилось
         });
@@ -20916,6 +20928,432 @@ console.log('🔧 Патч активен: свайп вправо = ВСЕГД�
 })();
 
 console.log('📱 Кнопка «Назад» Android: чат → список чатов');
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🌐 ЛОКАЛИЗАЦИЯ RU / EN — компактная версия
+//  • Автоперевод по тексту (без data-i18n в HTML)
+//  • MutationObserver ловит динамические элементы
+//  • Переключение: меню «⋯» → 🌐 Язык
+// ═══════════════════════════════════════════════════════════════
+
+(function installI18n() {
+    const STORAGE_KEY = 'chathub_language';
+
+    // ═══ СЛОВАРЬ: [русский, английский] ═══
+    // Просто пары. Всё, что нужно перевести — здесь.
+    const DICT = {
+        // Заголовки / бренды
+        'SMS Чат':                          'SMS Chat',
+        '💬 Добро пожаловать':              '💬 Welcome',
+        'Войдите в свой мессенджер':        'Sign in to your messenger',
+        '💬 Мои чаты':                      '💬 My chats',
+        'Чат':                              'Chat',
+
+        // Поля ввода
+        '👤 Ваш логин':                     '👤 Your login',
+        'Введите ник':                      'Enter nickname',
+        '🔑 GitHub Token':                  '🔑 GitHub Token',
+        'Вставьте токен доступа':           'Paste access token',
+        'Сообщение...':                     'Message...',
+
+        // Кнопки авторизации
+        'Создать токен':                    'Create token',
+        'Запомнить меня на этом устройстве':'Remember me on this device',
+        '🚀 Войти':                          '🚀 Sign in',
+        '🗑️ Очистить данные':               '🗑️ Clear data',
+        '⏳ Проверка...':                    '⏳ Checking...',
+        '❌ Неверный токен или нет доступа':'❌ Invalid token or no access',
+
+        // Кнопки чатов
+        '➕ Создать чат':                    '➕ Create chat',
+        '🔗 Присоединиться к чату':          '🔗 Join chat',
+        '💾 Экспорт':                        '💾 Export',
+        '📥 Импорт':                         '📥 Import',
+        'У вас пока нет чатов':             'You have no chats yet',
+        'Создайте первый или присоединитесь':'Create your first one or join',
+
+        // Меню ⋯
+        'Создать чат':                      'Create chat',
+        'Присоединиться':                   'Join',
+        'Экспорт профиля':                  'Export profile',
+        'Импорт профиля':                   'Import profile',
+        'Язык':                             'Language',
+
+        // Модалки создания/входа
+        '➕ Новый чат':                      '➕ New chat',
+        'Название чата':                    'Chat name',
+        'Например: Семья':                  'E.g.: Family',
+        'Пароль чата':                      'Chat password',
+        '🔗 Присоединиться':                 '🔗 Join',
+        'ID чата':                          'Chat ID',
+        'Отображаемое имя - первичное, позже вы сможете изменить его':
+                                            'Display name — initial, changeable later',
+        'Пароль для расшифровки':           'Decryption password',
+        'Введите пароль':                   'Enter password',
+        'Запомнить пароль для этого чата':  'Remember password for this chat',
+
+        'Вы':                               'You',
+        'Создать':                          'Create',
+        'Войти':                            'Enter',
+        'Сохранить':                        'Save',
+        'Закрыть':                          'Close',
+        'Удалить':                          'Delete',
+        'Скачать':                          'Download',
+        'Отправить':                        'Send',
+        'OK':                               'OK',
+
+        // Экспорт/импорт
+        '💾 Экспорт профиля':               '💾 Export profile',
+        '📥 Импорт':                        '📥 Import',
+        'Включить пароли чатов':            'Include chat passwords',
+        'Включить имя пользователя':        'Include username',
+        '💾 Скачать файл':                  '💾 Download file',
+        '📥 Импортировать':                 '📥 Import',
+        'Заменить текущий список (иначе — объединить)':
+                                            'Replace current list (otherwise merge)',
+
+        // Переименование
+        '✏️ Переименовать чат':             '✏️ Rename chat',
+        'Отображаемое имя':                 'Display name',
+        'Новое название':                   'New name',
+
+        // Поиск
+        '🔍 Поиск в чате':                  '🔍 Search in chat',
+        'Текст, автор или название трека...':'Text, author or track name...',
+        'Начните вводить запрос…':          'Start typing…',
+        '🔍 Ничего не найдено':             '🔍 Nothing found',
+        'Найдено:':                         'Found:',
+
+        // Редактирование
+        '✏️ Редактирование':                '✏️ Edit',
+        'Исходный текст':                   'Original text',
+        'Новый текст':                      'New text',
+        'Введите новый текст...':           'Enter new text...',
+        '⏳ Сохранение...':                  '⏳ Saving...',
+
+        // Приглашение
+        'Приглашение в чат':                'Chat invitation',
+        '✅ Добавить':                       '✅ Add',
+
+        // Поделиться
+        '💾 Поделиться чатом':              '💾 Share chat',
+        '📤 Поделиться с чатом':            '📤 Share with chat',
+        'Куда отправить:':                  'Where to send:',
+        'Другие приложения…':               'Other apps…',
+        '📤 Отправить':                      '📤 Send',
+
+        // Toast-сообщения (частые)
+        '🔒 Требуется вход в чат':           '🔒 You need to enter the chat',
+        '📵 Нет подключения':                '📵 No connection',
+        '📵 Соединение потеряно':            '📵 Connection lost',
+        '🌐 Соединение восстановлено':       '🌐 Connection restored',
+        '📋 Скопировано':                   '📋 Copied',
+        '✅ Отправлено!':                    '✅ Sent!',
+        '🗑️ Удалено':                       '🗑️ Deleted',
+        '👋 Вы вышли':                      '👋 Signed out',
+
+        // Фото-батч
+        'фото':                             'photos',
+        'Новые сообщения':                  'New messages',
+        '💬 История пуста':                 '💬 History is empty',
+        'Напишите первое сообщение!':       'Write the first message!',
+        '(изменено)':                       '(edited)',
+
+        // Меню долгого нажатия
+        'Выбрать несколько':                'Select multiple',
+        'Редактировать':                    'Edit',
+        'Ответить':                         'Reply',
+        'Копировать текст':                 'Copy text',
+
+        // Пакетное удаление
+        '0 выбрано':                        '0 selected',
+        'Тапайте по сообщениям':            'Tap messages',
+        'Свои':                             'Mine',
+        'Отменить':                         'Cancel',
+
+        // Заголовки tooltips
+        'К списку чатов':                   'Back to chats',
+        'Поиск':                            'Search',
+        'Пригласить в чат':                 'Invite to chat',
+        'Забыть пароль этого чата':         'Forget this chat password',
+        'Отметить все как прочитанные':     'Mark all as read',
+        'Действия':                         'Actions',
+        'Выйти':                            'Sign out',
+        'Прикрепить':                       'Attach',
+        'Записать аудио (до 10 сек)':       'Record audio (up to 10s)',
+        'Показать панель ввода':            'Show input',
+        'Скрыть панель':                    'Hide input',
+        'Вниз':                             'Scroll down',
+        'Эмодзи':                           'Emoji',
+
+        // Меню вложений
+        'Видеофайл':                        'Video file',
+        'MP4, MOV, WebM…':                  'MP4, MOV, WebM…',
+        'Изображения':                      'Images',
+        'До 20 шт, каждая до 25 МБ':        'Up to 20 files, max 25 MB each',
+        'Аудиофайл':                        'Audio file',
+        'MP3, OGG, WAV, M4A… до 25 МБ':     'MP3, OGG, WAV, M4A… up to 25 MB',
+        'Любой файл':                       'Any file',
+        'ZIP, MP4, PDF… до 25 МБ':          'ZIP, MP4, PDF… up to 25 MB',
+        'Документы':                        'Documents',
+        'PDF, DOCX, XLSX, TXT':             'PDF, DOCX, XLSX, TXT',
+
+        // Прогресс
+        'Отмена...':                        'Cancelling...',
+        '✓ Готово':                         '✓ Done',
+        'Подготовка':                       'Preparing',
+    };
+
+    // Обратный словарь: english → russian (чтобы переключаться в обе стороны)
+    const REVERSE = {};
+    for (const [ru, en] of Object.entries(DICT)) REVERSE[en] = ru;
+
+    // ═══ СОСТОЯНИЕ ═══
+    let lang = localStorage.getItem(STORAGE_KEY);
+    if (lang !== 'ru' && lang !== 'en') {
+        const nav = (navigator.language || '').toLowerCase();
+        lang = nav.startsWith('ru') ? 'ru' : 'en';
+        localStorage.setItem(STORAGE_KEY, lang);
+    }
+
+    // ═══ ФУНКЦИИ ═══
+    function translate(text) {
+        if (lang === 'en') return DICT[text] || text;
+        return REVERSE[text] || text;
+    }
+
+    // Перевести все текстовые узлы и атрибуты внутри элемента
+    function translateNode(root) {
+        if (!root) return;
+
+        // Текстовые узлы
+        const walker = document.createTreeWalker(
+            root,
+            NodeFilter.SHOW_TEXT,
+            {
+                acceptNode(node) {
+                    const txt = node.nodeValue.trim();
+                    if (!txt) return NodeFilter.FILTER_REJECT;
+                    // Пропускаем то, что внутри script/style
+                    const p = node.parentNode;
+                    if (!p || p.nodeName === 'SCRIPT' || p.nodeName === 'STYLE') {
+                        return NodeFilter.FILTER_REJECT;
+                    }
+                    return (DICT[txt] || REVERSE[txt])
+                        ? NodeFilter.FILTER_ACCEPT
+                        : NodeFilter.FILTER_REJECT;
+                }
+            }
+        );
+
+        const nodes = [];
+        while (walker.nextNode()) nodes.push(walker.currentNode);
+        nodes.forEach(n => {
+            const raw = n.nodeValue;
+            const trimmed = raw.trim();
+            const translated = translate(trimmed);
+            if (translated !== trimmed) {
+                // Сохраняем пробелы по краям
+                const before = raw.match(/^\s*/)[0];
+                const after = raw.match(/\s*$/)[0];
+                n.nodeValue = before + translated + after;
+            }
+        });
+
+        // placeholder
+        root.querySelectorAll?.('input[placeholder], textarea[placeholder]').forEach(el => {
+            const v = el.getAttribute('placeholder');
+            if (!v) return;
+            const tr = translate(v);
+            if (tr !== v) el.setAttribute('placeholder', tr);
+        });
+
+        // title (tooltips)
+        root.querySelectorAll?.('[title]').forEach(el => {
+            const v = el.getAttribute('title');
+            if (!v) return;
+            const tr = translate(v);
+            if (tr !== v) el.setAttribute('title', tr);
+        });
+    }
+
+    // ═══ ПЕРЕКЛЮЧЕНИЕ ЯЗЫКА ═══
+    function setLang(newLang, opts = {}) {
+        if (newLang !== 'ru' && newLang !== 'en') return;
+        if (newLang === lang && !opts.force) return;
+        lang = newLang;
+        localStorage.setItem(STORAGE_KEY, lang);
+        document.documentElement.lang = lang;
+        translateNode(document.body);
+        if (typeof document.title !== 'undefined') {
+            document.title = translate('SMS Чат');
+        }
+    }
+
+    // ═══ МОДАЛКА ВЫБОРА ЯЗЫКА ═══
+    function openLanguagePicker() {
+        let modal = document.getElementById('langPickerModal');
+        if (modal) modal.remove();
+
+        modal = document.createElement('div');
+        modal.id = 'langPickerModal';
+        modal.style.cssText = `
+            position: fixed; inset: 0;
+            background: rgba(0,0,0,0.7);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            z-index: 5500;
+            display: flex; align-items: center; justify-content: center;
+            padding: 20px;
+            animation: fadeInModal 0.2s ease;
+        `;
+        modal.innerHTML = `
+            <div style="
+                background: #1a1a2e;
+                border: 1px solid rgba(255,255,255,0.12);
+                border-radius: 20px;
+                padding: 22px 20px;
+                max-width: 340px;
+                width: 100%;
+                box-shadow: 0 20px 60px rgba(0,0,0,0.7);
+            ">
+                <h3 style="font-size:17px;font-weight:700;color:#fff;margin-bottom:18px;text-align:center;">
+                    ${lang === 'ru' ? '🌐 Язык' : '🌐 Language'}
+                </h3>
+
+                <div class="lang-opt" data-lang="ru" style="
+                    display:flex;align-items:center;gap:12px;padding:12px 14px;
+                    border-radius:12px;cursor:pointer;margin-bottom:8px;
+                    background:${lang === 'ru' ? 'linear-gradient(135deg,rgba(108,92,231,0.25),rgba(0,184,148,0.15))' : 'rgba(255,255,255,0.04)'};
+                    border:1px solid ${lang === 'ru' ? 'rgba(108,92,231,0.6)' : 'rgba(255,255,255,0.08)'};
+                    transition: all 0.15s;
+                ">
+                    <span style="font-size:28px;">🇷🇺</span>
+                    <div style="flex:1;">
+                        <div style="font-size:15px;font-weight:700;color:#fff;">Русский</div>
+                        <div style="font-size:11px;color:#888;">Russian</div>
+                    </div>
+                    ${lang === 'ru' ? '<span style="color:#00b894;font-weight:700;font-size:18px;">✓</span>' : ''}
+                </div>
+
+                <div class="lang-opt" data-lang="en" style="
+                    display:flex;align-items:center;gap:12px;padding:12px 14px;
+                    border-radius:12px;cursor:pointer;margin-bottom:16px;
+                    background:${lang === 'en' ? 'linear-gradient(135deg,rgba(108,92,231,0.25),rgba(0,184,148,0.15))' : 'rgba(255,255,255,0.04)'};
+                    border:1px solid ${lang === 'en' ? 'rgba(108,92,231,0.6)' : 'rgba(255,255,255,0.08)'};
+                    transition: all 0.15s;
+                ">
+                    <span style="font-size:28px;">🇬🇧</span>
+                    <div style="flex:1;">
+                        <div style="font-size:15px;font-weight:700;color:#fff;">English</div>
+                        <div style="font-size:11px;color:#888;">Английский</div>
+                    </div>
+                    ${lang === 'en' ? '<span style="color:#00b894;font-weight:700;font-size:18px;">✓</span>' : ''}
+                </div>
+
+                <button id="langPickerCloseBtn" style="
+                    width:100%;padding:11px;
+                    background:rgba(255,255,255,0.06);
+                    border:1px solid rgba(255,255,255,0.08);
+                    border-radius:12px;
+                    color:#aaa;font-size:14px;font-weight:600;
+                    cursor:pointer;font-family:inherit;
+                    transition: all 0.15s;
+                ">${lang === 'ru' ? 'Отмена' : 'Cancel'}</button>
+            </div>
+        `;
+        document.body.appendChild(modal);
+
+        // Обработчики
+        modal.querySelectorAll('.lang-opt').forEach(el => {
+            el.addEventListener('click', () => {
+                const newLang = el.dataset.lang;
+                setLang(newLang);
+                modal.remove();
+                if (typeof showToast === 'function') {
+                    showToast(newLang === 'ru' ? '🌐 Русский' : '🌐 English', 1200);
+                }
+                if (typeof soundManager !== 'undefined') soundManager.play('click');
+            });
+        });
+        modal.querySelector('#langPickerCloseBtn').addEventListener('click', () => modal.remove());
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) modal.remove();
+        });
+    }
+
+    // ═══ MUTATIONOBSERVER — ловит новые элементы и переводит их ═══
+const observer = new MutationObserver((mutations) => {
+    for (const mut of mutations) {
+        for (const node of mut.addedNodes) {
+            if (node.nodeType === 1) {
+                translateNode(node);
+            }
+        }
+    }
+});
+
+    // ═══ СТАРТ ═══
+    function start() {
+        document.documentElement.lang = lang;
+        translateNode(document.body);
+        document.title = translate('SMS Чат');
+        observer.observe(document.body, { childList: true, subtree: true });
+
+        console.log(`🌐 i18n активна: ${lang}`);
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', start);
+    } else {
+        start();
+    }
+
+    // ═══ ЭКСПОРТ ═══
+    window.i18n = {
+        t: translate,
+        get lang() { return lang; },
+        setLang,
+        open: openLanguagePicker,
+        dict: DICT,
+    };
+})();
+
+// Принудительно вставляем пункт "Язык" в меню при каждом открытии
+document.addEventListener('click', (e) => {
+    const menuBtn = e.target.closest('#chatsActionsBtn');
+    if (!menuBtn) return;
+    // Небольшая задержка — меню строится синхронно после клика
+    setTimeout(() => {
+        const menu = document.getElementById('chatsActionsMenu');
+        if (menu) {
+            // Просто добавляем пункт в стандартное меню (не в unifiedChatMenu)
+            if (!menu.querySelector('[data-action="language"]')) {
+                const item = document.createElement('div');
+                item.className = 'ucm-item';
+                item.dataset.action = 'language';
+                item.innerHTML = `
+                    <span class="ucm-icon">🌐</span>
+                    <span class="ucm-label">${lang === 'ru' ? 'Язык' : 'Language'}</span>
+                `;
+                item.addEventListener('click', (ev) => {
+                    ev.stopPropagation();
+                    menu.classList.remove('show');
+                    setTimeout(openLanguagePicker, 150);
+                });
+                // Вставляем перед последним divider или в конец
+                const lastDivider = menu.querySelector('.ucm-divider:last-of-type');
+                if (lastDivider) {
+                    lastDivider.parentNode.insertBefore(item, lastDivider);
+                } else {
+                    menu.appendChild(item);
+                }
+            }
+        }
+    }, 50);
+}, true);
+
 </script>
 
 <script>
@@ -21910,7 +22348,7 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
             bodyHtml += `<div class="${textCls}">${renderRadarTextWithLinks(text)}</div>`;
         }
 
-        const fromName = e.payload.from === state.username ? 'Вы' : (e.payload.from || '—');
+        const fromName = e.payload.from === state.username ? (window.i18n?.t('Вы') || 'Вы') : (e.payload.from || '—');
         const fromSafe = escapeHtml(fromName);
 
         const myBadge = e.isOnMyMessage
