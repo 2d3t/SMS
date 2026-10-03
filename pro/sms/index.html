@@ -2076,7 +2076,88 @@ body.player-active .scroll-down-btn {
             .file-action-btn { width: 26px; height: 26px; font-size: 12px; }
             .upload-progress-card { padding: 18px 16px; }
         }
-        ::-webkit-scrollbar { width: 0; height: 0; }
+                ::-webkit-scrollbar { width: 0; height: 0; }
+
+
+/* ═══ 🆕 Меню действий на экране чатов ═══ */
+#chatsActionsBtn {
+    font-size: 20px;
+    font-weight: 700;
+    padding-bottom: 6px;
+    letter-spacing: 1px;
+}
+
+
+#chatsBottomButtons {
+    display: none !important;
+}
+
+
+.chats-actions-menu {
+    position: absolute;
+    top: 60px;
+    right: 16px;
+    width: 240px;
+    background: #1a1a2e;
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 16px;
+    padding: 6px;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.6);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    display: none;
+    z-index: 100;
+    animation: chatsMenuIn 0.18s ease-out;
+}
+.chats-actions-menu.show { display: block; }
+@keyframes chatsMenuIn {
+    from { opacity: 0; transform: translateY(-8px) scale(0.96); }
+    to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+
+.chats-actions-menu .ucm-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 12px;
+    border-radius: 12px;
+    cursor: pointer;
+    transition: background 0.15s, transform 0.1s;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+}
+.chats-actions-menu .ucm-item:hover {
+    background: rgba(255,255,255,0.06);
+}
+.chats-actions-menu .ucm-item:active {
+    transform: scale(0.97);
+    background: rgba(108,92,231,0.15);
+}
+
+
+.chats-actions-menu .ucm-item .ucm-icon {
+    width: 24px;
+    text-align: center;
+    font-size: 18px;
+    flex-shrink: 0;
+}
+
+
+.chats-actions-menu .ucm-item .ucm-label {
+    flex: 1;
+    min-width: 0;
+    font-size: 14px;
+    font-weight: 600;
+    color: #e0e0e0;
+}
+
+
+.chats-actions-menu .ucm-divider {
+    height: 1px;
+    background: rgba(255,255,255,0.08);
+    margin: 4px 8px;
+}
 
 
 
@@ -3234,23 +3315,49 @@ body.player-active .messages-container { padding-bottom: 68px; }
         <span id="chatsUserLabel" style="font-size:13px;color:#888;"></span>
         <!-- 🆕 Кнопка обнуления уведомлений -->
         <button class="exit-btn" id="clearAllUnreadBtn" title="Отметить все как прочитанные" style="font-size:16px;">✓</button>
+        <!-- 🆕 Кнопка меню действий -->
+        <button class="exit-btn" id="chatsActionsBtn" title="Действия">⋯</button>
         <button class="exit-btn" id="chatsLogoutBtn" title="Выйти">✕</button>
     </div>
 </div>
+
+
+<!-- 🆕 Меню действий на экране чатов -->
+<div class="chats-actions-menu" id="chatsActionsMenu">
+    <div class="ucm-item" data-action="create-chat">
+        <span class="ucm-icon">➕</span>
+        <span class="ucm-label">Создать чат</span>
+    </div>
+    <div class="ucm-item" data-action="join-chat">
+        <span class="ucm-icon">🔗</span>
+        <span class="ucm-label">Присоединиться</span>
+    </div>
+    <div class="ucm-divider"></div>
+    <div class="ucm-item" data-action="export">
+        <span class="ucm-icon">💾</span>
+        <span class="ucm-label">Экспорт профиля</span>
+    </div>
+    <div class="ucm-item" data-action="import">
+        <span class="ucm-icon">📥</span>
+        <span class="ucm-label">Импорт профиля</span>
+    </div>
+</div>
+
+
     <div class="auth-content" style="justify-content:flex-start;padding-top:24px;">
         <h1 style="font-size:24px;margin-bottom:4px;">💬 Мои чаты</h1>
-        <p class="subtitle" style="margin-bottom:20px;">Выберите чат или создайте новый</p>
+        <div style="height:20px;"></div>
 
         <div id="chatsList" class="chats-list"></div>
 
-        <div style="width:100%;max-width:420px;display:flex;flex-direction:column;gap:10px;">
-            <button class="btn" id="createChatBtn">➕ Создать чат</button>
-            <button class="btn btn-secondary" id="joinChatBtn">🔗 Присоединиться к чату</button>
-            <div style="display:flex;gap:10px;">
-                <button class="btn btn-secondary" id="exportProfileBtn" style="flex:1;">💾 Экспорт</button>
-                <button class="btn btn-secondary" id="importProfileBtn" style="flex:1;">📥 Импорт</button>
-            </div>
-        </div>
+        <div id="chatsBottomButtons" style="width:100%;max-width:420px;display:flex;flex-direction:column;gap:10px;">
+    <button class="btn" id="createChatBtn">➕ Создать чат</button>
+    <button class="btn btn-secondary" id="joinChatBtn">🔗 Присоединиться к чату</button>
+    <div style="display:flex;gap:10px;">
+        <button class="btn btn-secondary" id="exportProfileBtn" style="flex:1;">💾 Экспорт</button>
+        <button class="btn btn-secondary" id="importProfileBtn" style="flex:1;">📥 Импорт</button>
+    </div>
+</div>
     </div>
 </div>
 
@@ -11646,6 +11753,85 @@ async function restoreSession() {
     showChatsScreen();
     tokenInput.classList.add('valid');
 }
+
+// ===================================================================
+//  🆕 МЕНЮ ДЕЙСТВИЙ НА ЭКРАНЕ ЧАТОВ
+// ===================================================================
+(function initChatsActionsMenu() {
+    const actionsBtn = document.getElementById('chatsActionsBtn');
+    const actionsMenu = document.getElementById('chatsActionsMenu');
+
+
+    if (!actionsBtn || !actionsMenu) {
+        console.warn('⚠️ Кнопка или меню действий не найдены');
+        return;
+    }
+
+
+    function toggleActionsMenu(force) {
+        const shouldOpen = typeof force === 'boolean' ? force : !actionsMenu.classList.contains('show');
+        actionsMenu.classList.toggle('show', shouldOpen);
+    }
+
+
+    actionsBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        toggleActionsMenu();
+        soundManager.play('click');
+    });
+
+
+    actionsMenu.addEventListener('click', (e) => {
+        const item = e.target.closest('.ucm-item');
+        if (!item) return;
+        e.stopPropagation();
+        const action = item.dataset.action;
+        toggleActionsMenu(false);
+
+
+        // Программный клик по старой (скрытой) кнопке
+        const trigger = (id) => {
+            const btn = document.getElementById(id);
+            if (btn) btn.click();
+        };
+
+
+        switch (action) {
+            case 'create-chat': trigger('createChatBtn'); break;
+            case 'join-chat':   trigger('joinChatBtn');   break;
+            case 'export':      trigger('exportProfileBtn'); break;
+            case 'import':      trigger('importProfileBtn'); break;
+        }
+    });
+
+
+    document.addEventListener('click', (e) => {
+        if (!actionsMenu.classList.contains('show')) return;
+        if (e.target.closest('#chatsActionsMenu')) return;
+        if (e.target.closest('#chatsActionsBtn')) return;
+        toggleActionsMenu(false);
+    });
+
+
+    const chatsListEl = document.getElementById('chatsList');
+    if (chatsListEl) {
+        chatsListEl.addEventListener('scroll', () => {
+            if (actionsMenu.classList.contains('show')) toggleActionsMenu(false);
+        }, { passive: true });
+    }
+
+
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && actionsMenu.classList.contains('show')) {
+            e.stopPropagation();
+            toggleActionsMenu(false);
+        }
+    }, true);
+
+
+    console.log('➕ Меню действий на экране чатов активно');
+})();
+
 
 // ===================================================================
 //  ЗАПУСК
