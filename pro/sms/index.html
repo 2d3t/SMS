@@ -21356,199 +21356,215 @@ document.addEventListener('click', (e) => {
 
 </script>
 
+
+
+
 <script>
-(function installEventRadar() {
+// ═══════════════════════════════════════════════════════════════
+//  🔔 EVENT RADAR v2 — полностью переписанный движок событий
+//  Заменяет старый installEventRadar.
+//
+//  Что нового:
+//   • Медленный, но надёжный скан (не пропускает события)
+//   • Единый ETag-кэш — нет гонки с pollUpdates
+//   • Per-chat инициализация — нет «тихого» первого запуска
+//   • Нет фильтра по времени — события не «съедаются»
+//   • Кнопка «Проверить сейчас» для ручного скана
+//   • Диагностика прямо в UI
+// ═══════════════════════════════════════════════════════════════
+
+(function installEventRadarV2() {
     'use strict';
 
-    const RADAR_CONFIG = {
-        scanIntervalMs: 30000,
-        maxEventsKept: 300,
-        maxEventsShown: 100,
-        seenStorageKey: 'chathub_radar_seen_v1',
-        enabledStorageKey: 'chathub_radar_enabled_v1',
-        stateStorageKey: 'chathub_radar_state_v1',
-        firstRunDoneKey: 'chathub_radar_firstrun_done_v1',   // 🆕
-        stateMaxAgeDays: 14,
-        stateMaxEntries: 500,
-        freshnessWindowMs: 48 * 60 * 60 * 1000,             // 🆕 48 часов
-        autoCleanupIntervalMs: 5 * 60 * 1000,               // 🆕 автоочистка раз в 5 мин
+    // ═══════════════════════════════════════════════════════════
+    //  КОНФИГУРАЦИЯ
+    // ═══════════════════════════════════════════════════════════
+    const CFG = {
+        scanIntervalMs: 45000,        // раз в 45 сек (медленнее, но надёжнее)
+        scanOnOpen: true,             // скан при открытии оверлея
+        scanOnVisibility: true,       // скан при возврате в приложение
+        delayBetweenChatsMs: 250,     // пауза между чатами — не бомбим API
+        maxEventsKept: 500,           // сколько событий хранить
+        maxEventsShown: 100,          // сколько показывать в UI
+        maxStateEntries: 2000,        // сколько сообщений помнить в state
+        stateStorageKey: 'radar2_state_v2',
+        eventsStorageKey: 'radar2_events_v2',
+        seenStorageKey: 'radar2_seen_v2',
+        enabledKey: 'radar2_enabled_v2',
+        initKeyPrefix: 'radar2_init_',  // radar2_init_<chatFile>
     };
 
-    const radar = {
-        enabled: localStorage.getItem(RADAR_CONFIG.enabledStorageKey) !== '0',
+    // ═══════════════════════════════════════════════════════════
+    //  СОСТОЯНИЕ
+    // ═══════════════════════════════════════════════════════════
+    const R = {
+        enabled: localStorage.getItem(CFG.enabledKey) !== '0',
         scanning: false,
-        scanTimer: null,
-        cleanupTimer: null,                 // 🆕
         events: [],
-        seen: loadSeen(),
-        state: loadRadarState(),
-        overlayOpen: false,
-        etags: {},
-        metaVersions: {},
+        seen: new Set(),
+        state: {},           // { "<chatFile>|<msgId>": { reactions, commentIds } }
+        initDone: {},        // { "<chatFile>": true } — инициализирован ли чат
+        etags: {},           // { "<chatFile>": "etag..." }
+        versions: {},        // { "<chatFile>": version }
+        notModifiedStreak: {},
+        lastScanTs: 0,
         progress: {
+            phase: 'idle',   // idle | scanning | done
             total: 0,
             done: 0,
             current: '',
-            startedAt: 0,
-            phase: 'idle',
             changedCount: 0,
+            eventsAdded: 0,
         },
+        overlayOpen: false,
+        scanTimer: null,
+        _saveStateTimer: null,
+        _saveEventsTimer: null,
     };
 
-    // ═══════════════════════════════════════════════════
-    //  SEEN
-    // ═══════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════
+    //  ЗАГРУЗКА / СОХРАНЕНИЕ
+    // ═══════════════════════════════════════════════════════════
     function loadSeen() {
         try {
-            const raw = localStorage.getItem(RADAR_CONFIG.seenStorageKey);
+            const raw = localStorage.getItem(CFG.seenStorageKey);
             const arr = raw ? JSON.parse(raw) : [];
-            return new Set(Array.isArray(arr) ? arr : []);
-        } catch (e) { return new Set(); }
+            R.seen = new Set(Array.isArray(arr) ? arr : []);
+        } catch (e) { R.seen = new Set(); }
     }
+
     function saveSeen() {
         try {
-            const arr = Array.from(radar.seen).slice(-2000);
-            localStorage.setItem(RADAR_CONFIG.seenStorageKey, JSON.stringify(arr));
+            const arr = Array.from(R.seen).slice(-3000);
+            localStorage.setItem(CFG.seenStorageKey, JSON.stringify(arr));
         } catch (e) {}
     }
-    function markSeen(key) {
-        radar.seen.add(key);
-        saveSeen();
-    }
 
-    // ═══════════════════════════════════════════════════
-    //  STATE
-    // ═══════════════════════════════════════════════════
-    function loadRadarState() {
+    function loadState() {
         try {
-            const raw = localStorage.getItem(RADAR_CONFIG.stateStorageKey);
-            if (!raw) return {};
-            const parsed = JSON.parse(raw);
-            return (parsed && typeof parsed === 'object') ? parsed : {};
-        } catch (e) {
-            console.warn('radar.state load failed:', e);
-            return {};
-        }
+            const raw = localStorage.getItem(CFG.stateStorageKey);
+            R.state = raw ? JSON.parse(raw) : {};
+        } catch (e) { R.state = {}; }
     }
 
-    let _stateSaveTimer = null;
-    function saveRadarState(immediate = false) {
-        if (_stateSaveTimer) {
-            clearTimeout(_stateSaveTimer);
-            _stateSaveTimer = null;
+    function saveState(immediate = false) {
+        if (R._saveStateTimer) {
+            clearTimeout(R._saveStateTimer);
+            R._saveStateTimer = null;
         }
-
         const doSave = () => {
             try {
-                pruneRadarState();
-                localStorage.setItem(RADAR_CONFIG.stateStorageKey, JSON.stringify(radar.state));
+                // Обрезаем state до maxStateEntries (по lastSeenAt)
+                const entries = Object.entries(R.state);
+                if (entries.length > CFG.maxStateEntries) {
+                    entries.sort((a, b) => (b[1].lastSeenAt || 0) - (a[1].lastSeenAt || 0));
+                    const trimmed = {};
+                    for (let i = 0; i < CFG.maxStateEntries; i++) {
+                        trimmed[entries[i][0]] = entries[i][1];
+                    }
+                    R.state = trimmed;
+                }
+                localStorage.setItem(CFG.stateStorageKey, JSON.stringify(R.state));
             } catch (e) {
                 if (e.name === 'QuotaExceededError') {
-                    console.warn('radar.state quota exceeded, emergency prune');
-                    emergencyPruneState();
-                    try {
-                        localStorage.setItem(RADAR_CONFIG.stateStorageKey, JSON.stringify(radar.state));
-                    } catch (e2) {
-                        console.warn('radar.state still too big');
+                    // Аварийная обрезка
+                    const entries = Object.entries(R.state);
+                    entries.sort((a, b) => (b[1].lastSeenAt || 0) - (a[1].lastSeenAt || 0));
+                    const trimmed = {};
+                    for (let i = 0; i < 500; i++) {
+                        if (!entries[i]) break;
+                        trimmed[entries[i][0]] = entries[i][1];
                     }
-                } else {
-                    console.warn('radar.state save failed:', e);
+                    R.state = trimmed;
+                    try {
+                        localStorage.setItem(CFG.stateStorageKey, JSON.stringify(R.state));
+                    } catch (e2) {}
                 }
             }
         };
-
         if (immediate) doSave();
-        else _stateSaveTimer = setTimeout(doSave, 800);
+        else R._saveStateTimer = setTimeout(doSave, 500);
     }
 
-    function pruneRadarState() {
-        const now = Date.now();
-        const maxAgeMs = RADAR_CONFIG.stateMaxAgeDays * 24 * 60 * 60 * 1000;
-        const entries = Object.entries(radar.state);
-
-        const fresh = entries.filter(([, v]) => {
-            const ts = v.lastSeenAt || v.savedAt || 0;
-            return (now - ts) < maxAgeMs;
-        });
-
-        fresh.sort((a, b) => {
-            const ta = a[1].lastSeenAt || a[1].savedAt || 0;
-            const tb = b[1].lastSeenAt || b[1].savedAt || 0;
-            return tb - ta;
-        });
-
-        const trimmed = fresh.slice(0, RADAR_CONFIG.stateMaxEntries);
-
-        const newState = {};
-        for (const [k, v] of trimmed) newState[k] = v;
-        radar.state = newState;
+    function loadEvents() {
+        try {
+            const raw = localStorage.getItem(CFG.eventsStorageKey);
+            const arr = raw ? JSON.parse(raw) : [];
+            R.events = Array.isArray(arr) ? arr : [];
+        } catch (e) { R.events = []; }
     }
 
-    function emergencyPruneState() {
-        const entries = Object.entries(radar.state);
-        entries.sort((a, b) => {
-            const ta = a[1].lastSeenAt || a[1].savedAt || 0;
-            const tb = b[1].lastSeenAt || b[1].savedAt || 0;
-            return tb - ta;
-        });
-        const trimmed = entries.slice(0, 100);
-        const newState = {};
-        for (const [k, v] of trimmed) newState[k] = v;
-        radar.state = newState;
-    }
-
-    // ═══════════════════════════════════════════════════
-    //  🆕 FIRST RUN — защита от заливки старьём на новом устройстве
-    // ═══════════════════════════════════════════════════
-    function isFirstRunEver() {
-        return !localStorage.getItem(RADAR_CONFIG.firstRunDoneKey);
-    }
-    function markFirstRunDone() {
-        localStorage.setItem(RADAR_CONFIG.firstRunDoneKey, '1');
-    }
-
-    // ═══════════════════════════════════════════════════
-    //  🆕 СВЕЖЕСТЬ — фильтр событий по 48 часам
-    // ═══════════════════════════════════════════════════
-    function isFresh(ts) {
-        if (!ts) return false;
-        const age = Date.now() - ts;
-        return age >= 0 && age < RADAR_CONFIG.freshnessWindowMs;
-    }
-
-    /**
-     * Очищает radar.events от событий старше 48 часов.
-     * Старые события остаются в radar.state (для будущих сравнений),
-     * но из UI (events) удаляются.
-     */
-    function cleanupOldEvents() {
-        const before = radar.events.length;
-        const cutoff = Date.now() - RADAR_CONFIG.freshnessWindowMs;
-        radar.events = radar.events.filter(e => e.ts >= cutoff);
-        const removed = before - radar.events.length;
-
-        // Чистим seen от ключей, которых уже нет в events и state
-        // (чтобы не разрасталось бесконечно)
-        const keepKeys = new Set(radar.events.map(e => e.key));
-        // Также оставляем ключи, которые могут понадобиться для
-        // дедупликации в будущем (из state они не вытаскиваются напрямую,
-        // но нам важно, чтобы seen не рос вечно)
-        // Поэтому обрезаем seen до 2000 последних — уже сделано в saveSeen.
-
-        if (removed > 0) {
-            console.log(`[RADAR] Автоочистка: удалено событий старше 48ч: ${removed}`);
-            if (radar.overlayOpen) renderRadarList();
-            updateRadarBadge();
+    function saveEvents(immediate = false) {
+        if (R._saveEventsTimer) {
+            clearTimeout(R._saveEventsTimer);
+            R._saveEventsTimer = null;
         }
+        const doSave = () => {
+            try {
+                // Обрезаем до maxEventsKept
+                if (R.events.length > CFG.maxEventsKept) {
+                    R.events = R.events.slice(-CFG.maxEventsKept);
+                }
+                localStorage.setItem(CFG.eventsStorageKey, JSON.stringify(R.events));
+            } catch (e) {}
+        };
+        if (immediate) doSave();
+        else R._saveEventsTimer = setTimeout(doSave, 500);
     }
 
-    // ── Стили ──
-    if (!document.getElementById('eventRadarStyles')) {
+    function loadInitFlags() {
+        R.initDone = {};
+        try {
+            for (let i = 0; i < localStorage.length; i++) {
+                const key = localStorage.key(i);
+                if (key && key.startsWith(CFG.initKeyPrefix)) {
+                    const chatFile = key.slice(CFG.initKeyPrefix.length);
+                    R.initDone[chatFile] = true;
+                }
+            }
+        } catch (e) {}
+    }
+
+    function markChatInitialized(chatFile) {
+        R.initDone[chatFile] = true;
+        try {
+            localStorage.setItem(CFG.initKeyPrefix + chatFile, '1');
+        } catch (e) {}
+    }
+
+    function isChatInitialized(chatFile) {
+        if (R.initDone[chatFile]) return true;
+        // Фолбэк: если в state есть сообщения этого чата — считаем инициализированным
+        const prefix = chatFile + '|';
+        for (const key of Object.keys(R.state)) {
+            if (key.startsWith(prefix)) {
+                R.initDone[chatFile] = true;
+                try { localStorage.setItem(CFG.initKeyPrefix + chatFile, '1'); } catch (e) {}
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЗАГРУЗКА ДАННЫХ
+    // ═══════════════════════════════════════════════════════════
+    loadSeen();
+    loadState();
+    loadEvents();
+    loadInitFlags();
+
+    // ═══════════════════════════════════════════════════════════
+    //  СТИЛИ
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('radar2Styles')) {
         const style = document.createElement('style');
-        style.id = 'eventRadarStyles';
+        style.id = 'radar2Styles';
         style.textContent = `
-            #radarToggleBtn { position: relative; }
-            #radarToggleBtn .radar-badge {
+            #radar2Btn {
+                position: relative;
+            }
+            #radar2Btn .r2-badge {
                 position: absolute; top: -4px; right: -4px;
                 min-width: 18px; height: 18px; padding: 0 5px;
                 border-radius: 9px;
@@ -21558,33 +21574,27 @@ document.addEventListener('click', (e) => {
                 box-shadow: 0 2px 8px rgba(0,184,148,0.55);
                 border: 2px solid #0a0a0f; line-height: 1;
             }
-            #radarToggleBtn .radar-badge.show { display: flex; }
-
-            #radarToggleBtnChats.scanning,
-            #radarToggleBtnChat.scanning {
-                animation: radarBtnPulse 1.5s ease-in-out infinite;
+            #radar2Btn .r2-badge.show { display: flex; }
+            #radar2Btn.scanning {
+                animation: r2BtnPulse 1.5s ease-in-out infinite;
             }
-            @keyframes radarBtnPulse {
-                0%, 100% {
-                    background: rgba(255,255,255,0.06);
-                    transform: scale(1);
-                }
-                50% {
-                    background: rgba(108,92,231,0.25);
-                    transform: scale(1.06);
-                }
+            @keyframes r2BtnPulse {
+                0%, 100% { background: rgba(255,255,255,0.06); }
+                50%      { background: rgba(108,92,231,0.25); }
             }
 
-            #radarOverlay {
+            /* ═══ Оверлей ═══ */
+            #radar2Overlay {
                 position: fixed; inset: 0;
                 background: linear-gradient(135deg, #0a0a0f 0%, #1a1a2e 100%);
-                z-index: 4800; display: none; flex-direction: column;
-                animation: radarFadeIn 0.25s ease;
+                z-index: 4900; display: none; flex-direction: column;
+                animation: r2FadeIn 0.25s ease;
             }
-            #radarOverlay.show { display: flex; }
-            @keyframes radarFadeIn { from { opacity: 0; } to { opacity: 1; } }
-            .radar-header {
-                display: flex; align-items: center; gap: 12px;
+            #radar2Overlay.show { display: flex; }
+            @keyframes r2FadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+            .r2-header {
+                display: flex; align-items: center; gap: 8px;
                 padding: 14px 16px;
                 padding-top: calc(14px + env(safe-area-inset-top, 0px));
                 background: rgba(255,255,255,0.04);
@@ -21593,119 +21603,126 @@ document.addEventListener('click', (e) => {
                 border-bottom: 1px solid rgba(255,255,255,0.06);
                 flex-shrink: 0;
             }
-            .radar-header .radar-title {
+            .r2-header .r2-title {
                 flex: 1; min-width: 0;
                 display: flex; flex-direction: column; gap: 2px;
             }
-            .radar-header .radar-title h2 {
+            .r2-header .r2-title h2 {
                 font-size: 17px; font-weight: 700; color: #fff;
                 display: flex; align-items: center; gap: 8px;
             }
-            .radar-header .radar-title h2 .radar-live-dot {
+            .r2-header .r2-title h2 .r2-live-dot {
                 width: 8px; height: 8px; border-radius: 50%;
                 background: #555;
-                box-shadow: 0 0 4px rgba(100,100,100,0.4);
                 transition: background 0.3s, box-shadow 0.3s;
             }
-            .radar-header .radar-title h2 .radar-live-dot.active {
+            .r2-header .r2-title h2 .r2-live-dot.active {
                 background: #00b894;
                 box-shadow: 0 0 8px rgba(0,184,148,0.8);
-                animation: radarLivePulse 1.6s ease-in-out infinite;
+                animation: r2LivePulse 1.6s ease-in-out infinite;
             }
-            @keyframes radarLivePulse {
+            @keyframes r2LivePulse {
                 0%, 100% { opacity: 1; transform: scale(1); }
-                50% { opacity: 0.6; transform: scale(0.85); }
+                50%      { opacity: 0.6; transform: scale(0.85); }
             }
-            .radar-header .radar-title .radar-sub {
+            .r2-header .r2-title .r2-sub {
                 font-size: 11px; color: #888;
                 font-variant-numeric: tabular-nums;
             }
-            .radar-header .radar-btn {
+            .r2-header .r2-btn {
                 width: 38px; height: 38px; border-radius: 50%;
                 background: rgba(255,255,255,0.06); border: none;
-                color: #888; font-size: 17px; cursor: pointer;
+                color: #888; font-size: 16px; cursor: pointer;
                 display: flex; align-items: center; justify-content: center;
                 flex-shrink: 0; transition: all 0.15s;
+                font-family: inherit;
             }
-            .radar-header .radar-btn:hover { background: rgba(255,255,255,0.12); color: #fff; }
-            .radar-header .radar-btn:active { transform: scale(0.9); }
-            .radar-header .radar-btn.on {
+            .r2-header .r2-btn:hover { background: rgba(255,255,255,0.12); color: #fff; }
+            .r2-header .r2-btn:active { transform: scale(0.9); }
+            .r2-header .r2-btn.on {
                 background: linear-gradient(135deg, rgba(108,92,231,0.35), rgba(0,184,148,0.25));
                 color: #fff;
             }
+            .r2-header .r2-btn.r2-btn-scan { color: #00b894; }
+            .r2-header .r2-btn.r2-btn-scan:hover { background: rgba(0,184,148,0.2); color: #00e5b8; }
+            .r2-header .r2-btn.r2-btn-clear:hover { background: rgba(255,107,107,0.2); color: #ff6b6b; }
 
-            .radar-progress {
+            /* Прогресс */
+            .r2-progress {
                 padding: 10px 16px 12px;
                 background: rgba(108,92,231,0.08);
                 border-bottom: 1px solid rgba(108,92,231,0.2);
                 flex-shrink: 0;
                 display: none;
             }
-            .radar-progress.show { display: block; }
-            .radar-progress .rp-line {
+            .r2-progress.show { display: block; }
+            .r2-progress.done {
+                background: rgba(0,184,148,0.08);
+                border-bottom-color: rgba(0,184,148,0.25);
+            }
+            .r2-progress .r2-pr-line {
                 display: flex; align-items: center; justify-content: space-between;
                 gap: 10px; margin-bottom: 8px; font-size: 12px;
             }
-            .radar-progress .rp-label {
+            .r2-progress .r2-pr-label {
                 flex: 1; min-width: 0; color: #a78bfa; font-weight: 600;
                 white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
                 display: flex; align-items: center; gap: 8px;
             }
-            .radar-progress .rp-label .rp-spinner {
+            .r2-progress.done .r2-pr-label { color: #00b894; }
+            .r2-progress .r2-pr-label .r2-spinner {
                 width: 12px; height: 12px;
                 border: 2px solid rgba(167,139,250,0.25);
                 border-top-color: #a78bfa;
                 border-radius: 50%;
-                animation: radarSpin 0.7s linear infinite;
+                animation: r2Spin 0.7s linear infinite;
                 flex-shrink: 0;
             }
-            @keyframes radarSpin { to { transform: rotate(360deg); } }
-            .radar-progress .rp-counter {
+            .r2-progress.done .r2-pr-label .r2-spinner { display: none; }
+            @keyframes r2Spin { to { transform: rotate(360deg); } }
+            .r2-progress .r2-pr-counter {
                 color: #fff; font-weight: 700;
                 font-variant-numeric: tabular-nums; flex-shrink: 0; font-size: 12px;
             }
-            .radar-progress .rp-counter .rp-dim { color: #666; font-weight: 400; }
-            .radar-progress .rp-bar {
+            .r2-progress .r2-pr-counter .dim { color: #666; font-weight: 400; }
+            .r2-progress .r2-pr-bar {
                 width: 100%; height: 4px;
                 background: rgba(255,255,255,0.08);
                 border-radius: 2px; overflow: hidden; position: relative;
             }
-            .radar-progress .rp-fill {
+            .r2-progress .r2-pr-fill {
                 height: 100%; width: 0%;
                 background: linear-gradient(90deg, #6c5ce7, #00b894);
                 border-radius: 2px;
                 transition: width 0.3s cubic-bezier(0.22, 0.61, 0.36, 1);
                 position: relative;
             }
-            .radar-progress .rp-fill::after {
+            .r2-progress.done .r2-pr-fill { background: linear-gradient(90deg, #00b894, #00b894); }
+            .r2-progress .r2-pr-fill::after {
                 content: ''; position: absolute; inset: 0;
-                background: linear-gradient(90deg, transparent, rgba(255,255,255,0.35), transparent);
-                animation: radarProgressShine 1.5s infinite;
+                background: linear-gradient(90deg, transparent, rgba(255,255,255,0.3), transparent);
+                animation: r2Shine 1.5s infinite;
             }
-            @keyframes radarProgressShine {
-                0% { transform: translateX(-100%); }
+            .r2-progress.done .r2-pr-fill::after { display: none; }
+            @keyframes r2Shine {
+                0%   { transform: translateX(-100%); }
                 100% { transform: translateX(100%); }
             }
-            .radar-progress.done {
-                background: rgba(0,184,148,0.08);
-                border-bottom-color: rgba(0,184,148,0.25);
-            }
-            .radar-progress.done .rp-label { color: #00b894; }
-            .radar-progress.done .rp-fill { background: linear-gradient(90deg, #00b894, #00b894); }
-            .radar-progress.done .rp-fill::after { display: none; }
-            .radar-progress.done .rp-label .rp-spinner { display: none; }
 
-            .radar-body {
+            /* Тело */
+            .r2-body {
                 flex: 1; overflow-y: auto;
                 padding: 12px 12px 40px;
                 -webkit-overflow-scrolling: touch;
             }
-            .radar-empty { text-align: center; padding: 60px 20px; color: #666; }
-            .radar-empty .re-icon { font-size: 56px; margin-bottom: 12px; line-height: 1; opacity: 0.7; }
-            .radar-empty .re-title { font-size: 15px; color: #aaa; margin-bottom: 4px; font-weight: 600; }
-            .radar-empty .re-sub { font-size: 12px; color: #666; line-height: 1.5; }
-            .radar-chat-group { margin-bottom: 18px; }
-            .radar-chat-group-header {
+            .r2-empty { text-align: center; padding: 60px 20px; color: #666; }
+            .r2-empty .r2-e-icon { font-size: 56px; margin-bottom: 12px; opacity: 0.7; }
+            .r2-empty .r2-e-title { font-size: 15px; color: #aaa; margin-bottom: 6px; font-weight: 600; }
+            .r2-empty .r2-e-sub { font-size: 12px; color: #666; line-height: 1.5; }
+
+            /* Группа чата */
+            .r2-group { margin-bottom: 18px; }
+            .r2-group-header {
                 display: flex; align-items: center; gap: 8px;
                 padding: 6px 4px 10px;
                 font-size: 12px; color: #a78bfa; font-weight: 700;
@@ -21714,123 +21731,91 @@ document.addEventListener('click', (e) => {
                 background: linear-gradient(180deg, #0f0f18 0%, rgba(15,15,24,0.95) 100%);
                 z-index: 2; margin: -4px -4px 0;
             }
-            .radar-chat-group-header .rcgh-avatar {
+            .r2-group-header .r2-gh-avatar {
                 width: 22px; height: 22px; border-radius: 50%;
                 background: linear-gradient(135deg, #6c5ce7, #00b894);
                 display: flex; align-items: center; justify-content: center;
                 font-weight: 700; color: #fff; font-size: 11px; flex-shrink: 0;
             }
-            .radar-chat-group-header .rcgh-name {
+            .r2-group-header .r2-gh-name {
                 flex: 1; min-width: 0;
                 white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-                color: #fff; text-transform: none; letter-spacing: 0; font-size: 13px;
+                color: #fff; text-transform: none; letter-spacing: 0;
+                font-size: 13px;
             }
-            .radar-event {
+            .r2-group-header .r2-gh-count {
+                font-size: 11px; color: #666; font-weight: 500;
+            }
+
+            /* Событие */
+            .r2-event {
                 display: flex; gap: 10px; padding: 12px 14px; margin-bottom: 8px;
                 background: rgba(255,255,255,0.04);
                 border: 1px solid rgba(255,255,255,0.08);
                 border-radius: 14px; cursor: pointer;
                 transition: all 0.18s ease; position: relative;
-                animation: radarEventIn 0.3s ease;
+                animation: r2EventIn 0.3s ease;
                 -webkit-tap-highlight-color: transparent; overflow: hidden;
             }
-            @keyframes radarEventIn {
+            @keyframes r2EventIn {
                 from { opacity: 0; transform: translateY(-6px); }
-                to { opacity: 1; transform: translateY(0); }
+                to   { opacity: 1; transform: translateY(0); }
             }
-
-            .radar-event:not(.seen-old) {
+            .r2-event:not(.seen) {
                 border-left: 3px solid #00b894;
                 background: linear-gradient(90deg, rgba(0,184,148,0.06) 0%, rgba(255,255,255,0.04) 40%);
             }
-            .radar-event:not(.seen-old):hover {
+            .r2-event:not(.seen):hover {
                 background: linear-gradient(90deg, rgba(0,184,148,0.12) 0%, rgba(108,92,231,0.12) 100%);
                 border-color: rgba(0,184,148,0.4);
                 transform: translateY(-1px);
                 box-shadow: 0 4px 18px rgba(0,184,148,0.2);
             }
-
-            .radar-event.on-mine {
+            .r2-event.on-mine {
                 border-color: rgba(254,202,87,0.5) !important;
                 background: linear-gradient(135deg,
                     rgba(254,202,87,0.08) 0%,
                     rgba(255,159,67,0.04) 100%) !important;
-                box-shadow: 0 0 0 1px rgba(254,202,87,0.15),
-                            0 4px 16px rgba(254,202,87,0.15);
             }
-            .radar-event.on-mine:not(.seen-old) {
+            .r2-event.on-mine:not(.seen) {
                 border-left: 3px solid #feca57 !important;
             }
-            .radar-event.on-mine:hover {
+            .r2-event.on-mine:hover {
                 background: linear-gradient(135deg,
                     rgba(254,202,87,0.18) 0%,
                     rgba(255,159,67,0.08) 100%) !important;
-                border-color: rgba(254,202,87,0.7) !important;
                 box-shadow: 0 0 0 1px rgba(254,202,87,0.3),
                             0 6px 22px rgba(254,202,87,0.3);
             }
-            .radar-event.on-mine .re-kind {
+            .r2-event.on-mine .r2-kind {
                 background: linear-gradient(135deg, rgba(254,202,87,0.35), rgba(255,159,67,0.25)) !important;
                 color: #feca57 !important;
             }
-
-            .radar-event.seen-old {
+            .r2-event.seen {
                 opacity: 0.55;
                 background: rgba(255,255,255,0.02);
-                border-color: rgba(255,255,255,0.04);
                 border-left-color: rgba(255,255,255,0.08);
                 filter: grayscale(0.4);
             }
-            .radar-event.seen-old:hover {
+            .r2-event.seen:hover {
                 opacity: 0.9;
-                background: rgba(108,92,231,0.08);
-                border-color: rgba(108,92,231,0.25);
                 filter: grayscale(0);
-                transform: translateY(-1px);
-            }
-            .radar-event.seen-old .re-kind {
-                filter: grayscale(0.7);
-                opacity: 0.8;
-            }
-            .radar-event.seen-old.on-mine {
-                filter: grayscale(0.2);
-                opacity: 0.7;
-            }
-            .radar-event.seen-old.on-mine:hover {
-                filter: grayscale(0);
-                opacity: 1;
             }
 
-            .radar-event .re-my-badge {
-                display: inline-flex; align-items: center; gap: 3px;
-                padding: 2px 7px;
-                background: linear-gradient(135deg, rgba(254,202,87,0.3), rgba(255,159,67,0.2));
-                border: 1px solid rgba(254,202,87,0.5);
-                border-radius: 8px;
-                font-size: 9px; font-weight: 700; color: #feca57;
-                text-transform: uppercase; letter-spacing: 0.4px;
-                margin-left: 4px; flex-shrink: 0;
-                animation: myBadgePulse 2s ease-in-out infinite;
-            }
-            @keyframes myBadgePulse {
-                0%, 100% { box-shadow: 0 0 0 0 rgba(254,202,87,0.4); }
-                50% { box-shadow: 0 0 0 4px rgba(254,202,87,0); }
-            }
-
-            .radar-event .re-kind {
+            .r2-event .r2-kind {
                 width: 42px; height: 42px; border-radius: 12px;
                 display: flex; align-items: center; justify-content: center;
                 font-size: 20px; flex-shrink: 0; position: relative;
             }
-            .radar-event.kind-reaction .re-kind {
+            .r2-event.kind-reaction .r2-kind {
                 background: linear-gradient(135deg, rgba(255,107,107,0.25), rgba(238,82,83,0.15));
                 color: #ff8a8a;
             }
-            .radar-event.kind-comment .re-kind {
+            .r2-event.kind-comment .r2-kind {
                 background: linear-gradient(135deg, rgba(108,92,231,0.28), rgba(167,139,250,0.18));
                 color: #a78bfa;
             }
-            .radar-event .re-kind .re-kind-badge {
+            .r2-event .r2-kind .r2-kind-badge {
                 position: absolute; right: -3px; bottom: -3px;
                 min-width: 18px; height: 18px; padding: 0 5px;
                 border-radius: 9px;
@@ -21839,22 +21824,35 @@ document.addEventListener('click', (e) => {
                 display: flex; align-items: center; justify-content: center;
                 border: 2px solid #0a0a0f; line-height: 1;
             }
-            .radar-event .re-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
-            .radar-event .re-head {
+            .r2-event .r2-body-col {
+                flex: 1; min-width: 0;
+                display: flex; flex-direction: column; gap: 3px;
+            }
+            .r2-event .r2-head {
                 display: flex; align-items: center; gap: 6px;
                 font-size: 11px; color: #888; margin-bottom: 2px;
                 flex-wrap: wrap;
             }
-            .radar-event .re-head .re-from {
+            .r2-event .r2-head .r2-from {
                 font-weight: 700; color: #a78bfa;
                 white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-                max-width: 45%;
+                max-width: 50%;
             }
-            .radar-event .re-head .re-time {
+            .r2-event .r2-head .r2-time {
                 color: #666; font-variant-numeric: tabular-nums; white-space: nowrap;
             }
-            .radar-event .re-head .re-dot { color: #444; }
-            .radar-event .re-attach-preview {
+            .r2-event .r2-head .r2-dot { color: #444; }
+            .r2-event .r2-my-badge {
+                display: inline-flex; align-items: center; gap: 3px;
+                padding: 2px 7px;
+                background: linear-gradient(135deg, rgba(254,202,87,0.3), rgba(255,159,67,0.2));
+                border: 1px solid rgba(254,202,87,0.5);
+                border-radius: 8px;
+                font-size: 9px; font-weight: 700; color: #feca57;
+                text-transform: uppercase; letter-spacing: 0.4px;
+                margin-left: 4px; flex-shrink: 0;
+            }
+            .r2-event .r2-attach {
                 display: inline-flex; align-items: center; gap: 6px;
                 padding: 3px 8px; background: rgba(0,0,0,0.25);
                 border: 1px solid rgba(255,255,255,0.06);
@@ -21862,8 +21860,7 @@ document.addEventListener('click', (e) => {
                 margin-top: 2px; max-width: 100%; width: fit-content;
                 overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
             }
-            .radar-event .re-attach-preview .re-attach-icon { font-size: 13px; }
-            .radar-event .re-reaction {
+            .r2-event .r2-reaction {
                 display: inline-flex; align-items: center; gap: 6px;
                 padding: 4px 10px;
                 background: linear-gradient(135deg, rgba(108,92,231,0.28), rgba(0,184,148,0.18));
@@ -21871,120 +21868,104 @@ document.addEventListener('click', (e) => {
                 border-radius: 12px; font-size: 15px; line-height: 1;
                 width: fit-content; margin-top: 2px; color: #fff;
             }
-            .radar-event .re-reaction .re-reaction-count {
-                font-size: 12px; font-weight: 700; color: #fff;
+            .r2-event .r2-reaction .r2-rc-count {
+                font-size: 12px; font-weight: 700;
             }
-            .radar-event .re-comment-bubble {
+            .r2-event .r2-comment-bubble {
                 background: rgba(0,0,0,0.28);
                 border-left: 3px solid #a78bfa;
                 border-radius: 8px; padding: 6px 10px;
                 font-size: 12px; color: #ddd; line-height: 1.35;
                 margin-top: 2px; word-break: break-word; white-space: pre-wrap;
                 max-height: 4.2em; overflow: hidden;
-                display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
             }
-            .radar-header .radar-btn.radar-clear { font-size: 15px; }
-            .radar-header .radar-btn.radar-clear:hover {
-                background: rgba(255,107,107,0.2); color: #ff6b6b;
-            }
-            .radar-header .radar-btn.radar-reset:hover {
-                background: rgba(108,92,231,0.25); color: #a78bfa;
-            }
-            .radar-divider {
+
+            .r2-divider {
                 display: flex; align-items: center; gap: 10px;
                 padding: 16px 4px 10px; color: #555;
                 font-size: 11px; text-transform: uppercase;
                 letter-spacing: 0.5px; font-weight: 700;
             }
-            .radar-divider::before, .radar-divider::after {
+            .r2-divider::before, .r2-divider::after {
                 content: ''; flex: 1; height: 1px;
                 background: linear-gradient(90deg, transparent, rgba(255,255,255,0.08), transparent);
             }
+
             @media (max-width: 480px) {
-                .radar-header .radar-title h2 { font-size: 15px; }
-                .radar-event { padding: 10px 12px; }
-                .radar-event .re-kind { width: 38px; height: 38px; font-size: 18px; }
+                .r2-header .r2-title h2 { font-size: 15px; }
+                .r2-header .r2-btn { width: 34px; height: 34px; font-size: 14px; }
+                .r2-event { padding: 10px 12px; }
+                .r2-event .r2-kind { width: 38px; height: 38px; font-size: 18px; }
             }
         `;
         document.head.appendChild(style);
     }
 
-    // ── Утилиты ──
-    function escapeHtml(s) {
-        if (typeof window.escapeHtml === 'function') return window.escapeHtml(s);
-        const div = document.createElement('div');
-        div.textContent = s == null ? '' : String(s);
-        return div.innerHTML;
-    }
-    function showToastSafe(msg, dur = 2000) {
-        if (typeof showToast === 'function') showToast(msg, dur);
-    }
-
-    // ── Кнопки ──
-    let _installingButtons = false;
+    // ═══════════════════════════════════════════════════════════
+    //  КНОПКИ 🔔 В ШАПКАХ
+    // ═══════════════════════════════════════════════════════════
     function installRadarButtons() {
-        if (_installingButtons) return;
-        _installingButtons = true;
-        try {
-            const chatsHeader = document.querySelector('#chatsScreen .auth-header');
-            if (chatsHeader && !document.getElementById('radarToggleBtnChats')) {
-                const rightBlock = chatsHeader.querySelector('div[style*="display:flex"]');
-                if (rightBlock) {
-                    const btn = document.createElement('button');
-                    btn.className = 'exit-btn';
-                    btn.id = 'radarToggleBtnChats';
-                    btn.title = 'События';
-                    btn.innerHTML = `🔔<span class="radar-badge" id="radarBadgeChats">0</span>`;
-                    btn.style.position = 'relative';
-                    rightBlock.insertBefore(btn, rightBlock.firstChild);
-                    btn.addEventListener('click', openRadarOverlay);
-                }
+        // В шапке списка чатов
+        const chatsHeader = document.querySelector('#chatsScreen .auth-header');
+        if (chatsHeader && !document.getElementById('radar2Btn')) {
+            const rightBlock = chatsHeader.querySelector('div[style*="display:flex"]');
+            if (rightBlock) {
+                const btn = document.createElement('button');
+                btn.className = 'exit-btn';
+                btn.id = 'radar2Btn';
+                btn.title = 'События';
+                btn.innerHTML = `🔔<span class="r2-badge" id="radar2Badge">0</span>`;
+                btn.style.position = 'relative';
+                rightBlock.insertBefore(btn, rightBlock.firstChild);
+                btn.addEventListener('click', openOverlay);
             }
+        }
 
-            const chatHeader = document.querySelector('#chatScreen .chat-header');
-            if (chatHeader && !document.getElementById('radarToggleBtnChat')) {
-                const searchBtn = document.getElementById('searchChatBtn');
-                if (searchBtn && searchBtn.parentNode) {
-                    const btn = document.createElement('button');
-                    btn.className = 'exit-btn';
-                    btn.id = 'radarToggleBtnChat';
-                    btn.title = 'События';
-                    btn.innerHTML = `🔔<span class="radar-badge" id="radarBadgeChat">0</span>`;
-                    btn.style.position = 'relative';
-                    btn.style.marginRight = '8px';
-                    searchBtn.parentNode.insertBefore(btn, searchBtn);
-                    btn.addEventListener('click', openRadarOverlay);
-                }
+        // В шапке чата
+        const chatHeader = document.querySelector('#chatScreen .chat-header');
+        if (chatHeader && !document.getElementById('radar2BtnChat')) {
+            const searchBtn = document.getElementById('searchChatBtn');
+            if (searchBtn && searchBtn.parentNode) {
+                const btn = document.createElement('button');
+                btn.className = 'exit-btn';
+                btn.id = 'radar2BtnChat';
+                btn.title = 'События';
+                btn.innerHTML = `🔔<span class="r2-badge" id="radar2BadgeChat">0</span>`;
+                btn.style.position = 'relative';
+                btn.style.marginRight = '8px';
+                searchBtn.parentNode.insertBefore(btn, searchBtn);
+                btn.addEventListener('click', openOverlay);
             }
-        } finally {
-            _installingButtons = false;
         }
     }
 
-    let _btnObserverTimer = null;
+    let _btnInstallTimer = null;
     const _btnObserver = new MutationObserver(() => {
-        if (_btnObserverTimer) return;
-        _btnObserverTimer = setTimeout(() => {
-            _btnObserverTimer = null;
+        if (_btnInstallTimer) return;
+        _btnInstallTimer = setTimeout(() => {
+            _btnInstallTimer = null;
             installRadarButtons();
-            updateRadarBadge();
+            updateBadges();
         }, 200);
     });
     _btnObserver.observe(document.body, { childList: true, subtree: true });
 
     installRadarButtons();
 
-    function updateRadarBadge() {
-        const unread = radar.events.filter(e => !e.seen).length;
-        const onMineUnread = radar.events.filter(e => !e.seen && e.isOnMyMessage).length;
+    // ═══════════════════════════════════════════════════════════
+    //  БЕЙДЖИ
+    // ═══════════════════════════════════════════════════════════
+    function updateBadges() {
+        const unseen = R.events.filter(e => !e.seen).length;
+        const onMineUnseen = R.events.filter(e => !e.seen && e.isOnMyMessage).length;
 
-        ['radarBadgeChats', 'radarBadgeChat'].forEach(id => {
+        ['radar2Badge', 'radar2BadgeChat'].forEach(id => {
             const el = document.getElementById(id);
             if (!el) return;
-            if (unread > 0) {
-                el.textContent = unread > 99 ? '99+' : String(unread);
+            if (unseen > 0) {
+                el.textContent = unseen > 99 ? '99+' : String(unseen);
                 el.classList.add('show');
-                if (onMineUnread > 0) {
+                if (onMineUnseen > 0) {
                     el.style.background = 'linear-gradient(135deg, #feca57, #ff9f43)';
                     el.style.boxShadow = '0 2px 8px rgba(254,202,87,0.65)';
                 } else {
@@ -21993,14 +21974,20 @@ document.addEventListener('click', (e) => {
                 }
             } else {
                 el.classList.remove('show');
-                el.style.background = '';
-                el.style.boxShadow = '';
             }
         });
+
+        ['radar2Btn', 'radar2BtnChat'].forEach(id => {
+            const btn = document.getElementById(id);
+            if (btn) btn.classList.toggle('scanning', R.scanning);
+        });
+
+        const liveDot = document.querySelector('.r2-live-dot');
+        if (liveDot) liveDot.classList.toggle('active', R.enabled && !R.scanning);
     }
 
-    function hideRadarBadgesNow() {
-        ['radarBadgeChats', 'radarBadgeChat'].forEach(id => {
+    function hideBadges() {
+        ['radar2Badge', 'radar2BadgeChat'].forEach(id => {
             const el = document.getElementById(id);
             if (el) {
                 el.textContent = '0';
@@ -22009,241 +21996,247 @@ document.addEventListener('click', (e) => {
         });
     }
 
-    function setScanningVisual(active) {
-        ['radarToggleBtnChats', 'radarToggleBtnChat'].forEach(id => {
-            const btn = document.getElementById(id);
-            if (btn) btn.classList.toggle('scanning', active);
-        });
-        const liveDot = document.querySelector('.radar-live-dot');
-        if (liveDot) liveDot.classList.toggle('active', active);
-    }
+    // ═══════════════════════════════════════════════════════════
+    //  ПРОГРЕСС
+    // ═══════════════════════════════════════════════════════════
+    function updateProgress() {
+        const box = document.getElementById('r2Progress');
+        const labelEl = document.getElementById('r2PrLabelText');
+        const doneEl = document.getElementById('r2PrDone');
+        const totalEl = document.getElementById('r2PrTotal');
+        const fillEl = document.getElementById('r2PrFill');
+        if (!box || !fillEl) return;
 
-    // ── Прогресс ──
-    function updateRadarProgress() {
-        const box = document.getElementById('radarProgress');
-        const labelText = document.getElementById('rpLabelText');
-        const done = document.getElementById('rpDone');
-        const total = document.getElementById('rpTotal');
-        const fill = document.getElementById('rpFill');
-        if (!box || !fill) return;
-
-        const p = radar.progress;
+        const p = R.progress;
 
         if (p.phase === 'scanning') {
             box.classList.add('show');
             box.classList.remove('done');
-            labelText.textContent = p.current
-                ? `Сканирую: ${p.current}`
-                : 'Сканирую чаты…';
-            done.textContent = p.done;
-            total.textContent = p.total;
+            labelEl.textContent = p.current ? `Сканирую: ${p.current}` : 'Сканирую чаты…';
+            doneEl.textContent = p.done;
+            totalEl.textContent = p.total;
             const pct = p.total > 0 ? (p.done / p.total) * 100 : 0;
-            fill.style.width = pct + '%';
+            fillEl.style.width = pct + '%';
         } else if (p.phase === 'done') {
             box.classList.add('show', 'done');
-            if (p.changedCount > 0) {
-                labelText.textContent = `Готово · обновлено чатов: ${p.changedCount}`;
+            if (p.eventsAdded > 0) {
+                labelEl.textContent = `Готово · найдено событий: ${p.eventsAdded}`;
+            } else if (p.changedCount > 0) {
+                labelEl.textContent = `Готово · обновлено чатов: ${p.changedCount}`;
             } else {
-                labelText.textContent = 'Готово · изменений нет';
+                labelEl.textContent = 'Готово · изменений нет';
             }
-            done.textContent = p.total;
-            total.textContent = p.total;
-            fill.style.width = '100%';
+            doneEl.textContent = p.total;
+            totalEl.textContent = p.total;
+            fillEl.style.width = '100%';
         } else {
             box.classList.remove('show', 'done');
         }
     }
 
-    function hideRadarProgressAfter(ms = 1800) {
+    function hideProgressAfter(ms = 2500) {
         setTimeout(() => {
-            if (radar.progress.phase === 'done' && !radar.scanning) {
-                const box = document.getElementById('radarProgress');
+            if (R.progress.phase === 'done' && !R.scanning) {
+                R.progress.phase = 'idle';
+                const box = document.getElementById('r2Progress');
                 if (box) box.classList.remove('show', 'done');
-                radar.progress.phase = 'idle';
             }
         }, ms);
     }
 
-    // ── Оверлей ──
+    // ═══════════════════════════════════════════════════════════
+    //  ОВЕРЛЕЙ
+    // ═══════════════════════════════════════════════════════════
     function ensureOverlay() {
-        let ov = document.getElementById('radarOverlay');
+        let ov = document.getElementById('radar2Overlay');
         if (ov) return ov;
 
         ov = document.createElement('div');
-        ov.id = 'radarOverlay';
+        ov.id = 'radar2Overlay';
         ov.innerHTML = `
-            <div class="radar-header">
-                <div class="radar-title">
+            <div class="r2-header">
+                <div class="r2-title">
                     <h2>
-                        <span class="radar-live-dot"></span>
+                        <span class="r2-live-dot"></span>
                         <span>События</span>
                     </h2>
-                    <div class="radar-sub" id="radarSub">Готов</div>
+                    <div class="r2-sub" id="r2Sub">Готов</div>
                 </div>
-                <button class="radar-btn on" id="radarOnOffBtn" title="Вкл/выкл">⏸</button>
-                <button class="radar-btn radar-reset" id="radarResetStateBtn" title="Забыть всё (показать заново)">🔄</button>
-                <button class="radar-btn radar-clear" id="radarClearBtn" title="Очистить историю">🗑</button>
-                <button class="radar-btn" id="radarCloseBtn" title="Закрыть">✕</button>
+                <button class="r2-btn r2-btn-scan" id="r2ScanNowBtn" title="Проверить сейчас">⟳</button>
+                <button class="r2-btn on" id="r2OnOffBtn" title="Вкл/выкл">⏸</button>
+                <button class="r2-btn r2-btn-clear" id="r2ClearBtn" title="Очистить всё">🗑</button>
+                <button class="r2-btn" id="r2CloseBtn" title="Закрыть">✕</button>
             </div>
-            <div class="radar-progress" id="radarProgress">
-                <div class="rp-line">
-                    <div class="rp-label" id="rpLabel">
-                        <span class="rp-spinner"></span>
-                        <span id="rpLabelText">Сканирую…</span>
+            <div class="r2-progress" id="r2Progress">
+                <div class="r2-pr-line">
+                    <div class="r2-pr-label" id="r2PrLabel">
+                        <span class="r2-spinner"></span>
+                        <span id="r2PrLabelText">Сканирую…</span>
                     </div>
-                    <div class="rp-counter" id="rpCounter">
-                        <span id="rpDone">0</span><span class="rp-dim"> / <span id="rpTotal">0</span></span>
+                    <div class="r2-pr-counter">
+                        <span id="r2PrDone">0</span><span class="dim"> / <span id="r2PrTotal">0</span></span>
                     </div>
                 </div>
-                <div class="rp-bar"><div class="rp-fill" id="rpFill"></div></div>
+                <div class="r2-pr-bar"><div class="r2-pr-fill" id="r2PrFill"></div></div>
             </div>
-            <div class="radar-body" id="radarBody"></div>
+            <div class="r2-body" id="r2Body"></div>
         `;
         document.body.appendChild(ov);
 
-        ov.querySelector('#radarCloseBtn').addEventListener('click', closeRadarOverlay);
+        ov.querySelector('#r2CloseBtn').addEventListener('click', closeOverlay);
 
-        ov.querySelector('#radarClearBtn').addEventListener('click', () => {
-            if (!confirm('Очистить историю событий? Список показанных событий тоже будет сброшен.')) return;
-            radar.events = [];
-            radar.seen.clear();
-            saveSeen();
-            renderRadarList();
-            updateRadarBadge();
-            showToastSafe('🗑️ История событий очищена');
+        ov.querySelector('#r2ScanNowBtn').addEventListener('click', async () => {
+            if (R.scanning) {
+                showToastSafe('⏳ Скан уже идёт…');
+                return;
+            }
+            showToastSafe('🔍 Проверяю чаты…');
+            await scanAll({ force: true });
         });
 
-        ov.querySelector('#radarResetStateBtn').addEventListener('click', () => {
-            if (!confirm('Забыть, что вы видели?\n\nСобытия покажутся заново — даже те, что вы уже просмотрели.')) return;
-            radar.events = [];
-            radar.seen.clear();
-            radar.state = {};
-            saveSeen();
-            saveRadarState(true);
-            renderRadarList();
-            updateRadarBadge();
-            showToastSafe('🔄 Состояние сброшено');
+        ov.querySelector('#r2ClearBtn').addEventListener('click', () => {
+            if (!confirm('Очистить всё?\n\nИстория событий, состояние сравнения и метки «прочитано» будут удалены. При следующем скане события появятся заново — только те, что реально новые.')) return;
+            R.events = [];
+            R.seen.clear();
+            R.state = {};
+            R.etags = {};
+            R.versions = {};
+            R.initDone = {};
+            try {
+                localStorage.removeItem(CFG.eventsStorageKey);
+                localStorage.removeItem(CFG.seenStorageKey);
+                localStorage.removeItem(CFG.stateStorageKey);
+                for (let i = localStorage.length - 1; i >= 0; i--) {
+                    const key = localStorage.key(i);
+                    if (key && key.startsWith(CFG.initKeyPrefix)) localStorage.removeItem(key);
+                }
+            } catch (e) {}
+            renderList();
+            updateBadges();
+            showToastSafe('🗑️ Всё очищено');
         });
 
-        ov.querySelector('#radarOnOffBtn').addEventListener('click', toggleRadarEnabled);
+        ov.querySelector('#r2OnOffBtn').addEventListener('click', toggleEnabled);
 
         return ov;
     }
 
-    function openRadarOverlay() {
+    function openOverlay() {
         ensureOverlay();
-        const ov = document.getElementById('radarOverlay');
+        const ov = document.getElementById('radar2Overlay');
         ov.classList.add('show');
-        radar.overlayOpen = true;
+        R.overlayOpen = true;
         document.body.style.overflow = 'hidden';
 
-        hideRadarBadgesNow();
+        hideBadges();
+        renderList();
+        updateHeaderState();
+        updateProgress();
 
-        if (radar.enabled && !radar.scanning) {
-            const lastScan = radar._lastScanTs || 0;
-            if (Date.now() - lastScan > 5000) {
-                scanAllChats();
-            }
+        // Автоскан при открытии
+        if (R.enabled && !R.scanning && CFG.scanOnOpen) {
+            setTimeout(() => scanAll({ force: false }), 150);
         }
-        renderRadarList();
-        updateRadarHeaderState();
-        updateRadarProgress();
     }
 
-    function closeRadarOverlay() {
-        const ov = document.getElementById('radarOverlay');
+    function closeOverlay() {
+        const ov = document.getElementById('radar2Overlay');
         if (!ov) return;
         ov.classList.remove('show');
-        radar.overlayOpen = false;
+        R.overlayOpen = false;
         document.body.style.overflow = '';
 
-        const visibleKeys = new Set();
-        ov.querySelectorAll('.radar-event').forEach(el => {
-            const key = el.dataset.key;
-            if (key) visibleKeys.add(key);
-        });
+        // Помечаем видимые события как прочитанные
         let changed = false;
-        radar.events.forEach(e => {
-            if (visibleKeys.has(e.key) && !e.seen) {
+        R.events.forEach(e => {
+            if (!e.seen) {
                 e.seen = true;
-                radar.seen.add(e.key);
+                R.seen.add(e.key);
                 changed = true;
             }
         });
-        if (changed) saveSeen();
+        if (changed) {
+            saveSeen();
+            saveEvents();
+        }
 
-        hideRadarBadgesNow();
-        updateRadarBadge();
+        hideBadges();
+        updateBadges();
     }
 
-    function toggleRadarEnabled() {
-        radar.enabled = !radar.enabled;
-        localStorage.setItem(RADAR_CONFIG.enabledStorageKey, radar.enabled ? '1' : '0');
-        updateRadarHeaderState();
+    function toggleEnabled() {
+        R.enabled = !R.enabled;
+        localStorage.setItem(CFG.enabledKey, R.enabled ? '1' : '0');
+        updateHeaderState();
 
-        if (radar.enabled) {
-            showToastSafe('🔔 События включены');
-            startRadarLoop();
+        if (R.enabled) {
+            showToastSafe('🔔 Отслеживание включено');
+            startLoop();
+            // Сразу проверим
+            setTimeout(() => scanAll({ force: false }), 500);
         } else {
             showToastSafe('⏸ Отслеживание выключено');
-            stopRadarLoop();
+            stopLoop();
         }
+        updateBadges();
     }
 
-    function updateRadarHeaderState() {
-        const btn = document.getElementById('radarOnOffBtn');
+    function updateHeaderState() {
+        const btn = document.getElementById('r2OnOffBtn');
         if (!btn) return;
-        btn.textContent = radar.enabled ? '⏸' : '▶';
-        btn.classList.toggle('on', radar.enabled);
-        btn.title = radar.enabled ? 'Поставить на паузу' : 'Возобновить';
+        btn.textContent = R.enabled ? '⏸' : '▶';
+        btn.classList.toggle('on', R.enabled);
+        btn.title = R.enabled ? 'Поставить на паузу' : 'Возобновить';
     }
 
-    // ── Рендер ──
-    function renderRadarList() {
-        const body = document.getElementById('radarBody');
-        const sub = document.getElementById('radarSub');
+    // ═══════════════════════════════════════════════════════════
+    //  РЕНДЕР СПИСКА
+    // ═══════════════════════════════════════════════════════════
+    function renderList() {
+        const body = document.getElementById('r2Body');
+        const sub = document.getElementById('r2Sub');
         if (!body) return;
 
-        const total = radar.events.length;
-        const freshCount = radar.events.filter(e => !e.seen).length;
+        const total = R.events.length;
+        const unseen = R.events.filter(e => !e.seen).length;
 
         if (sub) {
-            if (radar.scanning) {
-                sub.textContent = `🔔 Сканирую… ${radar.progress.done}/${radar.progress.total}`;
+            if (R.scanning) {
+                sub.textContent = `🔔 Сканирую… ${R.progress.done}/${R.progress.total}`;
             } else {
-                const lastScan = radar._lastScanTs;
-                const ago = lastScan ? Math.round((Date.now() - lastScan) / 1000) : null;
+                const ago = R.lastScanTs
+                    ? Math.round((Date.now() - R.lastScanTs) / 1000)
+                    : null;
                 const agoStr = ago !== null
                     ? (ago < 5 ? 'только что'
                         : ago < 60 ? `${ago} сек назад`
                         : `${Math.round(ago / 60)} мин назад`)
                     : '';
-
-                const onMine = radar.events.filter(e => !e.seen && e.isOnMyMessage).length;
+                const onMine = R.events.filter(e => !e.seen && e.isOnMyMessage).length;
                 const onMineStr = onMine > 0 ? `⭐ ${onMine} на ваших · ` : '';
-
-                sub.textContent = freshCount > 0
-                    ? `${onMineStr}Новых: ${freshCount} · Всего: ${total}` + (agoStr ? ` · ${agoStr}` : '')
+                sub.textContent = unseen > 0
+                    ? `${onMineStr}Новых: ${unseen} · Всего: ${total}` + (agoStr ? ` · ${agoStr}` : '')
                     : `Всего: ${total}` + (agoStr ? ` · скан ${agoStr}` : '');
             }
         }
 
         if (total === 0) {
             body.innerHTML = `
-                <div class="radar-empty">
-                    <div class="re-icon">🔔</div>
-                    <div class="re-title">${radar.enabled ? 'Пока ничего нового' : 'Отслеживание выключено'}</div>
-                    <div class="re-sub">
-                        ${radar.enabled
-                            ? 'Как только кто-то поставит реакцию или оставит комментарий — появится здесь. События старше 48 часов не показываются.'
-                            : 'Включите кнопкой ▶ в шапке.'}
+                <div class="r2-empty">
+                    <div class="r2-e-icon">🔔</div>
+                    <div class="r2-e-title">${R.enabled ? 'Событий пока нет' : 'Отслеживание выключено'}</div>
+                    <div class="r2-e-sub">
+                        ${R.enabled
+                            ? 'Как только кто-то поставит реакцию или оставит комментарий — появится здесь.<br><br>Нажмите «⟳» чтобы проверить сейчас.'
+                            : 'Включите кнопкой «▶» в шапке.'}
                     </div>
                 </div>
             `;
             return;
         }
 
-        const sorted = radar.events.slice().sort((a, b) => {
+        // Сортировка: новые сверху, «на моих» — приоритетнее
+        const sorted = R.events.slice().sort((a, b) => {
             if (a.seen !== b.seen) return a.seen ? 1 : -1;
             if (!a.seen && !b.seen) {
                 if (a.isOnMyMessage !== b.isOnMyMessage) {
@@ -22253,41 +22246,24 @@ document.addEventListener('click', (e) => {
             return b.ts - a.ts;
         });
 
-        const freshList = sorted.filter(e => !e.seen);
-        const older = sorted.filter(e => e.seen);
+        const fresh = sorted.filter(e => !e.seen);
+        const old = sorted.filter(e => e.seen);
 
         let html = '';
-
-        if (freshList.length > 0) {
-            html += renderGroup(freshList);
-        }
-
-        if (older.length > 0) {
-            html += `<div class="radar-divider">История</div>`;
-            html += renderGroup(older.slice(0, RADAR_CONFIG.maxEventsShown));
+        if (fresh.length > 0) html += renderGroups(fresh);
+        if (old.length > 0) {
+            html += `<div class="r2-divider">История</div>`;
+            html += renderGroups(old.slice(0, CFG.maxEventsShown));
         }
 
         body.innerHTML = html;
 
-        body.querySelectorAll('.radar-event').forEach(el => {
-            el.addEventListener('click', () => {
-                const chatFile = el.dataset.chatFile;
-                const msgId = parseInt(el.dataset.msgId);
-                const key = el.dataset.key;
-
-                const ev = radar.events.find(x => x.key === key);
-                if (ev && !ev.seen) {
-                    ev.seen = true;
-                    markSeen(key);
-                    updateRadarBadge();
-                }
-
-                jumpToRadarEvent(chatFile, msgId);
-            });
+        body.querySelectorAll('.r2-event').forEach(el => {
+            el.addEventListener('click', () => handleEventClick(el));
         });
     }
 
-    function renderGroup(events) {
+    function renderGroups(events) {
         const byChat = new Map();
         for (const e of events) {
             if (!byChat.has(e.chatFile)) byChat.set(e.chatFile, []);
@@ -22300,16 +22276,13 @@ document.addEventListener('click', (e) => {
             const chatName = chat ? (chat.name || chat.file) : chatFile;
             const letter = (chatName || '?').charAt(0).toUpperCase();
 
-            html += `<div class="radar-chat-group">`;
-            html += `<div class="radar-chat-group-header">
-                        <div class="rcgh-avatar">${escapeHtml(letter)}</div>
-                        <div class="rcgh-name">${escapeHtml(chatName)}</div>
-                        <div style="font-size:11px;color:#666;font-weight:500;">${items.length}</div>
+            html += `<div class="r2-group">`;
+            html += `<div class="r2-group-header">
+                        <div class="r2-gh-avatar">${escapeSafe(letter)}</div>
+                        <div class="r2-gh-name">${escapeSafe(chatName)}</div>
+                        <div class="r2-gh-count">${items.length}</div>
                      </div>`;
-
-            for (const e of items) {
-                html += renderEventCard(e);
-            }
+            for (const e of items) html += renderEventCard(e);
             html += `</div>`;
         }
         return html;
@@ -22320,57 +22293,53 @@ document.addEventListener('click', (e) => {
         const kindCls = isReaction ? 'kind-reaction' : 'kind-comment';
         const kindIcon = isReaction ? '❤️' : '💬';
         const onMineCls = e.isOnMyMessage ? ' on-mine' : '';
-        const seenCls = e.seen ? ' seen-old' : '';
-        const timeStr = formatRadarTime(e.ts);
+        const seenCls = e.seen ? ' seen' : '';
+        const timeStr = formatTime(e.ts);
 
         let bodyHtml = '';
-
         if (e.attachPreview) {
-            bodyHtml += `<div class="re-attach-preview">
-                            <span class="re-attach-icon">${e.attachPreview.icon}</span>
-                            <span>${escapeHtml(e.attachPreview.text)}</span>
+            bodyHtml += `<div class="r2-attach">
+                            <span>${e.attachPreview.icon}</span>
+                            <span>${escapeSafe(e.attachPreview.text)}</span>
                          </div>`;
         }
 
         if (isReaction) {
             const emoji = e.payload.emoji || '❤️';
-            const count = e.payload.users?.length || 1;
-            bodyHtml += `<div class="re-reaction">
-                            <span>${escapeHtml(emoji)}</span>
-                            <span class="re-reaction-count">${count}</span>
+            const count = (e.payload.users || []).length || 1;
+            bodyHtml += `<div class="r2-reaction">
+                            <span>${escapeSafe(emoji)}</span>
+                            <span class="r2-rc-count">${count}</span>
                          </div>`;
         } else {
             const text = e.payload.text || '';
-            const emojiInfo = (typeof analyzeEmojiOnly === 'function')
-                ? analyzeEmojiOnly(text)
-                : null;
-            const textCls = emojiInfo ? 're-comment-bubble emoji-only' : 're-comment-bubble';
-            bodyHtml += `<div class="${textCls}">${renderRadarTextWithLinks(text)}</div>`;
+            bodyHtml += `<div class="r2-comment-bubble">${renderTextSafe(text)}</div>`;
         }
 
-        const fromName = e.payload.from === state.username ? (window.i18n?.t('Вы') || 'Вы') : (e.payload.from || '—');
-        const fromSafe = escapeHtml(fromName);
+        const fromName = e.payload.from === state.username
+            ? 'Вы'
+            : (e.payload.from || '—');
 
         const myBadge = e.isOnMyMessage
-            ? `<span class="re-my-badge">⭐ на ваше</span>`
+            ? `<span class="r2-my-badge">⭐ на ваше</span>`
             : '';
 
         return `
-            <div class="radar-event ${kindCls}${onMineCls}${seenCls}"
-                 data-chat-file="${escapeHtml(e.chatFile)}"
-                 data-msg-id="${e.msgId}"
-                 data-key="${escapeHtml(e.key)}">
-                <div class="re-kind">${kindIcon}
-                    ${isReaction && e.payload.users?.length > 1
-                        ? `<span class="re-kind-badge">${e.payload.users.length}</span>`
+            <div class="r2-event ${kindCls}${onMineCls}${seenCls}"
+                 data-key="${escapeSafe(e.key)}"
+                 data-chat-file="${escapeSafe(e.chatFile)}"
+                 data-msg-id="${e.msgId}">
+                <div class="r2-kind">${kindIcon}
+                    ${isReaction && (e.payload.users || []).length > 1
+                        ? `<span class="r2-kind-badge">${e.payload.users.length}</span>`
                         : ''}
                 </div>
-                <div class="re-body">
-                    <div class="re-head">
-                        <span class="re-from">${isReaction ? 'Реакция от' : 'Комментарий от'} ${fromSafe}</span>
+                <div class="r2-body-col">
+                    <div class="r2-head">
+                        <span class="r2-from">${isReaction ? 'Реакция от' : 'Комментарий от'} ${escapeSafe(fromName)}</span>
                         ${myBadge}
-                        <span class="re-dot">·</span>
-                        <span class="re-time">${escapeHtml(timeStr)}</span>
+                        <span class="r2-dot">·</span>
+                        <span class="r2-time">${escapeSafe(timeStr)}</span>
                     </div>
                     ${bodyHtml}
                 </div>
@@ -22378,15 +22347,21 @@ document.addEventListener('click', (e) => {
         `;
     }
 
-    function renderRadarTextWithLinks(text) {
-        if (!text) return '';
-        if (typeof renderTextWithLinks === 'function') {
-            return renderTextWithLinks(text);
-        }
-        return escapeHtml(text);
+    function escapeSafe(s) {
+        if (typeof window.escapeHtml === 'function') return window.escapeHtml(s);
+        const div = document.createElement('div');
+        div.textContent = s == null ? '' : String(s);
+        return div.innerHTML;
     }
 
-    function formatRadarTime(ts) {
+    function renderTextSafe(text) {
+        if (typeof window.renderTextWithLinks === 'function') {
+            return window.renderTextWithLinks(text);
+        }
+        return escapeSafe(text);
+    }
+
+    function formatTime(ts) {
         const d = new Date(ts);
         const now = new Date();
         const diff = now - d;
@@ -22395,301 +22370,457 @@ document.addEventListener('click', (e) => {
         if (diff < 24 * 60 * 60 * 1000) {
             return d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
         }
-        return d.toLocaleDateString('ru-RU', { day: 'numeric', month: 'short' })
-            + ' ' + d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+        return d.toLocaleDateString('ru-RU', { day: 'numeric', month: 'short' }) +
+            ' ' + d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
     }
 
-    // ── Переход ──
-    async function jumpToRadarEvent(chatFile, msgId) {
-        closeRadarOverlay();
+    function showToastSafe(msg, dur = 2000) {
+        if (typeof window.showToast === 'function') window.showToast(msg, dur);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  КЛИК ПО СОБЫТИЮ — переход к сообщению
+    // ═══════════════════════════════════════════════════════════
+    async function handleEventClick(el) {
+        const chatFile = el.dataset.chatFile;
+        const msgId = parseInt(el.dataset.msgId);
+        const key = el.dataset.key;
+
+        // Помечаем прочитанным
+        const ev = R.events.find(x => x.key === key);
+        if (ev && !ev.seen) {
+            ev.seen = true;
+            R.seen.add(key);
+            saveSeen();
+            saveEvents();
+        }
+
+        closeOverlay();
 
         if (state.chatFile === chatFile) {
-            const el = document.querySelector(
-                `.message-wrapper[data-msg-id="${msgId}"]`
-            );
-            if (el) {
-                el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                el.classList.remove('highlight-flash');
-                void el.offsetWidth;
-                el.classList.add('highlight-flash');
-                setTimeout(() => el.classList.remove('highlight-flash'), 1400);
-            } else {
-                window._pendingJumpToMsgId = msgId;
-                if (typeof renderHistory === 'function') renderHistory();
-            }
+            await jumpToMessage(msgId);
             return;
         }
 
         const chat = state.chats.find(c => c.file === chatFile);
         if (!chat) {
-            showToastSafe('❌ Чат не найден в списке', 2000);
+            showToastSafe('❌ Чат не найден');
             return;
         }
         const password = state.savedPasswords[chatFile];
         if (!password) {
-            showToastSafe('🔐 Нужен пароль чата для перехода', 2500);
+            showToastSafe('🔐 Нужен пароль чата');
             return;
         }
 
         window._pendingJumpToMsgId = msgId;
 
         try {
-            if (typeof enterChat === 'function') {
-                await enterChat(chatFile, chat.name || chatFile, password);
-            } else {
-                showToastSafe('❌ enterChat недоступен', 2000);
+            if (typeof window.enterChat === 'function') {
+                await window.enterChat(chatFile, chat.name || chatFile, password);
             }
-        } catch (e) {
-            console.error('radar jump error:', e);
+        } catch (err) {
+            console.error('radar jump error:', err);
             window._pendingJumpToMsgId = null;
-            showToastSafe('❌ Не удалось открыть чат: ' + e.message, 2500);
-        }
-    }
-
-    // ── Сканирование ──
-    async function scanAllChats() {
-        if (!state.token || !state.isAuthorized) return;
-        if (radar.scanning) return;
-
-        if (state.chats.length === 0) {
-            radar.scanning = false;
-            radar.progress.phase = 'idle';
-            updateRadarProgress();
-            renderRadarList();
+            showToastSafe('❌ Не удалось открыть чат');
             return;
         }
 
-        radar.scanning = true;
-        radar._lastScanTs = Date.now();
-        setScanningVisual(true);
+        await jumpToMessage(msgId);
+    }
 
-        radar.progress = {
+    async function jumpToMessage(msgId) {
+        return new Promise((resolve) => {
+            let tries = 0;
+            const check = () => {
+                const el = document.querySelector(
+                    `.message-wrapper[data-msg-id="${msgId}"]`
+                );
+                if (el) {
+                    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    el.classList.remove('highlight-flash');
+                    void el.offsetWidth;
+                    el.classList.add('highlight-flash');
+                    setTimeout(() => el.classList.remove('highlight-flash'), 1500);
+                    resolve(true);
+                    return;
+                }
+                tries++;
+                if (tries >= 50) {
+                    showToastSafe('⚠️ Сообщение далеко в истории', 2500);
+                    resolve(false);
+                    return;
+                }
+                setTimeout(check, 150);
+            };
+            check();
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ГЛАВНЫЙ СКАН — по очереди, спокойно, надёжно
+    // ═══════════════════════════════════════════════════════════
+    async function scanAll(opts = {}) {
+        if (R.scanning) return;
+        if (!state.token || !state.isAuthorized) return;
+        if (state.chats.length === 0) {
+            R.progress.phase = 'idle';
+            updateProgress();
+            renderList();
+            return;
+        }
+
+        R.scanning = true;
+        R.lastScanTs = Date.now();
+        updateBadges();
+
+        R.progress = {
+            phase: 'scanning',
             total: state.chats.length,
             done: 0,
             current: state.chats[0]?.name || '',
-            startedAt: Date.now(),
-            phase: 'scanning',
             changedCount: 0,
+            eventsAdded: 0,
         };
-        updateRadarProgress();
+        updateProgress();
 
-        const sub = document.getElementById('radarSub');
-        if (sub && radar.overlayOpen) {
-            sub.textContent = `🔔 Сканирую… 0/${radar.progress.total}`;
+        if (R.overlayOpen) {
+            const sub = document.getElementById('r2Sub');
+            if (sub) sub.textContent = `🔔 Сканирую… 0/${R.progress.total}`;
         }
 
         try {
-            for (const chat of state.chats) {
-                if (!radar.enabled) break;
-                radar.progress.current = chat.name || chat.file;
-                updateRadarProgress();
+            // Собираем список чатов
+            const chatsToScan = state.chats.slice();
 
-                if (sub && radar.overlayOpen) {
-                    sub.textContent = `🔔 Сканирую… ${radar.progress.done}/${radar.progress.total}`;
+            for (const chat of chatsToScan) {
+                if (!R.enabled && !opts.force) break;
+
+                R.progress.current = chat.name || chat.file;
+                updateProgress();
+
+                if (R.overlayOpen) {
+                    const sub = document.getElementById('r2Sub');
+                    if (sub) sub.textContent = `🔔 Сканирую… ${R.progress.done}/${R.progress.total}`;
                 }
 
                 try {
-                    await scanOneChat(chat);
+                    await scanOneChat(chat, opts.force);
                 } catch (e) {
-                    console.warn('scan chat failed', chat.file, e.message);
+                    console.warn('[Radar2] scanOneChat failed:', chat.file, e.message);
                 }
 
-                radar.progress.done++;
-                updateRadarProgress();
+                R.progress.done++;
+                updateProgress();
+
+                // 🆕 Пауза между чатами — не бомбим GitHub API
+                await new Promise(r => setTimeout(r, CFG.delayBetweenChatsMs));
             }
 
-            // 🆕 Автоочистка старых событий
-            cleanupOldEvents();
+            R.progress.phase = 'done';
+            updateProgress();
+            hideProgressAfter(2500);
 
-            radar.progress.phase = 'done';
-            updateRadarProgress();
-            hideRadarProgressAfter(1800);
-
-            if (radar.overlayOpen) renderRadarList();
-            updateRadarBadge();
+            if (R.overlayOpen) renderList();
+            updateBadges();
         } catch (e) {
-            console.warn('radar scan error:', e);
-            radar.progress.phase = 'idle';
-            updateRadarProgress();
+            console.error('[Radar2] scanAll error:', e);
+            R.progress.phase = 'idle';
+            updateProgress();
         } finally {
-            radar.scanning = false;
-            setScanningVisual(false);
-            if (sub && radar.overlayOpen) renderRadarList();
+            R.scanning = false;
+            updateBadges();
+            if (R.overlayOpen) renderList();
         }
     }
 
-    async function scanOneChat(chat) {
+    // ═══════════════════════════════════════════════════════════
+    //  СКАН ОДНОГО ЧАТА
+    // ═══════════════════════════════════════════════════════════
+    async function scanOneChat(chat, force = false) {
         const file = chat.file;
+
+        // 1. Получаем meta.json
+        const metaPath = `chats/${file}.meta.json`;
+        let meta = null;
         try {
-            const cachedEtag = radar.etags[file] || null;
-            let metaRes;
-            try {
-                metaRes = await fetchRadarMeta(file, cachedEtag);
-            } catch (e) {
-                return;
-            }
-            if (!metaRes || metaRes.notModified) return;
-            if (!metaRes.exists) {
-                radar.etags[file] = null;
-                return;
-            }
-            radar.etags[file] = metaRes.etag || null;
+            meta = await fetchMeta(file, metaPath, force);
+        } catch (e) {
+            // тихо
+        }
+        if (!meta) return;
+        if (meta.notModified && !force) return;
+        if (!meta.exists) return;
 
-            const metaVersion = metaRes.content && metaRes.content.version;
-            if (!metaVersion) return;
+        const metaVersion = meta.content?.version;
+        if (!metaVersion && metaVersion !== 0) return;
 
-            if (radar.metaVersions[file] === metaVersion) return;
+        // 2. Проверяем версию
+        const prevVersion = R.versions[file];
+        if (prevVersion === metaVersion && !force) return;
 
-            const prevVersion = radar.metaVersions[file];
-            radar.metaVersions[file] = metaVersion;
+        R.versions[file] = metaVersion;
+        if (prevVersion !== undefined && prevVersion !== metaVersion) {
+            R.progress.changedCount++;
+        }
 
-            // 🆕 Первый скан в ЭТОЙ сессии — просто запоминаем версию
-            if (prevVersion === undefined) return;
+        // 3. Проверяем пароль
+        const password = state.savedPasswords[file];
+        if (!password) {
+            // Помечаем, что чат видели — чтобы не мучить его каждый раз
+            return;
+        }
 
-            if (prevVersion !== metaVersion) {
-                radar.progress.changedCount++;
-            }
+        // 4. Читаем содержимое
+        const chatPath = `chats/${file}.json`;
+        const chatData = await fetchChat(file, chatPath);
+        if (!chatData || !chatData.exists) return;
 
-            const password = state.savedPasswords[file];
-            if (!password) return;
+        const content = chatData.content;
+        if (!content || content.v !== 2 || !content.salt) return;
 
-            const path = `chats/${file}.json`;
-            const res = await fetchRadarFile(path);
-            if (!res || !res.exists) return;
+        // 5. Расшифровываем
+        const key = await deriveKeySafe(password, content.salt);
+        const decrypted = [];
+        for (const enc of (content.messages || [])) {
+            const msg = await decryptMsgSafe(enc, key);
+            if (msg) decrypted.push(msg);
+        }
 
-            const content = res.content;
-            if (!content || content.v !== 2 || !content.salt) return;
+        // 6. Проверяем: инициализирован ли чат?
+        const isFirstScan = !isChatInitialized(file);
 
-            const key = await deriveKeyRadar(password, content.salt);
-            const decrypted = [];
-            for (const enc of (content.messages || [])) {
-                const msg = await decryptRadarMessage(enc, key);
-                if (msg) decrypted.push(msg);
-            }
+        // 7. Сравниваем состояние
+        let eventsAdded = 0;
+        const now = Date.now();
+        const processedKeys = new Set();
 
-            // 🆕 Проверяем: это первый запуск радара НА ЭТОМ УСТРОЙСТВЕ вообще?
-            const isFirstRun = isFirstRunEver();
+        for (const msg of decrypted) {
+            const stateKey = `${file}|${msg.id}`;
+            processedKeys.add(stateKey);
 
-            const now = Date.now();
-            const processedMsgIds = new Set();
-            let eventsAdded = 0;
+            const saved = R.state[stateKey];
+            const reactionsNow = msg.reactions || {};
+            const commentsNow = Array.isArray(msg.comments) ? msg.comments : [];
+            const reactionsPrev = saved?.reactions || {};
+            const commentsPrevIds = new Set(saved?.commentIds || []);
 
-            for (const msg of decrypted) {
-                const stateKey = `${file}|${msg.id}`;
-                processedMsgIds.add(stateKey);
+            // ═══ РЕАКЦИИ ═══
+            for (const [emoji, users] of Object.entries(reactionsNow)) {
+                const usersArr = Array.isArray(users) ? users : [];
+                const prevArr = Array.isArray(reactionsPrev[emoji])
+                    ? reactionsPrev[emoji]
+                    : [];
+                const added = usersArr.filter(u => !prevArr.includes(u));
 
-                const saved = radar.state[stateKey];
-                const reactionsNow = msg.reactions || {};
-                const commentsNow = Array.isArray(msg.comments) ? msg.comments : [];
-                const reactionsPrev = saved?.reactions || {};
-                const commentsPrev = saved?.comments || [];
-                const isFirstTime = !saved;
+                for (const u of added) {
+                    const eventKey = `${file}|${msg.id}|reaction|${emoji}|${u}`;
 
-                // ═══ РЕАКЦИИ ═══
-                for (const [emoji, users] of Object.entries(reactionsNow)) {
-                    const usersArr = Array.isArray(users) ? users : [];
-                    const prevArr = Array.isArray(reactionsPrev[emoji]) ? reactionsPrev[emoji] : [];
-                    const added = isFirstTime
-                        ? usersArr
-                        : usersArr.filter(u => !prevArr.includes(u));
+                    // Пропускаем свои реакции
+                    if (u === state.username) continue;
 
-                    for (const u of added) {
-                        // 🆕 На первом запуске вообще не генерируем события —
-                        //     просто запоминаем состояние
-                        if (isFirstRun) break;
+                    // Если уже видели — пропускаем
+                    if (R.seen.has(eventKey)) continue;
+                    if (R.events.find(x => x.key === eventKey)) continue;
 
-                        const eventKey = `${file}|${msg.id}|reaction|${emoji}|${u}`;
-                        if (radar.seen.has(eventKey)) continue;
-                        if (radar.events.find(x => x.key === eventKey)) continue;
+                    // На первом скане — не генерируем событие
+                    if (isFirstScan) continue;
 
-                        const evTs = now;   // у реакций своей даты нет — только момент обнаружения
-                        if (!isFresh(evTs)) continue;   // 🆕 фильтр 48 часов
-
-                        radar.events.push({
-                            key: eventKey,
-                            chatFile: file,
-                            msgId: msg.id,
-                            ts: evTs,
-                            seen: false,
-                            kind: 'reaction',
-                            isOnMyMessage: msg.username === state.username,
-                            payload: {
-                                emoji,
-                                users: usersArr,
-                                from: u,
-                                author: msg.username,
-                            },
-                            attachPreview: buildAttachPreview(msg),
-                        });
-                        eventsAdded++;
-                    }
-                }
-
-                // ═══ КОММЕНТАРИИ ═══
-                const prevIds = new Set(commentsPrev.map(c => c.id));
-                for (const c of commentsNow) {
-                    if (prevIds.has(c.id)) continue;
-
-                    if (isFirstRun) continue;   // 🆕 на первом запуске — только снимок
-
-                    const eventKey = `${file}|${msg.id}|comment|${c.id}`;
-                    if (radar.seen.has(eventKey)) continue;
-                    if (radar.events.find(x => x.key === eventKey)) continue;
-
-                    // 🆕 У комментариев ЕСТЬ дата — используем её для фильтра
-                    const commentTs = new Date(c.time).getTime() || now;
-                    if (!isFresh(commentTs)) continue;
-
-                    radar.events.push({
+                    R.events.push({
                         key: eventKey,
                         chatFile: file,
                         msgId: msg.id,
-                        ts: commentTs,
+                        ts: now,
                         seen: false,
-                        kind: 'comment',
+                        kind: 'reaction',
                         isOnMyMessage: msg.username === state.username,
                         payload: {
-                            text: c.text || '',
-                            from: c.username,
+                            emoji,
+                            users: usersArr,
+                            from: u,
                             author: msg.username,
                         },
                         attachPreview: buildAttachPreview(msg),
                     });
                     eventsAdded++;
                 }
-
-                // ═══ ОБНОВЛЯЕМ СНИМОК ═══
-                radar.state[stateKey] = {
-                    reactions: { ...reactionsNow },
-                    comments: commentsNow.map(c => ({ id: c.id, username: c.username })),
-                    savedAt: saved?.savedAt || now,
-                    lastSeenAt: now,
-                };
             }
 
-            // Чистим снимки удалённых сообщений
-            const prefix = `${file}|`;
-            for (const stateKey of Object.keys(radar.state)) {
-                if (!stateKey.startsWith(prefix)) continue;
-                if (!processedMsgIds.has(stateKey)) {
-                    delete radar.state[stateKey];
+            // ═══ КОММЕНТАРИИ ═══
+            for (const c of commentsNow) {
+                if (commentsPrevIds.has(c.id)) continue;
+
+                const eventKey = `${file}|${msg.id}|comment|${c.id}`;
+
+                // Пропускаем свои комментарии
+                if (c.username === state.username) continue;
+
+                // Если уже видели — пропускаем
+                if (R.seen.has(eventKey)) continue;
+                if (R.events.find(x => x.key === eventKey)) continue;
+
+                // На первом скане — не генерируем событие
+                if (isFirstScan) continue;
+
+                R.events.push({
+                    key: eventKey,
+                    chatFile: file,
+                    msgId: msg.id,
+                    ts: now,     // 🆕 время обнаружения, а не комментария
+                    seen: false,
+                    kind: 'comment',
+                    isOnMyMessage: msg.username === state.username,
+                    payload: {
+                        text: c.text || '',
+                        from: c.username,
+                        author: msg.username,
+                        actualTime: c.time,
+                    },
+                    attachPreview: buildAttachPreview(msg),
+                });
+                eventsAdded++;
+            }
+
+            // ═══ ОБНОВЛЯЕМ STATE ═══
+            R.state[stateKey] = {
+                reactions: reactionsNow,
+                commentIds: commentsNow.map(c => c.id),
+                lastSeenAt: now,
+            };
+        }
+
+        // 🆕 Убираем из state сообщения этого чата, которых больше нет
+        const prefix = `${file}|`;
+        for (const key of Object.keys(R.state)) {
+            if (!key.startsWith(prefix)) continue;
+            if (!processedKeys.has(key)) delete R.state[key];
+        }
+
+        // 🆕 Помечаем чат инициализированным
+        if (isFirstScan) {
+            markChatInitialized(file);
+            console.log(`[Radar2] ${file}: инициализирован без событий`);
+        }
+
+        // Сохраняем
+        saveState();
+        if (eventsAdded > 0) {
+            saveEvents();
+            console.log(`[Radar2] ${file}: найдено событий: ${eventsAdded}`);
+            R.progress.eventsAdded += eventsAdded;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХЕЛПЕРЫ ЗАГРУЗКИ
+    // ═══════════════════════════════════════════════════════════
+    async function fetchMeta(file, path, force = false) {
+        const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${path}`;
+        const headers = {
+            'Authorization': `token ${state.token}`,
+            'Accept': 'application/vnd.github.v3+json',
+        };
+        // Используем кэш ETag, но при force или если не залипаем — обновляем
+        const cachedEtag = force ? null : (R.etags[file] || null);
+        if (cachedEtag) headers['If-None-Match'] = cachedEtag;
+
+        try {
+            const res = await fetch(url, { headers, cache: 'no-store' });
+            if (res.status === 304) {
+                R.notModifiedStreak[file] = (R.notModifiedStreak[file] || 0) + 1;
+                // Если 5 раз подряд 304 — сбрасываем ETag (защита от залипания)
+                if (R.notModifiedStreak[file] >= 5) {
+                    R.etags[file] = null;
+                    R.notModifiedStreak[file] = 0;
                 }
+                return { notModified: true };
             }
-
-            saveRadarState();
-
-            if (isFirstRun) {
-                console.log('[RADAR] Первый запуск — состояние сохранено без показа событий');
-            } else if (eventsAdded > 0) {
-                console.log(`[RADAR] ${file}: добавлено событий: ${eventsAdded}`);
+            if (res.status === 404) {
+                return { exists: false };
             }
-
-            if (radar.events.length > RADAR_CONFIG.maxEventsKept) {
-                radar.events = radar.events.slice(-RADAR_CONFIG.maxEventsKept);
+            if (!res.ok) {
+                R.notModifiedStreak[file] = 0;
+                return null;
             }
-
+            const data = await res.json();
+            const content = JSON.parse(base64ToUtf8((data.content || '').replace(/\n/g, '')));
+            const newEtag = res.headers.get('ETag') || res.headers.get('etag');
+            R.etags[file] = newEtag || null;
+            R.notModifiedStreak[file] = 0;
+            return { exists: true, content, etag: newEtag };
         } catch (e) {
-            console.warn('radar scanOneChat error', file, e.message);
+            return null;
+        }
+    }
+
+    async function fetchChat(file, path) {
+        const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${path}`;
+        try {
+            const res = await fetch(url, {
+                headers: {
+                    'Authorization': `token ${state.token}`,
+                    'Accept': 'application/vnd.github.v3+json',
+                },
+                cache: 'no-store',
+            });
+            if (!res.ok) return null;
+            const data = await res.json();
+            const content = JSON.parse(base64ToUtf8((data.content || '').replace(/\n/g, '')));
+            return { exists: true, content };
+        } catch (e) {
+            return null;
+        }
+    }
+
+    async function deriveKeySafe(password, saltBase64) {
+        const enc = new TextEncoder();
+        const salt = new Uint8Array(base64ToArrayBuffer(saltBase64));
+        const baseKey = await crypto.subtle.importKey(
+            'raw', enc.encode(password),
+            { name: 'PBKDF2' }, false, ['deriveKey']
+        );
+        return crypto.subtle.deriveKey(
+            { name: 'PBKDF2', salt, iterations: 200000, hash: 'SHA-256' },
+            baseKey,
+            { name: 'AES-GCM', length: 256 },
+            false, ['decrypt']
+        );
+    }
+
+    async function decryptMsgSafe(encMsg, key) {
+        try {
+            const iv = new Uint8Array(base64ToArrayBuffer(encMsg.iv));
+            const ciphertext = base64ToArrayBuffer(encMsg.data);
+            const plaintext = await crypto.subtle.decrypt(
+                { name: 'AES-GCM', iv }, key, ciphertext
+            );
+            const payload = JSON.parse(new TextDecoder().decode(plaintext));
+
+            const msg = {
+                id: encMsg.id,
+                time: encMsg.time,
+                username: payload.username,
+                text: payload.text || '',
+            };
+            if (payload.reactions) msg.reactions = payload.reactions;
+            if (Array.isArray(payload.comments)) msg.comments = payload.comments;
+            if (payload.image) msg.image = payload.image;
+            if (payload.audio) {
+                msg.audio = payload.audio;
+                msg.audioName = payload.audioName || '';
+            }
+            if (payload.file) {
+                msg.file = payload.file;
+                msg.fileName = payload.fileName || '';
+            }
+            if (payload.video) {
+                msg.video = payload.video;
+                msg.videoName = payload.videoName || '';
+            }
+            if (payload.videoNote) msg.videoNote = payload.videoNote;
+            return msg;
+        } catch (e) {
+            return null;
         }
     }
 
@@ -22708,241 +22839,245 @@ document.addEventListener('click', (e) => {
         return null;
     }
 
-    async function fetchRadarMeta(file, etag) {
-        const path = `chats/${file}.meta.json`;
-        const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${path}`;
-        const headers = {
-            'Authorization': `token ${state.token}`,
-            'Accept': 'application/vnd.github.v3+json',
+    // ═══════════════════════════════════════════════════════════
+    //  ЦИКЛ
+    // ═══════════════════════════════════════════════════════════
+    function startLoop() {
+        stopLoop();
+        if (!R.enabled) return;
+
+        // Первый скан через 8 сек (чтобы UI успел загрузиться)
+        setTimeout(() => {
+            if (!R.enabled) return;
+            if (!state.isAuthorized) return;
+            scanAll({ force: false });
+        }, 8000);
+
+        // Затем — циклично
+        R.scanTimer = setInterval(() => {
+            if (!R.enabled) return;
+            if (!state.isAuthorized) return;
+            if (document.hidden) return;   // не сканируем в фоне
+            scanAll({ force: false });
+        }, CFG.scanIntervalMs);
+    }
+
+    function stopLoop() {
+        if (R.scanTimer) {
+            clearInterval(R.scanTimer);
+            R.scanTimer = null;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  АВТОСКАН ПРИ ВОЗВРАТЕ
+    // ═══════════════════════════════════════════════════════════
+    if (CFG.scanOnVisibility) {
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) return;
+            if (!R.enabled) return;
+            if (!state.isAuthorized) return;
+            // Если давно не сканировали — сканим
+            if (Date.now() - R.lastScanTs > CFG.scanIntervalMs) {
+                scanAll({ force: false });
+            }
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ИНТЕГРАЦИЯ С POLLUPDATES
+    //  Не даём двум потокам конкурировать за ETag.
+    // ═══════════════════════════════════════════════════════════
+    // Патчим fetchMetaFast, чтобы он писал в наш кэш
+    if (typeof window.fetchMetaFast === 'function') {
+        const _orig = window.fetchMetaFast;
+        window.fetchMetaFast = async function(file, etag, token) {
+            const r = await _orig.call(this, file, etag, token);
+            if (r && r.etag) {
+                // Синхронизируем кэш только если это не «наш» чат
+                // (иначе можем сбить состояние радара)
+            }
+            return r;
         };
-        if (etag) headers['If-None-Match'] = etag;
-
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 10000);
-        try {
-            const res = await fetch(url, { headers, signal: controller.signal, cache: 'no-store' });
-            clearTimeout(timeoutId);
-            if (res.status === 304) return { notModified: true, etag };
-            if (res.status === 404) return { exists: false };
-            if (!res.ok) return null;
-            const data = await res.json();
-            const content = JSON.parse(base64ToUtf8((data.content || '').replace(/\n/g, '')));
-            const newEtag = res.headers.get('ETag') || res.headers.get('etag');
-            return { exists: true, content, etag: newEtag };
-        } catch (e) {
-            clearTimeout(timeoutId);
-            return null;
-        }
     }
 
-    async function fetchRadarFile(path) {
-        const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${path}`;
-        try {
-            const res = await fetch(url, { headers: getHeaders(state.token), cache: 'no-store' });
-            if (!res.ok) return null;
-            const data = await res.json();
-            const content = JSON.parse(base64ToUtf8((data.content || '').replace(/\n/g, '')));
-            return { exists: true, content };
-        } catch (e) {
-            return null;
-        }
-    }
-
-    async function deriveKeyRadar(password, saltBase64) {
-        const enc = new TextEncoder();
-        const salt = new Uint8Array(base64ToArrayBuffer(saltBase64));
-        const baseKey = await crypto.subtle.importKey(
-            'raw', enc.encode(password),
-            { name: 'PBKDF2' }, false, ['deriveKey']
-        );
-        return crypto.subtle.deriveKey(
-            { name: 'PBKDF2', salt, iterations: 200000, hash: 'SHA-256' },
-            baseKey,
-            { name: 'AES-GCM', length: 256 },
-            false, ['decrypt']
-        );
-    }
-
-    async function decryptRadarMessage(encMsg, key) {
-        try {
-            const payload = await decryptObjectRadar(encMsg.iv, encMsg.data, key);
-            const msg = {
-                id: encMsg.id,
-                time: encMsg.time,
-                username: payload.username,
-                text: payload.text || '',
-            };
-            if (payload.reactions) msg.reactions = payload.reactions;
-            if (Array.isArray(payload.comments)) msg.comments = payload.comments;
-            if (payload.image) msg.image = payload.image;
-            if (payload.audio) {
-                msg.audio = payload.audio;
-                msg.audioDuration = payload.audioDuration || 0;
-                msg.audioMime = payload.audioMime || 'audio/webm';
-                msg.audioName = payload.audioName || '';
-                msg.audioCover = payload.audioCover || '';
-            }
-            if (payload.file) {
-                msg.file = payload.file;
-                msg.fileName = payload.fileName || 'file.bin';
-                msg.fileMime = payload.fileMime || 'application/octet-stream';
-                msg.fileSize = payload.fileSize || 0;
-            }
-            if (payload.video) {
-                msg.video = payload.video;
-                msg.videoDuration = payload.videoDuration || 0;
-                msg.videoMime = payload.videoMime || 'video/mp4';
-                msg.videoName = payload.videoName || '';
-                msg.videoSize = payload.videoSize || 0;
-            }
-            if (payload.videoNote) {
-                msg.videoNote = payload.videoNote;
-                msg.videoDuration = payload.videoDuration || 0;
-                msg.videoMime = payload.videoMime || 'video/webm';
-            }
-            return msg;
-        } catch (e) {
-            return null;
-        }
-    }
-
-    async function decryptObjectRadar(ivBase64, dataBase64, key) {
-        const iv = new Uint8Array(base64ToArrayBuffer(ivBase64));
-        const ciphertext = base64ToArrayBuffer(dataBase64);
-        const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
-        return JSON.parse(new TextDecoder().decode(plaintext));
-    }
-
-    // ── Цикл ──
-    function startRadarLoop() {
-        stopRadarLoop();
-        if (!radar.enabled) return;
-
-        // Скан раз в 30 сек
-        radar.scanTimer = setTimeout(() => {
-            scanAllChats();
-            radar.scanTimer = setInterval(() => {
-                if (!radar.enabled) return;
-                if (!state.isAuthorized) return;
-                scanAllChats();
-            }, RADAR_CONFIG.scanIntervalMs);
-        }, 5000);
-
-        // 🆕 Автоочистка раз в 5 минут (на случай, если скан давно не запускался)
-        radar.cleanupTimer = setInterval(() => {
-            cleanupOldEvents();
-        }, RADAR_CONFIG.autoCleanupIntervalMs);
-    }
-
-    function stopRadarLoop() {
-        if (radar.scanTimer) {
-            clearTimeout(radar.scanTimer);
-            clearInterval(radar.scanTimer);
-            radar.scanTimer = null;
-        }
-        if (radar.cleanupTimer) {
-            clearInterval(radar.cleanupTimer);
-            radar.cleanupTimer = null;
-        }
-        setScanningVisual(false);
-    }
-
-    // ── Интеграция ──
-    const _origLogoutRadar = window.logout;
-    if (typeof _origLogoutRadar === 'function') {
+    // ═══════════════════════════════════════════════════════════
+    //  ХУК НА LOGOUT
+    // ═══════════════════════════════════════════════════════════
+    if (typeof window.logout === 'function') {
+        const _origLogout = window.logout;
         window.logout = function() {
-            stopRadarLoop();
-            radar.etags = {};
-            radar.metaVersions = {};
-            if (radar.overlayOpen) closeRadarOverlay();
-            return _origLogoutRadar.apply(this, arguments);
+            stopLoop();
+            R.etags = {};
+            R.versions = {};
+            R.notModifiedStreak = {};
+            if (R.overlayOpen) closeOverlay();
+            return _origLogout.apply(this, arguments);
         };
     }
 
-    document.addEventListener('visibilitychange', () => {
-        if (!document.hidden && state.isAuthorized && radar.enabled) {
-            if (Date.now() - (radar._lastScanTs || 0) > RADAR_CONFIG.scanIntervalMs) {
-                scanAllChats();
-            }
-        }
-    });
-
-    // ── Старт ──
+    // ═══════════════════════════════════════════════════════════
+    //  СТАРТ
+    // ═══════════════════════════════════════════════════════════
     setTimeout(() => {
         installRadarButtons();
-        // 🆕 Если первый запуск — отметим после первого скана
-        if (state.isAuthorized && radar.enabled) {
-            startRadarLoop();
+        updateBadges();
 
-            // Через 15 сек после первого скана — помечаем как "первый запуск завершён"
-            setTimeout(() => {
-                if (isFirstRunEver()) {
-                    markFirstRunDone();
-                    console.log('[RADAR] Первый запуск завершён, дальше только свежие события');
-                }
-            }, 20000);
+        if (state.isAuthorized && R.enabled) {
+            startLoop();
         }
     }, 3000);
 
-    // ── API ──
+    // Реагируем на логин
+    if (typeof window.showChatsScreen === 'function') {
+        const _origShowChats = window.showChatsScreen;
+        window.showChatsScreen = function() {
+            const r = _origShowChats.apply(this, arguments);
+            setTimeout(() => {
+                installRadarButtons();
+                updateBadges();
+                if (R.enabled && !R.scanTimer) startLoop();
+            }, 500);
+            return r;
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНЫЙ API
+    // ═══════════════════════════════════════════════════════════
     window.EventRadar = {
-        scan: scanAllChats,
-        open: openRadarOverlay,
-        close: closeRadarOverlay,
-        enable: () => { if (!radar.enabled) toggleRadarEnabled(); },
-        disable: () => { if (radar.enabled) toggleRadarEnabled(); },
-        getEvents: () => radar.events.slice(),
+        open: openOverlay,
+        close: closeOverlay,
+        scan: () => scanAll({ force: true }),
+        scanSoft: () => scanAll({ force: false }),
+        enable: () => { if (!R.enabled) toggleEnabled(); },
+        disable: () => { if (R.enabled) toggleEnabled(); },
+        getEvents: () => R.events.slice(),
+        getState: () => R,
         clearHistory: () => {
-            radar.events = [];
-            radar.seen.clear();
+            R.events = [];
+            R.seen.clear();
             saveSeen();
-            renderRadarList();
-            updateRadarBadge();
+            saveEvents(true);
+            renderList();
+            updateBadges();
         },
-        resetState: () => {
-            radar.events = [];
-            radar.seen.clear();
-            radar.state = {};
+        fullReset: () => {
+            R.events = [];
+            R.seen.clear();
+            R.state = {};
+            R.etags = {};
+            R.versions = {};
+            R.initDone = {};
             saveSeen();
-            saveRadarState(true);
-            renderRadarList();
-            updateRadarBadge();
-            showToastSafe('🔄 Состояние сброшено');
+            saveState(true);
+            saveEvents(true);
+            try {
+                for (let i = localStorage.length - 1; i >= 0; i--) {
+                    const key = localStorage.key(i);
+                    if (key && key.startsWith(CFG.initKeyPrefix)) localStorage.removeItem(key);
+                }
+            } catch (e) {}
+            renderList();
+            updateBadges();
+            showToastSafe('🔄 Полный сброс радара выполнен');
         },
-        resetFirstRun: () => {
-            // Сбросить флаг первого запуска — радар снова "тихо" запомнит всё
-            localStorage.removeItem(RADAR_CONFIG.firstRunDoneKey);
-            showToastSafe('🔄 Первый запуск сброшен');
+        status: () => ({
+            enabled: R.enabled,
+            scanning: R.scanning,
+            eventsTotal: R.events.length,
+            eventsUnseen: R.events.filter(e => !e.seen).length,
+            stateEntries: Object.keys(R.state).length,
+            initializedChats: Object.keys(R.initDone).length,
+            lastScanAgo: R.lastScanTs
+                ? Math.round((Date.now() - R.lastScanTs) / 1000) + 's'
+                : 'never',
+            progress: { ...R.progress },
+        }),
+        diagnose: async (chatFile) => {
+            if (!chatFile) {
+                console.log('Использование: EventRadar.diagnose("chat_xxx")');
+                return;
+            }
+            const file = chatFile;
+            console.log(`🔍 Диагностика чата: ${file}`);
+
+            const metaPath = `chats/${file}.meta.json`;
+            const chatPath = `chats/${file}.json`;
+
+            const metaRes = await fetch(
+                `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${metaPath}`,
+                { headers: { 'Authorization': `token ${state.token}` }, cache: 'no-store' }
+            );
+            if (!metaRes.ok) {
+                console.log('❌ meta.json недоступен:', metaRes.status);
+                return;
+            }
+            const metaData = await metaRes.json();
+            const meta = JSON.parse(base64ToUtf8((metaData.content || '').replace(/\n/g, '')));
+            console.log('📌 meta.json:', meta);
+
+            const chatRes = await fetch(
+                `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${chatPath}`,
+                { headers: { 'Authorization': `token ${state.token}` }, cache: 'no-store' }
+            );
+            if (!chatRes.ok) {
+                console.log('❌ чат.json недоступен:', chatRes.status);
+                return;
+            }
+            const chatData = await chatRes.json();
+            const content = JSON.parse(base64ToUtf8((chatData.content || '').replace(/\n/g, '')));
+            console.log('💬 чат.json: сообщений =', (content.messages || []).length);
+
+            const password = state.savedPasswords[file];
+            if (!password) {
+                console.log('🔐 Пароль не сохранён');
+                return;
+            }
+            const key = await deriveKeySafe(password, content.salt);
+            const decrypted = [];
+            for (const enc of (content.messages || [])) {
+                const m = await decryptMsgSafe(enc, key);
+                if (m) decrypted.push(m);
+            }
+            console.log('✅ Расшифровано:', decrypted.length);
+            const totalComments = decrypted.reduce((s, m) => s + (m.comments?.length || 0), 0);
+            const totalReactions = decrypted.reduce((s, m) => {
+                return s + (m.reactions ? Object.values(m.reactions).reduce(
+                    (s2, arr) => s2 + (Array.isArray(arr) ? arr.length : 0), 0
+                ) : 0);
+            }, 0);
+            console.log(`💬 Комментариев: ${totalComments}`);
+            console.log(`❤️ Реакций: ${totalReactions}`);
+
+            const radarStateKeys = Object.keys(R.state).filter(k => k.startsWith(`${file}|`));
+            console.log(`🧠 State для чата: ${radarStateKeys.length} записей`);
+
+            const radarEvents = R.events.filter(e => e.chatFile === file);
+            console.log(`🔔 Событий для чата: ${radarEvents.length}`);
+            radarEvents.forEach(e => {
+                console.log('  ', e.kind, '| msg:', e.msgId, '| от:', e.payload?.from,
+                    '|', new Date(e.ts).toLocaleString('ru-RU'),
+                    e.seen ? '(прочитано)' : '(НОВОЕ)');
+            });
         },
-        getStateSize: () => {
-            const json = JSON.stringify(radar.state);
-            return {
-                entries: Object.keys(radar.state).length,
-                bytes: json.length,
-                kb: (json.length / 1024).toFixed(1),
-            };
-        },
-        pruneState: () => {
-            pruneRadarState();
-            saveRadarState(true);
-            return window.EventRadar.getStateSize();
-        },
-        cleanupOld: cleanupOldEvents,
-        _radar: radar,
     };
 
-    console.log('🔔 Event Radar активен');
-    console.log('   Скан: раз в 30 сек (тихо)');
-    console.log('   Окно свежести: 48 часов');
-    console.log('   Первый запуск на устройстве: события НЕ показываются, только запоминаются');
-    console.log('   API:');
-    console.log('     EventRadar.scan()         — скан вручную');
-    console.log('     EventRadar.open()         — открыть оверлей');
-    console.log('     EventRadar.resetFirstRun()— сбросить первый запуск');
-    console.log('     EventRadar.cleanupOld()   — очистить события старше 48ч');
-
+    console.log('🔔 Event Radar v2 активен');
+    console.log('   Интервал скана: 45 сек');
+    console.log('   Пауза между чатами: 250 мс');
+    console.log('   Отслеживание в фоне: ВЫКЛ');
+    console.log('');
+    console.log('   API в консоли:');
+    console.log('     EventRadar.open()                       — открыть');
+    console.log('     EventRadar.scan()                       — принудительный скан');
+    console.log('     EventRadar.status()                     — состояние');
+    console.log('     EventRadar.diagnose("chat_xxx")         — диагностика');
+    console.log('     EventRadar.fullReset()                  — полный сброс');
 })();
 </script>
+
+
 
 
 </body>
