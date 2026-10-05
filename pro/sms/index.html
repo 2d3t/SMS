@@ -22742,6 +22742,566 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
     console.log('     EventRadar.fullReset()             — полный сброс');
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🎬 РЕЖИМ ПОСЛЕДОВАТЕЛЬНОГО ПРОСМОТРА СОБЫТИЙ
+//  Клик по 🔔 при наличии непрочитанных → показывает их по очереди,
+//  счётчик на колокольчике уменьшается, сверху — плашка-навигатор.
+// ═══════════════════════════════════════════════════════════════
 
+(function installEventAutoPlay() {
+    'use strict';
+
+    // ─── Состояние ───
+    const AP = {
+        active: false,          // мы в режиме автопоказа
+        queue: [],              // очередь событий для показа (по одному)
+        currentIndex: -1,       // индекс текущего события
+        barEl: null,            // DOM-элемент плашки
+        jumpTimer: null,        // таймер отложенного прыжка
+        originalCloseFn: null,  // сохранённый closeOverlay
+    };
+
+    // ─── Стили плашки ───
+    if (!document.getElementById('eventAutoPlayStyles')) {
+        const style = document.createElement('style');
+        style.id = 'eventAutoPlayStyles';
+        style.textContent = `
+            #eventAutoPlayBar {
+                position: fixed;
+                left: 50%;
+                bottom: 16px;
+                transform: translateX(-50%) translateY(140%);
+                width: calc(100% - 24px);
+                max-width: 460px;
+                background: rgba(26, 26, 46, 0.97);
+                backdrop-filter: blur(24px);
+                -webkit-backdrop-filter: blur(24px);
+                border: 1px solid rgba(108,92,231,0.5);
+                border-radius: 18px;
+                padding: 12px 14px;
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                z-index: 4950;
+                box-shadow: 0 16px 48px rgba(0,0,0,0.65),
+                            0 0 0 1px rgba(108,92,231,0.2);
+                transition: transform 0.35s cubic-bezier(0.22, 0.61, 0.36, 1),
+                            opacity 0.3s;
+                opacity: 0;
+                pointer-events: none;
+                font-family: inherit;
+            }
+            #eventAutoPlayBar.show {
+                transform: translateX(-50%) translateY(0);
+                opacity: 1;
+                pointer-events: auto;
+            }
+
+            #eventAutoPlayBar .ap-icon {
+                width: 40px;
+                height: 40px;
+                border-radius: 12px;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 20px;
+                flex-shrink: 0;
+                box-shadow: 0 4px 12px rgba(108,92,231,0.4);
+                position: relative;
+            }
+            #eventAutoPlayBar .ap-icon .ap-count {
+                position: absolute;
+                top: -6px;
+                right: -6px;
+                min-width: 20px;
+                height: 20px;
+                padding: 0 5px;
+                border-radius: 10px;
+                background: #00b894;
+                color: #fff;
+                font-size: 11px;
+                font-weight: 700;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                border: 2px solid #1a1a2e;
+                line-height: 1;
+            }
+
+            #eventAutoPlayBar .ap-info {
+                flex: 1;
+                min-width: 0;
+                display: flex;
+                flex-direction: column;
+                gap: 2px;
+            }
+            #eventAutoPlayBar .ap-title {
+                font-size: 13px;
+                font-weight: 700;
+                color: #fff;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            #eventAutoPlayBar .ap-sub {
+                font-size: 11px;
+                color: #888;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+
+            #eventAutoPlayBar .ap-controls {
+                display: flex;
+                align-items: center;
+                gap: 4px;
+                flex-shrink: 0;
+            }
+            #eventAutoPlayBar .ap-btn {
+                width: 36px;
+                height: 36px;
+                border-radius: 50%;
+                border: none;
+                background: transparent;
+                color: #ccc;
+                font-size: 15px;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                transition: all 0.15s;
+                -webkit-tap-highlight-color: transparent;
+                padding: 0;
+                font-family: inherit;
+            }
+            #eventAutoPlayBar .ap-btn:hover {
+                background: rgba(255,255,255,0.08);
+                color: #fff;
+            }
+            #eventAutoPlayBar .ap-btn:active { transform: scale(0.88); }
+            #eventAutoPlayBar .ap-btn:disabled {
+                opacity: 0.3;
+                cursor: not-allowed;
+                transform: none;
+            }
+            #eventAutoPlayBar .ap-btn.ap-next {
+                width: 42px;
+                height: 42px;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                color: #fff;
+                font-size: 17px;
+                box-shadow: 0 4px 14px rgba(108,92,231,0.4);
+            }
+            #eventAutoPlayBar .ap-btn.ap-next:hover {
+                background: linear-gradient(135deg, #7a6cf0, #00cfa4);
+            }
+            #eventAutoPlayBar .ap-btn.ap-close {
+                color: #888;
+                font-size: 13px;
+            }
+            #eventAutoPlayBar .ap-btn.ap-close:hover {
+                color: #ff6b6b;
+                background: rgba(255,107,107,0.12);
+            }
+
+            /* Прогресс-полоска сверху */
+            #eventAutoPlayBar .ap-progress {
+                position: absolute;
+                top: 0;
+                left: 0;
+                right: 0;
+                height: 3px;
+                background: rgba(255,255,255,0.06);
+                border-radius: 18px 18px 0 0;
+                overflow: hidden;
+            }
+            #eventAutoPlayBar .ap-progress-fill {
+                height: 100%;
+                width: 0%;
+                background: linear-gradient(90deg, #6c5ce7, #00b894);
+                border-radius: 0 2px 2px 0;
+                transition: width 0.3s ease;
+            }
+
+            @media (max-width: 480px) {
+                #eventAutoPlayBar {
+                    bottom: 10px;
+                    padding: 10px 12px;
+                    gap: 8px;
+                    border-radius: 16px;
+                }
+                #eventAutoPlayBar .ap-icon { width: 36px; height: 36px; font-size: 18px; }
+                #eventAutoPlayBar .ap-title { font-size: 12px; }
+                #eventAutoPlayBar .ap-sub { font-size: 10px; }
+                #eventAutoPlayBar .ap-btn { width: 32px; height: 32px; font-size: 14px; }
+                #eventAutoPlayBar .ap-btn.ap-next { width: 38px; height: 38px; font-size: 15px; }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ─── Хелперы ───
+    function getUnseenEvents() {
+        if (typeof window.EventRadar === 'undefined') return [];
+        const evs = window.EventRadar.getEvents();
+        // Сортируем как в оверлее: сначала "на моих", потом по времени
+        return evs
+            .filter(e => !e.seen)
+            .sort((a, b) => {
+                if (a.isOnMyMessage !== b.isOnMyMessage) return a.isOnMyMessage ? -1 : 1;
+                return a.ts - b.ts;   // старые → новые (по порядку появления)
+            });
+    }
+
+    function markEventSeen(event) {
+        if (!event || event.seen) return;
+        event.seen = true;
+
+        // Обновляем счётчики в EventRadar (через его публичное API — там нет метода,
+        // но мы работаем с теми же объектами, потому что getEvents() возвращает slice(),
+        // поэтому придётся работать через внутренний доступ)
+        // Проще: event — это ссылка на объект из массива R.events, значит мутируем напрямую.
+        // Но getEvents() возвращает .slice() — копию массива, ссылки на те же объекты.
+        // Значит event.seen = true изменит объект в R.events. Отлично.
+
+        // Синхронизируем Set seen внутри EventRadar через clearHistory-совместимый путь:
+        // — если есть публичный метод, используем; иначе просто пересчёт бейджа.
+        try {
+            // Скрываем бейдж вручную
+            const total = getUnseenEvents().length;
+            ['radar2Badge', 'radar2BadgeChat'].forEach(id => {
+                const el = document.getElementById(id);
+                if (!el) return;
+                if (total > 0) {
+                    el.textContent = total > 99 ? '99+' : String(total);
+                    el.classList.add('show');
+                } else {
+                    el.textContent = '';
+                    el.classList.remove('show');
+                }
+            });
+        } catch (e) { /* ignore */ }
+    }
+
+    // ─── Построение плашки ───
+    function buildBar() {
+        if (AP.barEl) return AP.barEl;
+
+        const bar = document.createElement('div');
+        bar.id = 'eventAutoPlayBar';
+        bar.innerHTML = `
+            <div class="ap-progress">
+                <div class="ap-progress-fill" id="apProgressFill"></div>
+            </div>
+            <div class="ap-icon">
+                🔔
+                <span class="ap-count" id="apCountBadge">0</span>
+            </div>
+            <div class="ap-info">
+                <div class="ap-title" id="apTitle">Событие</div>
+                <div class="ap-sub" id="apSub">—</div>
+            </div>
+            <div class="ap-controls">
+                <button class="ap-btn ap-prev" id="apPrevBtn" title="Предыдущее">‹</button>
+                <button class="ap-btn ap-next" id="apNextBtn" title="Следующее">›</button>
+                <button class="ap-btn ap-close" id="apCloseBtn" title="Закрыть">✕</button>
+            </div>
+        `;
+        document.body.appendChild(bar);
+        AP.barEl = bar;
+
+        bar.querySelector('#apPrevBtn').addEventListener('click', (e) => {
+            e.stopPropagation();
+            goPrev();
+        });
+        bar.querySelector('#apNextBtn').addEventListener('click', (e) => {
+            e.stopPropagation();
+            goNext();
+        });
+        bar.querySelector('#apCloseBtn').addEventListener('click', (e) => {
+            e.stopPropagation();
+            exitAutoPlay('user-close');
+        });
+
+        return bar;
+    }
+
+    // ─── Обновление UI плашки ───
+    function updateBarUI() {
+        if (!AP.barEl) return;
+
+        const total = AP.queue.length;
+        const idx = AP.currentIndex;
+
+        const titleEl = AP.barEl.querySelector('#apTitle');
+        const subEl = AP.barEl.querySelector('#apSub');
+        const countEl = AP.barEl.querySelector('#apCountBadge');
+        const fillEl = AP.barEl.querySelector('#apProgressFill');
+        const prevBtn = AP.barEl.querySelector('#apPrevBtn');
+        const nextBtn = AP.barEl.querySelector('#apNextBtn');
+
+        // Осталось непрочитанных (включая текущее) — до отметки
+        // но т.к. мы отмечаем сразу при показе, "total" уже без текущего.
+        // Логика: показываем "сколько ещё НЕ показано + 1 (текущее)".
+        const remaining = total - idx;   // включая текущее
+        countEl.textContent = remaining > 99 ? '99+' : String(remaining);
+
+        // Прогресс = (idx+1) / total
+        fillEl.style.width = total > 0
+            ? Math.round(((idx + 1) / total) * 100) + '%'
+            : '0%';
+
+        if (idx >= 0 && idx < total) {
+            const ev = AP.queue[idx];
+            const chat = state.chats.find(c => c.file === ev.chatFile);
+            const chatName = chat ? (chat.name || chat.file) : ev.chatFile;
+            const icon = ev.kind === 'reaction' ? '❤️' : '💬';
+            const fromName = ev.payload.from === state.username ? 'Вы' : (ev.payload.from || '—');
+
+            titleEl.textContent = `${icon} ${chatName}`;
+            subEl.textContent = ev.kind === 'reaction'
+                ? `${fromName} поставил ${ev.payload.emoji || '❤️'}`
+                : `Комментарий от ${fromName}`;
+        }
+
+        prevBtn.disabled = idx <= 0;
+        nextBtn.disabled = idx >= total - 1;
+        nextBtn.textContent = idx >= total - 1 ? '✓' : '›';
+        nextBtn.title = idx >= total - 1 ? 'Завершить' : 'Следующее';
+    }
+
+    // ─── Запуск режима ───
+    function startAutoPlay() {
+        const unseen = getUnseenEvents();
+        if (unseen.length === 0) return false;
+
+        AP.active = true;
+        AP.queue = unseen;
+        AP.currentIndex = -1;
+
+        buildBar();
+        AP.barEl.classList.add('show');
+
+        // 🆕 Перехватываем closeOverlay, чтобы юзер не закрыл оверлей случайно
+        // (мы работаем поверх списка)
+        // Но вообще-то при autoPlay оверлей и не открывается.
+
+        // Показываем первое
+        setTimeout(() => goNext(), 60);
+        return true;
+    }
+
+    // ─── Выход ───
+    function exitAutoPlay(reason = 'done') {
+        if (!AP.active) return;
+        AP.active = false;
+
+        if (AP.barEl) {
+            AP.barEl.classList.remove('show');
+        }
+        if (AP.jumpTimer) {
+            clearTimeout(AP.jumpTimer);
+            AP.jumpTimer = null;
+        }
+
+        // Обновляем бейджи
+        try {
+            const total = getUnseenEvents().length;
+            ['radar2Badge', 'radar2BadgeChat'].forEach(id => {
+                const el = document.getElementById(id);
+                if (!el) return;
+                if (total > 0) {
+                    el.textContent = total > 99 ? '99+' : String(total);
+                    el.classList.add('show');
+                } else {
+                    el.textContent = '';
+                    el.classList.remove('show');
+                }
+            });
+        } catch (e) {}
+
+        if (reason === 'done') {
+            if (typeof window.showToast === 'function') {
+                window.showToast('✅ Все события просмотрены', 2000);
+            }
+            if (navigator.vibrate) navigator.vibrate([30, 40, 30]);
+        }
+
+        AP.queue = [];
+        AP.currentIndex = -1;
+    }
+
+    // ─── Навигация ───
+    async function goNext() {
+        if (!AP.active) return;
+
+        const nextIdx = AP.currentIndex + 1;
+
+        if (nextIdx >= AP.queue.length) {
+            // Всё, закончили
+            exitAutoPlay('done');
+            return;
+        }
+
+        AP.currentIndex = nextIdx;
+        const ev = AP.queue[nextIdx];
+
+        // Помечаем как прочитанное СРАЗУ — счётчик уменьшится
+        markEventSeen(ev);
+
+        updateBarUI();
+
+        // Прыгаем к сообщению (как handleEventClick, но без закрытия оверлея)
+        await jumpToEvent(ev);
+
+        // Если очередь стала пуста — выходим
+        if (getUnseenEvents().length === 0) {
+            // Небольшая задержка, чтобы юзер увидел последнее
+            AP.jumpTimer = setTimeout(() => {
+                if (AP.active && AP.currentIndex >= AP.queue.length - 1) {
+                    exitAutoPlay('done');
+                }
+            }, 2200);
+        }
+    }
+
+    async function goPrev() {
+        if (!AP.active) return;
+        if (AP.currentIndex <= 0) return;
+
+        AP.currentIndex -= 1;
+        const ev = AP.queue[AP.currentIndex];
+        updateBarUI();
+        await jumpToEvent(ev);
+    }
+
+    // ─── Прыжок к событию (без закрытия плашки) ───
+    async function jumpToEvent(ev) {
+        if (!ev) return;
+        const chatFile = ev.chatFile;
+        const msgId = ev.msgId;
+
+        // Если мы уже в этом чате — просто скроллим
+        if (state.chatFile === chatFile) {
+            await jumpToMessage(msgId);
+            return;
+        }
+
+        const chat = state.chats.find(c => c.file === chatFile);
+        if (!chat) {
+            if (typeof window.showToast === 'function') {
+                window.showToast('❌ Чат не найден', 1500);
+            }
+            return;
+        }
+        const password = state.savedPasswords[chatFile];
+        if (!password) {
+            if (typeof window.showToast === 'function') {
+                window.showToast('🔐 Нужен пароль чата для перехода', 2000);
+            }
+            return;
+        }
+
+        // Указываем, куда прыгнуть после загрузки истории
+        window._pendingJumpToMsgId = msgId;
+
+        try {
+            if (typeof window.enterChat === 'function') {
+                await window.enterChat(chatFile, chat.name || chatFile, password);
+            }
+        } catch (err) {
+            console.error('autoPlay jump error:', err);
+            window._pendingJumpToMsgId = null;
+            return;
+        }
+
+        // Ждём появления сообщения в DOM
+        await jumpToMessage(msgId);
+    }
+
+    function jumpToMessage(msgId) {
+        return new Promise((resolve) => {
+            let tries = 0;
+            const check = () => {
+                const el = document.querySelector(
+                    `.message-wrapper[data-msg-id="${msgId}"]`
+                );
+                if (el) {
+                    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    el.classList.remove('highlight-flash');
+                    void el.offsetWidth;
+                    el.classList.add('highlight-flash');
+                    setTimeout(() => el.classList.remove('highlight-flash'), 1600);
+                    if (navigator.vibrate) navigator.vibrate(15);
+                    resolve(true);
+                    return;
+                }
+                tries++;
+                if (tries >= 60) {
+                    resolve(false);
+                    return;
+                }
+                setTimeout(check, 120);
+            };
+            check();
+        });
+    }
+
+    // ─── Перехват клика по колокольчику ───
+    function installClickInterceptors() {
+        const intercept = (btnId) => {
+            const btn = document.getElementById(btnId);
+            if (!btn || btn._autoPlayAttached) return;
+            btn._autoPlayAttached = true;
+
+            // Убираем все существующие обработчики через клонирование
+            // (проще всего — заменить элемент копией без слушателей, но так
+            //  мы потеряем badge-элемент. Поэтому используем capture-фазу:
+            //  ставим свой обработчик в CAPTURE и preventDefault+stopPropagation,
+            //  если решаем запустить autoPlay.)
+            btn.addEventListener('click', (e) => {
+                const unseen = getUnseenEvents();
+                if (unseen.length === 0) {
+                    // Нет непрочитанных — пусть работает обычное открытие оверлея
+                    return;
+                }
+                // Иначе — перехватываем
+                e.stopImmediatePropagation();
+                e.preventDefault();
+                startAutoPlay();
+            }, true);   // ⬅️ capture
+        };
+
+        intercept('radar2Btn');
+        intercept('radar2BtnChat');
+    }
+
+    // Переустанавливаем при появлении кнопок
+    const _observer = new MutationObserver(() => {
+        installClickInterceptors();
+    });
+    _observer.observe(document.body, { childList: true, subtree: true });
+
+    // Первая установка
+    setTimeout(installClickInterceptors, 3500);
+
+    // Экспорт для ручного вызова
+    window.EventAutoPlay = {
+        start: startAutoPlay,
+        next: goNext,
+        prev: goPrev,
+        stop: () => exitAutoPlay('manual'),
+        isActive: () => AP.active,
+    };
+
+    console.log('🎬 Режим автопоказа событий активен');
+    console.log('   • Клик по 🔔 при наличии непрочитанных → последовательный показ');
+    console.log('   • Счётчик на колокольчике уменьшается по мере просмотра');
+    console.log('   • Кнопки ‹ › ✕ в плашке внизу экрана');
+    console.log('   • API: EventAutoPlay.start() / .next() / .stop()');
+})();
+</script>
 </body>
 </html>
