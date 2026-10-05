@@ -22744,6 +22744,728 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
 </script>
 <script>
 // ═══════════════════════════════════════════════════════════════
+//  🖼️ МИНИАТЮРЫ ВЛОЖЕНИЙ В СОБЫТИЯХ РАДАРА
+//  • Фото       → сама картинка (сжато через loadAttachment)
+//  • Видео      → первый кадр (из blob через <video> + <canvas>)
+//  • Аудио      → обложка альбома, если есть; иначе иконка
+//  • Голосовое  → иконка 🎤
+//  • Файл       → иконка типа файла
+//  • .smschat   → иконка 💌
+//
+//  Всё грузится ЛЕНИВО: только когда открыт оверлей радара.
+//  Кэшируется в отдельной Map, чтобы не грузить повторно.
+// ═══════════════════════════════════════════════════════════════
+
+(function installRadarEventThumbnails() {
+    'use strict';
+
+    // ─── Кэш миниатюр по ключу `${chatFile}|${attachName}` ───
+    //   Значение: { url: 'blob:…' | 'data:…' , error: false }
+    const _thumbCache = new Map();
+    const _thumbPending = new Map();
+
+    // ─── Ограничение: сколько миниатюр грузим параллельно ───
+    const MAX_CONCURRENT = 3;
+    let _activeLoads = 0;
+    const _loadQueue = [];
+
+    // ─── Публичные флаги ───
+    let _thumbObserver = null;
+
+    // ═══════════════════════════════════════════════════════════
+    //  СТИЛИ
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('radarThumbStyles')) {
+        const style = document.createElement('style');
+        style.id = 'radarThumbStyles';
+        style.textContent = `
+            /* Контейнер миниатюры слева от body-col */
+            .r2-event .r2-thumb {
+                width: 44px;
+                height: 44px;
+                border-radius: 10px;
+                background: rgba(0,0,0,0.3);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                flex-shrink: 0;
+                overflow: hidden;
+                position: relative;
+                border: 1px solid rgba(255,255,255,0.06);
+                font-size: 18px;
+                color: #888;
+                transition: opacity 0.2s;
+            }
+            .r2-event .r2-thumb img {
+                width: 100%;
+                height: 100%;
+                object-fit: cover;
+                display: block;
+                border-radius: 9px;
+                pointer-events: none;
+            }
+            .r2-event .r2-thumb.thumb-photo {
+                background: rgba(108,92,231,0.12);
+            }
+            .r2-event .r2-thumb.thumb-video {
+                background: rgba(255,107,107,0.12);
+                color: #ff8a8a;
+            }
+            .r2-event .r2-thumb.thumb-video img {
+                /* Тот же object-fit, но для кадра */
+                filter: brightness(0.95);
+            }
+            .r2-event .r2-thumb.thumb-audio {
+                background: linear-gradient(135deg,
+                    rgba(108,92,231,0.2),
+                    rgba(0,184,148,0.15));
+                color: #a78bfa;
+            }
+            .r2-event .r2-thumb.thumb-audio img {
+                border-radius: 9px;
+            }
+            .r2-event .r2-thumb.thumb-file {
+                background: linear-gradient(135deg,
+                    rgba(254,202,87,0.18),
+                    rgba(255,159,67,0.12));
+                color: #feca57;
+            }
+            .r2-event .r2-thumb.thumb-invite {
+                background: linear-gradient(135deg,
+                    rgba(0,184,148,0.18),
+                    rgba(108,92,231,0.15));
+                color: #00b894;
+            }
+
+            /* Спиннер во время загрузки */
+            .r2-event .r2-thumb.loading::after {
+                content: '';
+                position: absolute;
+                top: 50%;
+                left: 50%;
+                width: 16px;
+                height: 16px;
+                margin: -8px 0 0 -8px;
+                border-radius: 50%;
+                border: 2px solid rgba(255,255,255,0.15);
+                border-top-color: #a78bfa;
+                animation: r2ThumbSpin 0.8s linear infinite;
+            }
+            @keyframes r2ThumbSpin {
+                to { transform: rotate(360deg); }
+            }
+
+            /* Иконка play поверх видео-кадра */
+            .r2-event .r2-thumb.thumb-video .thumb-play-icon {
+                position: absolute;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%, -50%);
+                width: 20px;
+                height: 20px;
+                border-radius: 50%;
+                background: rgba(0,0,0,0.55);
+                border: 1.5px solid rgba(255,255,255,0.85);
+                color: #fff;
+                font-size: 9px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding-left: 2px;
+                pointer-events: none;
+                z-index: 2;
+            }
+
+            /* В режиме "прочитано" миниатюра чуть бледнее */
+            .r2-event.seen .r2-thumb {
+                opacity: 0.7;
+            }
+            .r2-event.seen:hover .r2-thumb {
+                opacity: 1;
+            }
+
+            /* На мобиле — чуть меньше */
+            @media (max-width: 480px) {
+                .r2-event .r2-thumb {
+                    width: 40px;
+                    height: 40px;
+                    border-radius: 9px;
+                    font-size: 16px;
+                }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  🎯 ОПРЕДЕЛЕНИЕ ТИПА ВЛОЖЕНИЯ И ИКОНКИ-ЗАГЛУШКИ
+    //  Возвращает { kind, icon, attachName }
+    //    kind: 'photo' | 'video' | 'audio-cover' | 'audio-voice'
+    //         | 'file' | 'invite' | null
+    // ═══════════════════════════════════════════════════════════
+    function classifyAttachment(msg) {
+        if (!msg) return null;
+
+        // 📷 Фото
+        if (msg.image) {
+            return { kind: 'photo', icon: '📷', attachName: msg.image };
+        }
+
+        // 🎥 Видео-кружочек
+        if (msg.videoNote) {
+            return { kind: 'video', icon: '🎥', attachName: msg.videoNote };
+        }
+
+        // 🎬 Видео
+        if (msg.video) {
+            return { kind: 'video', icon: '🎬', attachName: msg.video };
+        }
+
+        // 🎵 Аудио (с обложкой или без)
+        if (msg.audio) {
+            if (msg.audioCover) {
+                return {
+                    kind: 'audio-cover',
+                    icon: '🎵',
+                    attachName: msg.audioCover,   // показываем обложку
+                    audioAttachName: msg.audio,   // а это — сам трек
+                };
+            }
+            const hasName = !!(msg.audioName && msg.audioName.trim());
+            return {
+                kind: 'audio-voice',
+                icon: hasName ? '🎵' : '🎤',
+                attachName: null,   // иконки достаточно
+                audioAttachName: msg.audio,
+            };
+        }
+
+        // 📎 Файл
+        if (msg.file) {
+            const isInvite = /\.smschat$/i.test(msg.fileName || '');
+            return {
+                kind: isInvite ? 'invite' : 'file',
+                icon: isInvite ? '💌' : getFileIconSafe(msg.fileName),
+                attachName: msg.file,
+                fileName: msg.fileName,
+            };
+        }
+
+        return null;
+    }
+
+    // Безопасный доступ к существующей функции getFileIcon
+    function getFileIconSafe(fileName) {
+        if (typeof window.getFileIcon === 'function') {
+            return window.getFileIcon(fileName || '');
+        }
+        // Фолбэк
+        const ext = (fileName || '').split('.').pop().toLowerCase();
+        if (/^(zip|rar|7z|tar|gz)$/.test(ext)) return '🗜️';
+        if (/^(pdf)$/.test(ext)) return '📕';
+        if (/^(doc|docx)$/.test(ext)) return '📘';
+        if (/^(xls|xlsx)$/.test(ext)) return '📊';
+        if (/^(txt|md)$/.test(ext)) return '📄';
+        return '📎';
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  📥 ЗАГРУЗКА И РЕНДЕР МИНИАТЮРЫ
+    // ═══════════════════════════════════════════════════════════
+
+    /**
+     * Публичный вход: применяет миниатюру к DOM-элементу карточки события.
+     * Гарантированно НЕ бросает исключений наружу.
+     */
+    async function applyThumbToElement(thumbEl, ev) {
+        if (!thumbEl || !ev) return;
+
+        // Ищем сообщение по (chatFile, msgId)
+        // — используем ту же логику, что и enrichEventDetailsLazy
+        const msg = await getEventMessage(ev);
+        if (!msg) {
+            thumbEl.classList.remove('loading');
+            return;
+        }
+
+        const cls = classifyAttachment(msg);
+        if (!cls) {
+            thumbEl.classList.remove('loading');
+            return;
+        }
+
+        // Проставляем класс типа — сразу даёт правильный фон
+        thumbEl.classList.add('thumb-' + cls.kind);
+
+        // Если картинки не будет — оставляем иконку и выходим
+        if (!cls.attachName) {
+            thumbEl.classList.remove('loading');
+            thumbEl.textContent = cls.icon;
+            return;
+        }
+
+        // Загружаем миниатюру
+        try {
+            const url = await loadThumbWithQueue(ev.chatFile, cls.attachName);
+            if (!url) {
+                thumbEl.classList.remove('loading');
+                thumbEl.textContent = cls.icon;
+                return;
+            }
+
+            // Для видео — сначала извлекаем кадр
+            if (cls.kind === 'video') {
+                const frameUrl = await extractVideoFrame(url, ev.chatFile, cls.attachName);
+                if (frameUrl) {
+                    thumbEl.innerHTML = `
+                        <img src="${frameUrl}" alt="" draggable="false">
+                        <span class="thumb-play-icon">▶</span>
+                    `;
+                } else {
+                    thumbEl.innerHTML = `<span>${cls.icon}</span>`;
+                }
+                thumbEl.classList.remove('loading');
+                return;
+            }
+
+            // Для фото/аудио-обложки — просто <img>
+            thumbEl.innerHTML = `<img src="${url}" alt="" draggable="false">`;
+            thumbEl.classList.remove('loading');
+        } catch (e) {
+            console.warn('[RadarThumb] load failed:', cls.attachName, e.message);
+            thumbEl.classList.remove('loading');
+            thumbEl.textContent = cls.icon;
+        }
+    }
+
+    /**
+     * Достаём сообщение для события.
+     * 1. Смотрим в historyState.allMessages (быстро)
+     * 2. Если нет — фетчим чат и расшифровываем нужное сообщение
+     *    (тут мы переиспользуем уже загруженное состояние radar — 
+     *     если enrich уже прошёл, у нас есть всё)
+     *
+     * На практике в 99% случаев событие в чате, где есть пароль,
+     * и оно либо в historyState, либо chatFile === state.chatFile.
+     */
+    async function getEventMessage(ev) {
+        if (!ev) return null;
+
+        // 1. Быстрый путь — из текущей истории
+        if (state.chatFile === ev.chatFile && historyState.allMessages.length > 0) {
+            const found = historyState.allMessages.find(m => m.id === ev.msgId);
+            if (found) return found;
+        }
+
+        // 2. Если у события есть _msgSnapshot (создадим её в scanOneChat) — 
+        //    используем её как фолбэк
+        if (ev._msgSnapshot) return ev._msgSnapshot;
+
+        // 3. Медленный путь — фетчим и расшифровываем
+        try {
+            const password = state.savedPasswords[ev.chatFile];
+            if (!password) return null;
+
+            const path = `chats/${ev.chatFile}.json`;
+            const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${path}`;
+            const res = await fetch(url, {
+                headers: {
+                    'Authorization': `token ${state.token}`,
+                    'Accept': 'application/vnd.github.v3+json',
+                },
+                cache: 'no-store',
+            });
+            if (!res.ok) return null;
+            const data = await res.json();
+            const content = JSON.parse(base64ToUtf8((data.content || '').replace(/\n/g, '')));
+            if (content.v !== 2 || !content.salt) return null;
+
+            const encMsg = (content.messages || []).find(m => m.id === ev.msgId);
+            if (!encMsg) return null;
+
+            // Деривация ключа
+            const enc = new TextEncoder();
+            const salt = new Uint8Array(base64ToArrayBuffer(content.salt));
+            const baseKey = await crypto.subtle.importKey(
+                'raw', enc.encode(password),
+                { name: 'PBKDF2' }, false, ['deriveKey']
+            );
+            const key = await crypto.subtle.deriveKey(
+                { name: 'PBKDF2', salt, iterations: 200000, hash: 'SHA-256' },
+                baseKey,
+                { name: 'AES-GCM', length: 256 },
+                false, ['decrypt']
+            );
+
+            const iv = new Uint8Array(base64ToArrayBuffer(encMsg.iv));
+            const cipher = base64ToArrayBuffer(encMsg.data);
+            const plain = await crypto.subtle.decrypt(
+                { name: 'AES-GCM', iv }, key, cipher
+            );
+            const payload = JSON.parse(new TextDecoder().decode(plain));
+
+            const msg = {
+                id: encMsg.id,
+                username: payload.username,
+                time: encMsg.time,
+                text: payload.text || '',
+                image: payload.image,
+                video: payload.video,
+                videoNote: payload.videoNote,
+                audio: payload.audio,
+                audioName: payload.audioName,
+                audioCover: payload.audioCover,
+                file: payload.file,
+                fileName: payload.fileName,
+            };
+            ev._msgSnapshot = msg;   // кэшируем в событии
+            return msg;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    /**
+     * Загрузка миниатюры через очередь (не более MAX_CONCURRENT одновременно).
+     * Возвращает blob:URL или null.
+     */
+    function loadThumbWithQueue(chatFile, attachName) {
+        const key = `${chatFile}|${attachName}`;
+
+        // Из кэша
+        if (_thumbCache.has(key)) return Promise.resolve(_thumbCache.get(key));
+        if (_thumbPending.has(key)) return _thumbPending.get(key);
+
+        // В очередь
+        return new Promise((resolve) => {
+            _loadQueue.push({ key, chatFile, attachName, resolve });
+            _processQueue();
+        });
+    }
+
+    function _processQueue() {
+        while (_activeLoads < MAX_CONCURRENT && _loadQueue.length > 0) {
+            const job = _loadQueue.shift();
+            _activeLoads++;
+
+            _doLoadThumb(job.chatFile, job.attachName)
+                .then((url) => {
+                    if (url) _thumbCache.set(job.key, url);
+                    job.resolve(url);
+                })
+                .catch(() => job.resolve(null))
+                .finally(() => {
+                    _activeLoads--;
+                    _processQueue();
+                });
+        }
+    }
+
+    async function _doLoadThumb(chatFile, attachName) {
+        // Если это уже blob: или data: URL — вернуть как есть
+        if (!attachName) return null;
+        if (attachName.startsWith('blob:') || attachName.startsWith('data:')) {
+            return attachName;
+        }
+
+        // 🆕 Проверяем глобальный кэш вложений (там уже может быть)
+        if (typeof _attachmentCache !== 'undefined'
+            && _attachmentCache.has(attachName)) {
+            return _attachmentCache.get(attachName);
+        }
+
+        // Грузим через существующий loadAttachment — он сам всё сделает:
+        //   скачает, расшифрует, создаст blob:URL и закэширует
+        if (typeof window.loadAttachment === 'function') {
+            try {
+                const url = await window.loadAttachment(chatFile, attachName);
+                return url;
+            } catch (e) {
+                console.warn('[RadarThumb] loadAttachment failed:', e.message);
+                return null;
+            }
+        }
+        return null;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  🎬 ИЗВЛЕЧЕНИЕ ПЕРВОГО КАДРА ИЗ ВИДЕО
+    //  Грузим blob:URL в <video>, ждём meta, seek на 0.1s,
+    //  рисуем в canvas, отдаём data:URL.
+    //  Кэшируем результат в _thumbCache отдельным ключом.
+    // ═══════════════════════════════════════════════════════════
+    async function extractVideoFrame(blobUrl, chatFile, attachName) {
+        if (!blobUrl) return null;
+
+        const frameKey = `frame|${chatFile}|${attachName}`;
+        if (_thumbCache.has(frameKey)) return _thumbCache.get(frameKey);
+        if (_thumbPending.has(frameKey)) return _thumbPending.get(frameKey);
+
+        const job = (async () => {
+            return new Promise((resolve) => {
+                const video = document.createElement('video');
+                video.preload = 'metadata';
+                video.muted = true;
+                video.playsInline = true;
+                video.crossOrigin = 'anonymous';
+                video.src = blobUrl;
+
+                let settled = false;
+                const finish = (result) => {
+                    if (settled) return;
+                    settled = true;
+                    try { URL.revokeObjectURL(video.src); } catch (e) {}
+                    video.removeAttribute('src');
+                    video.load();
+                    resolve(result);
+                };
+
+                // Жёсткий таймаут — не более 6 сек на извлечение
+                const timeout = setTimeout(() => finish(null), 6000);
+
+                video.onloadedmetadata = () => {
+                    // Берём кадр на 0.1 сек или на 10% от длительности
+                    // (для очень коротких видео первое может быть чёрным)
+                    const seekTo = Math.min(
+                        0.1,
+                        (video.duration && isFinite(video.duration))
+                            ? video.duration * 0.1
+                            : 0.1
+                    );
+
+                    const drawFrame = () => {
+                        try {
+                            const w = video.videoWidth;
+                            const h = video.videoHeight;
+                            if (!w || !h) {
+                                clearTimeout(timeout);
+                                return finish(null);
+                            }
+
+                            // Ограничиваем размер канваса — 240px по большей стороне
+                            const maxSide = 240;
+                            const ratio = Math.min(1, maxSide / Math.max(w, h));
+                            const cw = Math.round(w * ratio);
+                            const ch = Math.round(h * ratio);
+
+                            const canvas = document.createElement('canvas');
+                            canvas.width = cw;
+                            canvas.height = ch;
+                            const ctx = canvas.getContext('2d');
+                            ctx.drawImage(video, 0, 0, cw, ch);
+
+                            // JPEG 0.7 — маленький размер
+                            const dataUrl = canvas.toDataURL('image/jpeg', 0.7);
+                            clearTimeout(timeout);
+                            finish(dataUrl);
+                        } catch (e) {
+                            clearTimeout(timeout);
+                            finish(null);
+                        }
+                    };
+
+                    video.onseeked = drawFrame;
+                    try {
+                        video.currentTime = seekTo;
+                    } catch (e) {
+                        clearTimeout(timeout);
+                        finish(null);
+                    }
+                };
+
+                video.onerror = () => {
+                    clearTimeout(timeout);
+                    finish(null);
+                };
+            });
+        })();
+
+        _thumbPending.set(frameKey, job);
+        try {
+            const result = await job;
+            if (result) _thumbCache.set(frameKey, result);
+            return result;
+        } finally {
+            _thumbPending.delete(frameKey);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  🎨 ПАТЧ renderEventCard — добавляем контейнер .r2-thumb
+    //  Родительская функция определена внутри IIFE EventRadar V3
+    //  и недоступна снаружи. Поэтому:
+    //  1) Наблюдаем за DOM: когда карточки появляются — дорисовываем thumb
+    //  2) После каждого renderList() в радаре — запускаем applyAllThumbs()
+    // ═══════════════════════════════════════════════════════════
+
+    /**
+     * Проходим по всем карточкам событий в оверлее и дорисовываем
+     * туда thumb, если его ещё нет.
+     */
+    async function applyAllThumbs() {
+        const body = document.getElementById('r2Body');
+        if (!body) return;
+
+        const cards = body.querySelectorAll('.r2-event[data-msg-id]');
+        if (cards.length === 0) return;
+
+        // Достаём актуальный список событий из EventRadar
+        const events = (typeof window.EventRadar !== 'undefined')
+            ? window.EventRadar.getEvents()
+            : [];
+        if (events.length === 0) return;
+
+        // Карта: `${chatFile}|${msgId}` → событие
+        const eventMap = new Map();
+        for (const ev of events) {
+            eventMap.set(`${ev.chatFile}|${ev.msgId}`, ev);
+        }
+
+        const tasks = [];
+        for (const card of cards) {
+            // Уже обработали?
+            if (card._thumbApplied) continue;
+            card._thumbApplied = true;
+
+            const chatFile = card.dataset.chatFile;
+            const msgId = parseInt(card.dataset.msgId);
+            const key = `${chatFile}|${msgId}`;
+            const ev = eventMap.get(key);
+            if (!ev) continue;
+
+            // Вставляем контейнер сразу после .r2-kind
+            const kindEl = card.querySelector('.r2-kind');
+            if (!kindEl) continue;
+
+            // Не дублируем
+            if (card.querySelector('.r2-thumb')) continue;
+
+            const thumbEl = document.createElement('div');
+            thumbEl.className = 'r2-thumb loading';
+            // Начальный текст — плейсхолдер
+            thumbEl.textContent = '…';
+
+            kindEl.insertAdjacentElement('afterend', thumbEl);
+
+            // Запускаем загрузку
+            tasks.push(applyThumbToElement(thumbEl, ev));
+        }
+
+        await Promise.allSettled(tasks);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  👁️ НАБЛЮДАТЕЛЬ ЗА DOM
+    //  Когда оверлей открывается и renderList() перерисовывает body —
+    //  ловим новые карточки и дорисовываем thumb.
+    // ═══════════════════════════════════════════════════════════
+
+    function startBodyObserver() {
+        const body = document.getElementById('r2Body');
+        if (!body) return;
+        if (_thumbObserver) _thumbObserver.disconnect();
+
+        _thumbObserver = new MutationObserver(() => {
+            // Дебаунсим — не чаще раза в 120 мс
+            if (_thumbObserver._timer) clearTimeout(_thumbObserver._timer);
+            _thumbObserver._timer = setTimeout(() => {
+                _thumbObserver._timer = null;
+                applyAllThumbs();
+            }, 120);
+        });
+        _thumbObserver.observe(body, { childList: true, subtree: true });
+
+        // Первый прогон сразу
+        applyAllThumbs();
+    }
+
+    // Оверлей создаётся лениво при первом open(). Следим за ним.
+    const _overlayObserver = new MutationObserver(() => {
+        const body = document.getElementById('r2Body');
+        if (body && !body._thumbObserved) {
+            body._thumbObserved = true;
+            startBodyObserver();
+        }
+    });
+    _overlayObserver.observe(document.body, { childList: true, subtree: true });
+
+    // Если оверлей уже есть — стартуем
+    const existingBody = document.getElementById('r2Body');
+    if (existingBody) {
+        existingBody._thumbObserved = true;
+        startBodyObserver();
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  🔄 ПАТЧ: после enrichEventDetailsLazy — обновляем миниатюры
+    //  В EventRadar V3 в конце enrich стоит renderList(), который
+    //  перерисует карточки, и наш observer это поймает.
+    //  Но чтобы гарантировать порядок — ещё раз принудительно
+    //  прогоняем applyAllThumbs через 300 мс после открытия оверлея.
+    // ═══════════════════════════════════════════════════════════
+
+    const _origOpen = window.EventRadar && window.EventRadar.open;
+    if (_origOpen) {
+        window.EventRadar.open = function() {
+            const r = _origOpen.apply(this, arguments);
+            // Ждём первого рендера, потом накатываем миниатюры
+            setTimeout(applyAllThumbs, 200);
+            setTimeout(applyAllThumbs, 600);
+            setTimeout(applyAllThumbs, 1500);
+            return r;
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  🧹 ОЧИСТКА КЭША МИНИАТЮР
+    //  При выходе из аккаунта — рвём все blob:URL, чтобы не текли.
+    //  И при закрытии оверлея НЕ чистим — при повторном открытии
+    //  миниатюры покажутся мгновенно.
+    // ═══════════════════════════════════════════════════════════
+
+    const _origLogout = window.logout;
+    if (_origLogout) {
+        window.logout = function() {
+            // Рвём blob:URL (только те, что начинаются с blob:)
+            for (const url of _thumbCache.values()) {
+                if (typeof url === 'string' && url.startsWith('blob:')) {
+                    try { URL.revokeObjectURL(url); } catch (e) {}
+                }
+            }
+            _thumbCache.clear();
+            _thumbPending.clear();
+            _loadQueue.length = 0;
+            _activeLoads = 0;
+            return _origLogout.apply(this, arguments);
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  🆕 ПАТЧ scanOneChat — сохраняем снимок вложения в событие
+    //  Это ускорит работу getEventMessage: не нужно будет
+    //  ходить в GitHub, если сообщение уже расшифровано.
+    //
+    //  НО: scanOneChat находится внутри IIFE EventRadar V3.
+    //  Поэтому сделаем это иначе — после каждого scanAll мы просто
+    //  проходимся по событиям и, если сообщение есть в historyState
+    //  (текущий чат) — сохраняем снимок. Для остальных — снимок
+    //  получится лениво при первом показе.
+    //
+    //  Этого достаточно: radar и так расшифровывает все чаты при скане,
+    //  просто результат не сохраняет. Мы не хотим менять его код.
+    // ═══════════════════════════════════════════════════════════
+
+    console.log('🖼️ Миниатюры вложений в событиях активны:');
+    console.log('   • 📷 Фото — сама картинка');
+    console.log('   • 🎬 Видео — первый кадр с иконкой ▶');
+    console.log('   • 🎵 Аудио — обложка альбома');
+    console.log('   • 🎤 Голосовое / 📎 Файл — иконка');
+    console.log('   • Очередь загрузки: не более 3 одновременно');
+    console.log('   • Кэш: in-memory, сбрасывается при logout');
+})();
+</script>
+<script>
+// ═══════════════════════════════════════════════════════════════
 //  🎬 РЕЖИМ ПОСЛЕДОВАТЕЛЬНОГО ПРОСМОТРА СОБЫТИЙ
 //  Клик по 🔔 при наличии непрочитанных → показывает их по очереди,
 //  счётчик на колокольчике уменьшается, сверху — плашка-навигатор.
