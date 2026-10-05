@@ -6582,18 +6582,24 @@ if (msg.audio) {
         payload.batchIndex = msg.batchIndex;
         payload.batchTotal = msg.batchTotal;
     }
-    if (msg.replyTo) {
-    payload.replyTo = {
-        id: msg.replyTo.id,
-        username: msg.replyTo.username,
-        previewText: msg.replyTo.previewText || '',
-        attachKind: msg.replyTo.attachKind || null,
-        attachName: msg.replyTo.attachName || null,
-        thumbAttachName: msg.replyTo.thumbAttachName || null,
-        hasImage: msg.replyTo.attachKind === 'image' ? true : undefined,
-        hasAudio: msg.replyTo.attachKind === 'audio' ? true : undefined,
-        hasFile: msg.replyTo.attachKind === 'file' ? true : undefined,
-        fileName: msg.replyTo.attachName || undefined,
+    if (replyContext) {
+    const replied = historyState.allMessages.find(m => m.id === replyContext.id)
+        || state.messages.find(m => m.id === replyContext.id);
+
+
+    plainMsg.replyTo = {
+        id: replyContext.id,
+        username: replyContext.username,
+        previewText: replyContext.previewText || '',
+        attachKind: replyContext.attachKind || null,
+        attachName: replyContext.attachName || null,
+        thumbAttachName: replyContext.thumbAttachName || null,
+        // 🆕 Локальный blob:URL для мгновенного показа (не шифруется, не уходит на сервер)
+        _localThumbUrl: replyContext.thumbUrl || null,
+        hasImage: replied?.image ? true : undefined,
+        hasAudio: replied?.audio ? true : undefined,
+        hasFile: replied?.file ? true : undefined,
+        fileName: replied?.fileName || undefined,
     };
 }
     const encrypted = await encryptObject(payload, CRYPTO._key);
@@ -7330,18 +7336,20 @@ if (replyContext) {
 
 
     plainMsg.replyTo = {
-        id: replyContext.id,
-        username: replyContext.username,
-        previewText: replyContext.previewText || '',
-        attachKind: replyContext.attachKind || null,
-        attachName: replyContext.attachName || null,
-        thumbAttachName: replyContext.thumbAttachName || null,
-        // Оставляем legacy-поля для совместимости
-        hasImage: replied?.image ? true : undefined,
-        hasAudio: replied?.audio ? true : undefined,
-        hasFile: replied?.file ? true : undefined,
-        fileName: replied?.fileName || undefined,
-    };
+    id: replyContext.id,
+    username: replyContext.username,
+    previewText: replyContext.previewText || '',
+    attachKind: replyContext.attachKind || null,
+    attachName: replyContext.attachName || null,
+    thumbAttachName: replyContext.thumbAttachName || null,
+    // 🆕 Локальный blob:URL — мгновенный показ миниатюры у отправителя
+    _localThumbUrl: replyContext.thumbUrl || null,
+    // Legacy-поля для совместимости
+    hasImage: replied?.image ? true : undefined,
+    hasAudio: replied?.audio ? true : undefined,
+    hasFile: replied?.file ? true : undefined,
+    fileName: replied?.fileName || undefined,
+};
 }
 
 
@@ -8775,11 +8783,13 @@ if (msg.replyTo) {
     let thumbHtml = '';
 
 
-    if (rt.thumbUrl) {
-        thumbHtml = `<img src="${rt.thumbUrl}" alt="" class="rq-thumb">`;
-    } else if (rt.thumbAttachName && isAttachmentRef(rt.thumbAttachName)) {
-        thumbHtml = `<div class="rq-thumb rq-thumb-placeholder" data-rq-thumb-attach="${rt.thumbAttachName}">⏳</div>`;
-    } else if (rt.attachKind === 'videoNote') {
+    if (rt.thumbUrl || rt._localThumbUrl) {
+    // 🆕 Сначала пробуем локальный thumbUrl — для мгновенного показа
+    const src = rt.thumbUrl || rt._localThumbUrl;
+    thumbHtml = `<img src="${src}" alt="" class="rq-thumb">`;
+} else if (rt.thumbAttachName && isAttachmentRef(rt.thumbAttachName)) {
+    thumbHtml = `<div class="rq-thumb rq-thumb-placeholder" data-rq-thumb-attach="${rt.thumbAttachName}">⏳</div>`;
+} else if (rt.attachKind === 'videoNote') {
         thumbHtml = `<div class="rq-thumb rq-thumb-icon">🎥</div>`;
     } else if (rt.attachKind === 'video') {
         thumbHtml = `<div class="rq-thumb rq-thumb-icon">🎬</div>`;
