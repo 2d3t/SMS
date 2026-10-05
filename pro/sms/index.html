@@ -21178,18 +21178,20 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
 
 </script>
 
+
+
+
 <script>
 // ═══════════════════════════════════════════════════════════════
-//  🔔 EVENT RADAR v3 — Вариант B
+//  🔔 EVENT RADAR v3 — энергоэффективный движок событий
 //
-//  Скан происходит ТОЛЬКО:
-//   • Один раз через 15 сек после старта приложения
-//   • При возврате из фона (visibilitychange → visible)
-//   • При возврате фокуса окна (для десктопа)
-//   • При возврате онлайна
-//   • Вручную по кнопке ⟳
-//
-//  НЕТ setInterval. НЕТ фоновых сканов. Максимальная экономия.
+//  Отличия от v2:
+//   • Кэш versions/lastFullScan/metaEvents в localStorage
+//   • Первый скан после перезагрузки — лёгкий (только meta.json)
+//   • Страховочный full-scan раз в 10 минут
+//   • Ленивая подгрузка деталей события при открытии радара
+//   • Интервал скана 45 сек
+//   • Диагностика: сколько раз расшифровывали
 // ═══════════════════════════════════════════════════════════════
 
 (function installEventRadarV3() {
@@ -21199,10 +21201,10 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
     //  КОНФИГ
     // ═══════════════════════════════════════════════════════════
     const CFG = {
-        startupScanDelayMs: 15000,           // скан через 15 сек после старта
-        minTimeBetweenScansMs: 5000,         // 🆕 не чаще раза в 5 сек (защита от «дребезга»)
-        delayBetweenChatsMs: 250,            // пауза между чатами
-        fullScanIntervalMs: 10 * 60 * 1000,  // страховочный full-scan раз в 10 мин (если meta не обновился)
+        scanIntervalMs: 45000,               // 45 сек (было 20)
+        scanOnVisibility: true,
+        delayBetweenChatsMs: 250,
+        fullScanIntervalMs: 10 * 60 * 1000,  // 🆕 страховочный full-scan раз в 10 мин
         maxEventsKept: 500,
         maxEventsShown: 100,
         maxStateEntries: 2000,
@@ -21211,11 +21213,11 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
         eventsStorageKey: 'radar2_events_v2',
         seenStorageKey: 'radar2_seen_v2',
         enabledKey: 'radar2_enabled_v2',
-        versionsStorageKey: 'radar2_versions_v3',
-        lastFullScanKey: 'radar2_lastfull_v3',
-        metaEventsKey: 'radar2_metaEvents_v3',
+        versionsStorageKey: 'radar2_versions_v3',      // 🆕
+        lastFullScanKey: 'radar2_lastfull_v3',         // 🆕
+        metaEventsKey: 'radar2_metaEvents_v3',         // 🆕
         initKeyPrefix: 'radar2_init_',
-        diagKey: 'radar2_diag_v3',
+        diagKey: 'radar2_diag_v3',                     // 🆕
     };
 
     // ═══════════════════════════════════════════════════════════
@@ -21229,25 +21231,22 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
         state: {},
         initDone: {},
         etags: {},
-        versions: {},
-        lastFullScan: {},
-        metaEvents: {},
+        versions: {},           // 🆕 { [file]: version }
+        lastFullScan: {},       // 🆕 { [file]: timestamp }
+        metaEvents: {},         // 🆕 { [file]: { reactions: N, comments: N } }
         notModifiedStreak: {},
         lastScanTs: 0,
         overlayOpen: false,
+        scanTimer: null,
         _saveStateTimer: null,
         _saveEventsTimer: null,
-        _saveVersionsTimer: null,
+        _saveVersionsTimer: null,   // 🆕
+        // 🆕 Диагностика
         diag: {
             totalScans: 0,
-            fullDecrypts: 0,
-            metaOnlyChecks: 0,
-            decryptedMessages: 0,
-            manualScans: 0,
-            startupScans: 0,
-            visibilityScans: 0,
-            focusScans: 0,
-            onlineScans: 0,
+            fullDecrypts: 0,        // сколько раз расшифровывали весь чат
+            metaOnlyChecks: 0,      // сколько раз отделались meta.json
+            decryptedMessages: 0,   // всего расшифровано сообщений
         },
     };
 
@@ -21349,22 +21348,29 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
         return false;
     }
 
+    // 🆕 Кэш версий, последних full-scan и meta-событий
     function loadVersionsAndMeta() {
         try {
             const raw = localStorage.getItem(CFG.versionsStorageKey);
             R.versions = raw ? JSON.parse(raw) : {};
         } catch (e) { R.versions = {}; }
+
         try {
             const raw = localStorage.getItem(CFG.lastFullScanKey);
             R.lastFullScan = raw ? JSON.parse(raw) : {};
         } catch (e) { R.lastFullScan = {}; }
+
         try {
             const raw = localStorage.getItem(CFG.metaEventsKey);
             R.metaEvents = raw ? JSON.parse(raw) : {};
         } catch (e) { R.metaEvents = {}; }
+
         try {
             const raw = localStorage.getItem(CFG.diagKey);
-            if (raw) Object.assign(R.diag, JSON.parse(raw));
+            if (raw) {
+                const parsed = JSON.parse(raw);
+                Object.assign(R.diag, parsed);
+            }
         } catch (e) {}
     }
 
@@ -21381,11 +21387,13 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
         if (immediate) doSave(); else R._saveVersionsTimer = setTimeout(doSave, 500);
     }
 
+    // 🆕 Форсируем вкл. при первом запуске v3
     if (localStorage.getItem('radar3_forced_on') !== '1') {
         localStorage.setItem(CFG.enabledKey, '1');
         localStorage.setItem('radar3_forced_on', '1');
     }
 
+    // Загружаем всё
     loadSeen();
     loadState();
     loadEvents();
@@ -21393,7 +21401,7 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
     loadVersionsAndMeta();
 
     // ═══════════════════════════════════════════════════════════
-    //  СТИЛИ
+    //  СТИЛИ (без изменений)
     // ═══════════════════════════════════════════════════════════
     if (!document.getElementById('radar2Styles')) {
         const style = document.createElement('style');
@@ -21661,7 +21669,7 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  КНОПКИ
+    //  КНОПКИ 🔔 В ШАПКАХ
     // ═══════════════════════════════════════════════════════════
     function installRadarButtons() {
         const chatsHeader = document.querySelector('#chatsScreen .auth-header');
@@ -21767,9 +21775,8 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
 
         ov.querySelector('#r2ScanNowBtn').addEventListener('click', async () => {
             if (R.scanning) { showToastSafe('⏳ Скан уже идёт…'); return; }
-            R.diag.manualScans++;
             showToastSafe('🔍 Проверяю чаты…');
-            await scanAll({ force: true, reason: 'manual' });
+            await scanAll({ force: true });
         });
 
         ov.querySelector('#r2ClearBtn').addEventListener('click', () => {
@@ -21782,10 +21789,7 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
             R.lastFullScan = {};
             R.metaEvents = {};
             R.initDone = {};
-            R.diag = {
-                totalScans: 0, fullDecrypts: 0, metaOnlyChecks: 0, decryptedMessages: 0,
-                manualScans: 0, startupScans: 0, visibilityScans: 0, focusScans: 0, onlineScans: 0,
-            };
+            R.diag = { totalScans: 0, fullDecrypts: 0, metaOnlyChecks: 0, decryptedMessages: 0 };
             try {
                 localStorage.removeItem(CFG.eventsStorageKey);
                 localStorage.removeItem(CFG.seenStorageKey);
@@ -21821,7 +21825,7 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
         renderList();
         updateHeaderState();
 
-        // Фоновое обогащение событий (детали)
+        // 🆕 Лениво обогащаем события (детали подгрузим в фоне)
         enrichEventDetailsLazy();
     }
 
@@ -21841,10 +21845,11 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
 
         if (R.enabled) {
             showToastSafe('🔔 Отслеживание включено');
-            // При включении — сразу скан
-            setTimeout(() => scanAll({ force: false, reason: 'startup' }), 500);
+            startLoop();
+            setTimeout(() => scanAll({ force: false }), 500);
         } else {
             showToastSafe('⏸ Отслеживание выключено');
+            stopLoop();
         }
         updateBadges();
     }
@@ -21858,17 +21863,21 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ЛЕНИВОЕ ОБОГАЩЕНИЕ
+    //  🆕 ЛЕНИВОЕ ОБОГАЩЕНИЕ СОБЫТИЙ
+    //  Подгружаем детали (isOnMyMessage, preview) только когда
+    //  пользователь открыл оверлей. И только для чатов, где есть
+    //  необогащённые события.
     // ═══════════════════════════════════════════════════════════
     let _enrichInProgress = false;
 
     async function enrichEventDetailsLazy() {
         if (_enrichInProgress) return;
 
+        // Группируем необогащённые события по чатам
         const byChat = new Map();
         for (const ev of R.events) {
             if (ev._enriched) continue;
-            if (!ev.isOnMyMessage && ev.attachPreview) continue;
+            if (!ev.isOnMyMessage && ev.attachPreview) continue;  // уже что-то есть
             if (!byChat.has(ev.chatFile)) byChat.set(ev.chatFile, []);
             byChat.get(ev.chatFile).push(ev);
         }
@@ -21878,7 +21887,7 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
 
         try {
             for (const [file, events] of byChat) {
-                if (!R.overlayOpen) break;
+                if (!R.overlayOpen) break;   // юзер закрыл — не тратим батарею
 
                 const password = state.savedPasswords[file];
                 if (!password) continue;
@@ -21889,6 +21898,7 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
 
                     const content = chatData.content;
                     const key = await deriveKeySafe(password, content.salt);
+
                     const neededMsgIds = new Set(events.map(e => e.msgId));
                     const decrypted = new Map();
 
@@ -21912,6 +21922,7 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
                     console.warn('[Radar3] enrich failed:', file, e.message);
                 }
 
+                // Пауза между чатами
                 await new Promise(r => setTimeout(r, 200));
             }
         } finally {
@@ -21921,7 +21932,7 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  РЕНДЕР
+    //  РЕНДЕР СПИСКА
     // ═══════════════════════════════════════════════════════════
     function renderList() {
         const body = document.getElementById('r2Body');
@@ -21942,7 +21953,7 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
                 const onMine = R.events.filter(e => !e.seen && e.isOnMyMessage).length;
                 const onMineStr = onMine > 0 ? `⭐ ${onMine} на ваших · ` : '';
                 sub.textContent = unseen > 0
-                    ? `${onMineStr}Новых: ${unseen} · Всего: ${total}` + (agoStr ? ` · скан ${agoStr}` : '')
+                    ? `${onMineStr}Новых: ${unseen} · Всего: ${total}` + (agoStr ? ` · ${agoStr}` : '')
                     : `Всего: ${total}` + (agoStr ? ` · скан ${agoStr}` : '');
             }
         }
@@ -21954,7 +21965,7 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
                     <div class="r2-e-title">${R.enabled ? 'Событий пока нет' : 'Отслеживание выключено'}</div>
                     <div class="r2-e-sub">
                         ${R.enabled
-                            ? 'Как только кто-то поставит реакцию или оставит комментарий — появится здесь.<br><br>Проверка идёт при входе в приложение и при возврате из фона. Или нажмите «⟳».'
+                            ? 'Как только кто-то поставит реакцию или оставит комментарий — появится здесь.<br><br>Нажмите «⟳» чтобы проверить сейчас.'
                             : 'Включите кнопкой «▶» в шапке.'}
                     </div>
                 </div>
@@ -22204,26 +22215,9 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
         if (!state.token || !state.isAuthorized) return;
         if (state.chats.length === 0) return;
 
-        // 🆕 Защита от слишком частых сканов
-        const timeSinceLastScan = Date.now() - R.lastScanTs;
-        if (R.lastScanTs && timeSinceLastScan < CFG.minTimeBetweenScansMs && opts.reason !== 'manual') {
-            console.log(`[Radar3] Скан пропущен — прошло ${Math.round(timeSinceLastScan / 1000)}с < ${CFG.minTimeBetweenScansMs / 1000}с`);
-            return;
-        }
-
         R.scanning = true;
         R.lastScanTs = Date.now();
         R.diag.totalScans++;
-
-        // Считаем статистику по источнику
-        switch (opts.reason) {
-            case 'startup':    R.diag.startupScans++;    break;
-            case 'visibility': R.diag.visibilityScans++; break;
-            case 'focus':      R.diag.focusScans++;      break;
-            case 'online':     R.diag.onlineScans++;     break;
-            case 'manual':     /* считаем при клике */   break;
-        }
-
         updateBadges();
 
         try {
@@ -22247,17 +22241,16 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
             saveVersionsAndMeta();
             updateBadges();
             if (R.overlayOpen) renderList();
-
-            console.log(`[Radar3] Скан завершён (${opts.reason || 'unknown'}) — ${chatsToScan.length} чатов`);
         }
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  СКАН ОДНОГО ЧАТА
+    //  СКАН ОДНОГО ЧАТА — с экономией
     // ═══════════════════════════════════════════════════════════
     async function scanOneChat(chat, force = false) {
         const file = chat.file;
 
+        // ═══ УРОВЕНЬ 1: meta.json (крошечный, дешёвый) ═══
         const metaPath = `chats/${file}.meta.json`;
         let meta = null;
         try {
@@ -22273,19 +22266,22 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
         const metaVersion = meta.content?.version;
         if (metaVersion == null) return;
 
+        // ═══ УРОВЕНЬ 2: проверяем кэш версии ═══
         const prevVersion = R.versions[file];
         const lastFull = R.lastFullScan[file] || 0;
         const fullScanExpired = Date.now() - lastFull > CFG.fullScanIntervalMs;
 
         if (prevVersion === metaVersion && !force && !fullScanExpired) {
             R.diag.metaOnlyChecks++;
-            return;   // 🎉 экономия
+            return;   // 🎉 ГЛАВНАЯ ЭКОНОМИЯ — вообще не читаем чат
         }
 
+        // Обновляем кэш
         R.versions[file] = metaVersion;
         R.lastFullScan[file] = Date.now();
         saveVersionsAndMeta();
 
+        // ═══ УРОВЕНЬ 3: только теперь читаем чат ═══
         const password = state.savedPasswords[file];
         if (!password) return;
 
@@ -22386,6 +22382,7 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
             };
         }
 
+        // Чистим state
         const prefix = `${file}|`;
         for (const key of Object.keys(R.state)) {
             if (!key.startsWith(prefix)) continue;
@@ -22405,7 +22402,7 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ХЕЛПЕРЫ
+    //  ХЕЛПЕРЫ ЗАГРУЗКИ
     // ═══════════════════════════════════════════════════════════
     async function fetchMeta(file, path, force = false) {
         const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${path}`;
@@ -22523,68 +22520,41 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  🆕 ГЛАВНОЕ ОТЛИЧИЕ ВАРИАНТА B — ТРИГГЕРЫ СКАНА
+    //  ЦИКЛ
     // ═══════════════════════════════════════════════════════════
+    function startLoop() {
+        stopLoop();
+        if (!R.enabled) return;
 
-    // ─── Триггер 1: при старте приложения ───
-    function scheduleStartupScan() {
+        // Первый скан через 15 сек
         setTimeout(() => {
             if (!R.enabled) return;
-            if (!state.isAuthorized) {
-                // Пользователь ещё не авторизовался — подождём ещё
-                scheduleStartupScan();
-                return;
-            }
-            console.log('[Radar3] 🚀 Скан при старте приложения');
-            scanAll({ force: false, reason: 'startup' });
-        }, CFG.startupScanDelayMs);
+            if (!state.isAuthorized) return;
+            scanAll({ force: false });
+        }, 15000);
+
+        R.scanTimer = setInterval(() => {
+            if (!R.enabled) return;
+            if (!state.isAuthorized) return;
+            if (document.hidden) return;
+            scanAll({ force: false });
+        }, CFG.scanIntervalMs);
     }
 
-    // ─── Триггер 2: возврат из фона (visibilitychange) ───
-    document.addEventListener('visibilitychange', () => {
-        if (document.hidden) return;
-        if (!R.enabled) return;
-        if (!state.isAuthorized) return;
+    function stopLoop() {
+        if (R.scanTimer) { clearInterval(R.scanTimer); R.scanTimer = null; }
+    }
 
-        const timeSince = Date.now() - R.lastScanTs;
-        if (R.lastScanTs && timeSince < CFG.minTimeBetweenScansMs) {
-            console.log(`[Radar3] 👁 Возврат из фона — пропущено (прошло ${Math.round(timeSince / 1000)}с)`);
-            return;
-        }
-
-        console.log('[Radar3] 👁 Возврат из фона — скан');
-        scanAll({ force: false, reason: 'visibility' });
-    });
-
-    // ─── Триггер 3: возврат фокуса окна (десктоп) ───
-    window.addEventListener('focus', () => {
-        if (!R.enabled) return;
-        if (!state.isAuthorized) return;
-        if (document.hidden) return;
-
-        const timeSince = Date.now() - R.lastScanTs;
-        if (R.lastScanTs && timeSince < CFG.minTimeBetweenScansMs) return;
-
-        console.log('[Radar3] 🪟 Фокус окна — скан');
-        scanAll({ force: false, reason: 'focus' });
-    });
-
-    // ─── Триггер 4: возврат онлайна ───
-    window.addEventListener('online', () => {
-        if (!R.enabled) return;
-        if (!state.isAuthorized) return;
-
-        const timeSince = Date.now() - R.lastScanTs;
-        if (R.lastScanTs && timeSince < CFG.minTimeBetweenScansMs) return;
-
-        console.log('[Radar3] 🌐 Онлайн — скан');
-        scanAll({ force: false, reason: 'online' });
-    });
-
-    // ─── Первая установка: запоминаем время старта ───
-    // чтобы через minTimeBetweenScansMs можно было сканировать при
-    // возврате из фона сразу же (а не ждать 5 сек с нуля)
-    R.lastScanTs = Date.now() - CFG.minTimeBetweenScansMs;
+    if (CFG.scanOnVisibility) {
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) return;
+            if (!R.enabled) return;
+            if (!state.isAuthorized) return;
+            if (Date.now() - R.lastScanTs > CFG.scanIntervalMs) {
+                scanAll({ force: false });
+            }
+        });
+    }
 
     // ═══════════════════════════════════════════════════════════
     //  ИНТЕГРАЦИЯ С LOGOUT
@@ -22592,6 +22562,7 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
     if (typeof window.logout === 'function') {
         const _origLogout = window.logout;
         window.logout = function() {
+            stopLoop();
             R.etags = {};
             R.notModifiedStreak = {};
             saveVersionsAndMeta(true);
@@ -22610,6 +22581,7 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
             setTimeout(() => {
                 installRadarButtons();
                 updateBadges();
+                if (R.enabled && !R.scanTimer) startLoop();
             }, 500);
             return r;
         };
@@ -22621,10 +22593,8 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
     setTimeout(() => {
         installRadarButtons();
         updateBadges();
+        if (state.isAuthorized && R.enabled) startLoop();
     }, 3000);
-
-    // 🆕 Главный запуск — только триггеры, никаких таймеров
-    scheduleStartupScan();
 
     // ═══════════════════════════════════════════════════════════
     //  ПУБЛИЧНЫЙ API
@@ -22632,8 +22602,8 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
     window.EventRadar = {
         open: openOverlay,
         close: closeOverlay,
-        scan: () => scanAll({ force: true, reason: 'manual' }),
-        scanSoft: () => scanAll({ force: false, reason: 'manual' }),
+        scan: () => scanAll({ force: true }),
+        scanSoft: () => scanAll({ force: false }),
         enable: () => { if (!R.enabled) toggleEnabled(); },
         disable: () => { if (R.enabled) toggleEnabled(); },
         getEvents: () => R.events.slice(),
@@ -22657,10 +22627,7 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
             R.lastFullScan = {};
             R.metaEvents = {};
             R.initDone = {};
-            R.diag = {
-                totalScans: 0, fullDecrypts: 0, metaOnlyChecks: 0, decryptedMessages: 0,
-                manualScans: 0, startupScans: 0, visibilityScans: 0, focusScans: 0, onlineScans: 0,
-            };
+            R.diag = { totalScans: 0, fullDecrypts: 0, metaOnlyChecks: 0, decryptedMessages: 0 };
             saveSeen();
             saveState(true);
             saveEvents(true);
@@ -22677,7 +22644,6 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
         },
 
         status: () => ({
-            mode: 'variant-B (только вход + возврат из фона)',
             enabled: R.enabled,
             scanning: R.scanning,
             eventsTotal: R.events.length,
@@ -22688,15 +22654,9 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
             lastScanAgo: R.lastScanTs
                 ? Math.round((Date.now() - R.lastScanTs) / 1000) + 's'
                 : 'never',
-            scanReasons: {
-                startup: R.diag.startupScans,
-                visibility: R.diag.visibilityScans,
-                focus: R.diag.focusScans,
-                online: R.diag.onlineScans,
-                manual: R.diag.manualScans,
-            },
         }),
 
+        // 🆕 Отчёт по экономии
         economy: () => ({
             totalScans: R.diag.totalScans,
             fullDecrypts: R.diag.fullDecrypts,
@@ -22708,6 +22668,7 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
                 : 'нет данных',
         }),
 
+        // 🆕 Диагностика чата
         diagnose: async (chatFile) => {
             if (!chatFile) {
                 console.log('Использование: EventRadar.diagnose("chat_xxx")');
@@ -22741,13 +22702,10 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
         },
     };
 
-    console.log('🔔 Event Radar v3 — Вариант B активен');
-    console.log('   ⚡ НЕТ фоновых таймеров — скан ТОЛЬКО по событиям:');
-    console.log('      • 🚀 старт приложения (через 15 сек)');
-    console.log('      • 👁 возврат из фона (visibilitychange)');
-    console.log('      • 🪟 возврат фокуса окна (десктоп)');
-    console.log('      • 🌐 возврат онлайна');
-    console.log('      • ⟳ вручную по кнопке');
+    console.log('🔔 Event Radar v3 активен');
+    console.log('   Интервал скана: 45 сек');
+    console.log('   Страховочный full-scan: раз в 10 минут');
+    console.log('   Кэш версий: localStorage (radar2_versions_v3)');
     console.log('');
     console.log('   API в консоли:');
     console.log('     EventRadar.status()                — состояние');
@@ -22757,9 +22715,6 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
     console.log('     EventRadar.fullReset()             — полный сброс');
 })();
 </script>
-
-
-
 
 </body>
 </html>
