@@ -2306,6 +2306,57 @@ body.player-active .gallery-actions { bottom: 56px; }
     white-space: nowrap; overflow: hidden;
     text-overflow: ellipsis; max-width: 220px;
 }
+
+
+/* ═══ Миниатюра в цитате ответа ═══ */
+.reply-quote.has-thumb {
+    padding: 6px 10px 6px 6px;
+    gap: 10px;
+    align-items: center;
+}
+.reply-quote .rq-thumb {
+    width: 44px;
+    height: 44px;
+    border-radius: 8px;
+    object-fit: cover;
+    flex-shrink: 0;
+    background: rgba(0,0,0,0.3);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 20px;
+    line-height: 1;
+    overflow: hidden;
+}
+.reply-quote .rq-thumb-placeholder {
+    color: #555;
+    font-size: 14px;
+    animation: rqThumbPulse 1.4s ease-in-out infinite;
+}
+@keyframes rqThumbPulse {
+    0%, 100% { opacity: 0.5; }
+    50%      { opacity: 1; }
+}
+.reply-quote .rq-thumb-icon {
+    background: linear-gradient(135deg,
+        rgba(108,92,231,0.25),
+        rgba(0,184,148,0.15));
+    color: #a78bfa;
+    border: 1px solid rgba(108,92,231,0.3);
+}
+.message-wrapper.own .reply-quote .rq-thumb-icon {
+    background: rgba(0,0,0,0.3);
+    border-color: rgba(255,255,255,0.15);
+    color: #fff;
+}
+@media (max-width: 480px) {
+    .reply-quote .rq-thumb {
+        width: 38px;
+        height: 38px;
+        border-radius: 7px;
+        font-size: 17px;
+    }
+}
 .reply-preview-bar {
     display: none;
     align-items: center; gap: 10px;
@@ -2324,6 +2375,42 @@ body.player-active .gallery-actions { bottom: 56px; }
 .reply-preview-bar .rp-text {
     font-size: 12px; color: #aaa;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+
+/* ═══ Миниатюра в панели превью ответа ═══ */
+.reply-preview-bar .rp-content {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.reply-preview-bar .rp-thumb {
+    width: 36px;
+    height: 36px;
+    border-radius: 6px;
+    object-fit: cover;
+    flex-shrink: 0;
+    background: rgba(0,0,0,0.25);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+    line-height: 1;
+    overflow: hidden;
+}
+.reply-preview-bar .rp-thumb-icon {
+    background: linear-gradient(135deg, rgba(108,92,231,0.25), rgba(0,184,148,0.15));
+    color: #a78bfa;
+    border: 1px solid rgba(108,92,231,0.3);
+}
+.reply-preview-bar .rp-text-inline {
+    flex: 1;
+    min-width: 0;
+    font-size: 12px;
+    color: #aaa;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 .reply-preview-bar .rp-cancel {
     width: 26px; height: 26px; border-radius: 50%;
@@ -6161,7 +6248,43 @@ async function uploadAttachmentAuto(chatFile, attachName, plainBuffer, mime, dis
 }
 
 
+// ═══════════════════════════════════════════════════════════════
+//  🖼️ ПОДГРУЗКА МИНИАТЮР В ЦИТАТАХ ОТВЕТОВ
+// ═══════════════════════════════════════════════════════════════
+async function loadReplyThumbnails(root) {
+    const placeholders = root.querySelectorAll('.rq-thumb-placeholder[data-rq-thumb-attach]:not([data-loaded])');
+    if (placeholders.length === 0) return;
 
+    const tasks = [];
+    placeholders.forEach(el => {
+        el.dataset.loaded = '1';
+        const attachName = el.dataset.rqThumbAttach;
+
+        tasks.push((async () => {
+            try {
+                if (!/\.(jpg|jpeg|png|gif|webp|bmp|avif)$/i.test(attachName)) {
+                    el.textContent = '📎';
+                    el.classList.remove('rq-thumb-placeholder');
+                    el.classList.add('rq-thumb-icon');
+                    return;
+                }
+                const url = await loadAttachment(state.chatFile, attachName);
+                const img = document.createElement('img');
+                img.src = url;
+                img.alt = '';
+                img.className = 'rq-thumb';
+                el.replaceWith(img);
+            } catch (e) {
+                console.warn('reply thumb load error:', e);
+                el.textContent = '⚠️';
+                el.classList.remove('rq-thumb-placeholder');
+                el.classList.add('rq-thumb-icon');
+            }
+        })());
+    });
+
+    await Promise.allSettled(tasks);
+}
 
 
 async function loadAttachment(chatFile, attachName) {
@@ -6393,6 +6516,7 @@ async function loadAttachmentsIn(root) {
         })());
     });
     await Promise.allSettled(tasks);
+    await loadReplyThumbnails(root);
 setTimeout(initAudioPlayers, 0);
 // 🆕 Догоняем синхронизацию после создания плееров
 [0, 150, 400, 800].forEach(delay => {
@@ -6458,10 +6582,20 @@ if (msg.audio) {
         payload.batchIndex = msg.batchIndex;
         payload.batchTotal = msg.batchTotal;
     }
-    // ✅ ДОБАВЛЕНО: replyTo (цитата ответа)
     if (msg.replyTo) {
-        payload.replyTo = msg.replyTo;
-    }
+    payload.replyTo = {
+        id: msg.replyTo.id,
+        username: msg.replyTo.username,
+        previewText: msg.replyTo.previewText || '',
+        attachKind: msg.replyTo.attachKind || null,
+        attachName: msg.replyTo.attachName || null,
+        thumbAttachName: msg.replyTo.thumbAttachName || null,
+        hasImage: msg.replyTo.attachKind === 'image' ? true : undefined,
+        hasAudio: msg.replyTo.attachKind === 'audio' ? true : undefined,
+        hasFile: msg.replyTo.attachKind === 'file' ? true : undefined,
+        fileName: msg.replyTo.attachName || undefined,
+    };
+}
     const encrypted = await encryptObject(payload, CRYPTO._key);
     return { id: msg.id, time: msg.time, iv: encrypted.iv, data: encrypted.data };
 }
@@ -6504,10 +6638,12 @@ if (payload.audio) {
             msg.batchIndex = payload.batchIndex;
             msg.batchTotal = payload.batchTotal;
         }
-        // ✅ ДОБАВЛЕНО: replyTo (цитата ответа)
         if (payload.replyTo) {
-            msg.replyTo = payload.replyTo;
-        }
+    msg.replyTo = payload.replyTo;
+    if (payload.replyTo.thumbAttachName && isAttachmentRef(payload.replyTo.thumbAttachName)) {
+        msg.replyTo._needsThumbLoad = true;
+    }
+}
         return msg;
     } catch (e) {
         console.error('Не удалось расшифровать', encMsg.id, e);
@@ -7192,10 +7328,15 @@ if (replyContext) {
     const replied = historyState.allMessages.find(m => m.id === replyContext.id)
         || state.messages.find(m => m.id === replyContext.id);
 
+
     plainMsg.replyTo = {
         id: replyContext.id,
         username: replyContext.username,
         previewText: replyContext.previewText || '',
+        attachKind: replyContext.attachKind || null,
+        attachName: replyContext.attachName || null,
+        thumbAttachName: replyContext.thumbAttachName || null,
+        // Оставляем legacy-поля для совместимости
         hasImage: replied?.image ? true : undefined,
         hasAudio: replied?.audio ? true : undefined,
         hasFile: replied?.file ? true : undefined,
@@ -8628,15 +8769,35 @@ if (msg.file) {
     }
 
     // ═══ Цитата (reply) ═══
-    let replyQuote = '';
-    if (msg.replyTo) {
-        replyQuote = `<div class="reply-quote" onclick="event.stopPropagation(); scrollToMessage(${msg.replyTo.id})">
-            <div style="flex:1;min-width:0;">
-                <span class="rq-name">↩ ${msg.replyTo.username === state.username ? 'Вы' : escapeHtml(msg.replyTo.username)}</span>
-                <div class="rq-text">${escapeHtml(msg.replyTo.previewText || '')}</div>
-            </div>
-        </div>`;
+let replyQuote = '';
+if (msg.replyTo) {
+    const rt = msg.replyTo;
+    let thumbHtml = '';
+
+
+    if (rt.thumbUrl) {
+        thumbHtml = `<img src="${rt.thumbUrl}" alt="" class="rq-thumb">`;
+    } else if (rt.thumbAttachName && isAttachmentRef(rt.thumbAttachName)) {
+        thumbHtml = `<div class="rq-thumb rq-thumb-placeholder" data-rq-thumb-attach="${rt.thumbAttachName}">⏳</div>`;
+    } else if (rt.attachKind === 'videoNote') {
+        thumbHtml = `<div class="rq-thumb rq-thumb-icon">🎥</div>`;
+    } else if (rt.attachKind === 'video') {
+        thumbHtml = `<div class="rq-thumb rq-thumb-icon">🎬</div>`;
+    } else if (rt.attachKind === 'audio') {
+        thumbHtml = `<div class="rq-thumb rq-thumb-icon">${(rt.previewText || '').startsWith('🎵') ? '🎵' : '🎤'}</div>`;
+    } else if (rt.attachKind === 'file') {
+        thumbHtml = `<div class="rq-thumb rq-thumb-icon">📎</div>`;
     }
+
+
+    replyQuote = `<div class="reply-quote ${thumbHtml ? 'has-thumb' : ''}" onclick="event.stopPropagation(); scrollToMessage(${rt.id})">
+        ${thumbHtml}
+        <div style="flex:1;min-width:0;">
+            <span class="rq-name">↩ ${rt.username === state.username ? 'Вы' : escapeHtml(rt.username)}</span>
+            <div class="rq-text">${escapeHtml(rt.previewText || '')}</div>
+        </div>
+    </div>`;
+}
 
 
 
@@ -13669,39 +13830,104 @@ let _replyTo = null;
 
 
 
-function startReply(msgId) {
+async function startReply(msgId) {
     const msg = historyState.allMessages.find(m => m.id === msgId);
     if (!msg) return;
 
-    // 🆕 Скрываем панель комментария, если была открыта
+
+    // Скрываем панель комментария, если была открыта
     if (typeof cancelComment === 'function' && typeof _commentToMsgId !== 'undefined' && _commentToMsgId) {
         cancelComment();
     }
 
 
-
-
     let previewText = msg.text || '';
-if (msg.image) {
-    previewText = '📷 Изображение';
-} else if (msg.audio) {
-    const hasName = !!(msg.audioName && msg.audioName.trim());
-    previewText = hasName ? `🎵 ${msg.audioName}` : '🎤 Голосовое';
-} else if (msg.file) {
-    previewText = '📎 ' + (msg.fileName || 'Файл');
-}
+    let thumbUrl = null;
+    let thumbAttachName = null;
+    let attachKind = null;
+    let attachName = null;
 
+
+    // ═══ ИЗОБРАЖЕНИЕ ═══
+    if (msg.image) {
+        attachKind = 'image';
+        previewText = previewText || '📷 Изображение';
+        thumbAttachName = msg.image;
+        if (isAttachmentRef(msg.image)) {
+            thumbUrl = _attachmentCache.get(msg.image) || null;
+            if (!thumbUrl) {
+                try { thumbUrl = await loadAttachment(state.chatFile, msg.image); } catch (e) {}
+            }
+        } else {
+            thumbUrl = msg.image;
+        }
+    }
+    // ═══ ВИДЕО-КРУЖОЧЕК ═══
+    else if (msg.videoNote) {
+        attachKind = 'videoNote';
+        previewText = previewText || '🎥 Кружочек';
+    }
+    // ═══ ВИДЕОФАЙЛ ═══
+    else if (msg.video) {
+        attachKind = 'video';
+        previewText = previewText || ('🎬 ' + (msg.videoName || 'Видео'));
+    }
+    // ═══ АУДИО ═══
+    else if (msg.audio) {
+        const hasName = !!(msg.audioName && msg.audioName.trim());
+        attachKind = 'audio';
+        previewText = previewText || (hasName ? `🎵 ${msg.audioName}` : '🎤 Голосовое');
+        if (msg.audioCover && isAttachmentRef(msg.audioCover)) {
+            thumbAttachName = msg.audioCover;
+            thumbUrl = _attachmentCache.get(msg.audioCover) || null;
+            if (!thumbUrl) {
+                try { thumbUrl = await loadAttachment(state.chatFile, msg.audioCover); } catch (e) {}
+            }
+        }
+    }
+    // ═══ ФАЙЛ ═══
+    else if (msg.file) {
+        attachKind = 'file';
+        attachName = msg.fileName || 'Файл';
+        previewText = previewText || ('📎 ' + attachName);
+    }
 
 
     _replyTo = {
         id: msg.id,
         username: msg.username,
         previewText: previewText.slice(0, 100),
+        thumbUrl: thumbUrl,
+        thumbAttachName: thumbAttachName,
+        attachKind: attachKind,
+        attachName: attachName,
     };
+
 
     const bar = $('replyPreviewBar');
     $('replyPreviewName').textContent = '↩ ' + (msg.username === state.username ? 'Вы' : msg.username);
-    $('replyPreviewText').textContent = previewText;
+
+
+    const barContent = $('replyPreviewText');
+    if (thumbUrl) {
+        barContent.innerHTML = `
+            <img src="${thumbUrl}" alt="" class="rp-thumb">
+            <span class="rp-text-inline">${escapeHtml(previewText)}</span>
+        `;
+    } else if (attachKind === 'videoNote') {
+        barContent.innerHTML = `<span class="rp-thumb rp-thumb-icon">🎥</span><span class="rp-text-inline">${escapeHtml(previewText)}</span>`;
+    } else if (attachKind === 'video') {
+        barContent.innerHTML = `<span class="rp-thumb rp-thumb-icon">🎬</span><span class="rp-text-inline">${escapeHtml(previewText)}</span>`;
+    } else if (attachKind === 'audio') {
+        const ic = previewText.startsWith('🎵') ? '🎵' : '🎤';
+        barContent.innerHTML = `<span class="rp-thumb rp-thumb-icon">${ic}</span><span class="rp-text-inline">${escapeHtml(previewText)}</span>`;
+    } else if (attachKind === 'file') {
+        barContent.innerHTML = `<span class="rp-thumb rp-thumb-icon">📎</span><span class="rp-text-inline">${escapeHtml(previewText)}</span>`;
+    } else {
+        barContent.textContent = previewText;
+    }
+
+
     bar.classList.add('show');
     inputBar.insertBefore(bar, inputBar.firstChild);
     messageInput.focus();
@@ -16225,7 +16451,20 @@ encryptMessage = async function(msg) {
         payload.batchIndex = msg.batchIndex;
         payload.batchTotal = msg.batchTotal;
     }
-    if (msg.replyTo) payload.replyTo = msg.replyTo;
+    if (msg.replyTo) {
+    payload.replyTo = {
+        id: msg.replyTo.id,
+        username: msg.replyTo.username,
+        previewText: msg.replyTo.previewText || '',
+        attachKind: msg.replyTo.attachKind || null,
+        attachName: msg.replyTo.attachName || null,
+        thumbAttachName: msg.replyTo.thumbAttachName || null,
+        hasImage: msg.replyTo.attachKind === 'image' ? true : undefined,
+        hasAudio: msg.replyTo.attachKind === 'audio' ? true : undefined,
+        hasFile: msg.replyTo.attachKind === 'file' ? true : undefined,
+        fileName: msg.replyTo.attachName || undefined,
+    };
+}
 
     const encrypted = await encryptObject(payload, CRYPTO._key);
     return { id: msg.id, time: msg.time, iv: encrypted.iv, data: encrypted.data };
@@ -16271,7 +16510,12 @@ decryptMessage = async function(encMsg) {
             msg.batchIndex = payload.batchIndex;
             msg.batchTotal = payload.batchTotal;
         }
-        if (payload.replyTo) msg.replyTo = payload.replyTo;
+        if (payload.replyTo) {
+    msg.replyTo = payload.replyTo;
+    if (payload.replyTo.thumbAttachName && isAttachmentRef(payload.replyTo.thumbAttachName)) {
+        msg.replyTo._needsThumbLoad = true;
+    }
+}
         return msg;
     } catch (e) {
         console.error('Не удалось расшифровать', encMsg.id, e);
