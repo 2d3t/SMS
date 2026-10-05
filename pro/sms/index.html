@@ -21465,35 +21465,39 @@ loadInitFlags();
     //  БЕЙДЖИ
     // ═══════════════════════════════════════════════════════════
     function updateBadges() {
-        const unseen = R.events.filter(e => !e.seen).length;
-        const onMineUnseen = R.events.filter(e => !e.seen && e.isOnMyMessage).length;
+    const unseen = R.events.filter(e => !e.seen).length;
+    const onMineUnseen = R.events.filter(e => !e.seen && e.isOnMyMessage).length;
 
-        ['radar2Badge', 'radar2BadgeChat'].forEach(id => {
-            const el = document.getElementById(id);
-            if (!el) return;
-            if (unseen > 0) {
-                el.textContent = unseen > 99 ? '99+' : String(unseen);
-                el.classList.add('show');
-                if (onMineUnseen > 0) {
-                    el.style.background = 'linear-gradient(135deg, #feca57, #ff9f43)';
-                    el.style.boxShadow = '0 2px 8px rgba(254,202,87,0.65)';
-                } else {
-                    el.style.background = '';
-                    el.style.boxShadow = '';
-                }
+
+    ['radar2Badge', 'radar2BadgeChat'].forEach(id => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        if (unseen > 0) {
+            el.textContent = unseen > 99 ? '99+' : String(unseen);
+            el.classList.add('show');
+            if (onMineUnseen > 0) {
+                el.style.background = 'linear-gradient(135deg, #feca57, #ff9f43)';
+                el.style.boxShadow = '0 2px 8px rgba(254,202,87,0.65)';
             } else {
-                el.classList.remove('show');
+                el.style.background = '';
+                el.style.boxShadow = '';
             }
-        });
+        } else {
+            el.classList.remove('show');
+            el.textContent = '0';   // 🆕 сбрасываем текст — на случай если остался
+        }
+    });
 
-        ['radar2Btn', 'radar2BtnChat'].forEach(id => {
-            const btn = document.getElementById(id);
-            if (btn) btn.classList.toggle('scanning', R.scanning);
-        });
 
-        const liveDot = document.querySelector('.r2-live-dot');
-        if (liveDot) liveDot.classList.toggle('active', R.enabled && !R.scanning);
-    }
+    ['radar2Btn', 'radar2BtnChat'].forEach(id => {
+        const btn = document.getElementById(id);
+        if (btn) btn.classList.toggle('scanning', R.scanning);
+    });
+
+
+    const liveDot = document.querySelector('.r2-live-dot');
+    if (liveDot) liveDot.classList.toggle('active', R.enabled && !R.scanning);
+}
 
     function hideBadges() {
         ['radar2Badge', 'radar2BadgeChat'].forEach(id => {
@@ -21738,63 +21742,74 @@ function renderGroups(events) {
 
 
     function renderEventCard(e) {
-        const isReaction = e.kind === 'reaction';
-        const kindCls = isReaction ? 'kind-reaction' : 'kind-comment';
-        const kindIcon = isReaction ? '❤️' : '💬';
-        const onMineCls = e.isOnMyMessage ? ' on-mine' : '';
-        const seenCls = e.seen ? ' seen' : '';
-        const timeStr = formatTime(e.ts);
+    const isReaction = e.kind === 'reaction';
+    const kindCls = isReaction ? 'kind-reaction' : 'kind-comment';
+    const kindIcon = isReaction ? '❤️' : '💬';
+    const onMineCls = e.isOnMyMessage ? ' on-mine' : '';
+    const seenCls = e.seen ? ' seen' : '';
+    const timeStr = formatTime(e.ts);
 
-        let bodyHtml = '';
-        if (e.attachPreview) {
-            bodyHtml += `<div class="r2-attach">
-                            <span>${e.attachPreview.icon}</span>
-                            <span>${escapeSafe(e.attachPreview.text)}</span>
-                         </div>`;
-        }
 
-        if (isReaction) {
-            const emoji = e.payload.emoji || '❤️';
-            const count = (e.payload.users || []).length || 1;
-            bodyHtml += `<div class="r2-reaction">
-                            <span>${escapeSafe(emoji)}</span>
-                            <span class="r2-rc-count">${count}</span>
-                         </div>`;
-        } else {
-            const text = e.payload.text || '';
-            bodyHtml += `<div class="r2-comment-bubble">${renderTextSafe(text)}</div>`;
-        }
-
-        const fromName = e.payload.from === state.username
-            ? 'Вы'
-            : (e.payload.from || '—');
-
-        const myBadge = e.isOnMyMessage
-            ? `<span class="r2-my-badge">⭐ на ваше</span>`
-            : '';
-
-        return `
-            <div class="r2-event ${kindCls}${onMineCls}${seenCls}"
-                 data-key="${escapeSafe(e.key)}"
-                 data-chat-file="${escapeSafe(e.chatFile)}"
-                 data-msg-id="${e.msgId}">
-                <div class="r2-kind">${kindIcon}
-                    ${isReaction && (e.payload.users || []).length > 1
-                        ? `<span class="r2-kind-badge">${e.payload.users.length}</span>`
-                        : ''}
-                </div>
-                <div class="r2-body-col">
-                    <div class="r2-head">
-                        <span class="r2-from">${isReaction ? 'Реакция от' : 'Комментарий от'} ${escapeSafe(fromName)}</span>
-                        ${myBadge}
-                        <span class="r2-dot">·</span>
-                        <span class="r2-time">${escapeSafe(timeStr)}</span>
-                    </div>
-                    ${bodyHtml}
-                </div>
-            </div>
-        `;
+    let bodyHtml = '';
+    if (e.attachPreview) {
+        bodyHtml += `<div class="r2-attach">
+                        <span>${e.attachPreview.icon}</span>
+                        <span>${escapeSafe(e.attachPreview.text)}</span>
+                     </div>`;
     }
+
+
+    if (isReaction) {
+        const emoji = e.payload.emoji || '❤️';
+        const count = (e.payload.users || []).length || 1;
+        bodyHtml += `<div class="r2-reaction">
+                        <span>${escapeSafe(emoji)}</span>
+                        <span class="r2-rc-count">${count}</span>
+                     </div>`;
+    } else {
+        const text = e.payload.text || '';
+        bodyHtml += `<div class="r2-comment-bubble">${renderTextSafe(text)}</div>`;
+    }
+
+
+    const fromName = e.payload.from === state.username
+        ? 'Вы'
+        : (e.payload.from || '—');
+
+
+    const myBadge = e.isOnMyMessage
+        ? `<span class="r2-my-badge">⭐ на ваше</span>`
+        : '';
+
+
+    // 🆕 Ключ события передаём через ЧИСЛОВОЙ индекс, а не через data-key.
+    //     Это устраняет баг с порчей ключа в HTML-атрибуте.
+    const eventIdx = R.events.findIndex(x => x.key === e.key);
+    const idxAttr = eventIdx >= 0 ? `data-event-idx="${eventIdx}"` : '';
+
+
+    return `
+        <div class="r2-event ${kindCls}${onMineCls}${seenCls}"
+             ${idxAttr}
+             data-chat-file="${escapeSafe(e.chatFile)}"
+             data-msg-id="${e.msgId}">
+            <div class="r2-kind">${kindIcon}
+                ${isReaction && (e.payload.users || []).length > 1
+                    ? `<span class="r2-kind-badge">${e.payload.users.length}</span>`
+                    : ''}
+            </div>
+            <div class="r2-body-col">
+                <div class="r2-head">
+                    <span class="r2-from">${isReaction ? 'Реакция от' : 'Комментарий от'} ${escapeSafe(fromName)}</span>
+                    ${myBadge}
+                    <span class="r2-dot">·</span>
+                    <span class="r2-time">${escapeSafe(timeStr)}</span>
+                </div>
+                ${bodyHtml}
+            </div>
+        </div>
+    `;
+}
 
     function escapeSafe(s) {
         if (typeof window.escapeHtml === 'function') return window.escapeHtml(s);
@@ -21830,17 +21845,31 @@ function renderGroups(events) {
     // ═══════════════════════════════════════════════════════════
     //  КЛИК ПО СОБЫТИЮ — переход к сообщению
     // ═══════════════════════════════════════════════════════════
-    async function handleEventClick(el) {
+        async function handleEventClick(el) {
     const chatFile = el.dataset.chatFile;
     const msgId = parseInt(el.dataset.msgId);
-    const key = el.dataset.key;
+    const eventIdx = parseInt(el.dataset.eventIdx);
 
 
-    // Помечаем прочитанным ТОЛЬКО это событие
-    const ev = R.events.find(x => x.key === key);
+    // 🆕 Ищем событие по индексу — надёжнее, чем по ключу из data-атрибута
+    let ev = null;
+    if (!isNaN(eventIdx) && R.events[eventIdx]) {
+        ev = R.events[eventIdx];
+        if (ev.chatFile !== chatFile || ev.msgId !== msgId) ev = null;
+    }
+    // Fallback: ищем по chatFile + msgId среди непрочитанных
+    if (!ev) {
+        ev = R.events.find(e =>
+            e.chatFile === chatFile &&
+            e.msgId === msgId &&
+            !e.seen
+        );
+    }
+
+
     if (ev && !ev.seen) {
         ev.seen = true;
-        R.seen.add(key);
+        R.seen.add(ev.key);   // ← используем ev.key, а не dataset
         saveSeen();
         saveEvents();
 
@@ -21874,37 +21903,42 @@ function renderGroups(events) {
 
     closeOverlay();
 
-        if (state.chatFile === chatFile) {
-            await jumpToMessage(msgId);
-            return;
-        }
 
-        const chat = state.chats.find(c => c.file === chatFile);
-        if (!chat) {
-            showToastSafe('❌ Чат не найден');
-            return;
-        }
-        const password = state.savedPasswords[chatFile];
-        if (!password) {
-            showToastSafe('🔐 Нужен пароль чата');
-            return;
-        }
-
-        window._pendingJumpToMsgId = msgId;
-
-        try {
-            if (typeof window.enterChat === 'function') {
-                await window.enterChat(chatFile, chat.name || chatFile, password);
-            }
-        } catch (err) {
-            console.error('radar jump error:', err);
-            window._pendingJumpToMsgId = null;
-            showToastSafe('❌ Не удалось открыть чат');
-            return;
-        }
-
+    if (state.chatFile === chatFile) {
         await jumpToMessage(msgId);
+        return;
     }
+
+
+    const chat = state.chats.find(c => c.file === chatFile);
+    if (!chat) {
+        showToastSafe('❌ Чат не найден');
+        return;
+    }
+    const password = state.savedPasswords[chatFile];
+    if (!password) {
+        showToastSafe('🔐 Нужен пароль чата');
+        return;
+    }
+
+
+    window._pendingJumpToMsgId = msgId;
+
+
+    try {
+        if (typeof window.enterChat === 'function') {
+            await window.enterChat(chatFile, chat.name || chatFile, password);
+        }
+    } catch (err) {
+        console.error('radar jump error:', err);
+        window._pendingJumpToMsgId = null;
+        showToastSafe('❌ Не удалось открыть чат');
+        return;
+    }
+
+
+    await jumpToMessage(msgId);
+}
 
     async function jumpToMessage(msgId) {
         return new Promise((resolve) => {
