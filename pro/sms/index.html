@@ -6268,6 +6268,18 @@ async function loadReplyThumbnails(root) {
                     el.classList.add('rq-thumb-icon');
                     return;
                 }
+
+                // 🆕 Проверяем кэш синхронно — если есть, отрисуем МГНОВЕННО
+                const cached = _attachmentCache.get(attachName);
+                if (cached) {
+                    const img = document.createElement('img');
+                    img.src = cached;
+                    img.alt = '';
+                    img.className = 'rq-thumb';
+                    el.replaceWith(img);
+                    return;
+                }
+
                 const url = await loadAttachment(state.chatFile, attachName);
                 const img = document.createElement('img');
                 img.src = url;
@@ -6285,7 +6297,6 @@ async function loadReplyThumbnails(root) {
 
     await Promise.allSettled(tasks);
 }
-
 
 async function loadAttachment(chatFile, attachName) {
     if (_attachmentCache.has(attachName)) return _attachmentCache.get(attachName);
@@ -6516,7 +6527,7 @@ async function loadAttachmentsIn(root) {
         })());
     });
     await Promise.allSettled(tasks);
-    await loadReplyThumbnails(root);
+// 🆕 loadReplyThumbnails теперь запускается отдельно и раньше
 setTimeout(initAudioPlayers, 0);
 // 🆕 Догоняем синхронизацию после создания плееров
 [0, 150, 400, 800].forEach(delay => {
@@ -8788,7 +8799,15 @@ if (msg.replyTo) {
     const src = rt.thumbUrl || rt._localThumbUrl;
     thumbHtml = `<img src="${src}" alt="" class="rq-thumb">`;
 } else if (rt.thumbAttachName && isAttachmentRef(rt.thumbAttachName)) {
-    thumbHtml = `<div class="rq-thumb rq-thumb-placeholder" data-rq-thumb-attach="${rt.thumbAttachName}">⏳</div>`;
+    // 🆕 Если миниатюра уже в кэше — показываем её сразу, без "часов"
+    const cachedThumb = (typeof _attachmentCache !== 'undefined')
+        ? _attachmentCache.get(rt.thumbAttachName)
+        : null;
+    if (cachedThumb) {
+        thumbHtml = `<img src="${cachedThumb}" alt="" class="rq-thumb">`;
+    } else {
+        thumbHtml = `<div class="rq-thumb rq-thumb-placeholder" data-rq-thumb-attach="${rt.thumbAttachName}">⏳</div>`;
+    }
 } else if (rt.attachKind === 'videoNote') {
         thumbHtml = `<div class="rq-thumb rq-thumb-icon">🎥</div>`;
     } else if (rt.attachKind === 'video') {
@@ -8928,9 +8947,10 @@ function renderHistory() {
     }
 
     messagesInner.innerHTML = html;
-    messagesInner.dataset.lastDate = lastDate;
-    loadAttachmentsIn(messagesInner);
-    requestAnimationFrame(() => {
+messagesInner.dataset.lastDate = lastDate;
+loadReplyThumbnails(messagesInner);   // 🆕 параллельно
+loadAttachmentsIn(messagesInner);
+requestAnimationFrame(() => {
         messagesContainer.scrollTop = messagesContainer.scrollHeight;
         updateScrollButton();
     });
@@ -8961,8 +8981,15 @@ function appendMessages(newMsgs) {
     }
     messagesInner.dataset.lastDate = lastDate;
     messagesInner.insertAdjacentHTML('beforeend', html);
-    loadAttachmentsIn(messagesInner);
-    trimDomTop();
+
+
+// 🆕 СРАЗУ запускаем загрузку миниатюр ответов — не ждём основных вложений
+loadReplyThumbnails(messagesInner);
+
+
+// 🆕 Основные вложения — параллельно
+loadAttachmentsIn(messagesInner);
+trimDomTop();
 }
 
 // ═══════════════════════════════════════════════════════════════
