@@ -21300,11 +21300,13 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
                 z-index: 2; margin: -4px -4px 0;
             }
             .r2-group-header .r2-gh-avatar {
-                width: 22px; height: 22px; border-radius: 50%;
-                background: linear-gradient(135deg, #6c5ce7, #00b894);
-                display: flex; align-items: center; justify-content: center;
-                font-weight: 700; color: #fff; font-size: 11px; flex-shrink: 0;
-            }
+    width: 22px; height: 22px; border-radius: 50%;
+    background: linear-gradient(135deg, #6c5ce7, #00b894);
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700; color: #fff; font-size: 11px; flex-shrink: 0;
+    overflow: hidden;  /* 🆕 чтобы img не вылезал */
+    position: relative;
+}
             .r2-group-header .r2-gh-name {
                 flex: 1; min-width: 0;
                 white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
@@ -21831,30 +21833,40 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
         });
     }
 
-    function renderGroups(events) {
-        const byChat = new Map();
-        for (const e of events) {
-            if (!byChat.has(e.chatFile)) byChat.set(e.chatFile, []);
-            byChat.get(e.chatFile).push(e);
-        }
-
-        let html = '';
-        for (const [chatFile, items] of byChat) {
-            const chat = state.chats.find(c => c.file === chatFile);
-            const chatName = chat ? (chat.name || chat.file) : chatFile;
-            const letter = (chatName || '?').charAt(0).toUpperCase();
-
-            html += `<div class="r2-group">`;
-            html += `<div class="r2-group-header">
-                        <div class="r2-gh-avatar">${escapeSafe(letter)}</div>
-                        <div class="r2-gh-name">${escapeSafe(chatName)}</div>
-                        <div class="r2-gh-count">${items.length}</div>
-                     </div>`;
-            for (const e of items) html += renderEventCard(e);
-            html += `</div>`;
-        }
-        return html;
+function renderGroups(events) {
+    const byChat = new Map();
+    for (const e of events) {
+        if (!byChat.has(e.chatFile)) byChat.set(e.chatFile, []);
+        byChat.get(e.chatFile).push(e);
     }
+
+    let html = '';
+    for (const [chatFile, items] of byChat) {
+        const chat = state.chats.find(c => c.file === chatFile);
+        const chatName = chat ? (chat.name || chat.file) : chatFile;
+        const letter = (chatName || '?').charAt(0).toUpperCase();
+        
+        // 🆕 Подхватываем кастомную аватарку чата
+        const customAvatar = (typeof getChatAvatar === 'function') 
+            ? getChatAvatar(chatFile) 
+            : null;
+        
+        const avatarHtml = customAvatar
+            ? `<img src="${customAvatar}" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:50%;pointer-events:none;">`
+            : escapeSafe(letter);
+
+        html += `<div class="r2-group">`;
+        html += `<div class="r2-group-header">
+                    <div class="r2-gh-avatar">${avatarHtml}</div>
+                    <div class="r2-gh-name">${escapeSafe(chatName)}</div>
+                    <div class="r2-gh-count">${items.length}</div>
+                 </div>`;
+        for (const e of items) html += renderEventCard(e);
+        html += `</div>`;
+    }
+    return html;
+}
+
 
     function renderEventCard(e) {
         const isReaction = e.kind === 'reaction';
