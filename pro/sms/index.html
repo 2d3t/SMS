@@ -20948,19 +20948,19 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
     //  КОНФИГУРАЦИЯ
     // ═══════════════════════════════════════════════════════════
     const CFG = {
-        scanIntervalMs: 45000,        // раз в 45 сек (медленнее, но надёжнее)
-        scanOnOpen: true,             // скан при открытии оверлея
-        scanOnVisibility: true,       // скан при возврате в приложение
-        delayBetweenChatsMs: 250,     // пауза между чатами — не бомбим API
-        maxEventsKept: 500,           // сколько событий хранить
-        maxEventsShown: 100,          // сколько показывать в UI
-        maxStateEntries: 2000,        // сколько сообщений помнить в state
-        stateStorageKey: 'radar2_state_v2',
-        eventsStorageKey: 'radar2_events_v2',
-        seenStorageKey: 'radar2_seen_v2',
-        enabledKey: 'radar2_enabled_v2',
-        initKeyPrefix: 'radar2_init_',  // radar2_init_<chatFile>
-    };
+    scanIntervalMs: 20000,        // раз в 20 сек — тихо, в фоне
+    scanOnOpen: false,            // НЕ сканировать при открытии оверлея
+    scanOnVisibility: true,       // скан при возврате в приложение
+    delayBetweenChatsMs: 250,     // пауза между чатами — не бомбим API
+    maxEventsKept: 500,           // сколько событий хранить
+    maxEventsShown: 100,          // сколько показывать в UI
+    maxStateEntries: 2000,        // сколько сообщений помнить в state
+    stateStorageKey: 'radar2_state_v2',
+    eventsStorageKey: 'radar2_events_v2',
+    seenStorageKey: 'radar2_seen_v2',
+    enabledKey: 'radar2_enabled_v2',
+    initKeyPrefix: 'radar2_init_',  // radar2_init_<chatFile>
+};
 
     // ═══════════════════════════════════════════════════════════
     //  СОСТОЯНИЕ
@@ -20976,15 +20976,8 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
         versions: {},        // { "<chatFile>": version }
         notModifiedStreak: {},
         lastScanTs: 0,
-        progress: {
-            phase: 'idle',   // idle | scanning | done
-            total: 0,
-            done: 0,
-            current: '',
-            changedCount: 0,
-            eventsAdded: 0,
-        },
-        overlayOpen: false,
+// прогресс не отслеживаем — работает в тихую
+overlayOpen: false,
         scanTimer: null,
         _saveStateTimer: null,
         _saveEventsTimer: null,
@@ -21117,10 +21110,18 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
     // ═══════════════════════════════════════════════════════════
     //  ЗАГРУЗКА ДАННЫХ
     // ═══════════════════════════════════════════════════════════
-    loadSeen();
-    loadState();
-    loadEvents();
-    loadInitFlags();
+    // 🆕 Принудительно включаем радар при первом запуске этой версии.
+// Если пользователь сам выключит — флаг сохранится и больше не будет навязчивым.
+if (localStorage.getItem('radar2_forced_on_v2') !== '1') {
+    localStorage.setItem(CFG.enabledKey, '1');
+    localStorage.setItem('radar2_forced_on_v2', '1');
+}
+
+
+loadSeen();
+loadState();
+loadEvents();
+loadInitFlags();
 
     // ═══════════════════════════════════════════════════════════
     //  СТИЛИ
@@ -21214,68 +21215,6 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
             .r2-header .r2-btn.r2-btn-scan { color: #00b894; }
             .r2-header .r2-btn.r2-btn-scan:hover { background: rgba(0,184,148,0.2); color: #00e5b8; }
             .r2-header .r2-btn.r2-btn-clear:hover { background: rgba(255,107,107,0.2); color: #ff6b6b; }
-
-            /* Прогресс */
-            .r2-progress {
-                padding: 10px 16px 12px;
-                background: rgba(108,92,231,0.08);
-                border-bottom: 1px solid rgba(108,92,231,0.2);
-                flex-shrink: 0;
-                display: none;
-            }
-            .r2-progress.show { display: block; }
-            .r2-progress.done {
-                background: rgba(0,184,148,0.08);
-                border-bottom-color: rgba(0,184,148,0.25);
-            }
-            .r2-progress .r2-pr-line {
-                display: flex; align-items: center; justify-content: space-between;
-                gap: 10px; margin-bottom: 8px; font-size: 12px;
-            }
-            .r2-progress .r2-pr-label {
-                flex: 1; min-width: 0; color: #a78bfa; font-weight: 600;
-                white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-                display: flex; align-items: center; gap: 8px;
-            }
-            .r2-progress.done .r2-pr-label { color: #00b894; }
-            .r2-progress .r2-pr-label .r2-spinner {
-                width: 12px; height: 12px;
-                border: 2px solid rgba(167,139,250,0.25);
-                border-top-color: #a78bfa;
-                border-radius: 50%;
-                animation: r2Spin 0.7s linear infinite;
-                flex-shrink: 0;
-            }
-            .r2-progress.done .r2-pr-label .r2-spinner { display: none; }
-            @keyframes r2Spin { to { transform: rotate(360deg); } }
-            .r2-progress .r2-pr-counter {
-                color: #fff; font-weight: 700;
-                font-variant-numeric: tabular-nums; flex-shrink: 0; font-size: 12px;
-            }
-            .r2-progress .r2-pr-counter .dim { color: #666; font-weight: 400; }
-            .r2-progress .r2-pr-bar {
-                width: 100%; height: 4px;
-                background: rgba(255,255,255,0.08);
-                border-radius: 2px; overflow: hidden; position: relative;
-            }
-            .r2-progress .r2-pr-fill {
-                height: 100%; width: 0%;
-                background: linear-gradient(90deg, #6c5ce7, #00b894);
-                border-radius: 2px;
-                transition: width 0.3s cubic-bezier(0.22, 0.61, 0.36, 1);
-                position: relative;
-            }
-            .r2-progress.done .r2-pr-fill { background: linear-gradient(90deg, #00b894, #00b894); }
-            .r2-progress .r2-pr-fill::after {
-                content: ''; position: absolute; inset: 0;
-                background: linear-gradient(90deg, transparent, rgba(255,255,255,0.3), transparent);
-                animation: r2Shine 1.5s infinite;
-            }
-            .r2-progress.done .r2-pr-fill::after { display: none; }
-            @keyframes r2Shine {
-                0%   { transform: translateX(-100%); }
-                100% { transform: translateX(100%); }
-            }
 
             /* Тело */
             .r2-body {
@@ -21567,56 +21506,8 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ПРОГРЕСС
-    // ═══════════════════════════════════════════════════════════
-    function updateProgress() {
-        const box = document.getElementById('r2Progress');
-        const labelEl = document.getElementById('r2PrLabelText');
-        const doneEl = document.getElementById('r2PrDone');
-        const totalEl = document.getElementById('r2PrTotal');
-        const fillEl = document.getElementById('r2PrFill');
-        if (!box || !fillEl) return;
-
-        const p = R.progress;
-
-        if (p.phase === 'scanning') {
-            box.classList.add('show');
-            box.classList.remove('done');
-            labelEl.textContent = p.current ? `Сканирую: ${p.current}` : 'Сканирую чаты…';
-            doneEl.textContent = p.done;
-            totalEl.textContent = p.total;
-            const pct = p.total > 0 ? (p.done / p.total) * 100 : 0;
-            fillEl.style.width = pct + '%';
-        } else if (p.phase === 'done') {
-            box.classList.add('show', 'done');
-            if (p.eventsAdded > 0) {
-                labelEl.textContent = `Готово · найдено событий: ${p.eventsAdded}`;
-            } else if (p.changedCount > 0) {
-                labelEl.textContent = `Готово · обновлено чатов: ${p.changedCount}`;
-            } else {
-                labelEl.textContent = 'Готово · изменений нет';
-            }
-            doneEl.textContent = p.total;
-            totalEl.textContent = p.total;
-            fillEl.style.width = '100%';
-        } else {
-            box.classList.remove('show', 'done');
-        }
-    }
-
-    function hideProgressAfter(ms = 2500) {
-        setTimeout(() => {
-            if (R.progress.phase === 'done' && !R.scanning) {
-                R.progress.phase = 'idle';
-                const box = document.getElementById('r2Progress');
-                if (box) box.classList.remove('show', 'done');
-            }
-        }, ms);
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ОВЕРЛЕЙ
-    // ═══════════════════════════════════════════════════════════
+//  ОВЕРЛЕЙ
+// ═══════════════════════════════════════════════════════════
     function ensureOverlay() {
         let ov = document.getElementById('radar2Overlay');
         if (ov) return ov;
@@ -21624,33 +21515,21 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
         ov = document.createElement('div');
         ov.id = 'radar2Overlay';
         ov.innerHTML = `
-            <div class="r2-header">
-                <div class="r2-title">
-                    <h2>
-                        <span class="r2-live-dot"></span>
-                        <span>События</span>
-                    </h2>
-                    <div class="r2-sub" id="r2Sub">Готов</div>
-                </div>
-                <button class="r2-btn r2-btn-scan" id="r2ScanNowBtn" title="Проверить сейчас">⟳</button>
-                <button class="r2-btn on" id="r2OnOffBtn" title="Вкл/выкл">⏸</button>
-                <button class="r2-btn r2-btn-clear" id="r2ClearBtn" title="Очистить всё">🗑</button>
-                <button class="r2-btn" id="r2CloseBtn" title="Закрыть">✕</button>
-            </div>
-            <div class="r2-progress" id="r2Progress">
-                <div class="r2-pr-line">
-                    <div class="r2-pr-label" id="r2PrLabel">
-                        <span class="r2-spinner"></span>
-                        <span id="r2PrLabelText">Сканирую…</span>
-                    </div>
-                    <div class="r2-pr-counter">
-                        <span id="r2PrDone">0</span><span class="dim"> / <span id="r2PrTotal">0</span></span>
-                    </div>
-                </div>
-                <div class="r2-pr-bar"><div class="r2-pr-fill" id="r2PrFill"></div></div>
-            </div>
-            <div class="r2-body" id="r2Body"></div>
-        `;
+    <div class="r2-header">
+        <div class="r2-title">
+            <h2>
+                <span class="r2-live-dot"></span>
+                <span>События</span>
+            </h2>
+            <div class="r2-sub" id="r2Sub">Готов</div>
+        </div>
+        <button class="r2-btn r2-btn-scan" id="r2ScanNowBtn" title="Проверить сейчас">⟳</button>
+        <button class="r2-btn on" id="r2OnOffBtn" title="Вкл/выкл">⏸</button>
+        <button class="r2-btn r2-btn-clear" id="r2ClearBtn" title="Очистить всё">🗑</button>
+        <button class="r2-btn" id="r2CloseBtn" title="Закрыть">✕</button>
+    </div>
+    <div class="r2-body" id="r2Body"></div>
+`;
         document.body.appendChild(ov);
 
         ov.querySelector('#r2CloseBtn').addEventListener('click', closeOverlay);
@@ -21692,22 +21571,17 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
     }
 
     function openOverlay() {
-        ensureOverlay();
-        const ov = document.getElementById('radar2Overlay');
-        ov.classList.add('show');
-        R.overlayOpen = true;
-        document.body.style.overflow = 'hidden';
+    ensureOverlay();
+    const ov = document.getElementById('radar2Overlay');
+    ov.classList.add('show');
+    R.overlayOpen = true;
+    document.body.style.overflow = 'hidden';
 
-        hideBadges();
-        renderList();
-        updateHeaderState();
-        updateProgress();
 
-        // Автоскан при открытии
-        if (R.enabled && !R.scanning && CFG.scanOnOpen) {
-            setTimeout(() => scanAll({ force: false }), 150);
-        }
-    }
+    hideBadges();
+    renderList();
+    updateHeaderState();
+}
 
     function closeOverlay() {
     const ov = document.getElementById('radar2Overlay');
@@ -21760,9 +21634,9 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
         const unseen = R.events.filter(e => !e.seen).length;
 
         if (sub) {
-            if (R.scanning) {
-                sub.textContent = `🔔 Сканирую… ${R.progress.done}/${R.progress.total}`;
-            } else {
+    if (R.scanning) {
+        sub.textContent = `🔔 Сканирую…`;
+    } else {
                 const ago = R.lastScanTs
                     ? Math.round((Date.now() - R.lastScanTs) / 1000)
                     : null;
@@ -22063,79 +21937,41 @@ function renderGroups(events) {
     // ═══════════════════════════════════════════════════════════
     //  ГЛАВНЫЙ СКАН — по очереди, спокойно, надёжно
     // ═══════════════════════════════════════════════════════════
-    async function scanAll(opts = {}) {
-        if (R.scanning) return;
-        if (!state.token || !state.isAuthorized) return;
-        if (state.chats.length === 0) {
-            R.progress.phase = 'idle';
-            updateProgress();
-            renderList();
-            return;
-        }
 
-        R.scanning = true;
-        R.lastScanTs = Date.now();
-        updateBadges();
+async function scanAll(opts = {}) {
+    if (R.scanning) return;
+    if (!state.token || !state.isAuthorized) return;
+    if (state.chats.length === 0) return;
 
-        R.progress = {
-            phase: 'scanning',
-            total: state.chats.length,
-            done: 0,
-            current: state.chats[0]?.name || '',
-            changedCount: 0,
-            eventsAdded: 0,
-        };
-        updateProgress();
+    R.scanning = true;
+    R.lastScanTs = Date.now();
+    updateBadges();
 
-        if (R.overlayOpen) {
-            const sub = document.getElementById('r2Sub');
-            if (sub) sub.textContent = `🔔 Сканирую… 0/${R.progress.total}`;
-        }
+    try {
+        const chatsToScan = state.chats.slice();
 
-        try {
-            // Собираем список чатов
-            const chatsToScan = state.chats.slice();
+        for (const chat of chatsToScan) {
+            if (!R.enabled && !opts.force) break;
 
-            for (const chat of chatsToScan) {
-                if (!R.enabled && !opts.force) break;
-
-                R.progress.current = chat.name || chat.file;
-                updateProgress();
-
-                if (R.overlayOpen) {
-                    const sub = document.getElementById('r2Sub');
-                    if (sub) sub.textContent = `🔔 Сканирую… ${R.progress.done}/${R.progress.total}`;
-                }
-
-                try {
-                    await scanOneChat(chat, opts.force);
-                } catch (e) {
-                    console.warn('[Radar2] scanOneChat failed:', chat.file, e.message);
-                }
-
-                R.progress.done++;
-                updateProgress();
-
-                // 🆕 Пауза между чатами — не бомбим GitHub API
-                await new Promise(r => setTimeout(r, CFG.delayBetweenChatsMs));
+            try {
+                await scanOneChat(chat, opts.force);
+            } catch (e) {
+                console.warn('[Radar2] scanOneChat failed:', chat.file, e.message);
             }
 
-            R.progress.phase = 'done';
-            updateProgress();
-            hideProgressAfter(2500);
-
-            if (R.overlayOpen) renderList();
-            updateBadges();
-        } catch (e) {
-            console.error('[Radar2] scanAll error:', e);
-            R.progress.phase = 'idle';
-            updateProgress();
-        } finally {
-            R.scanning = false;
-            updateBadges();
-            if (R.overlayOpen) renderList();
+            // Пауза между чатами — не бомбим GitHub API
+            await new Promise(r => setTimeout(r, CFG.delayBetweenChatsMs));
         }
+
+        if (R.overlayOpen) renderList();
+    } catch (e) {
+        console.error('[Radar2] scanAll error:', e);
+    } finally {
+        R.scanning = false;
+        updateBadges();
+        if (R.overlayOpen) renderList();
     }
+}
 
     // ═══════════════════════════════════════════════════════════
     //  СКАН ОДНОГО ЧАТА
@@ -22163,9 +21999,6 @@ function renderGroups(events) {
         if (prevVersion === metaVersion && !force) return;
 
         R.versions[file] = metaVersion;
-        if (prevVersion !== undefined && prevVersion !== metaVersion) {
-            R.progress.changedCount++;
-        }
 
         // 3. Проверяем пароль
         const password = state.savedPasswords[file];
@@ -22306,12 +22139,11 @@ function renderGroups(events) {
         }
 
         // Сохраняем
-        saveState();
-        if (eventsAdded > 0) {
-            saveEvents();
-            console.log(`[Radar2] ${file}: найдено событий: ${eventsAdded}`);
-            R.progress.eventsAdded += eventsAdded;
-        }
+saveState();
+if (eventsAdded > 0) {
+    saveEvents();
+    console.log(`[Radar2] ${file}: найдено событий: ${eventsAdded}`);
+}
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -22591,12 +22423,10 @@ function renderGroups(events) {
             eventsTotal: R.events.length,
             eventsUnseen: R.events.filter(e => !e.seen).length,
             stateEntries: Object.keys(R.state).length,
-            initializedChats: Object.keys(R.initDone).length,
-            lastScanAgo: R.lastScanTs
-                ? Math.round((Date.now() - R.lastScanTs) / 1000) + 's'
-                : 'never',
-            progress: { ...R.progress },
-        }),
+            initializedChats: Object.keys(R.initDone).length,    lastScanAgo: R.lastScanTs
+        ? Math.round((Date.now() - R.lastScanTs) / 1000) + 's'
+        : 'never',
+}),
         diagnose: async (chatFile) => {
             if (!chatFile) {
                 console.log('Использование: EventRadar.diagnose("chat_xxx")');
