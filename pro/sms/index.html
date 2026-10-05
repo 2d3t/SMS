@@ -21710,29 +21710,18 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
     }
 
     function closeOverlay() {
-        const ov = document.getElementById('radar2Overlay');
-        if (!ov) return;
-        ov.classList.remove('show');
-        R.overlayOpen = false;
-        document.body.style.overflow = '';
+    const ov = document.getElementById('radar2Overlay');
+    if (!ov) return;
+    ov.classList.remove('show');
+    R.overlayOpen = false;
+    document.body.style.overflow = '';
 
-        // Помечаем видимые события как прочитанные
-        let changed = false;
-        R.events.forEach(e => {
-            if (!e.seen) {
-                e.seen = true;
-                R.seen.add(e.key);
-                changed = true;
-            }
-        });
-        if (changed) {
-            saveSeen();
-            saveEvents();
-        }
 
-        hideBadges();
-        updateBadges();
-    }
+    // 🆕 НЕ помечаем события прочитанными при закрытии.
+    // Они остаются яркими, пока пользователь сам не кликнет по ним.
+    // Обновляем только бейдж (на случай если что-то изменилось).
+    updateBadges();
+}
 
     function toggleEnabled() {
         R.enabled = !R.enabled;
@@ -21829,8 +21818,14 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
         body.innerHTML = html;
 
         body.querySelectorAll('.r2-event').forEach(el => {
-            el.addEventListener('click', () => handleEventClick(el));
-        });
+    el.addEventListener('click', () => handleEventClick(el));
+});
+
+
+// 🆕 Если оверлей открыт и мы вернулись после клика —
+// пересортировка уже сделана в handleEventClick,
+// здесь просто убеждаемся что бейдж актуален
+updateBadges();
     }
 
 function renderGroups(events) {
@@ -21962,20 +21957,48 @@ function renderGroups(events) {
     //  КЛИК ПО СОБЫТИЮ — переход к сообщению
     // ═══════════════════════════════════════════════════════════
     async function handleEventClick(el) {
-        const chatFile = el.dataset.chatFile;
-        const msgId = parseInt(el.dataset.msgId);
-        const key = el.dataset.key;
+    const chatFile = el.dataset.chatFile;
+    const msgId = parseInt(el.dataset.msgId);
+    const key = el.dataset.key;
 
-        // Помечаем прочитанным
-        const ev = R.events.find(x => x.key === key);
-        if (ev && !ev.seen) {
-            ev.seen = true;
-            R.seen.add(key);
-            saveSeen();
-            saveEvents();
+
+    // Помечаем прочитанным ТОЛЬКО это событие
+    const ev = R.events.find(x => x.key === key);
+    if (ev && !ev.seen) {
+        ev.seen = true;
+        R.seen.add(key);
+        saveSeen();
+        saveEvents();
+
+
+        // 🆕 Мгновенно визуально помечаем карточку потускневшей
+        el.classList.add('seen');
+
+
+        // 🆕 Мгновенно уменьшаем бейдж на колокольчике
+        updateBadges();
+
+
+        // 🆕 И обновляем счётчик в шапке радара
+        const sub = document.getElementById('r2Sub');
+        if (sub) {
+            const newUnseen = R.events.filter(e => !e.seen).length;
+            const total = R.events.length;
+            const onMine = R.events.filter(e => !e.seen && e.isOnMyMessage).length;
+            const onMineStr = onMine > 0 ? `⭐ ${onMine} на ваших · ` : '';
+            sub.textContent = newUnseen > 0
+                ? `${onMineStr}Новых: ${newUnseen} · Всего: ${total}`
+                : `Всего: ${total}`;
         }
+    }
 
-        closeOverlay();
+
+    // 🆕 Небольшая пауза, чтобы пользователь увидел «потускнело»,
+    //    и только потом закрываем оверлей + переходим к сообщению
+    await new Promise(r => setTimeout(r, 280));
+
+
+    closeOverlay();
 
         if (state.chatFile === chatFile) {
             await jumpToMessage(msgId);
