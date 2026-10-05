@@ -21178,43 +21178,45 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
 
 </script>
 
-
-
-
 <script>
 // ═══════════════════════════════════════════════════════════════
-//  🔔 EVENT RADAR v2 — полностью переписанный движок событий
-//  Заменяет старый installEventRadar.
+//  🔔 EVENT RADAR v3 — Вариант B
 //
-//  Что нового:
-//   • Медленный, но надёжный скан (не пропускает события)
-//   • Единый ETag-кэш — нет гонки с pollUpdates
-//   • Per-chat инициализация — нет «тихого» первого запуска
-//   • Нет фильтра по времени — события не «съедаются»
-//   • Кнопка «Проверить сейчас» для ручного скана
-//   • Диагностика прямо в UI
+//  Скан происходит ТОЛЬКО:
+//   • Один раз через 15 сек после старта приложения
+//   • При возврате из фона (visibilitychange → visible)
+//   • При возврате фокуса окна (для десктопа)
+//   • При возврате онлайна
+//   • Вручную по кнопке ⟳
+//
+//  НЕТ setInterval. НЕТ фоновых сканов. Максимальная экономия.
 // ═══════════════════════════════════════════════════════════════
 
-(function installEventRadarV2() {
+(function installEventRadarV3() {
     'use strict';
 
     // ═══════════════════════════════════════════════════════════
-    //  КОНФИГУРАЦИЯ
+    //  КОНФИГ
     // ═══════════════════════════════════════════════════════════
     const CFG = {
-    scanIntervalMs: 60000,        // раз в 60 сек — тихо, в фоне
-    scanOnOpen: false,            // НЕ сканировать при открытии оверлея
-    scanOnVisibility: true,       // скан при возврате в приложение
-    delayBetweenChatsMs: 250,     // пауза между чатами — не бомбим API
-    maxEventsKept: 500,           // сколько событий хранить
-    maxEventsShown: 100,          // сколько показывать в UI
-    maxStateEntries: 2000,        // сколько сообщений помнить в state
-    stateStorageKey: 'radar2_state_v2',
-    eventsStorageKey: 'radar2_events_v2',
-    seenStorageKey: 'radar2_seen_v2',
-    enabledKey: 'radar2_enabled_v2',
-    initKeyPrefix: 'radar2_init_',  // radar2_init_<chatFile>
-};
+        startupScanDelayMs: 15000,           // скан через 15 сек после старта
+        minTimeBetweenScansMs: 5000,         // 🆕 не чаще раза в 5 сек (защита от «дребезга»)
+        delayBetweenChatsMs: 250,            // пауза между чатами
+        fullScanIntervalMs: 10 * 60 * 1000,  // страховочный full-scan раз в 10 мин (если meta не обновился)
+        maxEventsKept: 500,
+        maxEventsShown: 100,
+        maxStateEntries: 2000,
+
+        stateStorageKey: 'radar2_state_v2',
+        eventsStorageKey: 'radar2_events_v2',
+        seenStorageKey: 'radar2_seen_v2',
+        enabledKey: 'radar2_enabled_v2',
+        versionsStorageKey: 'radar2_versions_v3',
+        lastFullScanKey: 'radar2_lastfull_v3',
+        metaEventsKey: 'radar2_metaEvents_v3',
+        initKeyPrefix: 'radar2_init_',
+        diagKey: 'radar2_diag_v3',
+    };
 
     // ═══════════════════════════════════════════════════════════
     //  СОСТОЯНИЕ
@@ -21224,17 +21226,29 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
         scanning: false,
         events: [],
         seen: new Set(),
-        state: {},           // { "<chatFile>|<msgId>": { reactions, commentIds } }
-        initDone: {},        // { "<chatFile>": true } — инициализирован ли чат
-        etags: {},           // { "<chatFile>": "etag..." }
-        versions: {},        // { "<chatFile>": version }
+        state: {},
+        initDone: {},
+        etags: {},
+        versions: {},
+        lastFullScan: {},
+        metaEvents: {},
         notModifiedStreak: {},
         lastScanTs: 0,
-// прогресс не отслеживаем — работает в тихую
-overlayOpen: false,
-        scanTimer: null,
+        overlayOpen: false,
         _saveStateTimer: null,
         _saveEventsTimer: null,
+        _saveVersionsTimer: null,
+        diag: {
+            totalScans: 0,
+            fullDecrypts: 0,
+            metaOnlyChecks: 0,
+            decryptedMessages: 0,
+            manualScans: 0,
+            startupScans: 0,
+            visibilityScans: 0,
+            focusScans: 0,
+            onlineScans: 0,
+        },
     };
 
     // ═══════════════════════════════════════════════════════════
@@ -21247,7 +21261,6 @@ overlayOpen: false,
             R.seen = new Set(Array.isArray(arr) ? arr : []);
         } catch (e) { R.seen = new Set(); }
     }
-
     function saveSeen() {
         try {
             const arr = Array.from(R.seen).slice(-3000);
@@ -21261,28 +21274,20 @@ overlayOpen: false,
             R.state = raw ? JSON.parse(raw) : {};
         } catch (e) { R.state = {}; }
     }
-
     function saveState(immediate = false) {
-        if (R._saveStateTimer) {
-            clearTimeout(R._saveStateTimer);
-            R._saveStateTimer = null;
-        }
+        if (R._saveStateTimer) { clearTimeout(R._saveStateTimer); R._saveStateTimer = null; }
         const doSave = () => {
             try {
-                // Обрезаем state до maxStateEntries (по lastSeenAt)
                 const entries = Object.entries(R.state);
                 if (entries.length > CFG.maxStateEntries) {
                     entries.sort((a, b) => (b[1].lastSeenAt || 0) - (a[1].lastSeenAt || 0));
                     const trimmed = {};
-                    for (let i = 0; i < CFG.maxStateEntries; i++) {
-                        trimmed[entries[i][0]] = entries[i][1];
-                    }
+                    for (let i = 0; i < CFG.maxStateEntries; i++) trimmed[entries[i][0]] = entries[i][1];
                     R.state = trimmed;
                 }
                 localStorage.setItem(CFG.stateStorageKey, JSON.stringify(R.state));
             } catch (e) {
                 if (e.name === 'QuotaExceededError') {
-                    // Аварийная обрезка
                     const entries = Object.entries(R.state);
                     entries.sort((a, b) => (b[1].lastSeenAt || 0) - (a[1].lastSeenAt || 0));
                     const trimmed = {};
@@ -21291,14 +21296,11 @@ overlayOpen: false,
                         trimmed[entries[i][0]] = entries[i][1];
                     }
                     R.state = trimmed;
-                    try {
-                        localStorage.setItem(CFG.stateStorageKey, JSON.stringify(R.state));
-                    } catch (e2) {}
+                    try { localStorage.setItem(CFG.stateStorageKey, JSON.stringify(R.state)); } catch (e2) {}
                 }
             }
         };
-        if (immediate) doSave();
-        else R._saveStateTimer = setTimeout(doSave, 500);
+        if (immediate) doSave(); else R._saveStateTimer = setTimeout(doSave, 500);
     }
 
     function loadEvents() {
@@ -21308,23 +21310,15 @@ overlayOpen: false,
             R.events = Array.isArray(arr) ? arr : [];
         } catch (e) { R.events = []; }
     }
-
     function saveEvents(immediate = false) {
-        if (R._saveEventsTimer) {
-            clearTimeout(R._saveEventsTimer);
-            R._saveEventsTimer = null;
-        }
+        if (R._saveEventsTimer) { clearTimeout(R._saveEventsTimer); R._saveEventsTimer = null; }
         const doSave = () => {
             try {
-                // Обрезаем до maxEventsKept
-                if (R.events.length > CFG.maxEventsKept) {
-                    R.events = R.events.slice(-CFG.maxEventsKept);
-                }
+                if (R.events.length > CFG.maxEventsKept) R.events = R.events.slice(-CFG.maxEventsKept);
                 localStorage.setItem(CFG.eventsStorageKey, JSON.stringify(R.events));
             } catch (e) {}
         };
-        if (immediate) doSave();
-        else R._saveEventsTimer = setTimeout(doSave, 500);
+        if (immediate) doSave(); else R._saveEventsTimer = setTimeout(doSave, 500);
     }
 
     function loadInitFlags() {
@@ -21333,23 +21327,17 @@ overlayOpen: false,
             for (let i = 0; i < localStorage.length; i++) {
                 const key = localStorage.key(i);
                 if (key && key.startsWith(CFG.initKeyPrefix)) {
-                    const chatFile = key.slice(CFG.initKeyPrefix.length);
-                    R.initDone[chatFile] = true;
+                    R.initDone[key.slice(CFG.initKeyPrefix.length)] = true;
                 }
             }
         } catch (e) {}
     }
-
     function markChatInitialized(chatFile) {
         R.initDone[chatFile] = true;
-        try {
-            localStorage.setItem(CFG.initKeyPrefix + chatFile, '1');
-        } catch (e) {}
+        try { localStorage.setItem(CFG.initKeyPrefix + chatFile, '1'); } catch (e) {}
     }
-
     function isChatInitialized(chatFile) {
         if (R.initDone[chatFile]) return true;
-        // Фолбэк: если в state есть сообщения этого чата — считаем инициализированным
         const prefix = chatFile + '|';
         for (const key of Object.keys(R.state)) {
             if (key.startsWith(prefix)) {
@@ -21361,21 +21349,48 @@ overlayOpen: false,
         return false;
     }
 
-    // ═══════════════════════════════════════════════════════════
-    //  ЗАГРУЗКА ДАННЫХ
-    // ═══════════════════════════════════════════════════════════
-    // 🆕 Принудительно включаем радар при первом запуске этой версии.
-// Если пользователь сам выключит — флаг сохранится и больше не будет навязчивым.
-if (localStorage.getItem('radar2_forced_on_v2') !== '1') {
-    localStorage.setItem(CFG.enabledKey, '1');
-    localStorage.setItem('radar2_forced_on_v2', '1');
-}
+    function loadVersionsAndMeta() {
+        try {
+            const raw = localStorage.getItem(CFG.versionsStorageKey);
+            R.versions = raw ? JSON.parse(raw) : {};
+        } catch (e) { R.versions = {}; }
+        try {
+            const raw = localStorage.getItem(CFG.lastFullScanKey);
+            R.lastFullScan = raw ? JSON.parse(raw) : {};
+        } catch (e) { R.lastFullScan = {}; }
+        try {
+            const raw = localStorage.getItem(CFG.metaEventsKey);
+            R.metaEvents = raw ? JSON.parse(raw) : {};
+        } catch (e) { R.metaEvents = {}; }
+        try {
+            const raw = localStorage.getItem(CFG.diagKey);
+            if (raw) Object.assign(R.diag, JSON.parse(raw));
+        } catch (e) {}
+    }
 
+    function saveVersionsAndMeta(immediate = false) {
+        if (R._saveVersionsTimer) { clearTimeout(R._saveVersionsTimer); R._saveVersionsTimer = null; }
+        const doSave = () => {
+            try {
+                localStorage.setItem(CFG.versionsStorageKey, JSON.stringify(R.versions));
+                localStorage.setItem(CFG.lastFullScanKey, JSON.stringify(R.lastFullScan));
+                localStorage.setItem(CFG.metaEventsKey, JSON.stringify(R.metaEvents));
+                localStorage.setItem(CFG.diagKey, JSON.stringify(R.diag));
+            } catch (e) {}
+        };
+        if (immediate) doSave(); else R._saveVersionsTimer = setTimeout(doSave, 500);
+    }
 
-loadSeen();
-loadState();
-loadEvents();
-loadInitFlags();
+    if (localStorage.getItem('radar3_forced_on') !== '1') {
+        localStorage.setItem(CFG.enabledKey, '1');
+        localStorage.setItem('radar3_forced_on', '1');
+    }
+
+    loadSeen();
+    loadState();
+    loadEvents();
+    loadInitFlags();
+    loadVersionsAndMeta();
 
     // ═══════════════════════════════════════════════════════════
     //  СТИЛИ
@@ -21384,31 +21399,26 @@ loadInitFlags();
         const style = document.createElement('style');
         style.id = 'radar2Styles';
         style.textContent = `
-            #radar2Btn {
-                position: relative;
-            }
+            #radar2Btn { position: relative; }
             #radar2Btn .r2-badge,
-#radar2BtnChat .r2-badge {
-    position: absolute; top: -4px; right: -4px;
-    min-width: 18px; height: 18px; padding: 0 5px;
-    border-radius: 9px;
-    background: linear-gradient(135deg, #00b894, #00a884);
-    color: #fff; font-size: 10px; font-weight: 700;
-    display: none; align-items: center; justify-content: center;
-    box-shadow: 0 2px 8px rgba(0,184,148,0.55);
-    border: 2px solid #0a0a0f; line-height: 1;
-}
-#radar2Btn .r2-badge.show,
-#radar2BtnChat .r2-badge.show { display: flex; }
-            #radar2Btn.scanning {
-                animation: r2BtnPulse 1.5s ease-in-out infinite;
+            #radar2BtnChat .r2-badge {
+                position: absolute; top: -4px; right: -4px;
+                min-width: 18px; height: 18px; padding: 0 5px;
+                border-radius: 9px;
+                background: linear-gradient(135deg, #00b894, #00a884);
+                color: #fff; font-size: 10px; font-weight: 700;
+                display: none; align-items: center; justify-content: center;
+                box-shadow: 0 2px 8px rgba(0,184,148,0.55);
+                border: 2px solid #0a0a0f; line-height: 1;
             }
+            #radar2Btn .r2-badge.show,
+            #radar2BtnChat .r2-badge.show { display: flex; }
+            #radar2Btn.scanning { animation: r2BtnPulse 1.5s ease-in-out infinite; }
             @keyframes r2BtnPulse {
                 0%, 100% { background: rgba(255,255,255,0.06); }
                 50%      { background: rgba(108,92,231,0.25); }
             }
 
-            /* ═══ Оверлей ═══ */
             #radar2Overlay {
                 position: fixed; inset: 0;
                 background: linear-gradient(135deg, #0a0a0f 0%, #1a1a2e 100%);
@@ -21472,7 +21482,6 @@ loadInitFlags();
             .r2-header .r2-btn.r2-btn-scan:hover { background: rgba(0,184,148,0.2); color: #00e5b8; }
             .r2-header .r2-btn.r2-btn-clear:hover { background: rgba(255,107,107,0.2); color: #ff6b6b; }
 
-            /* Тело */
             .r2-body {
                 flex: 1; overflow-y: auto;
                 padding: 12px 12px 40px;
@@ -21483,7 +21492,6 @@ loadInitFlags();
             .r2-empty .r2-e-title { font-size: 15px; color: #aaa; margin-bottom: 6px; font-weight: 600; }
             .r2-empty .r2-e-sub { font-size: 12px; color: #666; line-height: 1.5; }
 
-            /* Группа чата */
             .r2-group { margin-bottom: 18px; }
             .r2-group-header {
                 display: flex; align-items: center; gap: 8px;
@@ -21495,13 +21503,12 @@ loadInitFlags();
                 z-index: 2; margin: -4px -4px 0;
             }
             .r2-group-header .r2-gh-avatar {
-    width: 22px; height: 22px; border-radius: 50%;
-    background: linear-gradient(135deg, #6c5ce7, #00b894);
-    display: flex; align-items: center; justify-content: center;
-    font-weight: 700; color: #fff; font-size: 11px; flex-shrink: 0;
-    overflow: hidden;  /* 🆕 чтобы img не вылезал */
-    position: relative;
-}
+                width: 22px; height: 22px; border-radius: 50%;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                display: flex; align-items: center; justify-content: center;
+                font-weight: 700; color: #fff; font-size: 11px; flex-shrink: 0;
+                overflow: hidden; position: relative;
+            }
             .r2-group-header .r2-gh-name {
                 flex: 1; min-width: 0;
                 white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
@@ -21512,7 +21519,6 @@ loadInitFlags();
                 font-size: 11px; color: #666; font-weight: 500;
             }
 
-            /* Событие */
             .r2-event {
                 display: flex; gap: 10px; padding: 12px 14px; margin-bottom: 8px;
                 background: rgba(255,255,255,0.04);
@@ -21538,19 +21544,12 @@ loadInitFlags();
             }
             .r2-event.on-mine {
                 border-color: rgba(254,202,87,0.5) !important;
-                background: linear-gradient(135deg,
-                    rgba(254,202,87,0.08) 0%,
-                    rgba(255,159,67,0.04) 100%) !important;
+                background: linear-gradient(135deg, rgba(254,202,87,0.08) 0%, rgba(255,159,67,0.04) 100%) !important;
             }
-            .r2-event.on-mine:not(.seen) {
-                border-left: 3px solid #feca57 !important;
-            }
+            .r2-event.on-mine:not(.seen) { border-left: 3px solid #feca57 !important; }
             .r2-event.on-mine:hover {
-                background: linear-gradient(135deg,
-                    rgba(254,202,87,0.18) 0%,
-                    rgba(255,159,67,0.08) 100%) !important;
-                box-shadow: 0 0 0 1px rgba(254,202,87,0.3),
-                            0 6px 22px rgba(254,202,87,0.3);
+                background: linear-gradient(135deg, rgba(254,202,87,0.18) 0%, rgba(255,159,67,0.08) 100%) !important;
+                box-shadow: 0 0 0 1px rgba(254,202,87,0.3), 0 6px 22px rgba(254,202,87,0.3);
             }
             .r2-event.on-mine .r2-kind {
                 background: linear-gradient(135deg, rgba(254,202,87,0.35), rgba(255,159,67,0.25)) !important;
@@ -21562,10 +21561,7 @@ loadInitFlags();
                 border-left-color: rgba(255,255,255,0.08);
                 filter: grayscale(0.4);
             }
-            .r2-event.seen:hover {
-                opacity: 0.9;
-                filter: grayscale(0);
-            }
+            .r2-event.seen:hover { opacity: 0.9; filter: grayscale(0); }
 
             .r2-event .r2-kind {
                 width: 42px; height: 42px; border-radius: 12px;
@@ -21633,9 +21629,7 @@ loadInitFlags();
                 border-radius: 12px; font-size: 15px; line-height: 1;
                 width: fit-content; margin-top: 2px; color: #fff;
             }
-            .r2-event .r2-reaction .r2-rc-count {
-                font-size: 12px; font-weight: 700;
-            }
+            .r2-event .r2-reaction .r2-rc-count { font-size: 12px; font-weight: 700; }
             .r2-event .r2-comment-bubble {
                 background: rgba(0,0,0,0.28);
                 border-left: 3px solid #a78bfa;
@@ -21667,10 +21661,9 @@ loadInitFlags();
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  КНОПКИ 🔔 В ШАПКАХ
+    //  КНОПКИ
     // ═══════════════════════════════════════════════════════════
     function installRadarButtons() {
-        // В шапке списка чатов
         const chatsHeader = document.querySelector('#chatsScreen .auth-header');
         if (chatsHeader && !document.getElementById('radar2Btn')) {
             const rightBlock = chatsHeader.querySelector('div[style*="display:flex"]');
@@ -21686,7 +21679,6 @@ loadInitFlags();
             }
         }
 
-        // В шапке чата
         const chatHeader = document.querySelector('#chatScreen .chat-header');
         if (chatHeader && !document.getElementById('radar2BtnChat')) {
             const searchBtn = document.getElementById('searchChatBtn');
@@ -21721,46 +21713,35 @@ loadInitFlags();
     //  БЕЙДЖИ
     // ═══════════════════════════════════════════════════════════
     function updateBadges() {
-    const unseen = R.events.filter(e => !e.seen).length;
-    const onMineUnseen = R.events.filter(e => !e.seen && e.isOnMyMessage).length;
-
-
-    ['radar2Badge', 'radar2BadgeChat'].forEach(id => {
-    const el = document.getElementById(id);
-    if (!el) return;
-    if (unseen > 0) {
-        el.textContent = unseen > 99 ? '99+' : String(unseen);
-        el.classList.add('show');
-    } else {
-        el.classList.remove('show');
-        el.textContent = '';
+        const unseen = R.events.filter(e => !e.seen).length;
+        ['radar2Badge', 'radar2BadgeChat'].forEach(id => {
+            const el = document.getElementById(id);
+            if (!el) return;
+            if (unseen > 0) {
+                el.textContent = unseen > 99 ? '99+' : String(unseen);
+                el.classList.add('show');
+            } else {
+                el.classList.remove('show');
+                el.textContent = '';
+            }
+        });
+        ['radar2Btn', 'radar2BtnChat'].forEach(id => {
+            const btn = document.getElementById(id);
+            if (btn) btn.classList.toggle('scanning', R.scanning);
+        });
+        const liveDot = document.querySelector('.r2-live-dot');
+        if (liveDot) liveDot.classList.toggle('active', R.enabled && !R.scanning);
     }
-});
-
-
-    ['radar2Btn', 'radar2BtnChat'].forEach(id => {
-        const btn = document.getElementById(id);
-        if (btn) btn.classList.toggle('scanning', R.scanning);
-    });
-
-
-    const liveDot = document.querySelector('.r2-live-dot');
-    if (liveDot) liveDot.classList.toggle('active', R.enabled && !R.scanning);
-}
-
     function hideBadges() {
         ['radar2Badge', 'radar2BadgeChat'].forEach(id => {
             const el = document.getElementById(id);
-            if (el) {
-                el.textContent = '0';
-                el.classList.remove('show');
-            }
+            if (el) { el.textContent = '0'; el.classList.remove('show'); }
         });
     }
 
     // ═══════════════════════════════════════════════════════════
-//  ОВЕРЛЕЙ
-// ═══════════════════════════════════════════════════════════
+    //  ОВЕРЛЕЙ
+    // ═══════════════════════════════════════════════════════════
     function ensureOverlay() {
         let ov = document.getElementById('radar2Overlay');
         if (ov) return ov;
@@ -21770,10 +21751,7 @@ loadInitFlags();
         ov.innerHTML = `
     <div class="r2-header">
         <div class="r2-title">
-            <h2>
-                <span class="r2-live-dot"></span>
-                <span>События</span>
-            </h2>
+            <h2><span class="r2-live-dot"></span><span>События</span></h2>
             <div class="r2-sub" id="r2Sub">Готов</div>
         </div>
         <button class="r2-btn r2-btn-scan" id="r2ScanNowBtn" title="Проверить сейчас">⟳</button>
@@ -21788,31 +21766,40 @@ loadInitFlags();
         ov.querySelector('#r2CloseBtn').addEventListener('click', closeOverlay);
 
         ov.querySelector('#r2ScanNowBtn').addEventListener('click', async () => {
-            if (R.scanning) {
-                showToastSafe('⏳ Скан уже идёт…');
-                return;
-            }
+            if (R.scanning) { showToastSafe('⏳ Скан уже идёт…'); return; }
+            R.diag.manualScans++;
             showToastSafe('🔍 Проверяю чаты…');
-            await scanAll({ force: true });
+            await scanAll({ force: true, reason: 'manual' });
         });
 
         ov.querySelector('#r2ClearBtn').addEventListener('click', () => {
-            if (!confirm('Очистить всё?\n\nИстория событий, состояние сравнения и метки «прочитано» будут удалены. При следующем скане события появятся заново — только те, что реально новые.')) return;
+            if (!confirm('Очистить всё?\n\nИстория событий, состояние сравнения и метки «прочитано» будут удалены.')) return;
             R.events = [];
             R.seen.clear();
             R.state = {};
             R.etags = {};
             R.versions = {};
+            R.lastFullScan = {};
+            R.metaEvents = {};
             R.initDone = {};
+            R.diag = {
+                totalScans: 0, fullDecrypts: 0, metaOnlyChecks: 0, decryptedMessages: 0,
+                manualScans: 0, startupScans: 0, visibilityScans: 0, focusScans: 0, onlineScans: 0,
+            };
             try {
                 localStorage.removeItem(CFG.eventsStorageKey);
                 localStorage.removeItem(CFG.seenStorageKey);
                 localStorage.removeItem(CFG.stateStorageKey);
+                localStorage.removeItem(CFG.versionsStorageKey);
+                localStorage.removeItem(CFG.lastFullScanKey);
+                localStorage.removeItem(CFG.metaEventsKey);
+                localStorage.removeItem(CFG.diagKey);
                 for (let i = localStorage.length - 1; i >= 0; i--) {
                     const key = localStorage.key(i);
                     if (key && key.startsWith(CFG.initKeyPrefix)) localStorage.removeItem(key);
                 }
             } catch (e) {}
+            saveVersionsAndMeta(true);
             renderList();
             updateBadges();
             showToastSafe('🗑️ Всё очищено');
@@ -21824,31 +21811,28 @@ loadInitFlags();
     }
 
     function openOverlay() {
-    ensureOverlay();
-    const ov = document.getElementById('radar2Overlay');
-    ov.classList.add('show');
-    R.overlayOpen = true;
-    document.body.style.overflow = 'hidden';
+        ensureOverlay();
+        const ov = document.getElementById('radar2Overlay');
+        ov.classList.add('show');
+        R.overlayOpen = true;
+        document.body.style.overflow = 'hidden';
 
+        hideBadges();
+        renderList();
+        updateHeaderState();
 
-    hideBadges();
-    renderList();
-    updateHeaderState();
-}
+        // Фоновое обогащение событий (детали)
+        enrichEventDetailsLazy();
+    }
 
     function closeOverlay() {
-    const ov = document.getElementById('radar2Overlay');
-    if (!ov) return;
-    ov.classList.remove('show');
-    R.overlayOpen = false;
-    document.body.style.overflow = '';
-
-
-    // 🆕 НЕ помечаем события прочитанными при закрытии.
-    // Они остаются яркими, пока пользователь сам не кликнет по ним.
-    // Обновляем только бейдж (на случай если что-то изменилось).
-    updateBadges();
-}
+        const ov = document.getElementById('radar2Overlay');
+        if (!ov) return;
+        ov.classList.remove('show');
+        R.overlayOpen = false;
+        document.body.style.overflow = '';
+        updateBadges();
+    }
 
     function toggleEnabled() {
         R.enabled = !R.enabled;
@@ -21857,12 +21841,10 @@ loadInitFlags();
 
         if (R.enabled) {
             showToastSafe('🔔 Отслеживание включено');
-            startLoop();
-            // Сразу проверим
-            setTimeout(() => scanAll({ force: false }), 500);
+            // При включении — сразу скан
+            setTimeout(() => scanAll({ force: false, reason: 'startup' }), 500);
         } else {
             showToastSafe('⏸ Отслеживание выключено');
-            stopLoop();
         }
         updateBadges();
     }
@@ -21876,7 +21858,70 @@ loadInitFlags();
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  РЕНДЕР СПИСКА
+    //  ЛЕНИВОЕ ОБОГАЩЕНИЕ
+    // ═══════════════════════════════════════════════════════════
+    let _enrichInProgress = false;
+
+    async function enrichEventDetailsLazy() {
+        if (_enrichInProgress) return;
+
+        const byChat = new Map();
+        for (const ev of R.events) {
+            if (ev._enriched) continue;
+            if (!ev.isOnMyMessage && ev.attachPreview) continue;
+            if (!byChat.has(ev.chatFile)) byChat.set(ev.chatFile, []);
+            byChat.get(ev.chatFile).push(ev);
+        }
+        if (byChat.size === 0) return;
+
+        _enrichInProgress = true;
+
+        try {
+            for (const [file, events] of byChat) {
+                if (!R.overlayOpen) break;
+
+                const password = state.savedPasswords[file];
+                if (!password) continue;
+
+                try {
+                    const chatData = await fetchChat(file, `chats/${file}.json`);
+                    if (!chatData?.exists) continue;
+
+                    const content = chatData.content;
+                    const key = await deriveKeySafe(password, content.salt);
+                    const neededMsgIds = new Set(events.map(e => e.msgId));
+                    const decrypted = new Map();
+
+                    for (const enc of (content.messages || [])) {
+                        if (!neededMsgIds.has(enc.id)) continue;
+                        const msg = await decryptMsgSafe(enc, key);
+                        if (msg) decrypted.set(msg.id, msg);
+                    }
+
+                    let changed = false;
+                    for (const ev of events) {
+                        const msg = decrypted.get(ev.msgId);
+                        if (!msg) continue;
+                        ev.isOnMyMessage = msg.username === state.username;
+                        ev.attachPreview = buildAttachPreview(msg);
+                        ev._enriched = true;
+                        changed = true;
+                    }
+                    if (changed) saveEvents();
+                } catch (e) {
+                    console.warn('[Radar3] enrich failed:', file, e.message);
+                }
+
+                await new Promise(r => setTimeout(r, 200));
+            }
+        } finally {
+            _enrichInProgress = false;
+            if (R.overlayOpen) renderList();
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  РЕНДЕР
     // ═══════════════════════════════════════════════════════════
     function renderList() {
         const body = document.getElementById('r2Body');
@@ -21887,21 +21932,17 @@ loadInitFlags();
         const unseen = R.events.filter(e => !e.seen).length;
 
         if (sub) {
-    if (R.scanning) {
-        sub.textContent = `🔔 Сканирую…`;
-    } else {
-                const ago = R.lastScanTs
-                    ? Math.round((Date.now() - R.lastScanTs) / 1000)
-                    : null;
+            if (R.scanning) {
+                sub.textContent = `🔔 Сканирую…`;
+            } else {
+                const ago = R.lastScanTs ? Math.round((Date.now() - R.lastScanTs) / 1000) : null;
                 const agoStr = ago !== null
-                    ? (ago < 5 ? 'только что'
-                        : ago < 60 ? `${ago} сек назад`
-                        : `${Math.round(ago / 60)} мин назад`)
+                    ? (ago < 5 ? 'только что' : ago < 60 ? `${ago} сек назад` : `${Math.round(ago / 60)} мин назад`)
                     : '';
                 const onMine = R.events.filter(e => !e.seen && e.isOnMyMessage).length;
                 const onMineStr = onMine > 0 ? `⭐ ${onMine} на ваших · ` : '';
                 sub.textContent = unseen > 0
-                    ? `${onMineStr}Новых: ${unseen} · Всего: ${total}` + (agoStr ? ` · ${agoStr}` : '')
+                    ? `${onMineStr}Новых: ${unseen} · Всего: ${total}` + (agoStr ? ` · скан ${agoStr}` : '')
                     : `Всего: ${total}` + (agoStr ? ` · скан ${agoStr}` : '');
             }
         }
@@ -21913,7 +21954,7 @@ loadInitFlags();
                     <div class="r2-e-title">${R.enabled ? 'Событий пока нет' : 'Отслеживание выключено'}</div>
                     <div class="r2-e-sub">
                         ${R.enabled
-                            ? 'Как только кто-то поставит реакцию или оставит комментарий — появится здесь.<br><br>Нажмите «⟳» чтобы проверить сейчас.'
+                            ? 'Как только кто-то поставит реакцию или оставит комментарий — появится здесь.<br><br>Проверка идёт при входе в приложение и при возврате из фона. Или нажмите «⟳».'
                             : 'Включите кнопкой «▶» в шапке.'}
                     </div>
                 </div>
@@ -21921,13 +21962,10 @@ loadInitFlags();
             return;
         }
 
-        // Сортировка: новые сверху, «на моих» — приоритетнее
         const sorted = R.events.slice().sort((a, b) => {
             if (a.seen !== b.seen) return a.seen ? 1 : -1;
             if (!a.seen && !b.seen) {
-                if (a.isOnMyMessage !== b.isOnMyMessage) {
-                    return a.isOnMyMessage ? -1 : 1;
-                }
+                if (a.isOnMyMessage !== b.isOnMyMessage) return a.isOnMyMessage ? -1 : 1;
             }
             return b.ts - a.ts;
         });
@@ -21945,120 +21983,99 @@ loadInitFlags();
         body.innerHTML = html;
 
         body.querySelectorAll('.r2-event').forEach(el => {
-    el.addEventListener('click', () => handleEventClick(el));
-});
+            el.addEventListener('click', () => handleEventClick(el));
+        });
 
-
-// 🆕 Если оверлей открыт и мы вернулись после клика —
-// пересортировка уже сделана в handleEventClick,
-// здесь просто убеждаемся что бейдж актуален
-updateBadges();
+        updateBadges();
     }
 
-function renderGroups(events) {
-    const byChat = new Map();
-    for (const e of events) {
-        if (!byChat.has(e.chatFile)) byChat.set(e.chatFile, []);
-        byChat.get(e.chatFile).push(e);
+    function renderGroups(events) {
+        const byChat = new Map();
+        for (const e of events) {
+            if (!byChat.has(e.chatFile)) byChat.set(e.chatFile, []);
+            byChat.get(e.chatFile).push(e);
+        }
+
+        let html = '';
+        for (const [chatFile, items] of byChat) {
+            const chat = state.chats.find(c => c.file === chatFile);
+            const chatName = chat ? (chat.name || chat.file) : chatFile;
+            const letter = (chatName || '?').charAt(0).toUpperCase();
+
+            const customAvatar = (typeof getChatAvatar === 'function')
+                ? getChatAvatar(chatFile) : null;
+
+            const avatarHtml = customAvatar
+                ? `<img src="${customAvatar}" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:50%;pointer-events:none;">`
+                : escapeSafe(letter);
+
+            html += `<div class="r2-group">`;
+            html += `<div class="r2-group-header">
+                        <div class="r2-gh-avatar">${avatarHtml}</div>
+                        <div class="r2-gh-name">${escapeSafe(chatName)}</div>
+                        <div class="r2-gh-count">${items.length}</div>
+                     </div>`;
+            for (const e of items) html += renderEventCard(e);
+            html += `</div>`;
+        }
+        return html;
     }
-
-    let html = '';
-    for (const [chatFile, items] of byChat) {
-        const chat = state.chats.find(c => c.file === chatFile);
-        const chatName = chat ? (chat.name || chat.file) : chatFile;
-        const letter = (chatName || '?').charAt(0).toUpperCase();
-        
-        // 🆕 Подхватываем кастомную аватарку чата
-        const customAvatar = (typeof getChatAvatar === 'function') 
-            ? getChatAvatar(chatFile) 
-            : null;
-        
-        const avatarHtml = customAvatar
-            ? `<img src="${customAvatar}" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:50%;pointer-events:none;">`
-            : escapeSafe(letter);
-
-        html += `<div class="r2-group">`;
-        html += `<div class="r2-group-header">
-                    <div class="r2-gh-avatar">${avatarHtml}</div>
-                    <div class="r2-gh-name">${escapeSafe(chatName)}</div>
-                    <div class="r2-gh-count">${items.length}</div>
-                 </div>`;
-        for (const e of items) html += renderEventCard(e);
-        html += `</div>`;
-    }
-    return html;
-}
-
 
     function renderEventCard(e) {
-    const isReaction = e.kind === 'reaction';
-    const kindCls = isReaction ? 'kind-reaction' : 'kind-comment';
-    const kindIcon = isReaction ? '❤️' : '💬';
-    const onMineCls = e.isOnMyMessage ? ' on-mine' : '';
-    const seenCls = e.seen ? ' seen' : '';
-    const timeStr = formatTime(e.ts);
+        const isReaction = e.kind === 'reaction';
+        const kindCls = isReaction ? 'kind-reaction' : 'kind-comment';
+        const kindIcon = isReaction ? '❤️' : '💬';
+        const onMineCls = e.isOnMyMessage ? ' on-mine' : '';
+        const seenCls = e.seen ? ' seen' : '';
+        const timeStr = formatTime(e.ts);
 
+        let bodyHtml = '';
+        if (e.attachPreview) {
+            bodyHtml += `<div class="r2-attach">
+                            <span>${e.attachPreview.icon}</span>
+                            <span>${escapeSafe(e.attachPreview.text)}</span>
+                         </div>`;
+        }
 
-    let bodyHtml = '';
-    if (e.attachPreview) {
-        bodyHtml += `<div class="r2-attach">
-                        <span>${e.attachPreview.icon}</span>
-                        <span>${escapeSafe(e.attachPreview.text)}</span>
-                     </div>`;
-    }
+        if (isReaction) {
+            const emoji = e.payload.emoji || '❤️';
+            const count = (e.payload.users || []).length || 1;
+            bodyHtml += `<div class="r2-reaction">
+                            <span>${escapeSafe(emoji)}</span>
+                            <span class="r2-rc-count">${count}</span>
+                         </div>`;
+        } else {
+            const text = e.payload.text || '';
+            bodyHtml += `<div class="r2-comment-bubble">${renderTextSafe(text)}</div>`;
+        }
 
+        const fromName = e.payload.from === state.username ? 'Вы' : (e.payload.from || '—');
+        const myBadge = e.isOnMyMessage ? `<span class="r2-my-badge">⭐ на ваше</span>` : '';
+        const eventIdx = R.events.findIndex(x => x.key === e.key);
+        const idxAttr = eventIdx >= 0 ? `data-event-idx="${eventIdx}"` : '';
 
-    if (isReaction) {
-        const emoji = e.payload.emoji || '❤️';
-        const count = (e.payload.users || []).length || 1;
-        bodyHtml += `<div class="r2-reaction">
-                        <span>${escapeSafe(emoji)}</span>
-                        <span class="r2-rc-count">${count}</span>
-                     </div>`;
-    } else {
-        const text = e.payload.text || '';
-        bodyHtml += `<div class="r2-comment-bubble">${renderTextSafe(text)}</div>`;
-    }
-
-
-    const fromName = e.payload.from === state.username
-        ? 'Вы'
-        : (e.payload.from || '—');
-
-
-    const myBadge = e.isOnMyMessage
-        ? `<span class="r2-my-badge">⭐ на ваше</span>`
-        : '';
-
-
-    // 🆕 Ключ события передаём через ЧИСЛОВОЙ индекс, а не через data-key.
-    //     Это устраняет баг с порчей ключа в HTML-атрибуте.
-    const eventIdx = R.events.findIndex(x => x.key === e.key);
-    const idxAttr = eventIdx >= 0 ? `data-event-idx="${eventIdx}"` : '';
-
-
-    return `
-        <div class="r2-event ${kindCls}${onMineCls}${seenCls}"
-             ${idxAttr}
-             data-chat-file="${escapeSafe(e.chatFile)}"
-             data-msg-id="${e.msgId}">
-            <div class="r2-kind">${kindIcon}
-                ${isReaction && (e.payload.users || []).length > 1
-                    ? `<span class="r2-kind-badge">${e.payload.users.length}</span>`
-                    : ''}
-            </div>
-            <div class="r2-body-col">
-                <div class="r2-head">
-                    <span class="r2-from">${isReaction ? 'Реакция от' : 'Комментарий от'} ${escapeSafe(fromName)}</span>
-                    ${myBadge}
-                    <span class="r2-dot">·</span>
-                    <span class="r2-time">${escapeSafe(timeStr)}</span>
+        return `
+            <div class="r2-event ${kindCls}${onMineCls}${seenCls}"
+                 ${idxAttr}
+                 data-chat-file="${escapeSafe(e.chatFile)}"
+                 data-msg-id="${e.msgId}">
+                <div class="r2-kind">${kindIcon}
+                    ${isReaction && (e.payload.users || []).length > 1
+                        ? `<span class="r2-kind-badge">${e.payload.users.length}</span>`
+                        : ''}
                 </div>
-                ${bodyHtml}
+                <div class="r2-body-col">
+                    <div class="r2-head">
+                        <span class="r2-from">${isReaction ? 'Реакция от' : 'Комментарий от'} ${escapeSafe(fromName)}</span>
+                        ${myBadge}
+                        <span class="r2-dot">·</span>
+                        <span class="r2-time">${escapeSafe(timeStr)}</span>
+                    </div>
+                    ${bodyHtml}
+                </div>
             </div>
-        </div>
-    `;
-}
+        `;
+    }
 
     function escapeSafe(s) {
         if (typeof window.escapeHtml === 'function') return window.escapeHtml(s);
@@ -22066,14 +22083,10 @@ function renderGroups(events) {
         div.textContent = s == null ? '' : String(s);
         return div.innerHTML;
     }
-
     function renderTextSafe(text) {
-        if (typeof window.renderTextWithLinks === 'function') {
-            return window.renderTextWithLinks(text);
-        }
+        if (typeof window.renderTextWithLinks === 'function') return window.renderTextWithLinks(text);
         return escapeSafe(text);
     }
-
     function formatTime(ts) {
         const d = new Date(ts);
         const now = new Date();
@@ -22086,116 +22099,82 @@ function renderGroups(events) {
         return d.toLocaleDateString('ru-RU', { day: 'numeric', month: 'short' }) +
             ' ' + d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
     }
-
     function showToastSafe(msg, dur = 2000) {
         if (typeof window.showToast === 'function') window.showToast(msg, dur);
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  КЛИК ПО СОБЫТИЮ — переход к сообщению
+    //  КЛИК ПО СОБЫТИЮ
     // ═══════════════════════════════════════════════════════════
-        async function handleEventClick(el) {
-    const chatFile = el.dataset.chatFile;
-    const msgId = parseInt(el.dataset.msgId);
-    const eventIdx = parseInt(el.dataset.eventIdx);
+    async function handleEventClick(el) {
+        const chatFile = el.dataset.chatFile;
+        const msgId = parseInt(el.dataset.msgId);
+        const eventIdx = parseInt(el.dataset.eventIdx);
 
-
-    // 🆕 Ищем событие по индексу — надёжнее, чем по ключу из data-атрибута
-    let ev = null;
-    if (!isNaN(eventIdx) && R.events[eventIdx]) {
-        ev = R.events[eventIdx];
-        if (ev.chatFile !== chatFile || ev.msgId !== msgId) ev = null;
-    }
-    // Fallback: ищем по chatFile + msgId среди непрочитанных
-    if (!ev) {
-        ev = R.events.find(e =>
-            e.chatFile === chatFile &&
-            e.msgId === msgId &&
-            !e.seen
-        );
-    }
-
-
-    if (ev && !ev.seen) {
-        ev.seen = true;
-        R.seen.add(ev.key);   // ← используем ev.key, а не dataset
-        saveSeen();
-        saveEvents();
-
-
-        // 🆕 Мгновенно визуально помечаем карточку потускневшей
-        el.classList.add('seen');
-
-
-        // 🆕 Мгновенно уменьшаем бейдж на колокольчике
-        updateBadges();
-
-
-        // 🆕 И обновляем счётчик в шапке радара
-        const sub = document.getElementById('r2Sub');
-        if (sub) {
-            const newUnseen = R.events.filter(e => !e.seen).length;
-            const total = R.events.length;
-            const onMine = R.events.filter(e => !e.seen && e.isOnMyMessage).length;
-            const onMineStr = onMine > 0 ? `⭐ ${onMine} на ваших · ` : '';
-            sub.textContent = newUnseen > 0
-                ? `${onMineStr}Новых: ${newUnseen} · Всего: ${total}`
-                : `Всего: ${total}`;
+        let ev = null;
+        if (!isNaN(eventIdx) && R.events[eventIdx]) {
+            ev = R.events[eventIdx];
+            if (ev.chatFile !== chatFile || ev.msgId !== msgId) ev = null;
         }
-    }
+        if (!ev) {
+            ev = R.events.find(e => e.chatFile === chatFile && e.msgId === msgId && !e.seen);
+        }
 
+        if (ev && !ev.seen) {
+            ev.seen = true;
+            R.seen.add(ev.key);
+            saveSeen();
+            saveEvents();
 
-    // 🆕 Небольшая пауза, чтобы пользователь увидел «потускнело»,
-    //    и только потом закрываем оверлей + переходим к сообщению
-    await new Promise(r => setTimeout(r, 280));
+            el.classList.add('seen');
+            updateBadges();
 
+            const sub = document.getElementById('r2Sub');
+            if (sub) {
+                const newUnseen = R.events.filter(e => !e.seen).length;
+                const total = R.events.length;
+                const onMine = R.events.filter(e => !e.seen && e.isOnMyMessage).length;
+                const onMineStr = onMine > 0 ? `⭐ ${onMine} на ваших · ` : '';
+                sub.textContent = newUnseen > 0
+                    ? `${onMineStr}Новых: ${newUnseen} · Всего: ${total}`
+                    : `Всего: ${total}`;
+            }
+        }
 
-    closeOverlay();
+        await new Promise(r => setTimeout(r, 280));
+        closeOverlay();
 
+        if (state.chatFile === chatFile) {
+            await jumpToMessage(msgId);
+            return;
+        }
 
-    if (state.chatFile === chatFile) {
+        const chat = state.chats.find(c => c.file === chatFile);
+        if (!chat) { showToastSafe('❌ Чат не найден'); return; }
+        const password = state.savedPasswords[chatFile];
+        if (!password) { showToastSafe('🔐 Нужен пароль чата'); return; }
+
+        window._pendingJumpToMsgId = msgId;
+
+        try {
+            if (typeof window.enterChat === 'function') {
+                await window.enterChat(chatFile, chat.name || chatFile, password);
+            }
+        } catch (err) {
+            console.error('radar jump error:', err);
+            window._pendingJumpToMsgId = null;
+            showToastSafe('❌ Не удалось открыть чат');
+            return;
+        }
+
         await jumpToMessage(msgId);
-        return;
     }
-
-
-    const chat = state.chats.find(c => c.file === chatFile);
-    if (!chat) {
-        showToastSafe('❌ Чат не найден');
-        return;
-    }
-    const password = state.savedPasswords[chatFile];
-    if (!password) {
-        showToastSafe('🔐 Нужен пароль чата');
-        return;
-    }
-
-
-    window._pendingJumpToMsgId = msgId;
-
-
-    try {
-        if (typeof window.enterChat === 'function') {
-            await window.enterChat(chatFile, chat.name || chatFile, password);
-        }
-    } catch (err) {
-        console.error('radar jump error:', err);
-        window._pendingJumpToMsgId = null;
-        showToastSafe('❌ Не удалось открыть чат');
-        return;
-    }
-
-
-    await jumpToMessage(msgId);
-}
 
     async function jumpToMessage(msgId) {
         return new Promise((resolve) => {
             let tries = 0;
             const check = () => {
-                const el = document.querySelector(
-                    `.message-wrapper[data-msg-id="${msgId}"]`
-                );
+                const el = document.querySelector(`.message-wrapper[data-msg-id="${msgId}"]`);
                 if (el) {
                     el.scrollIntoView({ behavior: 'smooth', block: 'center' });
                     el.classList.remove('highlight-flash');
@@ -22218,43 +22197,60 @@ function renderGroups(events) {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ГЛАВНЫЙ СКАН — по очереди, спокойно, надёжно
+    //  ГЛАВНЫЙ СКАН
     // ═══════════════════════════════════════════════════════════
+    async function scanAll(opts = {}) {
+        if (R.scanning) return;
+        if (!state.token || !state.isAuthorized) return;
+        if (state.chats.length === 0) return;
 
-async function scanAll(opts = {}) {
-    if (R.scanning) return;
-    if (!state.token || !state.isAuthorized) return;
-    if (state.chats.length === 0) return;
-
-    R.scanning = true;
-    R.lastScanTs = Date.now();
-    updateBadges();
-
-    try {
-        const chatsToScan = state.chats.slice();
-
-        for (const chat of chatsToScan) {
-            if (!R.enabled && !opts.force) break;
-
-            try {
-                await scanOneChat(chat, opts.force);
-            } catch (e) {
-                console.warn('[Radar2] scanOneChat failed:', chat.file, e.message);
-            }
-
-            // Пауза между чатами — не бомбим GitHub API
-            await new Promise(r => setTimeout(r, CFG.delayBetweenChatsMs));
+        // 🆕 Защита от слишком частых сканов
+        const timeSinceLastScan = Date.now() - R.lastScanTs;
+        if (R.lastScanTs && timeSinceLastScan < CFG.minTimeBetweenScansMs && opts.reason !== 'manual') {
+            console.log(`[Radar3] Скан пропущен — прошло ${Math.round(timeSinceLastScan / 1000)}с < ${CFG.minTimeBetweenScansMs / 1000}с`);
+            return;
         }
 
-        if (R.overlayOpen) renderList();
-    } catch (e) {
-        console.error('[Radar2] scanAll error:', e);
-    } finally {
-        R.scanning = false;
+        R.scanning = true;
+        R.lastScanTs = Date.now();
+        R.diag.totalScans++;
+
+        // Считаем статистику по источнику
+        switch (opts.reason) {
+            case 'startup':    R.diag.startupScans++;    break;
+            case 'visibility': R.diag.visibilityScans++; break;
+            case 'focus':      R.diag.focusScans++;      break;
+            case 'online':     R.diag.onlineScans++;     break;
+            case 'manual':     /* считаем при клике */   break;
+        }
+
         updateBadges();
-        if (R.overlayOpen) renderList();
+
+        try {
+            const chatsToScan = state.chats.slice();
+
+            for (const chat of chatsToScan) {
+                if (!R.enabled && !opts.force) break;
+                try {
+                    await scanOneChat(chat, opts.force);
+                } catch (e) {
+                    console.warn('[Radar3] scanOneChat failed:', chat.file, e.message);
+                }
+                await new Promise(r => setTimeout(r, CFG.delayBetweenChatsMs));
+            }
+
+            if (R.overlayOpen) renderList();
+        } catch (e) {
+            console.error('[Radar3] scanAll error:', e);
+        } finally {
+            R.scanning = false;
+            saveVersionsAndMeta();
+            updateBadges();
+            if (R.overlayOpen) renderList();
+
+            console.log(`[Radar3] Скан завершён (${opts.reason || 'unknown'}) — ${chatsToScan.length} чатов`);
+        }
     }
-}
 
     // ═══════════════════════════════════════════════════════════
     //  СКАН ОДНОГО ЧАТА
@@ -22262,35 +22258,39 @@ async function scanAll(opts = {}) {
     async function scanOneChat(chat, force = false) {
         const file = chat.file;
 
-        // 1. Получаем meta.json
         const metaPath = `chats/${file}.meta.json`;
         let meta = null;
         try {
             meta = await fetchMeta(file, metaPath, force);
-        } catch (e) {
-            // тихо
-        }
+        } catch (e) { /* тихо */ }
         if (!meta) return;
-        if (meta.notModified && !force) return;
+        if (meta.notModified && !force) {
+            R.diag.metaOnlyChecks++;
+            return;
+        }
         if (!meta.exists) return;
 
         const metaVersion = meta.content?.version;
-        if (!metaVersion && metaVersion !== 0) return;
+        if (metaVersion == null) return;
 
-        // 2. Проверяем версию
         const prevVersion = R.versions[file];
-        if (prevVersion === metaVersion && !force) return;
+        const lastFull = R.lastFullScan[file] || 0;
+        const fullScanExpired = Date.now() - lastFull > CFG.fullScanIntervalMs;
 
-        R.versions[file] = metaVersion;
-
-        // 3. Проверяем пароль
-        const password = state.savedPasswords[file];
-        if (!password) {
-            // Помечаем, что чат видели — чтобы не мучить его каждый раз
-            return;
+        if (prevVersion === metaVersion && !force && !fullScanExpired) {
+            R.diag.metaOnlyChecks++;
+            return;   // 🎉 экономия
         }
 
-        // 4. Читаем содержимое
+        R.versions[file] = metaVersion;
+        R.lastFullScan[file] = Date.now();
+        saveVersionsAndMeta();
+
+        const password = state.savedPasswords[file];
+        if (!password) return;
+
+        R.diag.fullDecrypts++;
+
         const chatPath = `chats/${file}.json`;
         const chatData = await fetchChat(file, chatPath);
         if (!chatData || !chatData.exists) return;
@@ -22298,18 +22298,15 @@ async function scanAll(opts = {}) {
         const content = chatData.content;
         if (!content || content.v !== 2 || !content.salt) return;
 
-        // 5. Расшифровываем
         const key = await deriveKeySafe(password, content.salt);
         const decrypted = [];
         for (const enc of (content.messages || [])) {
             const msg = await decryptMsgSafe(enc, key);
             if (msg) decrypted.push(msg);
         }
+        R.diag.decryptedMessages += decrypted.length;
 
-        // 6. Проверяем: инициализирован ли чат?
         const isFirstScan = !isChatInitialized(file);
-
-        // 7. Сравниваем состояние
         let eventsAdded = 0;
         const now = Date.now();
         const processedKeys = new Set();
@@ -22324,25 +22321,17 @@ async function scanAll(opts = {}) {
             const reactionsPrev = saved?.reactions || {};
             const commentsPrevIds = new Set(saved?.commentIds || []);
 
-            // ═══ РЕАКЦИИ ═══
+            // ─── Реакции ───
             for (const [emoji, users] of Object.entries(reactionsNow)) {
                 const usersArr = Array.isArray(users) ? users : [];
-                const prevArr = Array.isArray(reactionsPrev[emoji])
-                    ? reactionsPrev[emoji]
-                    : [];
+                const prevArr = Array.isArray(reactionsPrev[emoji]) ? reactionsPrev[emoji] : [];
                 const added = usersArr.filter(u => !prevArr.includes(u));
 
                 for (const u of added) {
                     const eventKey = `${file}|${msg.id}|reaction|${emoji}|${u}`;
-
-                    // Пропускаем свои реакции
                     if (u === state.username) continue;
-
-                    // Если уже видели — пропускаем
                     if (R.seen.has(eventKey)) continue;
                     if (R.events.find(x => x.key === eventKey)) continue;
-
-                    // На первом скане — не генерируем событие
                     if (isFirstScan) continue;
 
                     R.events.push({
@@ -22353,39 +22342,28 @@ async function scanAll(opts = {}) {
                         seen: false,
                         kind: 'reaction',
                         isOnMyMessage: msg.username === state.username,
-                        payload: {
-                            emoji,
-                            users: usersArr,
-                            from: u,
-                            author: msg.username,
-                        },
+                        payload: { emoji, users: usersArr, from: u, author: msg.username },
                         attachPreview: buildAttachPreview(msg),
+                        _enriched: true,
                     });
                     eventsAdded++;
                 }
             }
 
-            // ═══ КОММЕНТАРИИ ═══
+            // ─── Комментарии ───
             for (const c of commentsNow) {
                 if (commentsPrevIds.has(c.id)) continue;
-
                 const eventKey = `${file}|${msg.id}|comment|${c.id}`;
-
-                // Пропускаем свои комментарии
                 if (c.username === state.username) continue;
-
-                // Если уже видели — пропускаем
                 if (R.seen.has(eventKey)) continue;
                 if (R.events.find(x => x.key === eventKey)) continue;
-
-                // На первом скане — не генерируем событие
                 if (isFirstScan) continue;
 
                 R.events.push({
                     key: eventKey,
                     chatFile: file,
                     msgId: msg.id,
-                    ts: now,     // 🆕 время обнаружения, а не комментария
+                    ts: now,
                     seen: false,
                     kind: 'comment',
                     isOnMyMessage: msg.username === state.username,
@@ -22396,11 +22374,11 @@ async function scanAll(opts = {}) {
                         actualTime: c.time,
                     },
                     attachPreview: buildAttachPreview(msg),
+                    _enriched: true,
                 });
                 eventsAdded++;
             }
 
-            // ═══ ОБНОВЛЯЕМ STATE ═══
             R.state[stateKey] = {
                 reactions: reactionsNow,
                 commentIds: commentsNow.map(c => c.id),
@@ -22408,29 +22386,26 @@ async function scanAll(opts = {}) {
             };
         }
 
-        // 🆕 Убираем из state сообщения этого чата, которых больше нет
         const prefix = `${file}|`;
         for (const key of Object.keys(R.state)) {
             if (!key.startsWith(prefix)) continue;
             if (!processedKeys.has(key)) delete R.state[key];
         }
 
-        // 🆕 Помечаем чат инициализированным
         if (isFirstScan) {
             markChatInitialized(file);
-            console.log(`[Radar2] ${file}: инициализирован без событий`);
+            console.log(`[Radar3] ${file}: инициализирован без событий`);
         }
 
-        // Сохраняем
-saveState();
-if (eventsAdded > 0) {
-    saveEvents();
-    console.log(`[Radar2] ${file}: найдено событий: ${eventsAdded}`);
-}
+        saveState();
+        if (eventsAdded > 0) {
+            saveEvents();
+            console.log(`[Radar3] ${file}: найдено событий: ${eventsAdded}`);
+        }
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ХЕЛПЕРЫ ЗАГРУЗКИ
+    //  ХЕЛПЕРЫ
     // ═══════════════════════════════════════════════════════════
     async function fetchMeta(file, path, force = false) {
         const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${path}`;
@@ -22438,7 +22413,6 @@ if (eventsAdded > 0) {
             'Authorization': `token ${state.token}`,
             'Accept': 'application/vnd.github.v3+json',
         };
-        // Используем кэш ETag, но при force или если не залипаем — обновляем
         const cachedEtag = force ? null : (R.etags[file] || null);
         if (cachedEtag) headers['If-None-Match'] = cachedEtag;
 
@@ -22446,20 +22420,14 @@ if (eventsAdded > 0) {
             const res = await fetch(url, { headers, cache: 'no-store' });
             if (res.status === 304) {
                 R.notModifiedStreak[file] = (R.notModifiedStreak[file] || 0) + 1;
-                // Если 5 раз подряд 304 — сбрасываем ETag (защита от залипания)
                 if (R.notModifiedStreak[file] >= 5) {
                     R.etags[file] = null;
                     R.notModifiedStreak[file] = 0;
                 }
                 return { notModified: true };
             }
-            if (res.status === 404) {
-                return { exists: false };
-            }
-            if (!res.ok) {
-                R.notModifiedStreak[file] = 0;
-                return null;
-            }
+            if (res.status === 404) return { exists: false };
+            if (!res.ok) { R.notModifiedStreak[file] = 0; return null; }
             const data = await res.json();
             const content = JSON.parse(base64ToUtf8((data.content || '').replace(/\n/g, '')));
             const newEtag = res.headers.get('ETag') || res.headers.get('etag');
@@ -22548,89 +22516,102 @@ if (eventsAdded > 0) {
         if (msg.video) return { icon: '🎬', text: msg.videoName || 'Видео' };
         if (msg.audio) {
             const hasName = !!(msg.audioName && msg.audioName.trim());
-            return {
-                icon: hasName ? '🎵' : '🎤',
-                text: hasName ? msg.audioName : 'Голосовое',
-            };
+            return { icon: hasName ? '🎵' : '🎤', text: hasName ? msg.audioName : 'Голосовое' };
         }
         if (msg.file) return { icon: '📎', text: msg.fileName || 'Файл' };
         return null;
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ЦИКЛ
+    //  🆕 ГЛАВНОЕ ОТЛИЧИЕ ВАРИАНТА B — ТРИГГЕРЫ СКАНА
     // ═══════════════════════════════════════════════════════════
-    function startLoop() {
-        stopLoop();
-        if (!R.enabled) return;
 
-        // Первый скан через 8 сек (чтобы UI успел загрузиться)
+    // ─── Триггер 1: при старте приложения ───
+    function scheduleStartupScan() {
         setTimeout(() => {
             if (!R.enabled) return;
-            if (!state.isAuthorized) return;
-            scanAll({ force: false });
-        }, 8000);
-
-        // Затем — циклично
-        R.scanTimer = setInterval(() => {
-            if (!R.enabled) return;
-            if (!state.isAuthorized) return;
-            if (document.hidden) return;   // не сканируем в фоне
-            scanAll({ force: false });
-        }, CFG.scanIntervalMs);
+            if (!state.isAuthorized) {
+                // Пользователь ещё не авторизовался — подождём ещё
+                scheduleStartupScan();
+                return;
+            }
+            console.log('[Radar3] 🚀 Скан при старте приложения');
+            scanAll({ force: false, reason: 'startup' });
+        }, CFG.startupScanDelayMs);
     }
 
-    function stopLoop() {
-        if (R.scanTimer) {
-            clearInterval(R.scanTimer);
-            R.scanTimer = null;
+    // ─── Триггер 2: возврат из фона (visibilitychange) ───
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) return;
+        if (!R.enabled) return;
+        if (!state.isAuthorized) return;
+
+        const timeSince = Date.now() - R.lastScanTs;
+        if (R.lastScanTs && timeSince < CFG.minTimeBetweenScansMs) {
+            console.log(`[Radar3] 👁 Возврат из фона — пропущено (прошло ${Math.round(timeSince / 1000)}с)`);
+            return;
         }
-    }
+
+        console.log('[Radar3] 👁 Возврат из фона — скан');
+        scanAll({ force: false, reason: 'visibility' });
+    });
+
+    // ─── Триггер 3: возврат фокуса окна (десктоп) ───
+    window.addEventListener('focus', () => {
+        if (!R.enabled) return;
+        if (!state.isAuthorized) return;
+        if (document.hidden) return;
+
+        const timeSince = Date.now() - R.lastScanTs;
+        if (R.lastScanTs && timeSince < CFG.minTimeBetweenScansMs) return;
+
+        console.log('[Radar3] 🪟 Фокус окна — скан');
+        scanAll({ force: false, reason: 'focus' });
+    });
+
+    // ─── Триггер 4: возврат онлайна ───
+    window.addEventListener('online', () => {
+        if (!R.enabled) return;
+        if (!state.isAuthorized) return;
+
+        const timeSince = Date.now() - R.lastScanTs;
+        if (R.lastScanTs && timeSince < CFG.minTimeBetweenScansMs) return;
+
+        console.log('[Radar3] 🌐 Онлайн — скан');
+        scanAll({ force: false, reason: 'online' });
+    });
+
+    // ─── Первая установка: запоминаем время старта ───
+    // чтобы через minTimeBetweenScansMs можно было сканировать при
+    // возврате из фона сразу же (а не ждать 5 сек с нуля)
+    R.lastScanTs = Date.now() - CFG.minTimeBetweenScansMs;
 
     // ═══════════════════════════════════════════════════════════
-    //  АВТОСКАН ПРИ ВОЗВРАТЕ
-    // ═══════════════════════════════════════════════════════════
-    if (CFG.scanOnVisibility) {
-        document.addEventListener('visibilitychange', () => {
-            if (document.hidden) return;
-            if (!R.enabled) return;
-            if (!state.isAuthorized) return;
-            // Если давно не сканировали — сканим
-            if (Date.now() - R.lastScanTs > CFG.scanIntervalMs) {
-                scanAll({ force: false });
-            }
-        });
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ИНТЕГРАЦИЯ С POLLUPDATES
-    //  Не даём двум потокам конкурировать за ETag.
-    // ═══════════════════════════════════════════════════════════
-    // Патчим fetchMetaFast, чтобы он писал в наш кэш
-    if (typeof window.fetchMetaFast === 'function') {
-        const _orig = window.fetchMetaFast;
-        window.fetchMetaFast = async function(file, etag, token) {
-            const r = await _orig.call(this, file, etag, token);
-            if (r && r.etag) {
-                // Синхронизируем кэш только если это не «наш» чат
-                // (иначе можем сбить состояние радара)
-            }
-            return r;
-        };
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ХУК НА LOGOUT
+    //  ИНТЕГРАЦИЯ С LOGOUT
     // ═══════════════════════════════════════════════════════════
     if (typeof window.logout === 'function') {
         const _origLogout = window.logout;
         window.logout = function() {
-            stopLoop();
             R.etags = {};
-            R.versions = {};
             R.notModifiedStreak = {};
+            saveVersionsAndMeta(true);
             if (R.overlayOpen) closeOverlay();
             return _origLogout.apply(this, arguments);
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХУК НА SHOWCHATSSCREEN
+    // ═══════════════════════════════════════════════════════════
+    if (typeof window.showChatsScreen === 'function') {
+        const _origShowChats = window.showChatsScreen;
+        window.showChatsScreen = function() {
+            const r = _origShowChats.apply(this, arguments);
+            setTimeout(() => {
+                installRadarButtons();
+                updateBadges();
+            }, 500);
+            return r;
         };
     }
 
@@ -22640,25 +22621,10 @@ if (eventsAdded > 0) {
     setTimeout(() => {
         installRadarButtons();
         updateBadges();
-
-        if (state.isAuthorized && R.enabled) {
-            startLoop();
-        }
     }, 3000);
 
-    // Реагируем на логин
-    if (typeof window.showChatsScreen === 'function') {
-        const _origShowChats = window.showChatsScreen;
-        window.showChatsScreen = function() {
-            const r = _origShowChats.apply(this, arguments);
-            setTimeout(() => {
-                installRadarButtons();
-                updateBadges();
-                if (R.enabled && !R.scanTimer) startLoop();
-            }, 500);
-            return r;
-        };
-    }
+    // 🆕 Главный запуск — только триггеры, никаких таймеров
+    scheduleStartupScan();
 
     // ═══════════════════════════════════════════════════════════
     //  ПУБЛИЧНЫЙ API
@@ -22666,12 +22632,13 @@ if (eventsAdded > 0) {
     window.EventRadar = {
         open: openOverlay,
         close: closeOverlay,
-        scan: () => scanAll({ force: true }),
-        scanSoft: () => scanAll({ force: false }),
+        scan: () => scanAll({ force: true, reason: 'manual' }),
+        scanSoft: () => scanAll({ force: false, reason: 'manual' }),
         enable: () => { if (!R.enabled) toggleEnabled(); },
         disable: () => { if (R.enabled) toggleEnabled(); },
         getEvents: () => R.events.slice(),
         getState: () => R,
+
         clearHistory: () => {
             R.events = [];
             R.seen.clear();
@@ -22680,16 +22647,24 @@ if (eventsAdded > 0) {
             renderList();
             updateBadges();
         },
+
         fullReset: () => {
             R.events = [];
             R.seen.clear();
             R.state = {};
             R.etags = {};
             R.versions = {};
+            R.lastFullScan = {};
+            R.metaEvents = {};
             R.initDone = {};
+            R.diag = {
+                totalScans: 0, fullDecrypts: 0, metaOnlyChecks: 0, decryptedMessages: 0,
+                manualScans: 0, startupScans: 0, visibilityScans: 0, focusScans: 0, onlineScans: 0,
+            };
             saveSeen();
             saveState(true);
             saveEvents(true);
+            saveVersionsAndMeta(true);
             try {
                 for (let i = localStorage.length - 1; i >= 0; i--) {
                     const key = localStorage.key(i);
@@ -22700,16 +22675,39 @@ if (eventsAdded > 0) {
             updateBadges();
             showToastSafe('🔄 Полный сброс радара выполнен');
         },
+
         status: () => ({
+            mode: 'variant-B (только вход + возврат из фона)',
             enabled: R.enabled,
             scanning: R.scanning,
             eventsTotal: R.events.length,
             eventsUnseen: R.events.filter(e => !e.seen).length,
             stateEntries: Object.keys(R.state).length,
-            initializedChats: Object.keys(R.initDone).length,    lastScanAgo: R.lastScanTs
-        ? Math.round((Date.now() - R.lastScanTs) / 1000) + 's'
-        : 'never',
-}),
+            versionsCached: Object.keys(R.versions).length,
+            initializedChats: Object.keys(R.initDone).length,
+            lastScanAgo: R.lastScanTs
+                ? Math.round((Date.now() - R.lastScanTs) / 1000) + 's'
+                : 'never',
+            scanReasons: {
+                startup: R.diag.startupScans,
+                visibility: R.diag.visibilityScans,
+                focus: R.diag.focusScans,
+                online: R.diag.onlineScans,
+                manual: R.diag.manualScans,
+            },
+        }),
+
+        economy: () => ({
+            totalScans: R.diag.totalScans,
+            fullDecrypts: R.diag.fullDecrypts,
+            metaOnlyChecks: R.diag.metaOnlyChecks,
+            decryptedMessages: R.diag.decryptedMessages,
+            efficiency: R.diag.totalScans > 0
+                ? `${Math.round(100 * R.diag.metaOnlyChecks /
+                    Math.max(1, R.diag.metaOnlyChecks + R.diag.fullDecrypts))}% сканов обошлись без расшифровки`
+                : 'нет данных',
+        }),
+
         diagnose: async (chatFile) => {
             if (!chatFile) {
                 console.log('Использование: EventRadar.diagnose("chat_xxx")');
@@ -22718,56 +22716,20 @@ if (eventsAdded > 0) {
             const file = chatFile;
             console.log(`🔍 Диагностика чата: ${file}`);
 
-            const metaPath = `chats/${file}.meta.json`;
-            const chatPath = `chats/${file}.json`;
-
             const metaRes = await fetch(
-                `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${metaPath}`,
+                `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/chats/${file}.meta.json`,
                 { headers: { 'Authorization': `token ${state.token}` }, cache: 'no-store' }
             );
-            if (!metaRes.ok) {
-                console.log('❌ meta.json недоступен:', metaRes.status);
-                return;
-            }
+            if (!metaRes.ok) { console.log('❌ meta.json недоступен:', metaRes.status); return; }
             const metaData = await metaRes.json();
             const meta = JSON.parse(base64ToUtf8((metaData.content || '').replace(/\n/g, '')));
             console.log('📌 meta.json:', meta);
-
-            const chatRes = await fetch(
-                `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${chatPath}`,
-                { headers: { 'Authorization': `token ${state.token}` }, cache: 'no-store' }
+            console.log('   Кэш версия:', R.versions[file] || '—');
+            console.log('   Last full scan:',
+                R.lastFullScan[file]
+                    ? Math.round((Date.now() - R.lastFullScan[file]) / 1000) + 's ago'
+                    : 'never'
             );
-            if (!chatRes.ok) {
-                console.log('❌ чат.json недоступен:', chatRes.status);
-                return;
-            }
-            const chatData = await chatRes.json();
-            const content = JSON.parse(base64ToUtf8((chatData.content || '').replace(/\n/g, '')));
-            console.log('💬 чат.json: сообщений =', (content.messages || []).length);
-
-            const password = state.savedPasswords[file];
-            if (!password) {
-                console.log('🔐 Пароль не сохранён');
-                return;
-            }
-            const key = await deriveKeySafe(password, content.salt);
-            const decrypted = [];
-            for (const enc of (content.messages || [])) {
-                const m = await decryptMsgSafe(enc, key);
-                if (m) decrypted.push(m);
-            }
-            console.log('✅ Расшифровано:', decrypted.length);
-            const totalComments = decrypted.reduce((s, m) => s + (m.comments?.length || 0), 0);
-            const totalReactions = decrypted.reduce((s, m) => {
-                return s + (m.reactions ? Object.values(m.reactions).reduce(
-                    (s2, arr) => s2 + (Array.isArray(arr) ? arr.length : 0), 0
-                ) : 0);
-            }, 0);
-            console.log(`💬 Комментариев: ${totalComments}`);
-            console.log(`❤️ Реакций: ${totalReactions}`);
-
-            const radarStateKeys = Object.keys(R.state).filter(k => k.startsWith(`${file}|`));
-            console.log(`🧠 State для чата: ${radarStateKeys.length} записей`);
 
             const radarEvents = R.events.filter(e => e.chatFile === file);
             console.log(`🔔 Событий для чата: ${radarEvents.length}`);
@@ -22779,17 +22741,20 @@ if (eventsAdded > 0) {
         },
     };
 
-    console.log('🔔 Event Radar v2 активен');
-    console.log('   Интервал скана: 45 сек');
-    console.log('   Пауза между чатами: 250 мс');
-    console.log('   Отслеживание в фоне: ВЫКЛ');
+    console.log('🔔 Event Radar v3 — Вариант B активен');
+    console.log('   ⚡ НЕТ фоновых таймеров — скан ТОЛЬКО по событиям:');
+    console.log('      • 🚀 старт приложения (через 15 сек)');
+    console.log('      • 👁 возврат из фона (visibilitychange)');
+    console.log('      • 🪟 возврат фокуса окна (десктоп)');
+    console.log('      • 🌐 возврат онлайна');
+    console.log('      • ⟳ вручную по кнопке');
     console.log('');
     console.log('   API в консоли:');
-    console.log('     EventRadar.open()                       — открыть');
-    console.log('     EventRadar.scan()                       — принудительный скан');
-    console.log('     EventRadar.status()                     — состояние');
-    console.log('     EventRadar.diagnose("chat_xxx")         — диагностика');
-    console.log('     EventRadar.fullReset()                  — полный сброс');
+    console.log('     EventRadar.status()                — состояние');
+    console.log('     EventRadar.economy()               — 🆕 отчёт экономии');
+    console.log('     EventRadar.scan()                  — принудительный скан');
+    console.log('     EventRadar.diagnose("chat_xxx")    — диагностика');
+    console.log('     EventRadar.fullReset()             — полный сброс');
 })();
 </script>
 
