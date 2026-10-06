@@ -19368,35 +19368,90 @@ messagesInner.addEventListener('click', (e) => {
         }
         @keyframes avatarSpin { to { transform: rotate(360deg); } }
 
-        /* Кружок в .sender (рядом с именем автора сообщения) */
+
+        /* Кружок в .sender */
         .sender-avatar {
             width: 20px;
             height: 20px;
             font-size: 11px;
-            margin-right: 6px;
+            margin-right: 0;
             vertical-align: middle;
         }
 
-        /* Родительский .sender — делаем flex, чтобы кружок и имя стояли ровно */
-        .message .sender {
-            display: inline-flex;
-            align-items: center;
-            gap: 0;
-            line-height: 1;
-            margin-bottom: 4px;
-        }
-        .message .sender .sender-name {
-            display: inline-block;
-            line-height: 1.2;
-        }
 
-        /* Своё имя (Вы) — тот же кружок, но свой цвет не нужен, 
-           фон уже с градиентом. Просто работаем как с остальными. */
+        /* ═══ 🆕 ГЛАВНОЕ ИЗМЕНЕНИЕ ═══
+   .sender — grid: [аватарка] [имя]. Весь контент .message 
+   (текст, фото, реакции, время) сдвигаем вправо, чтобы он 
+   начинался ровно ПОД ИМЕНЕМ.
+   Делаем это через flex-колонку: .message = flex-column,
+   .sender — первая строка, остальное — следующие,
+   с общим левым паддингом = ширина аватарки + gap. */
 
-        /* Небольшие правки для мобилы */
-        @media (max-width: 480px) {
-            .sender-avatar { width: 18px; height: 18px; font-size: 10px; margin-right: 5px; }
-        }
+
+/* .message — flex-колонка, чтобы .sender был первым блоком */
+.message {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+}
+
+
+/* .sender — grid из [аватарка] [имя], прижат влево */
+.message .sender {
+    display: inline-grid;
+    grid-template-columns: auto auto;
+    align-items: center;
+    column-gap: 6px;
+    line-height: 1.1;
+    margin-bottom: 4px;
+    width: fit-content;
+}
+.message .sender .sender-avatar {
+    grid-column: 1;
+    margin-right: 0;
+}
+.message .sender .sender-name {
+    grid-column: 2;
+    font-weight: 700;
+    letter-spacing: 0.1px;
+    /* 🆕 Имя и текст должны начинаться в одной точке —
+       значит, аватарка сдвигает имя. А чтобы текст под именем
+       начинался с той же точки, задаём всем остальным
+       элементам left-margin ровно на ширину аватарки + gap. */
+}
+
+
+/* Все прямые дети .message, КРОМЕ .sender — отступ слева,
+   равный ширине аватарки (20) + column-gap (6) = 26px.
+   Так первая буква текста окажется ровно под первой буквой имени. */
+.message > *:not(.sender) {
+    margin-left: 26px;
+}
+
+
+/* Системные сообщения не трогаем */
+.message.system {
+    display: block;   /* чтобы flex-column не ломал центрирование */
+}
+.message.system > *:not(.sender) {
+    margin-left: 0;
+}
+
+
+/* Небольшие правки для мобилы */
+@media (max-width: 480px) {
+    .sender-avatar {
+        width: 18px;
+        height: 18px;
+        font-size: 10px;
+        margin-right: 0;
+    }
+    /* 18 + 6 = 24 */
+    .message > *:not(.sender) {
+        margin-left: 24px;
+    }
+}
+
 
         /* Отключаем в режиме мультивыбора */
         body.selection-mode .sender-avatar {
