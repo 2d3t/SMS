@@ -22908,13 +22908,18 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
         }
 
         if (ev && !ev.seen) {
-            ev.seen = true;
-            R.seen.add(ev.key);
-            saveSeen();
-            saveEvents();
+    // 🆕 Используем новый markSeen — он сохраняет в localStorage
+    if (window.EventRadar && typeof window.EventRadar.markSeen === 'function') {
+        window.EventRadar.markSeen(ev);
+    } else {
+        ev.seen = true;
+        R.seen.add(ev.key);
+        saveSeen();
+        saveEvents(true);
+    }
 
-            el.classList.add('seen');
-            updateBadges();
+    el.classList.add('seen');
+    updateBadges();
 
             const sub = document.getElementById('r2Sub');
             if (sub) {
@@ -23385,6 +23390,43 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
         getEvents: () => R.events.slice(),
         getState: () => R,
 
+// 🆕 Пометить событие прочитанным (с сохранением в localStorage)
+markSeen: (eventOrKey) => {
+    const ev = typeof eventOrKey === 'string'
+        ? R.events.find(e => e.key === eventOrKey)
+        : eventOrKey;
+    if (!ev || ev.seen) return false;
+
+    ev.seen = true;
+    R.seen.add(ev.key);
+
+    saveSeen();
+    saveEvents(true);   // сразу в localStorage
+
+    updateBadges();
+    if (R.overlayOpen) renderList();
+
+    console.log('[Radar3] Помечено прочитанным:', ev.key);
+    return true;
+},
+
+// 🆕 Снять метку «прочитано» (на всякий случай)
+markUnseen: (eventOrKey) => {
+    const ev = typeof eventOrKey === 'string'
+        ? R.events.find(e => e.key === eventOrKey)
+        : eventOrKey;
+    if (!ev || !ev.seen) return false;
+
+    ev.seen = false;
+    R.seen.delete(ev.key);
+
+    saveSeen();
+    saveEvents(true);
+    updateBadges();
+    if (R.overlayOpen) renderList();
+    return true;
+},
+
         clearHistory: () => {
             R.events = [];
             R.seen.clear();
@@ -23704,35 +23746,33 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
             });
     }
 
-    function markEventSeen(event) {
-        if (!event || event.seen) return;
+   function markEventSeen(event) {
+    if (!event || event.seen) return;
+
+    // 🆕 Делегируем EventRadar — там есть доступ к saveEvents() и R.seen
+    if (window.EventRadar && typeof window.EventRadar.markSeen === 'function') {
+        window.EventRadar.markSeen(event);
+    } else {
+        // Fallback: старая логика (в localStorage не сохранится)
         event.seen = true;
-
-        // Обновляем счётчики в EventRadar (через его публичное API — там нет метода,
-        // но мы работаем с теми же объектами, потому что getEvents() возвращает slice(),
-        // поэтому придётся работать через внутренний доступ)
-        // Проще: event — это ссылка на объект из массива R.events, значит мутируем напрямую.
-        // Но getEvents() возвращает .slice() — копию массива, ссылки на те же объекты.
-        // Значит event.seen = true изменит объект в R.events. Отлично.
-
-        // Синхронизируем Set seen внутри EventRadar через clearHistory-совместимый путь:
-        // — если есть публичный метод, используем; иначе просто пересчёт бейджа.
-        try {
-            // Скрываем бейдж вручную
-            const total = getUnseenEvents().length;
-            ['radar2Badge', 'radar2BadgeChat'].forEach(id => {
-                const el = document.getElementById(id);
-                if (!el) return;
-                if (total > 0) {
-                    el.textContent = total > 99 ? '99+' : String(total);
-                    el.classList.add('show');
-                } else {
-                    el.textContent = '';
-                    el.classList.remove('show');
-                }
-            });
-        } catch (e) { /* ignore */ }
     }
+
+    // Обновляем бейджи
+    try {
+        const total = getUnseenEvents().length;
+        ['radar2Badge', 'radar2BadgeChat'].forEach(id => {
+            const el = document.getElementById(id);
+            if (!el) return;
+            if (total > 0) {
+                el.textContent = total > 99 ? '99+' : String(total);
+                el.classList.add('show');
+            } else {
+                el.textContent = '';
+                el.classList.remove('show');
+            }
+        });
+    } catch (e) { /* ignore */ }
+}
 
     // ─── Построение плашки ───
     function buildBar() {
