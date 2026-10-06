@@ -24803,5 +24803,167 @@ markUnseen: (eventOrKey) => {
     console.log('   Проверить вручную: offlineCacheSyncNow("manual")');
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🩹 ПАТЧ: УБИРАЕМ СИСТЕМНОЕ МЕНЮ БРАУЗЕРА НА БЕЙДЖЕ ПЛЕЕРА
+//  Проблема: долгий тап на бейдже ⏸/♫ в списке чатов вызывает
+//  хромовское "Толкование слова" / "Искать в Google".
+//  Решение: превращаем span в button + глушим все события.
+// ═══════════════════════════════════════════════════════════════
+
+(function patchPlayingBadgeNoContextMenu() {
+    'use strict';
+
+    // ─── 1. Дополнительные CSS-правила ───
+    if (!document.getElementById('playingBadgeNoContextStyles')) {
+        const style = document.createElement('style');
+        style.id = 'playingBadgeNoContextStyles';
+        style.textContent = `
+            .chat-playing-badge {
+                -webkit-touch-callout: none !important;
+                -webkit-user-select: none !important;
+                -moz-user-select: none !important;
+                -ms-user-select: none !important;
+                user-select: none !important;
+                -webkit-tap-highlight-color: transparent !important;
+                -webkit-appearance: none !important;
+                appearance: none !important;
+                outline: none !important;
+                padding: 0 !important;
+                font-family: inherit !important;
+                cursor: pointer;
+                border: 1px solid rgba(254,202,87,0.5);
+                border-radius: 50%;
+                background: linear-gradient(135deg, rgba(254,202,87,0.25), rgba(255,159,67,0.2));
+                color: #feca57;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                width: 22px;
+                height: 22px;
+                font-size: 11px;
+                flex-shrink: 0;
+                margin-left: 6px;
+                line-height: 1;
+            }
+            .chat-playing-badge.paused {
+                background: linear-gradient(135deg, rgba(136,136,136,0.25), rgba(100,100,100,0.2));
+                border-color: rgba(136,136,136,0.5);
+                color: #888;
+            }
+
+            /* Скрытый временный элемент для перехвата событий */
+            .chat-playing-badge * {
+                pointer-events: none !important;
+                user-select: none !important;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ─── 2. Патч renderChatsList: span → button ───
+    if (typeof renderChatsList === 'function') {
+        const _origRenderChatsList = renderChatsList;
+
+        renderChatsList = function() {
+            const result = _origRenderChatsList.apply(this, arguments);
+
+            // После отрисовки — заменяем span на button и вешаем защиту
+            const container = document.getElementById('chatsList');
+            if (!container) return result;
+
+            container.querySelectorAll('.chat-playing-badge').forEach(el => {
+                // Если это ещё span — превращаем в button
+                if (el.tagName === 'SPAN') {
+                    const btn = document.createElement('button');
+                    btn.type = 'button';
+                    btn.className = el.className;
+                    btn.dataset.playChat = el.dataset.playChat || '';
+                    btn.title = el.title || '';
+                    btn.textContent = el.textContent;
+                    btn.style.cssText = el.style.cssText;
+                    el.replaceWith(btn);
+                    el = btn;
+                }
+
+                // Защита от системного меню
+                if (!el._noMenuAttached) {
+                    el._noMenuAttached = true;
+
+                    // Глушим все события, вызывающие системное меню
+                    ['contextmenu', 'selectstart', 'dragstart'].forEach(evt => {
+                        el.addEventListener(evt, (e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            return false;
+                        }, true);
+                    });
+
+                    // Долгий тап на Android → тоже гасим
+                    let _lpTimer = null;
+                    el.addEventListener('touchstart', (e) => {
+                        _lpTimer = setTimeout(() => {
+                            _lpTimer = null;
+                            e.preventDefault();
+                        }, 400);
+                    }, { passive: false });
+                    el.addEventListener('touchend', () => {
+                        if (_lpTimer) { clearTimeout(_lpTimer); _lpTimer = null; }
+                    });
+                    el.addEventListener('touchmove', () => {
+                        if (_lpTimer) { clearTimeout(_lpTimer); _lpTimer = null; }
+                    });
+                    el.addEventListener('touchcancel', () => {
+                        if (_lpTimer) { clearTimeout(_lpTimer); _lpTimer = null; }
+                    });
+                }
+
+                // Перепривязываем клик — чтобы наверняка работал toggle
+                if (!el._toggleBound) {
+                    el._toggleBound = true;
+                    el.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        e.preventDefault();
+                        if (typeof GlobalPlayer !== 'undefined') {
+                            GlobalPlayer.toggle();
+                            setTimeout(() => {
+                                if (typeof renderChatsList === 'function') renderChatsList();
+                            }, 100);
+                        }
+                    });
+                }
+            });
+
+            return result;
+        };
+
+        console.log('🩹 patch: renderChatsList — бейдж плеера защищён от системного меню');
+    }
+
+    // ─── 3. Глобальная защита: гасим contextmenu на всём #chatsList ───
+    //     для элементов .chat-playing-badge
+    document.addEventListener('contextmenu', (e) => {
+        if (e.target.closest && e.target.closest('.chat-playing-badge')) {
+            e.preventDefault();
+            e.stopPropagation();
+        }
+    }, true);
+
+    // ─── 4. Ищем долгий тап через selectionchange ───
+    //     Если браузер всё-таки начал выделение — снимаем
+    document.addEventListener('selectionchange', () => {
+        const sel = window.getSelection();
+        if (!sel || sel.rangeCount === 0) return;
+        const node = sel.anchorNode;
+        if (!node) return;
+        const parent = node.nodeType === 1 ? node : node.parentElement;
+        if (parent && parent.closest && parent.closest('.chat-playing-badge')) {
+            sel.removeAllRanges();
+        }
+    });
+
+    console.log('✅ Патч применён: бейдж плеера больше не вызывает системное меню');
+})();
+</script>
 </body>
 </html>
