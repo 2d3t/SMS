@@ -12032,7 +12032,729 @@ async function restoreSession() {
     console.log('➕ Меню действий на экране чатов активно');
 })();
 
+// ═══════════════════════════════════════════════════════════════
+//  📴 ОФЛАЙН-РЕЖИМ v1
+//  Кэширует расшифрованные сообщения чатов в IndexedDB.
+//  Позволяет читать тексты, реакции, комментарии и метаданные
+//  вложений без интернета. Отправка блокируется.
+// ═══════════════════════════════════════════════════════════════
 
+const OfflineCache = (() => {
+    const DB_NAME = 'smschat_offline';
+    const DB_VERSION = 1;
+    const STORE_CHATS = 'chats';
+    const STORE_META = 'meta';   // для служебных данных (последний синк, размер)
+
+    let _dbPromise = null;
+    let _saveTimer = null;
+    let _savePending = new Map();  // file -> { messages, salt, lastMessageId }
+
+    // ─── Открытие БД ───
+    function openDB() {
+        if (_dbPromise) return _dbPromise;
+        _dbPromise = new Promise((resolve, reject) => {
+            if (!('indexedDB' in window)) {
+                reject(new Error('IndexedDB не поддерживается'));
+                return;
+            }
+            const req = indexedDB.open(DB_NAME, DB_VERSION);
+
+            req.onupgradeneeded = (e) => {
+                const db = e.target.result;
+                if (!db.objectStoreNames.contains(STORE_CHATS)) {
+                    const store = db.createObjectStore(STORE_CHATS, { keyPath: 'file' });
+                    store.createIndex('savedAt', 'savedAt', { unique: false });
+                }
+                if (!db.objectStoreNames.contains(STORE_META)) {
+                    db.createObjectStore(STORE_META, { keyPath: 'key' });
+                }
+            };
+
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error);
+            req.onblocked = () => reject(new Error('IndexedDB заблокирован'));
+        });
+        return _dbPromise;
+    }
+
+    // ─── Обёртки транзакций ───
+    async function tx(storeName, mode, fn) {
+        const db = await openDB();
+        return new Promise((resolve, reject) => {
+            const t = db.transaction(storeName, mode);
+            const store = t.objectStore(storeName);
+            let result;
+            try {
+                result = fn(store);
+            } catch (e) {
+                reject(e);
+                return;
+            }
+            t.oncomplete = () => resolve(result);
+            t.onerror = () => reject(t.error);
+            t.onabort = () => reject(t.error || new Error('Транзакция отменена'));
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API
+    // ═══════════════════════════════════════════════════════════
+
+    /**
+     * Сохранить чат (отложенно, дебаунс).
+     * @param {string} file — ID чата
+     * @param {Array} messages — расшифрованные сообщения
+     * @param {string} salt — base64 соли чата
+     */
+    function scheduleSave(file, messages, salt) {
+        if (!file || !Array.isArray(messages)) return;
+
+        _savePending.set(file, {
+            file,
+            messages,
+            salt: salt || null,
+            lastMessageId: messages.length > 0
+                ? messages[messages.length - 1].id
+                : null,
+            savedAt: Date.now(),
+        });
+
+        if (_saveTimer) clearTimeout(_saveTimer);
+        _saveTimer = setTimeout(flushSave, 2000);
+    }
+
+    async function flushSave() {
+        _saveTimer = null;
+        const pending = Array.from(_savePending.values());
+        _savePending.clear();
+
+        if (pending.length === 0) return;
+
+        try {
+            const db = await openDB();
+            const t = db.transaction(STORE_CHATS, 'readwrite');
+            const store = t.objectStore(STORE_CHATS);
+            for (const rec of pending) {
+                store.put(rec);
+            }
+            await new Promise((res, rej) => {
+                t.oncomplete = res;
+                t.onerror = () => rej(t.error);
+            });
+            console.log(`[OfflineCache] 💾 Сохранено чатов: ${pending.length}`);
+        } catch (e) {
+            console.warn('[OfflineCache] save failed:', e);
+        }
+    }
+
+    /**
+     * Мгновенное сохранение (без дебаунса) — например, при уходе со страницы.
+     */
+    async function saveNow(file, messages, salt) {
+        if (!file || !Array.isArray(messages)) return;
+        const rec = {
+            file,
+            messages,
+            salt: salt || null,
+            lastMessageId: messages.length > 0 ? messages[messages.length - 1].id : null,
+            savedAt: Date.now(),
+        };
+        try {
+            const db = await openDB();
+            const t = db.transaction(STORE_CHATS, 'readwrite');
+            t.objectStore(STORE_CHATS).put(rec);
+            await new Promise((res, rej) => {
+                t.oncomplete = res;
+                t.onerror = () => rej(t.error);
+            });
+        } catch (e) {
+            console.warn('[OfflineCache] saveNow failed:', e);
+        }
+    }
+
+    /**
+     * Прочитать чат из кэша.
+     * @returns {Promise<{messages, salt, savedAt}|null>}
+     */
+    async function getChat(file) {
+        try {
+            const db = await openDB();
+            return new Promise((resolve, reject) => {
+                const t = db.transaction(STORE_CHATS, 'readonly');
+                const req = t.objectStore(STORE_CHATS).get(file);
+                req.onsuccess = () => resolve(req.result || null);
+                req.onerror = () => reject(req.error);
+            });
+        } catch (e) {
+            console.warn('[OfflineCache] getChat failed:', e);
+            return null;
+        }
+    }
+
+    /**
+     * Удалить чат из кэша.
+     */
+    async function removeChat(file) {
+        try {
+            await tx(STORE_CHATS, 'readwrite', (store) => store.delete(file));
+        } catch (e) {}
+    }
+
+    /**
+     * Полная очистка кэша.
+     */
+    async function clearAll() {
+        try {
+            await tx(STORE_CHATS, 'readwrite', (store) => store.clear());
+            await tx(STORE_META, 'readwrite', (store) => store.clear());
+        } catch (e) {}
+    }
+
+    /**
+     * Оценка занятого места.
+     */
+    async function estimateUsage() {
+        try {
+            if (!navigator.storage || !navigator.storage.estimate) return null;
+            const est = await navigator.storage.estimate();
+            return {
+                usage: est.usage || 0,
+                quota: est.quota || 0,
+                percent: est.quota ? (est.usage / est.quota) * 100 : 0,
+            };
+        } catch (e) {
+            return null;
+        }
+    }
+
+    /**
+     * Список всех закэшированных чатов (только метаданные).
+     */
+    async function listCached() {
+        try {
+            const db = await openDB();
+            return new Promise((resolve, reject) => {
+                const t = db.transaction(STORE_CHATS, 'readonly');
+                const req = t.objectStore(STORE_CHATS).getAll();
+                req.onsuccess = () => {
+                    resolve((req.result || []).map(r => ({
+                        file: r.file,
+                        savedAt: r.savedAt,
+                        messageCount: (r.messages || []).length,
+                        size: JSON.stringify(r).length,
+                    })));
+                };
+                req.onerror = () => reject(req.error);
+            });
+        } catch (e) {
+            return [];
+        }
+    }
+
+    // ─── LRU: удаляем самые старые, если места мало ───
+    async function pruneIfNeeded(maxBytes = 150 * 1024 * 1024) {
+        try {
+            const all = await listCached();
+            let total = all.reduce((s, c) => s + (c.size || 0), 0);
+            if (total <= maxBytes) return 0;
+
+            // Сортируем по savedAt (старые первыми) и удаляем пока не уложимся
+            all.sort((a, b) => (a.savedAt || 0) - (b.savedAt || 0));
+            let deleted = 0;
+            for (const c of all) {
+                if (total <= maxBytes * 0.8) break;
+                await removeChat(c.file);
+                total -= c.size || 0;
+                deleted++;
+            }
+            console.log(`[OfflineCache] 🗑️ Удалено по LRU: ${deleted}`);
+            return deleted;
+        } catch (e) {
+            return 0;
+        }
+    }
+
+    // ─── Сохранение при уходе со страницы ───
+    window.addEventListener('beforeunload', () => {
+        if (_savePending.size > 0) {
+            // Синхронный флаш не сделать, но попытаемся
+            flushSave();
+        }
+    });
+
+    // ─── Сохранение при сворачивании приложения ───
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden' && _savePending.size > 0) {
+            flushSave();
+        }
+    });
+
+    return {
+        scheduleSave,
+        saveNow,
+        flushSave,
+        getChat,
+        removeChat,
+        clearAll,
+        estimateUsage,
+        listCached,
+        pruneIfNeeded,
+    };
+})();
+
+// ═══════════════════════════════════════════════════════════════
+//  📴 ОФЛАЙН-РЕЖИМ: состояние и UI
+// ═══════════════════════════════════════════════════════════════
+
+const OfflineMode = (() => {
+    let _bannerEl = null;
+    let _forced = false;         // ручной режим (через API)
+    let _lastOnlineState = navigator.onLine;
+
+    function isOffline() {
+        return _forced || !navigator.onLine || !networkState.isOnline;
+    }
+
+    // ─── Плашка сверху ───
+    function ensureBanner() {
+        if (_bannerEl) return _bannerEl;
+
+        const el = document.createElement('div');
+        el.id = 'offlineBanner';
+        el.innerHTML = `
+            <span class="ob-icon">📵</span>
+            <span class="ob-text">Офлайн-режим — только чтение</span>
+            <button class="ob-retry" id="offlineRetryBtn" title="Проверить соединение">⟳</button>
+        `;
+        el.style.cssText = `
+            position: fixed;
+            top: 0; left: 0; right: 0;
+            background: linear-gradient(135deg, rgba(255,159,67,0.95), rgba(254,202,87,0.9));
+            color: #1a1a2e;
+            font-size: 12px;
+            font-weight: 700;
+            padding: 8px 14px;
+            padding-top: calc(8px + env(safe-area-inset-top, 0px));
+            display: none;
+            align-items: center;
+            gap: 8px;
+            z-index: 7000;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+            transform: translateY(-100%);
+            transition: transform 0.3s cubic-bezier(0.22, 0.61, 0.36, 1);
+        `;
+        el.querySelector('.ob-icon').style.cssText = 'font-size: 16px;';
+        el.querySelector('.ob-text').style.cssText = 'flex: 1; min-width: 0;';
+        el.querySelector('.ob-retry').style.cssText = `
+            width: 28px; height: 28px;
+            border-radius: 50%;
+            border: none;
+            background: rgba(0,0,0,0.15);
+            color: #1a1a2e;
+            font-size: 14px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            font-weight: 700;
+            -webkit-tap-highlight-color: transparent;
+        `;
+
+        document.body.appendChild(el);
+        _bannerEl = el;
+
+        el.querySelector('#offlineRetryBtn').addEventListener('click', async (e) => {
+            e.stopPropagation();
+            const btn = e.currentTarget;
+            btn.style.animation = 'obSpin 0.8s linear infinite';
+            try {
+                const ok = await checkNetwork();
+                if (ok) {
+                    hideBanner();
+                    showToast('🌐 Соединение восстановлено', 2000);
+                    // Перезапускаем поллинг
+                    if (state.chatFile) {
+                        try { await pollUpdates(); } catch (e) {}
+                    }
+                } else {
+                    showToast('📵 Соединения всё ещё нет', 2000);
+                }
+            } finally {
+                btn.style.animation = '';
+            }
+        });
+
+        // Стиль для спиннера
+        if (!document.getElementById('offlineBannerStyles')) {
+            const style = document.createElement('style');
+            style.id = 'offlineBannerStyles';
+            style.textContent = `
+                @keyframes obSpin { to { transform: rotate(360deg); } }
+                body.offline-mode .input-bar { opacity: 0.6; }
+                body.offline-mode .input-bar textarea { cursor: not-allowed; }
+                body.offline-mode .send-btn { opacity: 0.4; cursor: not-allowed; }
+                body.offline-mode .mic-btn { opacity: 0.4; cursor: not-allowed; }
+            `;
+            document.head.appendChild(style);
+        }
+
+        return el;
+    }
+
+    function showBanner(text) {
+        const el = ensureBanner();
+        if (text) el.querySelector('.ob-text').textContent = text;
+        el.style.display = 'flex';
+        requestAnimationFrame(() => {
+            el.style.transform = 'translateY(0)';
+        });
+        document.body.classList.add('offline-mode');
+
+        // Сдвигаем шапки вниз
+        const height = el.offsetHeight || 36;
+        document.querySelectorAll('.auth-header, .chat-header').forEach(h => {
+            h.style.paddingTop = `calc(${height}px + env(safe-area-inset-top, 0px) + 14px)`;
+        });
+    }
+
+    function hideBanner() {
+        if (!_bannerEl) return;
+        _bannerEl.style.transform = 'translateY(-100%)';
+        setTimeout(() => {
+            if (_bannerEl) _bannerEl.style.display = 'none';
+        }, 350);
+        document.body.classList.remove('offline-mode');
+
+        // Возвращаем отступы
+        document.querySelectorAll('.auth-header, .chat-header').forEach(h => {
+            h.style.paddingTop = '';
+        });
+    }
+
+    // ─── Включение / выключение офлайн-режима ───
+    function activate(reason = 'auto') {
+        if (document.body.classList.contains('offline-mode')) return;
+        showBanner();
+        console.log(`[OfflineMode] Активирован (${reason})`);
+    }
+
+    function deactivate() {
+        hideBanner();
+        console.log('[OfflineMode] Деактивирован');
+    }
+
+    // ─── Автоотслеживание ───
+    window.addEventListener('offline', () => {
+        activate('browser-offline');
+    });
+
+    window.addEventListener('online', async () => {
+        // Не деактивируем сразу — ждём checkNetwork()
+        const ok = await checkNetwork();
+        if (ok) deactivate();
+    });
+
+    // Периодическая проверка (каждые 5 сек), когда в офлайне
+    setInterval(async () => {
+        if (!document.body.classList.contains('offline-mode')) return;
+        const ok = await checkNetwork();
+        if (ok) {
+            deactivate();
+            showToast('🌐 Соединение восстановлено', 2000);
+        }
+    }, 5000);
+
+    return {
+        isOffline,
+        activate,
+        deactivate,
+        forceOffline: () => { _forced = true; activate('forced'); },
+        forceOnline: () => { _forced = false; deactivate(); },
+        getBanner: () => _bannerEl,
+    };
+})();
+
+// ═══════════════════════════════════════════════════════════════
+//  🔌 ИНТЕГРАЦИЯ ОФЛАЙН-КЭША С СУЩЕСТВУЮЩИМ КОДОМ
+// ═══════════════════════════════════════════════════════════════
+
+// ─── 1. Хук на enterChat: сохраняем историю после загрузки ───
+const _origEnterChatForOffline = enterChat;
+enterChat = async function(file, name, password) {
+    const result = await _origEnterChatForOffline.apply(this, arguments);
+
+    // Если успешно вошли и есть сообщения — сохраняем в кэш
+    if (state.chatFile === file && historyState.allMessages.length > 0) {
+        OfflineCache.scheduleSave(file, historyState.allMessages, state.salt);
+        // LRU-обрезка (в фоне, не блокирует UI)
+        setTimeout(() => OfflineCache.pruneIfNeeded(), 5000);
+    }
+    return result;
+};
+
+// ─── 2. Хук на renderHistory: сохраняем каждый раз, когда рендерим ───
+const _origRenderHistoryForOffline = renderHistory;
+renderHistory = function() {
+    const result = _origRenderHistoryForOffline.apply(this, arguments);
+    if (state.chatFile && historyState.allMessages.length > 0) {
+        OfflineCache.scheduleSave(
+            state.chatFile,
+            historyState.allMessages,
+            state.salt
+        );
+    }
+    return result;
+};
+
+// ─── 3. Хук на appendMessages: сохраняем после добавления новых ───
+const _origAppendMessagesForOffline = appendMessages;
+appendMessages = function(newMsgs) {
+    const result = _origAppendMessagesForOffline.apply(this, arguments);
+    if (state.chatFile && historyState.allMessages.length > 0) {
+        OfflineCache.scheduleSave(
+            state.chatFile,
+            historyState.allMessages,
+            state.salt
+        );
+    }
+    return result;
+};
+
+// ─── 4. Хук на restoreSession: офлайн-ветка ───
+const _origRestoreSessionForOffline = restoreSession;
+restoreSession = async function() {
+    const savedUsername = localStorage.getItem('chathub_username');
+    const remember = localStorage.getItem('chathub_remember') === '1';
+    const savedToken = remember ? localStorage.getItem('chathub_token') : null;
+
+    if (savedUsername) usernameInput.value = savedUsername;
+
+    // 🆕 Если офлайн и есть сохранённые данные — включаем офлайн-режим
+    if (!navigator.onLine || !savedToken) {
+        if (savedUsername && savedToken) {
+            // Восстанавливаем сессию без проверки сети
+            state.username = savedUsername;
+            state.token = savedToken.trim();
+            state.isAuthorized = true;
+            loadChatsList();
+            loadSavedPasswords();
+            OfflineMode.activate('restore-no-network');
+            showChatsScreen();
+            console.log('[OfflineMode] Сессия восстановлена в офлайн-режиме');
+            return;
+        }
+        // Нет токена — обычный путь (покажет экран авторизации)
+        return _origRestoreSessionForOffline.apply(this, arguments);
+    }
+
+    // Онлайн — обычный путь
+    return _origRestoreSessionForOffline.apply(this, arguments);
+};
+
+// ─── 5. Хук на enterChat: fallback на кэш при ошибке сети ───
+// Обёртка вокруг fetchFile внутри enterChat.
+// Проще всего — перехватить через глобальный флаг: если fetchFile упал
+// по сети, enterChat выбросит ошибку, и мы её перехватим.
+const _origEnterChatForCacheFallback = enterChat;
+enterChat = async function(file, name, password) {
+    try {
+        return await _origEnterChatForCacheFallback.apply(this, arguments);
+    } catch (e) {
+        const isNetworkError =
+            !navigator.onLine ||
+            e.message.includes('Failed to fetch') ||
+            e.message.includes('NetworkError') ||
+            e.name === 'TypeError' ||
+            e.name === 'AbortError';
+
+        if (!isNetworkError) throw e;
+
+        // 🆕 Пробуем загрузить из кэша
+        console.log('[OfflineCache] Пробуем загрузить чат из кэша:', file);
+        const cached = await OfflineCache.getChat(file);
+
+        if (!cached || !cached.messages || cached.messages.length === 0) {
+            showToast('📵 Нет сети и нет кэша этого чата', 3000);
+            throw new Error('Нет сети и нет кэша');
+        }
+
+        // Восстанавливаем офлайн-сессию
+        OfflineMode.activate('chat-load-failed');
+
+        // Эмулируем успешный вход
+        state.chatFile = file;
+        state.chatName = name;
+        state.chatPassword = password;
+        state.salt = cached.salt || null;
+        state.messages = cached.messages.slice();
+        state.lastMessageCount = cached.messages.length;
+        state._lastCommitSha = null;
+        state._lastMetaVersion = null;
+        state._metaEtag = null;
+        state._chatEntered = false;
+
+        historyState.allMessages = cached.messages.slice();
+        historyState.startIndex = 0;
+        historyState.renderedCount = cached.messages.length;
+
+        // UI
+        chatTitle.textContent = name;
+        userAvatar.textContent = getInitials(state.username);
+        messagesInner.dataset.lastDate = '';
+        showChatScreen();
+        showInputBar();
+
+        // Рендерим историю БЕЗ инициализации audioPlayers (blob'ов нет)
+        renderHistory();
+
+        // Блокируем ввод
+        messageInput.disabled = true;
+        messageInput.placeholder = '📵 Офлайн — только чтение';
+        sendBtn.disabled = true;
+        micBtn.disabled = true;
+
+        showToast(`📴 «${name}» открыт из кэша`, 2500);
+
+        return;
+    }
+};
+
+// ─── 6. Хук на sendMessage: блокировка отправки в офлайне ───
+const _origSendMessageForOffline = _origSendMessage;
+// ⚠️ sendMessage — это уже обёртка, поэтому оборачиваем финальный window.sendMessage
+const _finalSendMessage = window.sendMessage || sendMessage;
+window.sendMessage = async function(...args) {
+    if (OfflineMode.isOffline()) {
+        showToast('📵 Офлайн-режим — отправка недоступна', 2000);
+        soundManager.play('error');
+        return;
+    }
+    return _finalSendMessage.apply(this, args);
+};
+
+// ─── 7. Разблокировка при возврате в онлайн ───
+window.addEventListener('online', () => {
+    if (state.chatFile) {
+        messageInput.disabled = false;
+        messageInput.placeholder = 'Сообщение...';
+        sendBtn.disabled = !state.isAuthorized;
+        micBtn.disabled = !state.isAuthorized;
+
+        // Автосинк: подтягиваем новые сообщения
+        setTimeout(async () => {
+            try {
+                await pollUpdates();
+                // Обновляем кэш
+                if (state.chatFile && historyState.allMessages.length > 0) {
+                    OfflineCache.scheduleSave(
+                        state.chatFile,
+                        historyState.allMessages,
+                        state.salt
+                    );
+                }
+            } catch (e) {}
+        }, 500);
+    }
+});
+
+// ─── 8. При офлайне — блокируем ввод, если открыт чат ───
+window.addEventListener('offline', () => {
+    if (state.chatFile) {
+        messageInput.disabled = true;
+        messageInput.placeholder = '📵 Офлайн — только чтение';
+        sendBtn.disabled = true;
+        micBtn.disabled = true;
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════
+//  📊 API ДЛЯ ОТЛАДКИ
+// ═══════════════════════════════════════════════════════════════
+
+window.OfflineAPI = {
+    // Статус
+    status: async () => {
+        const usage = await OfflineCache.estimateUsage();
+        const cached = await OfflineCache.listCached();
+        return {
+            isOffline: OfflineMode.isOffline(),
+            navigatorOnline: navigator.onLine,
+            networkStateOnline: networkState.isOnline,
+            cachedChats: cached.length,
+            cachedDetails: cached,
+            storage: usage,
+        };
+    },
+
+    // Список закэшированных чатов
+    list: () => OfflineCache.listCached(),
+
+    // Принудительно сохранить текущий чат
+    saveCurrent: async () => {
+        if (!state.chatFile) {
+            console.log('Не в чате');
+            return;
+        }
+        await OfflineCache.saveNow(
+            state.chatFile,
+            historyState.allMessages,
+            state.salt
+        );
+        console.log('✅ Сохранено');
+    },
+
+    // Очистить весь кэш
+    clear: async () => {
+        await OfflineCache.clearAll();
+        console.log('🗑️ Кэш очищен');
+    },
+
+    // Форсировать офлайн-режим (для тестов!)
+    forceOffline: () => OfflineMode.forceOffline(),
+    forceOnline: () => OfflineMode.forceOnline(),
+
+    // Предзагрузить все чаты в кэш (полезно сделать один раз онлайн)
+    prefetchAll: async () => {
+        if (OfflineMode.isOffline()) {
+            console.log('Нужен онлайн для предзагрузки');
+            return;
+        }
+        console.log(`📥 Предзагрузка ${state.chats.length} чатов...`);
+        let ok = 0, failed = 0;
+        for (const chat of state.chats) {
+            const password = state.savedPasswords[chat.file];
+            if (!password) {
+                console.log(`  ⏭ ${chat.file} — нет пароля`);
+                failed++;
+                continue;
+            }
+            try {
+                const path = getChatPath(chat.file);
+                const result = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
+                if (!result.exists) { failed++; continue; }
+                const content = result.content;
+                if (!content || content.v !== CRYPTO.VERSION) { failed++; continue; }
+
+                const decrypted = await loadAndDecrypt(content.salt, content.messages || []);
+                await OfflineCache.saveNow(chat.file, decrypted, content.salt);
+                ok++;
+                console.log(`  ✅ ${chat.file} — ${decrypted.length} сообщ.`);
+            } catch (e) {
+                failed++;
+                console.log(`  ❌ ${chat.file} — ${e.message}`);
+            }
+            // Небольшая пауза, чтобы не упираться в rate limit
+            await new Promise(r => setTimeout(r, 300));
+        }
+        console.log(`📥 Готово: ${ok} успешно, ${failed} с ошибками`);
+    },
+};
+
+console.log('📴 Офлайн-режим активирован');
+console.log('   API: OfflineAPI.status() / .list() / .prefetchAll() / .clear()');
+console.log('   Тест: OfflineAPI.forceOffline() — симулировать офлайн');
+console.log('   Онлайн: OfflineAPI.forceOnline()');
 // ===================================================================
 //  ЗАПУСК
 // ===================================================================
@@ -23301,6 +24023,386 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
     console.log('   • Счётчик на колокольчике уменьшается по мере просмотра');
     console.log('   • Кнопки ‹ › ✕ в плашке внизу экрана');
     console.log('   • API: EventAutoPlay.start() / .next() / .stop()');
+})();
+
+// ═══════════════════════════════════════════════════════════════
+//  🎲 SHUFFLE-РЕЖИМ ДЛЯ ГЛОБАЛЬНОГО ПЛЕЕРА (v2 — надёжный)
+// ═══════════════════════════════════════════════════════════════
+
+(function installShuffleMode() {
+    'use strict';
+
+    const STATE = {
+        enabled: localStorage.getItem('chathub_player_shuffle') === '1',
+        history: [],
+        historyPos: -1,
+        btnEl: null,
+        attached: false,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  СТИЛИ
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('shuffleModeStyles')) {
+        const style = document.createElement('style');
+        style.id = 'shuffleModeStyles';
+        style.textContent = `
+            #globalPlayerBar .gp-btn-shuffle {
+                color: #888;
+                font-size: 15px;
+                position: relative;
+            }
+            #globalPlayerBar .gp-btn-shuffle:hover {
+                color: #a78bfa;
+                background: rgba(108,92,231,0.12);
+            }
+            #globalPlayerBar .gp-btn-shuffle.active {
+                color: #00b894;
+                background: linear-gradient(135deg, rgba(0,184,148,0.2), rgba(108,92,231,0.15));
+                box-shadow: 0 0 10px rgba(0,184,148,0.3);
+                animation: shuffleGlow 2s ease-in-out infinite;
+            }
+            #globalPlayerBar .gp-btn-shuffle.active::after {
+                content: '';
+                position: absolute;
+                bottom: 2px; left: 50%;
+                transform: translateX(-50%);
+                width: 4px; height: 4px;
+                border-radius: 50%;
+                background: #00b894;
+                box-shadow: 0 0 6px rgba(0,184,148,0.8);
+            }
+            @keyframes shuffleGlow {
+                0%, 100% { box-shadow: 0 0 8px rgba(0,184,148,0.25); }
+                50%      { box-shadow: 0 0 16px rgba(0,184,148,0.5); }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ВСТАВКА КНОПКИ — вызывается часто, идемпотентно
+    // ═══════════════════════════════════════════════════════════
+    function tryInjectButton() {
+        const bar = document.getElementById('globalPlayerBar');
+        if (!bar) return false;
+        // Проверяем что DOM бара уже построен (есть gpClose)
+        if (!bar.querySelector('#gpClose')) return false;
+        // Уже вставлена?
+        if (bar.querySelector('#gpShuffle')) {
+            STATE.btnEl = bar.querySelector('#gpShuffle');
+            updateButtonState();
+            return true;
+        }
+
+        const controls = bar.querySelector('.gp-controls');
+        if (!controls) return false;
+
+        const btn = document.createElement('button');
+        btn.className = 'gp-btn gp-btn-shuffle';
+        btn.id = 'gpShuffle';
+        btn.title = 'Случайный порядок';
+        btn.textContent = '🎲';
+
+        // Вставляем перед closeBtn
+        const closeBtn = bar.querySelector('#gpClose');
+        if (closeBtn) {
+            controls.insertBefore(btn, closeBtn);
+        } else {
+            controls.appendChild(btn);
+        }
+
+        STATE.btnEl = btn;
+        updateButtonState();
+
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+            toggleShuffle();
+        });
+
+        console.log('🎲 Кнопка shuffle вставлена в плеер');
+        return true;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  НАБЛЮДАТЕЛЬ — ловит построение UI плеера
+    // ═══════════════════════════════════════════════════════════
+    const observer = new MutationObserver(() => {
+        tryInjectButton();
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    // Страховка: периодическая проверка (плеер может быть создан раньше наблюдателя)
+    setInterval(tryInjectButton, 1000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЛОГИКА
+    // ═══════════════════════════════════════════════════════════
+    function toggleShuffle() {
+        STATE.enabled = !STATE.enabled;
+        localStorage.setItem('chathub_player_shuffle', STATE.enabled ? '1' : '0');
+
+        if (STATE.enabled) {
+            const curIdx = getCurrentIndex();
+            STATE.history = curIdx >= 0 ? [curIdx] : [];
+            STATE.historyPos = STATE.history.length - 1;
+            showToast('🎲 Случайный порядок включён', 1500);
+        } else {
+            STATE.history = [];
+            STATE.historyPos = -1;
+            showToast('🎵 Обычный порядок', 1500);
+        }
+
+        updateButtonState();
+        updatePlayerButtonsState();
+    }
+
+    function updateButtonState() {
+        if (!STATE.btnEl) STATE.btnEl = document.getElementById('gpShuffle');
+        if (!STATE.btnEl) return;
+        if (STATE.enabled) {
+            STATE.btnEl.classList.add('active');
+            STATE.btnEl.title = 'Случайный порядок включён';
+        } else {
+            STATE.btnEl.classList.remove('active');
+            STATE.btnEl.title = 'Случайный порядок выключен';
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Доступ к внутренностям плеера
+    // ═══════════════════════════════════════════════════════════
+    function getQueue() {
+        return (typeof GlobalPlayer !== 'undefined' && GlobalPlayer.queue) || [];
+    }
+    function getCurrentIndex() {
+        return (typeof GlobalPlayer !== 'undefined') ? GlobalPlayer.currentIndex : -1;
+    }
+    function getAudio() {
+        return (typeof GlobalPlayer !== 'undefined') ? GlobalPlayer.audioEl : null;
+    }
+
+    function getRandomIndex(exclude) {
+        const q = getQueue();
+        if (q.length <= 1) return 0;
+        let idx, attempts = 0;
+        do {
+            idx = Math.floor(Math.random() * q.length);
+            attempts++;
+        } while (idx === exclude && attempts < 20);
+        return idx;
+    }
+
+    function updatePlayerButtonsState() {
+        const bar = document.getElementById('globalPlayerBar');
+        if (!bar) return;
+        const prevBtn = bar.querySelector('#gpPrev');
+        const nextBtn = bar.querySelector('#gpNext');
+        if (!prevBtn || !nextBtn) return;
+
+        const q = getQueue();
+        const audio = getAudio();
+
+        if (STATE.enabled) {
+            const nextDisabled = q.length <= 1;
+            const nearStart = !audio || audio.currentTime <= 3;
+            const prevDisabled = STATE.historyPos <= 0 && nearStart;
+
+            nextBtn.disabled = nextDisabled;
+            prevBtn.disabled = prevDisabled;
+            nextBtn.style.opacity = nextDisabled ? '0.3' : '1';
+            prevBtn.style.opacity = prevDisabled ? '0.3' : '1';
+
+            nextBtn.textContent = '⏭';
+            prevBtn.textContent = '⏮';
+            nextBtn.title = 'Случайный трек';
+            prevBtn.title = 'Предыдущий сыгранный';
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ КЛИКОВ ⏭ / ⏮
+    // ═══════════════════════════════════════════════════════════
+    function installInterceptors() {
+        const bar = document.getElementById('globalPlayerBar');
+        if (!bar || bar._shuffleInterceptorsInstalled) return;
+        // Ждём когда кнопки будут готовы
+        const prevBtn = bar.querySelector('#gpPrev');
+        const nextBtn = bar.querySelector('#gpNext');
+        if (!prevBtn || !nextBtn) return;
+
+        bar._shuffleInterceptorsInstalled = true;
+
+        nextBtn.addEventListener('click', (e) => {
+            if (!STATE.enabled) return;
+            e.stopImmediatePropagation();
+            e.preventDefault();
+            handleShuffleNext();
+        }, true);
+
+        prevBtn.addEventListener('click', (e) => {
+            if (!STATE.enabled) return;
+            e.stopImmediatePropagation();
+            e.preventDefault();
+            handleShufflePrev();
+        }, true);
+    }
+    setInterval(installInterceptors, 500);
+
+    function handleShuffleNext() {
+        const q = getQueue();
+        if (q.length <= 1) return;
+
+        if (STATE.historyPos < STATE.history.length - 1) {
+            STATE.historyPos++;
+            jumpToIndex(STATE.history[STATE.historyPos]);
+            return;
+        }
+
+        const curIdx = getCurrentIndex();
+        const targetIdx = getRandomIndex(curIdx);
+        STATE.history.push(targetIdx);
+        STATE.historyPos = STATE.history.length - 1;
+        jumpToIndex(targetIdx);
+    }
+
+    function handleShufflePrev() {
+        const audio = getAudio();
+        if (audio && audio.currentTime > 3) {
+            audio.currentTime = 0;
+            return;
+        }
+        if (STATE.historyPos > 0) {
+            STATE.historyPos--;
+            jumpToIndex(STATE.history[STATE.historyPos]);
+        }
+    }
+
+    /**
+     * Прыжок к треку по индексу — использует публичный API playQueue
+     * с правильным startIndex. Это ЕДИНСТВЕННЫЙ надёжный путь,
+     * т.к. GlobalPlayer.playTrack — приватный.
+     */
+    async function jumpToIndex(index) {
+        const q = getQueue();
+        if (index < 0 || index >= q.length) return;
+        const track = q[index];
+        if (!track || !track.src) return;
+
+        const chatFile = (typeof GlobalPlayer !== 'undefined')
+            ? GlobalPlayer.currentChatFile : null;
+
+        // playQueue пересоздаст плеер с тем же плейлистом, но другим index
+        // Это НЕ идеально (сбрасывает историю), но надёжно.
+        // Чтобы сохранить историю — восстанавливаем её после вызова.
+        const savedHistory = STATE.history.slice();
+        const savedPos = STATE.historyPos;
+
+        if (typeof GlobalPlayer !== 'undefined') {
+            GlobalPlayer.playQueue(q.slice(), index, chatFile);
+        }
+
+        // Восстанавливаем историю через микротаск
+        setTimeout(() => {
+            STATE.history = savedHistory;
+            STATE.historyPos = savedPos;
+            updatePlayerButtonsState();
+        }, 50);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  АВТОПЕРЕХОД ПОСЛЕ 'ended'
+    //  Патчим через перезапись GlobalPlayer.next, но также
+    //  ловим сам 'ended' для надёжности.
+    // ═══════════════════════════════════════════════════════════
+    function patchAudio() {
+        const audio = getAudio();
+        if (!audio || audio._shuffleEndedAttached) return;
+        audio._shuffleEndedAttached = true;
+
+        // Слушаем 'ended' в capture-фазе (наш — раньше).
+        audio.addEventListener('ended', () => {
+            if (!STATE.enabled) return;
+            // Проблема: у GlobalPlayer есть свой обработчик 'ended' → next()
+            // Он вызовет ВНУТРЕННИЙ next, не наш патченный.
+            //
+            // Решение: после его вызова (через микротаск) — если
+            // currentTrack не совпадает с нашим ожиданием — переключаем сами.
+            setTimeout(() => {
+                if (!STATE.enabled) return;
+                const audioEl = getAudio();
+                // Если GlobalPlayer не переключился и трек всё ещё ended
+                if (audioEl && audioEl.ended) {
+                    handleShuffleNext();
+                }
+            }, 400);
+        });
+    }
+    setInterval(patchAudio, 800);
+
+    // ═══════════════════════════════════════════════════════════
+    //  СБРОС ИСТОРИИ ПРИ СМЕНЕ ПЛЕЙЛИСТА И STOP
+    // ═══════════════════════════════════════════════════════════
+    function patchPlayerMethods() {
+        if (typeof GlobalPlayer === 'undefined') return;
+        if (GlobalPlayer._shufflePatched) return;
+        GlobalPlayer._shufflePatched = true;
+
+        // Патч playQueue
+        const _origPlayQueue = GlobalPlayer.playQueue;
+        GlobalPlayer.playQueue = function(newQueue, startIndex, chatFile) {
+            STATE.history = typeof startIndex === 'number' ? [startIndex] : [];
+            STATE.historyPos = STATE.history.length - 1;
+            const result = _origPlayQueue.call(this, newQueue, startIndex, chatFile);
+            setTimeout(() => {
+                updateButtonState();
+                updatePlayerButtonsState();
+            }, 100);
+            return result;
+        };
+
+        // Патч stop
+        const _origStop = GlobalPlayer.stop;
+        GlobalPlayer.stop = function() {
+            STATE.history = [];
+            STATE.historyPos = -1;
+            return _origStop.apply(this, arguments);
+        };
+
+        console.log('🎲 GlobalPlayer.next/playQueue/stop — запatchено');
+    }
+    setInterval(patchPlayerMethods, 500);
+
+    // ═══════════════════════════════════════════════════════════
+    //  СИНХРОНИЗАЦИЯ СОСТОЯНИЯ КНОПОК ПРИ PLAY/TIMEUPDATE
+    // ═══════════════════════════════════════════════════════════
+    setInterval(() => {
+        if (STATE.enabled) updatePlayerButtonsState();
+    }, 1500);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЭКСПОРТ ДЛЯ ОТЛАДКИ
+    // ═══════════════════════════════════════════════════════════
+    window.PlayerShuffle = {
+        toggle: toggleShuffle,
+        isEnabled: () => STATE.enabled,
+        getHistory: () => STATE.history.slice(),
+        getHistoryPos: () => STATE.historyPos,
+        reset: () => {
+            STATE.history = [];
+            STATE.historyPos = -1;
+        },
+        // 🆕 принудительно вставить кнопку
+        inject: tryInjectButton,
+    };
+
+    // Пробуем вставить сразу
+    tryInjectButton();
+
+    console.log('🎲 Shuffle-режим v2 активирован');
+    console.log('   • Кнопка 🎲 появится в плеере при его открытии');
+    console.log('   • API: PlayerShuffle.toggle() / .inject()');
 })();
 </script>
 </body>
