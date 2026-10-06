@@ -25345,6 +25345,198 @@ markUnseen: (eventOrKey) => {
     console.log('   • API: AutoRefresh.status() / .trigger() / .reset()');
     console.log('   • Тест: AutoRefresh.simulateOfflineChatOpen()');
 })();
+// ═══════════════════════════════════════════════════════════════
+//  🎧 ФИКС MEDIA SESSION — управление с наушников/локскрина
+// ═══════════════════════════════════════════════════════════════
+(function fixMediaSessionHandlers() {
+    if (!('mediaSession' in navigator)) {
+        console.warn('🎧 Media Session API не поддерживается');
+        return;
+    }
+
+    // Ждём, пока GlobalPlayer будет готов
+    function attachWhenReady() {
+        if (typeof GlobalPlayer === 'undefined' || !GlobalPlayer.audioEl) {
+            setTimeout(attachWhenReady, 300);
+            return;
+        }
+
+        const audio = GlobalPlayer.audioEl;
+
+        // ═══ 1. Хелпер: blob:URL → data:URL для artwork ═══
+        async function blobToDataUrl(blobUrl) {
+            try {
+                const res = await fetch(blobUrl);
+                const blob = await res.blob();
+                return await new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onloadend = () => resolve(reader.result);
+                    reader.onerror = reject;
+                    reader.readAsDataURL(blob);
+                });
+            } catch (e) {
+                return null;
+            }
+        }
+
+        // ═══ 2. Обновление метаданных с безопасным artwork ═══
+        async function updateMediaSessionMetadata(track) {
+            if (!track) return;
+
+            let artwork = [];
+            if (track.coverUrl) {
+                // 🆕 Только data:URL работает стабильно в Media Session
+                let coverSrc = track.coverUrl;
+                if (coverSrc.startsWith('blob:')) {
+                    const dataUrl = await blobToDataUrl(coverSrc);
+                    if (dataUrl) {
+                        coverSrc = dataUrl;
+                    } else {
+                        coverSrc = null;   // не рискуем — оставляем без обложки
+                    }
+                }
+
+                if (coverSrc) {
+                    artwork = [
+                        { src: coverSrc, sizes: '96x96',   type: 'image/jpeg' },
+                        { src: coverSrc, sizes: '128x128', type: 'image/jpeg' },
+                        { src: coverSrc, sizes: '192x192', type: 'image/jpeg' },
+                        { src: coverSrc, sizes: '256x256', type: 'image/jpeg' },
+                        { src: coverSrc, sizes: '384x384', type: 'image/jpeg' },
+                        { src: coverSrc, sizes: '512x512', type: 'image/jpeg' },
+                    ];
+                }
+            }
+
+            try {
+                navigator.mediaSession.metadata = new MediaMetadata({
+                    title:  track.name || 'Аудио',
+                    artist: track.username === state.username ? 'Вы' : (track.username || 'Аноним'),
+                    album:  state.chatName || 'SMS Чат',
+                    artwork,
+                });
+            } catch (e) {
+                console.warn('🎧 MediaMetadata error:', e);
+            }
+        }
+
+        // ═══ 3. Регистрация ВСЕХ обработчиков ═══
+        function attachHandlers() {
+            try {
+                navigator.mediaSession.setActionHandler('play', () => {
+                    console.log('🎧 MediaSession: play');
+                    if (audio.paused) audio.play().catch(() => {});
+                });
+
+                navigator.mediaSession.setActionHandler('pause', () => {
+                    console.log('🎧 MediaSession: pause');
+                    if (!audio.paused) audio.pause();
+                });
+
+                navigator.mediaSession.setActionHandler('nexttrack', () => {
+                    console.log('🎧 MediaSession: nexttrack');
+                    // 🆕 Принудительно вперёд, не зависим от direction
+                    const q = GlobalPlayer.queue;
+                    const cur = GlobalPlayer.currentIndex;
+                    if (cur >= 0 && cur < q.length - 1) {
+                        GlobalPlayer.next();
+                    } else {
+                        console.log('🎧 Конец очереди');
+                    }
+                });
+
+                navigator.mediaSession.setActionHandler('previoustrack', () => {
+                    console.log('🎧 MediaSession: previoustrack');
+                    // 🆕 Если играет больше 3 сек — в начало, иначе назад
+                    if (audio.currentTime > 3) {
+                        audio.currentTime = 0;
+                    } else {
+                        GlobalPlayer.prev();
+                    }
+                });
+
+                // 🆕 Перемотка с наушников
+                try {
+                    navigator.mediaSession.setActionHandler('seekbackward', (details) => {
+                        const skip = details.seekOffset || 10;
+                        audio.currentTime = Math.max(0, audio.currentTime - skip);
+                    });
+                    navigator.mediaSession.setActionHandler('seekforward', (details) => {
+                        const skip = details.seekOffset || 10;
+                        audio.currentTime = Math.min(audio.duration || 0, audio.currentTime + skip);
+                    });
+                    navigator.mediaSession.setActionHandler('seekto', (details) => {
+                        if (details.seekTime != null) {
+                            audio.currentTime = details.seekTime;
+                        }
+                    });
+                } catch (e) {
+                    // Некоторые браузеры не поддерживают seekto — игнорируем
+                }
+
+                // 🆕 stop — закрыть плеер
+                try {
+                    navigator.mediaSession.setActionHandler('stop', () => {
+                        GlobalPlayer.stop();
+                    });
+                } catch (e) {}
+
+                console.log('🎧 MediaSession handlers зарегистрированы');
+            } catch (e) {
+                console.warn('🎧 setActionHandler error:', e);
+            }
+        }
+
+        // ═══ 4. Синхронизация playbackState ═══
+        function updatePlaybackState() {
+            try {
+                navigator.mediaSession.playbackState = audio.paused ? 'paused' : 'playing';
+            } catch (e) {}
+        }
+
+        audio.addEventListener('play',  updatePlaybackState);
+        audio.addEventListener('pause', updatePlaybackState);
+        audio.addEventListener('ended', updatePlaybackState);
+
+        // ═══ 5. Патч playTrack — обновляем metadata ПРАВИЛЬНО ═══
+        // Нам нужно обернуть playQueue, чтобы после смены трека
+        // метаданные гарантированно обновились.
+        const _origPlayQueue = GlobalPlayer.playQueue;
+        GlobalPlayer.playQueue = function(newQueue, startIndex, chatFile) {
+            const result = _origPlayQueue.call(this, newQueue, startIndex, chatFile);
+            // Метаданные обновляем с задержкой — чтобы track уже был выбран
+            setTimeout(() => {
+                const track = newQueue[startIndex];
+                if (track) updateMediaSessionMetadata(track);
+                attachHandlers();   // перепривязываем на случай, если слетели
+                updatePlaybackState();
+            }, 50);
+            return result;
+        };
+
+        // 🆕 Также патчим toggle — иногда браузер требует перепривязки
+        const _origToggle = GlobalPlayer.toggle;
+        GlobalPlayer.toggle = function() {
+            const r = _origToggle.apply(this, arguments);
+            attachHandlers();
+            updatePlaybackState();
+            return r;
+        };
+
+        // Первичная установка
+        attachHandlers();
+
+        // 🆕 Перепривязка при каждом play — некоторые браузеры сбрасывают
+        //    handlers после длительной паузы
+        audio.addEventListener('play', () => {
+            attachHandlers();
+        });
+
+        console.log('🎧 Фикс Media Session активен');
+    }
+
+    attachWhenReady();
+})();
 </script>
 </body>
 </html>
