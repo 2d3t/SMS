@@ -1,5 +1,5 @@
 // sw.js - Универсальный кеш + уведомления
-const CACHE_NAME = 'sms-pwa-v105-offlinebuttonoff';
+const CACHE_NAME = 'sms-pwa-v105-offlinebuttonoffv2';
 
 const FILES_TO_CACHE = [
     '/SMS/pro/sms/index.html',
