@@ -3561,6 +3561,9 @@ body.player-active .messages-container { padding-bottom: 68px; }
     <button class="gallery-action-btn" id="galleryShareBtn" title="Отправить">
         <span>↗</span><small>Отправить</small>
     </button>
+    <button class="gallery-action-btn" id="galleryJumpBtn" title="Перейти к сообщению">
+        <span>💬</span><small>К фото</small>
+    </button>
 </div>
 
     <div class="gallery-dots" id="galleryDots"></div>
@@ -11782,16 +11785,29 @@ document.addEventListener('keydown', (e) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-//  СКАЧАТЬ / ОТПРАВИТЬ ИЗ ГАЛЕРЕИ
+//  СКАЧАТЬ / ОТПРАВИТЬ / ПЕРЕЙТИ ИЗ ГАЛЕРЕИ
 // ═══════════════════════════════════════════════════════════════
 (function initGalleryActions() {
     const downloadBtn = $('galleryDownloadBtn');
     const shareBtn = $('galleryShareBtn');
+    const jumpBtn = $('galleryJumpBtn');   // 🆕
+
 
     function getCurrentSrc() {
         if (!galleryState.isOpen || galleryState.images.length === 0) return null;
         return galleryState.images[galleryState.currentIndex];
     }
+
+
+    // 🆕 Возвращает msgId текущей картинки в галерее
+    function getCurrentMsgId() {
+        if (!galleryState.isOpen) return null;
+        const map = galleryState._windowMsgIds || [];
+        const idx = galleryState.currentIndex;
+        const id = map[idx];
+        return (id !== undefined && id !== null) ? id : null;
+    }
+
 
     downloadBtn.addEventListener('click', (e) => {
         e.stopPropagation();
@@ -11807,11 +11823,13 @@ document.addEventListener('keydown', (e) => {
         if (navigator.vibrate) navigator.vibrate(20);
     });
 
+
     shareBtn.addEventListener('click', async (e) => {
         e.stopPropagation();
         const src = getCurrentSrc();
         if (!src) return;
         if (navigator.vibrate) navigator.vibrate(20);
+
 
         try {
             const res = await fetch(src);
@@ -11825,6 +11843,30 @@ document.addEventListener('keydown', (e) => {
                 showToast('❌ Не удалось поделиться', 2000);
             }
         }
+    });
+
+
+    // 🆕 Кнопка «Перейти к сообщению» — закрыть галерею и проскроллить к фото в чате
+    jumpBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (navigator.vibrate) navigator.vibrate(20);
+
+
+        const msgId = getCurrentMsgId();
+        if (!msgId) {
+            showToast('⚠️ Не удалось найти сообщение', 1800);
+            return;
+        }
+
+
+        // Закрываем галерею
+        closeImageModal();
+
+
+        // Небольшая задержка — чтобы модалка успела закрыться и DOM устоялся
+        setTimeout(() => {
+            scrollToMessage(msgId);
+        }, 200);
     });
 })();
 
