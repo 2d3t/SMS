@@ -24805,16 +24805,15 @@ markUnseen: (eventOrKey) => {
 </script>
 <script>
 // ═══════════════════════════════════════════════════════════════
-//  🩹 ПАТЧ: УБИРАЕМ СИСТЕМНОЕ МЕНЮ БРАУЗЕРА НА БЕЙДЖЕ ПЛЕЕРА
-//  Проблема: долгий тап на бейдже ⏸/♫ в списке чатов вызывает
-//  хромовское "Толкование слова" / "Искать в Google".
-//  Решение: превращаем span в button + глушим все события.
+//  🩹 ПАТЧ: УБИРАЕМ СИСТЕМНОЕ МЕНЮ НА БЕЙДЖЕ ПЛЕЕРА (v2, безопасный)
+//  НЕ трогает renderChatsList — работает через делегирование событий.
+//  НЕ конфликтует с офлайн-кэшем и другими патчами.
 // ═══════════════════════════════════════════════════════════════
 
-(function patchPlayingBadgeNoContextMenu() {
+(function patchPlayingBadgeNoContextMenuSafe() {
     'use strict';
 
-    // ─── 1. Дополнительные CSS-правила ───
+    // ─── 1. CSS-правила ───
     if (!document.getElementById('playingBadgeNoContextStyles')) {
         const style = document.createElement('style');
         style.id = 'playingBadgeNoContextStyles';
@@ -24826,131 +24825,67 @@ markUnseen: (eventOrKey) => {
                 -ms-user-select: none !important;
                 user-select: none !important;
                 -webkit-tap-highlight-color: transparent !important;
-                -webkit-appearance: none !important;
-                appearance: none !important;
                 outline: none !important;
-                padding: 0 !important;
-                font-family: inherit !important;
-                cursor: pointer;
-                border: 1px solid rgba(254,202,87,0.5);
-                border-radius: 50%;
-                background: linear-gradient(135deg, rgba(254,202,87,0.25), rgba(255,159,67,0.2));
-                color: #feca57;
-                display: inline-flex;
-                align-items: center;
-                justify-content: center;
-                width: 22px;
-                height: 22px;
-                font-size: 11px;
-                flex-shrink: 0;
-                margin-left: 6px;
-                line-height: 1;
-            }
-            .chat-playing-badge.paused {
-                background: linear-gradient(135deg, rgba(136,136,136,0.25), rgba(100,100,100,0.2));
-                border-color: rgba(136,136,136,0.5);
-                color: #888;
-            }
-
-            /* Скрытый временный элемент для перехвата событий */
-            .chat-playing-badge * {
-                pointer-events: none !important;
-                user-select: none !important;
             }
         `;
         document.head.appendChild(style);
     }
 
-    // ─── 2. Патч renderChatsList: span → button ───
-    if (typeof renderChatsList === 'function') {
-        const _origRenderChatsList = renderChatsList;
+    // ─── 2. Делегирование на document (работает для любых бейджей) ───
+    //     Ловим все события, вызывающие системное меню, в CAPTURE-фазе.
+    const stopEvents = ['contextmenu', 'selectstart', 'dragstart'];
 
-        renderChatsList = function() {
-            const result = _origRenderChatsList.apply(this, arguments);
+    stopEvents.forEach(evt => {
+        document.addEventListener(evt, (e) => {
+            const badge = e.target.closest && e.target.closest('.chat-playing-badge');
+            if (!badge) return;
+            e.preventDefault();
+            e.stopPropagation();
+        }, true);   // ⬅️ capture
+    });
 
-            // После отрисовки — заменяем span на button и вешаем защиту
-            const container = document.getElementById('chatsList');
-            if (!container) return result;
+    // ─── 3. Долгий тап на Android ───
+    //     Гасим touch-callout, но НЕ ломаем обычный tap для toggle.
+    let _lpTarget = null;
+    let _lpTimer = null;
+    let _lpFired = false;
 
-            container.querySelectorAll('.chat-playing-badge').forEach(el => {
-                // Если это ещё span — превращаем в button
-                if (el.tagName === 'SPAN') {
-                    const btn = document.createElement('button');
-                    btn.type = 'button';
-                    btn.className = el.className;
-                    btn.dataset.playChat = el.dataset.playChat || '';
-                    btn.title = el.title || '';
-                    btn.textContent = el.textContent;
-                    btn.style.cssText = el.style.cssText;
-                    el.replaceWith(btn);
-                    el = btn;
-                }
+    document.addEventListener('touchstart', (e) => {
+        const badge = e.target.closest && e.target.closest('.chat-playing-badge');
+        if (!badge) return;
 
-                // Защита от системного меню
-                if (!el._noMenuAttached) {
-                    el._noMenuAttached = true;
+        _lpTarget = badge;
+        _lpFired = false;
 
-                    // Глушим все события, вызывающие системное меню
-                    ['contextmenu', 'selectstart', 'dragstart'].forEach(evt => {
-                        el.addEventListener(evt, (e) => {
-                            e.preventDefault();
-                            e.stopPropagation();
-                            return false;
-                        }, true);
-                    });
+        _lpTimer = setTimeout(() => {
+            _lpFired = true;
+            _lpTimer = null;
+            // Гасим выделение, которое мог начать браузер
+            try {
+                const sel = window.getSelection();
+                if (sel && sel.rangeCount > 0) sel.removeAllRanges();
+            } catch (err) {}
+        }, 400);
+    }, { passive: true, capture: true });
 
-                    // Долгий тап на Android → тоже гасим
-                    let _lpTimer = null;
-                    el.addEventListener('touchstart', (e) => {
-                        _lpTimer = setTimeout(() => {
-                            _lpTimer = null;
-                            e.preventDefault();
-                        }, 400);
-                    }, { passive: false });
-                    el.addEventListener('touchend', () => {
-                        if (_lpTimer) { clearTimeout(_lpTimer); _lpTimer = null; }
-                    });
-                    el.addEventListener('touchmove', () => {
-                        if (_lpTimer) { clearTimeout(_lpTimer); _lpTimer = null; }
-                    });
-                    el.addEventListener('touchcancel', () => {
-                        if (_lpTimer) { clearTimeout(_lpTimer); _lpTimer = null; }
-                    });
-                }
+    document.addEventListener('touchmove', () => {
+        if (_lpTimer) { clearTimeout(_lpTimer); _lpTimer = null; }
+        _lpTarget = null;
+    }, { passive: true, capture: true });
 
-                // Перепривязываем клик — чтобы наверняка работал toggle
-                if (!el._toggleBound) {
-                    el._toggleBound = true;
-                    el.addEventListener('click', (e) => {
-                        e.stopPropagation();
-                        e.preventDefault();
-                        if (typeof GlobalPlayer !== 'undefined') {
-                            GlobalPlayer.toggle();
-                            setTimeout(() => {
-                                if (typeof renderChatsList === 'function') renderChatsList();
-                            }, 100);
-                        }
-                    });
-                }
-            });
+    document.addEventListener('touchend', (e) => {
+        if (_lpTimer) { clearTimeout(_lpTimer); _lpTimer = null; }
 
-            return result;
-        };
-
-        console.log('🩹 patch: renderChatsList — бейдж плеера защищён от системного меню');
-    }
-
-    // ─── 3. Глобальная защита: гасим contextmenu на всём #chatsList ───
-    //     для элементов .chat-playing-badge
-    document.addEventListener('contextmenu', (e) => {
-        if (e.target.closest && e.target.closest('.chat-playing-badge')) {
+        // Если сработал долгий тап — гасим клик, чтобы не сработал toggle
+        if (_lpFired && _lpTarget) {
             e.preventDefault();
             e.stopPropagation();
         }
-    }, true);
+        _lpFired = false;
+        _lpTarget = null;
+    }, { capture: true });
 
-    // ─── 4. Ищем долгий тап через selectionchange ───
-    //     Если браузер всё-таки начал выделение — снимаем
+    // ─── 4. Страховка: снимаем выделение, если оно всё-таки возникло ───
     document.addEventListener('selectionchange', () => {
         const sel = window.getSelection();
         if (!sel || sel.rangeCount === 0) return;
@@ -24962,7 +24897,409 @@ markUnseen: (eventOrKey) => {
         }
     });
 
-    console.log('✅ Патч применён: бейдж плеера больше не вызывает системное меню');
+    console.log('✅ Бейдж плеера защищён от системного меню (без перепривязки renderChatsList)');
+})();
+</script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🔄 ПАТЧ: АВТО-ПЕРЕЗАГРУЗКА ПРИ ВОССТАНОВЛЕНИИ СВЯЗИ
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: связь пропала → юзер открыл чат из офлайн-кэша →
+//  связь вернулась, но вложения (фото, видео, аудио) не грузятся,
+//  потому что blob:URL'ы из кэша — это уже расшифрованные объекты,
+//  а не ссылки. Нужно перезагрузить чат из сети.
+//
+//  Решение:
+//   1. Помечаем, что чат открыт из офлайна (флаг wasOffline).
+//   2. При возврате связи:
+//      • Если чат открыт из офлайна → мягкий ре-энтер в чат.
+//      • Если мягкий не удался → жёсткий location.reload().
+//      • Если мы на списке чатов → просто обновляем список.
+//   3. Защита от повторных срабатываний (кулдаун 5 сек).
+// ═══════════════════════════════════════════════════════════════
+
+(function installAutoRefreshOnReconnect() {
+    'use strict';
+
+    // ─── Состояние ───
+    const ST = {
+        // Был ли текущий чат открыт из офлайн-кэша?
+        chatOpenedFromCache: false,
+        // Какой файл чата был открыт
+        cachedChatFile: null,
+        // Кулдаун, чтобы не было лавины перезагрузок
+        lastReloadTs: 0,
+        // Уже перезагружаемся?
+        reloading: false,
+        // Был ли вообще офлайн в этой сессии
+        wasOffline: !navigator.onLine,
+    };
+
+    const RELOAD_COOLDOWN_MS = 5000;
+
+    // ═══════════════════════════════════════════════════════════
+    //  1. Помечаем «чат открыт из кэша»
+    //  Патчим enterChat — точнее, ловим ветку кэш-fallback.
+    //  Она внутри OfflineCache-патча, поэтому ловим по факту:
+    //  если после enterChat OfflineMode активен → значит из кэша.
+    // ═══════════════════════════════════════════════════════════
+    if (typeof enterChat === 'function') {
+        const _origEnterChat = enterChat;
+        enterChat = async function(file, name, password) {
+            const wasOfflineBefore = (typeof OfflineMode !== 'undefined')
+                ? OfflineMode.isOffline()
+                : !navigator.onLine;
+
+            const result = await _origEnterChat.call(this, file, name, password);
+
+            // Проверяем: оказались ли мы в чате, открытом без сети?
+            const stillOffline = (typeof OfflineMode !== 'undefined')
+                ? OfflineMode.isOffline()
+                : !navigator.onLine;
+
+            if (state.chatFile === file && stillOffline) {
+                // Чат успешно открыт, но мы всё ещё офлайн —
+                // значит, скорее всего, из кэша.
+                ST.chatOpenedFromCache = true;
+                ST.cachedChatFile = file;
+                console.log('🔄 [AutoRefresh] Чат открыт из офлайна:', file);
+            } else if (state.chatFile === file && !stillOffline) {
+                // Открыт из сети — сбрасываем флаг
+                ST.chatOpenedFromCache = false;
+                ST.cachedChatFile = null;
+            }
+
+            return result;
+        };
+        console.log('🔄 patched: enterChat — отслеживает офлайн-открытие');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  2. Патчим OfflineMode.activate / deactivate — точнее ловим
+    // ═══════════════════════════════════════════════════════════
+    if (typeof OfflineMode !== 'undefined') {
+        const _origActivate = OfflineMode.activate;
+        const _origDeactivate = OfflineMode.deactivate;
+
+        OfflineMode.activate = function(reason) {
+            ST.wasOffline = true;
+            const r = _origActivate.apply(this, arguments);
+            return r;
+        };
+
+        OfflineMode.deactivate = function() {
+            const r = _origDeactivate.apply(this, arguments);
+
+            // 🆕 В момент деактивации офлайна — проверяем, надо ли перезагрузить
+            setTimeout(() => tryReconnectRecovery('offline-mode-deactivated'), 150);
+            return r;
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. Слушаем события восстановления связи
+    // ═══════════════════════════════════════════════════════════
+    window.addEventListener('online', () => {
+        console.log('🔄 [AutoRefresh] Событие online');
+        // Небольшая задержка — пусть checkNetwork() отработает
+        setTimeout(() => tryReconnectRecovery('window.online'), 1200);
+    });
+
+    // 🆕 Также поллинг — на случай если событие online не придёт
+    // (Android PWA иногда теряет событие)
+    setInterval(async () => {
+        if (!navigator.onLine) return;
+        if (!ST.wasOffline && !ST.chatOpenedFromCache) return;
+        if (ST.reloading) return;
+
+        // Проверяем, что сеть реально жива
+        if (typeof checkNetwork === 'function') {
+            try {
+                const ok = await checkNetwork();
+                if (ok) {
+                    console.log('🔄 [AutoRefresh] Поллинг обнаружил восстановление');
+                    await tryReconnectRecovery('polling');
+                }
+            } catch (e) {}
+        }
+    }, 10000);   // раз в 10 сек
+
+    // ═══════════════════════════════════════════════════════════
+    //  4. Основная функция восстановления
+    // ═══════════════════════════════════════════════════════════
+    async function tryReconnectRecovery(source = '') {
+        // Защита от повторных вызовов
+        if (ST.reloading) return;
+        const now = Date.now();
+        if (now - ST.lastReloadTs < RELOAD_COOLDOWN_MS) {
+            return;
+        }
+
+        // Нужна авторизация
+        if (!state.isAuthorized || !state.token) {
+            ST.wasOffline = false;
+            return;
+        }
+
+        // Проверяем, что сеть реально вернулась
+        if (typeof checkNetwork === 'function') {
+            const ok = await checkNetwork();
+            if (!ok) return;
+        }
+
+        console.log(`🔄 [AutoRefresh] Восстановление (${source})`, {
+            chatOpenedFromCache: ST.chatOpenedFromCache,
+            wasOffline: ST.wasOffline,
+            currentScreen: state.currentScreen,
+            currentChat: state.chatFile,
+        });
+
+        // ═══ СЦЕНАРИЙ A: мы в чате, открытом из офлайна ═══
+        if (ST.chatOpenedFromCache && state.chatFile && state.currentScreen === 'chat') {
+            const file = state.chatFile;
+            const chat = state.chats.find(c => c.file === file);
+            const name = chat ? (chat.name || chat.file) : file;
+            const password = state.savedPasswords[file];
+
+            if (!password) {
+                console.warn('🔄 [AutoRefresh] Нет пароля — жёсткая перезагрузка');
+                doHardReload();
+                return;
+            }
+
+            ST.reloading = true;
+            ST.lastReloadTs = now;
+
+            try {
+                // Показываем красивую плашку «восстанавливаем…»
+                showRecoveryToast();
+
+                // Сбрасываем флаги заранее — чтобы повторные online не триггерили
+                ST.chatOpenedFromCache = false;
+                ST.cachedChatFile = null;
+                ST.wasOffline = false;
+
+                // 🆕 Мягкий ре-энтер в тот же чат
+                await enterChat(file, name, password);
+
+                console.log('✅ [AutoRefresh] Чат переоткрыт из сети');
+                showRecoveredToast();
+                ST.reloading = false;
+                return;
+            } catch (e) {
+                console.error('❌ [AutoRefresh] Мягкий ре-энтер не удался:', e);
+                ST.reloading = false;
+                // Падаем в жёсткую перезагрузку
+                doHardReload();
+                return;
+            }
+        }
+
+        // ═══ СЦЕНАРИЙ B: мы в списке чатов ═══
+        if (state.currentScreen === 'chats') {
+            ST.wasOffline = false;
+            ST.chatOpenedFromCache = false;
+            ST.cachedChatFile = null;
+
+            // Обновляем список и бейджи
+            if (typeof refreshUnreadBadges === 'function') {
+                refreshUnreadBadges().catch(() => {});
+            }
+            showRecoveredToast();
+            return;
+        }
+
+        // ═══ СЦЕНАРИЙ C: мы на экране чата, но чат НЕ из офлайна ═══
+        // Мог быть открыт давно, просто с плохой связью.
+        // Тут достаточно тихо поллить обновления.
+        if (state.chatFile && state.currentScreen === 'chat') {
+            ST.wasOffline = false;
+            try {
+                if (typeof pollUpdates === 'function') await pollUpdates();
+            } catch (e) {}
+            return;
+        }
+
+        // ═══ СЦЕНАРИЙ D: всё остальное — сбрасываем флаги ═══
+        ST.wasOffline = false;
+        ST.chatOpenedFromCache = false;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  5. Жёсткая перезагрузка (с защитой)
+    // ═══════════════════════════════════════════════════════════
+    function doHardReload() {
+        if (ST.reloading) return;
+        ST.reloading = true;
+        ST.lastReloadTs = Date.now();
+
+        showRecoveryToast('Перезагружаем страницу…');
+
+        // Небольшая задержка — чтобы юзер увидел плашку
+        setTimeout(() => {
+            try {
+                // Мягкая перезагрузка через location
+                location.reload();
+            } catch (e) {
+                // Совсем крайний случай
+                window.location.href = window.location.href;
+            }
+        }, 700);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  6. Визуальные плашки
+    // ═══════════════════════════════════════════════════════════
+    function ensureRecoveryToastStyles() {
+        if (document.getElementById('recoveryToastStyles')) return;
+        const style = document.createElement('style');
+        style.id = 'recoveryToastStyles';
+        style.textContent = `
+            #recoveryToast {
+                position: fixed;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%, -50%) scale(0.9);
+                background: linear-gradient(135deg, #1a1a2e, #252540);
+                border: 1px solid rgba(108,92,231,0.5);
+                border-radius: 18px;
+                padding: 18px 24px;
+                display: none;
+                align-items: center;
+                gap: 12px;
+                z-index: 9999;
+                box-shadow: 0 20px 60px rgba(0,0,0,0.7),
+                            0 0 0 1px rgba(108,92,231,0.2);
+                opacity: 0;
+                transition: opacity 0.25s, transform 0.25s;
+                pointer-events: none;
+                max-width: calc(100vw - 40px);
+            }
+            #recoveryToast.show {
+                display: flex;
+                opacity: 1;
+                transform: translate(-50%, -50%) scale(1);
+            }
+            #recoveryToast .rt-spinner {
+                width: 24px;
+                height: 24px;
+                border: 2.5px solid rgba(108,92,231,0.25);
+                border-top-color: #6c5ce7;
+                border-right-color: #00b894;
+                border-radius: 50%;
+                animation: rtSpin 0.8s linear infinite;
+                flex-shrink: 0;
+            }
+            @keyframes rtSpin { to { transform: rotate(360deg); } }
+            #recoveryToast .rt-icon {
+                font-size: 24px;
+                flex-shrink: 0;
+            }
+            #recoveryToast .rt-text {
+                display: flex;
+                flex-direction: column;
+                gap: 3px;
+            }
+            #recoveryToast .rt-title {
+                font-size: 14px;
+                font-weight: 700;
+                color: #fff;
+            }
+            #recoveryToast .rt-sub {
+                font-size: 11px;
+                color: #888;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    function showRecoveryToast(subText = 'Подгружаем вложения…') {
+        ensureRecoveryToastStyles();
+        let el = document.getElementById('recoveryToast');
+        if (!el) {
+            el = document.createElement('div');
+            el.id = 'recoveryToast';
+            document.body.appendChild(el);
+        }
+        el.innerHTML = `
+            <div class="rt-spinner"></div>
+            <div class="rt-text">
+                <div class="rt-title">🔄 Восстанавливаем связь</div>
+                <div class="rt-sub">${subText}</div>
+            </div>
+        `;
+        el.classList.add('show');
+    }
+
+    function showRecoveredToast() {
+        ensureRecoveryToastStyles();
+        let el = document.getElementById('recoveryToast');
+        if (!el) {
+            el = document.createElement('div');
+            el.id = 'recoveryToast';
+            document.body.appendChild(el);
+        }
+        el.innerHTML = `
+            <div class="rt-icon">✅</div>
+            <div class="rt-text">
+                <div class="rt-title">Связь восстановлена</div>
+                <div class="rt-sub">Можно продолжать общение</div>
+            </div>
+        `;
+        el.classList.add('show');
+        setTimeout(() => el.classList.remove('show'), 1800);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  7. Сброс флагов при выходе из чата / logout
+    // ═══════════════════════════════════════════════════════════
+    if (typeof backToChats === 'function') {
+        const _origBackToChats = backToChats;
+        backToChats = function() {
+            ST.chatOpenedFromCache = false;
+            ST.cachedChatFile = null;
+            return _origBackToChats.apply(this, arguments);
+        };
+    }
+
+    if (typeof logout === 'function') {
+        const _origLogout = logout;
+        logout = function() {
+            ST.chatOpenedFromCache = false;
+            ST.cachedChatFile = null;
+            ST.wasOffline = false;
+            ST.reloading = false;
+            return _origLogout.apply(this, arguments);
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  8. API для отладки
+    // ═══════════════════════════════════════════════════════════
+    window.AutoRefresh = {
+        status: () => ({ ...ST }),
+        trigger: () => tryReconnectRecovery('manual'),
+        reset: () => {
+            ST.chatOpenedFromCache = false;
+            ST.cachedChatFile = null;
+            ST.wasOffline = false;
+            ST.reloading = false;
+            ST.lastReloadTs = 0;
+            console.log('🔄 [AutoRefresh] Состояние сброшено');
+        },
+        simulateOfflineChatOpen: () => {
+            ST.chatOpenedFromCache = true;
+            ST.cachedChatFile = state.chatFile;
+            ST.wasOffline = true;
+            console.log('🔄 [AutoRefresh] Симулировано открытие чата офлайн');
+        },
+    };
+
+    console.log('🔄 AutoRefresh активен:');
+    console.log('   • Связь вернулась + чат был из офлайна → мягкий ре-энтер');
+    console.log('   • Мягкий не удался → жёсткая перезагрузка страницы');
+    console.log('   • API: AutoRefresh.status() / .trigger() / .reset()');
+    console.log('   • Тест: AutoRefresh.simulateOfflineChatOpen()');
 })();
 </script>
 </body>
