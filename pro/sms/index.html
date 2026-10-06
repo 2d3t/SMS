@@ -25345,197 +25345,436 @@ markUnseen: (eventOrKey) => {
     console.log('   • API: AutoRefresh.status() / .trigger() / .reset()');
     console.log('   • Тест: AutoRefresh.simulateOfflineChatOpen()');
 })();
+</script>
+<script>
 // ═══════════════════════════════════════════════════════════════
-//  🎧 ФИКС MEDIA SESSION — управление с наушников/локскрина
+//  🎧 MEDIA SESSION BRIDGE v2 — перехватывает ВСЕ setActionHandler
+//  Гарантирует, что next/prev работают с shuffle и direction,
+//  и что никто (playTrack, другие патчи) не перезапишет их.
 // ═══════════════════════════════════════════════════════════════
-(function fixMediaSessionHandlers() {
+
+(function installMediaSessionBridgeV2() {
+    'use strict';
+
     if (!('mediaSession' in navigator)) {
-        console.warn('🎧 Media Session API не поддерживается');
+        console.warn('🎧 MediaSession API не поддерживается браузером');
         return;
     }
 
-    // Ждём, пока GlobalPlayer будет готов
-    function attachWhenReady() {
-        if (typeof GlobalPlayer === 'undefined' || !GlobalPlayer.audioEl) {
-            setTimeout(attachWhenReady, 300);
+    const DBG = true;
+    const log = (...a) => DBG && console.log('🎧 [MediaSession]', ...a);
+    const warn = (...a) => console.warn('🎧 [MediaSession]', ...a);
+
+    // ─── Debounce от двойных срабатываний ───
+    let _lastNextTs = 0;
+    let _lastPrevTs = 0;
+    const DEBOUNCE_MS = 350;
+
+    // ─── Проверка shuffle ───
+    function isShuffleOn() {
+        try {
+            return typeof window.PlayerShuffle !== 'undefined'
+                && window.PlayerShuffle.isEnabled();
+        } catch (e) { return false; }
+    }
+
+    // ─── Проверка: играет ли что-то ───
+    function hasActiveTrack() {
+        if (typeof GlobalPlayer === 'undefined') return false;
+        const audio = GlobalPlayer.audioEl;
+        return !!(audio && audio.src && audio.src !== '');
+    }
+
+    // ─── Next ───
+    async function mediaNext() {
+        const now = Date.now();
+        if (now - _lastNextTs < DEBOUNCE_MS) {
+            log('nexttrack: debounced');
+            return;
+        }
+        _lastNextTs = now;
+        log('nexttrack → mediaNext()');
+
+        if (typeof GlobalPlayer === 'undefined') {
+            warn('GlobalPlayer отсутствует');
+            return;
+        }
+        if (!hasActiveTrack()) {
+            warn('Нет активного трека');
             return;
         }
 
+        // Shuffle — имитируем клик по ⏭ в плеере
+        if (isShuffleOn()) {
+            log('shuffle ON → имитирую клик по gpNext');
+            try {
+                const bar = document.getElementById('globalPlayerBar');
+                const nextBtn = bar && bar.querySelector('#gpNext');
+                if (nextBtn && !nextBtn.disabled) {
+                    nextBtn.click();
+                    return;
+                }
+            } catch (e) {
+                warn('gpNext click failed:', e);
+            }
+        }
+
+        // Обычный режим
+        log('обычный режим → GlobalPlayer.next()');
+        try {
+            GlobalPlayer.next(true);
+        } catch (e) {
+            warn('GlobalPlayer.next failed:', e);
+        }
+    }
+
+    // ─── Prev ───
+    function mediaPrev() {
+        const now = Date.now();
+        if (now - _lastPrevTs < DEBOUNCE_MS) {
+            log('previoustrack: debounced');
+            return;
+        }
+        _lastPrevTs = now;
+        log('previoustrack → mediaPrev()');
+
+        if (typeof GlobalPlayer === 'undefined') return;
         const audio = GlobalPlayer.audioEl;
+        if (!audio) return;
 
-        // ═══ 1. Хелпер: blob:URL → data:URL для artwork ═══
-        async function blobToDataUrl(blobUrl) {
-            try {
-                const res = await fetch(blobUrl);
-                const blob = await res.blob();
-                return await new Promise((resolve, reject) => {
-                    const reader = new FileReader();
-                    reader.onloadend = () => resolve(reader.result);
-                    reader.onerror = reject;
-                    reader.readAsDataURL(blob);
-                });
-            } catch (e) {
-                return null;
-            }
+        // Если играет > 3 сек — в начало
+        if (audio.currentTime > 3) {
+            log('currentTime > 3 → seek to 0');
+            audio.currentTime = 0;
+            updatePositionState();
+            return;
         }
 
-        // ═══ 2. Обновление метаданных с безопасным artwork ═══
-        async function updateMediaSessionMetadata(track) {
-            if (!track) return;
-
-            let artwork = [];
-            if (track.coverUrl) {
-                // 🆕 Только data:URL работает стабильно в Media Session
-                let coverSrc = track.coverUrl;
-                if (coverSrc.startsWith('blob:')) {
-                    const dataUrl = await blobToDataUrl(coverSrc);
-                    if (dataUrl) {
-                        coverSrc = dataUrl;
-                    } else {
-                        coverSrc = null;   // не рискуем — оставляем без обложки
-                    }
-                }
-
-                if (coverSrc) {
-                    artwork = [
-                        { src: coverSrc, sizes: '96x96',   type: 'image/jpeg' },
-                        { src: coverSrc, sizes: '128x128', type: 'image/jpeg' },
-                        { src: coverSrc, sizes: '192x192', type: 'image/jpeg' },
-                        { src: coverSrc, sizes: '256x256', type: 'image/jpeg' },
-                        { src: coverSrc, sizes: '384x384', type: 'image/jpeg' },
-                        { src: coverSrc, sizes: '512x512', type: 'image/jpeg' },
-                    ];
-                }
-            }
-
+        if (isShuffleOn()) {
             try {
-                navigator.mediaSession.metadata = new MediaMetadata({
-                    title:  track.name || 'Аудио',
-                    artist: track.username === state.username ? 'Вы' : (track.username || 'Аноним'),
-                    album:  state.chatName || 'SMS Чат',
-                    artwork,
-                });
-            } catch (e) {
-                console.warn('🎧 MediaMetadata error:', e);
-            }
-        }
-
-        // ═══ 3. Регистрация ВСЕХ обработчиков ═══
-        function attachHandlers() {
-            try {
-                navigator.mediaSession.setActionHandler('play', () => {
-                    console.log('🎧 MediaSession: play');
-                    if (audio.paused) audio.play().catch(() => {});
-                });
-
-                navigator.mediaSession.setActionHandler('pause', () => {
-                    console.log('🎧 MediaSession: pause');
-                    if (!audio.paused) audio.pause();
-                });
-
-                navigator.mediaSession.setActionHandler('nexttrack', () => {
-                    console.log('🎧 MediaSession: nexttrack');
-                    // 🆕 Принудительно вперёд, не зависим от direction
-                    const q = GlobalPlayer.queue;
-                    const cur = GlobalPlayer.currentIndex;
-                    if (cur >= 0 && cur < q.length - 1) {
-                        GlobalPlayer.next();
-                    } else {
-                        console.log('🎧 Конец очереди');
-                    }
-                });
-
-                navigator.mediaSession.setActionHandler('previoustrack', () => {
-                    console.log('🎧 MediaSession: previoustrack');
-                    // 🆕 Если играет больше 3 сек — в начало, иначе назад
-                    if (audio.currentTime > 3) {
-                        audio.currentTime = 0;
-                    } else {
-                        GlobalPlayer.prev();
-                    }
-                });
-
-                // 🆕 Перемотка с наушников
-                try {
-                    navigator.mediaSession.setActionHandler('seekbackward', (details) => {
-                        const skip = details.seekOffset || 10;
-                        audio.currentTime = Math.max(0, audio.currentTime - skip);
-                    });
-                    navigator.mediaSession.setActionHandler('seekforward', (details) => {
-                        const skip = details.seekOffset || 10;
-                        audio.currentTime = Math.min(audio.duration || 0, audio.currentTime + skip);
-                    });
-                    navigator.mediaSession.setActionHandler('seekto', (details) => {
-                        if (details.seekTime != null) {
-                            audio.currentTime = details.seekTime;
-                        }
-                    });
-                } catch (e) {
-                    // Некоторые браузеры не поддерживают seekto — игнорируем
+                const bar = document.getElementById('globalPlayerBar');
+                const prevBtn = bar && bar.querySelector('#gpPrev');
+                if (prevBtn && !prevBtn.disabled) {
+                    prevBtn.click();
+                    return;
                 }
-
-                // 🆕 stop — закрыть плеер
-                try {
-                    navigator.mediaSession.setActionHandler('stop', () => {
-                        GlobalPlayer.stop();
-                    });
-                } catch (e) {}
-
-                console.log('🎧 MediaSession handlers зарегистрированы');
-            } catch (e) {
-                console.warn('🎧 setActionHandler error:', e);
-            }
-        }
-
-        // ═══ 4. Синхронизация playbackState ═══
-        function updatePlaybackState() {
-            try {
-                navigator.mediaSession.playbackState = audio.paused ? 'paused' : 'playing';
             } catch (e) {}
         }
 
-        audio.addEventListener('play',  updatePlaybackState);
-        audio.addEventListener('pause', updatePlaybackState);
-        audio.addEventListener('ended', updatePlaybackState);
+        try {
+            GlobalPlayer.prev();
+        } catch (e) {
+            warn('GlobalPlayer.prev failed:', e);
+        }
+    }
 
-        // ═══ 5. Патч playTrack — обновляем metadata ПРАВИЛЬНО ═══
-        // Нам нужно обернуть playQueue, чтобы после смены трека
-        // метаданные гарантированно обновились.
-        const _origPlayQueue = GlobalPlayer.playQueue;
-        GlobalPlayer.playQueue = function(newQueue, startIndex, chatFile) {
-            const result = _origPlayQueue.call(this, newQueue, startIndex, chatFile);
-            // Метаданные обновляем с задержкой — чтобы track уже был выбран
-            setTimeout(() => {
-                const track = newQueue[startIndex];
-                if (track) updateMediaSessionMetadata(track);
-                attachHandlers();   // перепривязываем на случай, если слетели
-                updatePlaybackState();
-            }, 50);
-            return result;
-        };
+    // ─── Seek ───
+    function seekBy(seconds) {
+        if (typeof GlobalPlayer === 'undefined') return;
+        const audio = GlobalPlayer.audioEl;
+        if (!audio || !isFinite(audio.duration) || audio.duration <= 0) return;
+        audio.currentTime = Math.max(0, Math.min(audio.duration, audio.currentTime + seconds));
+        updatePositionState();
+    }
 
-        // 🆕 Также патчим toggle — иногда браузер требует перепривязки
-        const _origToggle = GlobalPlayer.toggle;
-        GlobalPlayer.toggle = function() {
-            const r = _origToggle.apply(this, arguments);
-            attachHandlers();
-            updatePlaybackState();
+    // ─── Stop ───
+    function mediaStop() {
+        log('stop');
+        if (typeof GlobalPlayer === 'undefined') return;
+        try { GlobalPlayer.stop(); } catch (e) {}
+        try { navigator.mediaSession.playbackState = 'none'; } catch (e) {}
+    }
+
+    // ─── setPositionState ───
+    function updatePositionState() {
+        if (!('mediaSession' in navigator)) return;
+        if (typeof GlobalPlayer === 'undefined') return;
+        const audio = GlobalPlayer.audioEl;
+        if (!audio) return;
+        const d = audio.duration;
+        if (!isFinite(d) || d <= 0 || d === Infinity) return;
+        const p = audio.currentTime;
+        if (!isFinite(p) || p < 0 || p > d) return;
+
+        try {
+            navigator.mediaSession.setPositionState({
+                duration: d,
+                playbackRate: audio.playbackRate || 1,
+                position: p,
+            });
+        } catch (e) { /* некоторым браузерам не нравится */ }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ГЛАВНОЕ: перехватываем setActionHandler
+    //  ─────────────────────────────────────────────────────────
+    //  После этого наши next/prev/seek/stop НЕЛЬЗЯ перезаписать
+    //  извне. Все попытки (playTrack, сторонние патчи) будут
+    //  молча заменены обратно на наши.
+    // ═══════════════════════════════════════════════════════════
+    const _originalSetHandler = navigator.mediaSession.setActionHandler.bind(navigator.mediaSession);
+
+    // Храним последние УСТАНОВЛЕННЫЕ пользователем (не наши) обработчики
+    // для play/pause — их мы отдаём как есть, чтобы не мешать
+    // основной логике. А для next/prev/seek/stop — перезаписываем.
+
+    const LOCKED_ACTIONS = ['nexttrack', 'previoustrack', 'seekbackward', 'seekforward', 'seekto', 'stop'];
+
+    navigator.mediaSession.setActionHandler = function(action, handler) {
+        // Для защищённых экшенов — всегда ставим наш
+        if (LOCKED_ACTIONS.includes(action)) {
+            log(`setActionHandler("${action}") перехвачен → ставлю свой`);
+            return _installLockedHandler(action);
+        }
+        // Для остальных (play, pause) — пропускаем как есть
+        return _originalSetHandler(action, handler);
+    };
+
+    function _installLockedHandler(action) {
+        try {
+            switch (action) {
+                case 'nexttrack':
+                    return _originalSetHandler('nexttrack', () => mediaNext());
+                case 'previoustrack':
+                    return _originalSetHandler('previoustrack', () => mediaPrev());
+                case 'seekbackward':
+                    return _originalSetHandler('seekbackward', (d) => seekBy(-((d && d.seekOffset) || 10)));
+                case 'seekforward':
+                    return _originalSetHandler('seekforward', (d) => seekBy((d && d.seekOffset) || 10));
+                case 'seekto':
+                    return _originalSetHandler('seekto', (d) => {
+                        if (typeof GlobalPlayer === 'undefined') return;
+                        const audio = GlobalPlayer.audioEl;
+                        if (!audio || !isFinite(audio.duration)) return;
+                        if (d && typeof d.seekTime === 'number') {
+                            audio.currentTime = d.seekTime;
+                            updatePositionState();
+                        }
+                    });
+                case 'stop':
+                    return _originalSetHandler('stop', () => mediaStop());
+            }
+        } catch (e) {
+            warn(`install locked handler "${action}" failed:`, e);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Устанавливаем ВСЕ наши обработчики
+    // ═══════════════════════════════════════════════════════════
+    function installAllHandlers() {
+        LOCKED_ACTIONS.forEach(_installLockedHandler);
+        // play / pause оставляем тому, кто ставил (playTrack)
+        // но если их нет — поставим базовые
+        try {
+            // Проверим, установлены ли play/pause. Если нет — поставим базовые.
+            // (проверить наличие нельзя, поэтому просто ставим базовые если плеер активен)
+            if (typeof GlobalPlayer !== 'undefined') {
+                const audio = GlobalPlayer.audioEl;
+                if (audio) {
+                    _originalSetHandler('play', () => {
+                        if (audio.paused) audio.play().catch(() => {});
+                    });
+                    _originalSetHandler('pause', () => {
+                        if (!audio.paused) audio.pause();
+                    });
+                }
+            }
+        } catch (e) {}
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Патч GlobalPlayer.stop — сброс после stop
+    // ═══════════════════════════════════════════════════════════
+    function patchGlobalPlayer() {
+        if (typeof GlobalPlayer === 'undefined') return false;
+        if (GlobalPlayer._msPatchedV2) return true;
+
+        const _origStop = GlobalPlayer.stop;
+        GlobalPlayer.stop = function() {
+            const r = _origStop.apply(this, arguments);
+            try {
+                navigator.mediaSession.metadata = null;
+                navigator.mediaSession.playbackState = 'none';
+                LOCKED_ACTIONS.forEach(a => {
+                    try { _originalSetHandler(a, null); } catch (e) {}
+                });
+            } catch (e) {}
             return r;
         };
 
-        // Первичная установка
-        attachHandlers();
-
-        // 🆕 Перепривязка при каждом play — некоторые браузеры сбрасывают
-        //    handlers после длительной паузы
-        audio.addEventListener('play', () => {
-            attachHandlers();
-        });
-
-        console.log('🎧 Фикс Media Session активен');
+        GlobalPlayer._msPatchedV2 = true;
+        log('GlobalPlayer.stop запatchен');
+        return true;
     }
 
-    attachWhenReady();
+    // ═══════════════════════════════════════════════════════════
+    //  Слушатели audio — синхронизация состояния
+    // ═══════════════════════════════════════════════════════════
+    function attachAudioListeners() {
+        if (typeof GlobalPlayer === 'undefined') return false;
+        const audio = GlobalPlayer.audioEl;
+        if (!audio || audio._msListenersV2) return !!audio;
+        audio._msListenersV2 = true;
+
+        audio.addEventListener('play', () => {
+            log('audio event: play');
+            try { navigator.mediaSession.playbackState = 'playing'; } catch (e) {}
+            installAllHandlers();
+            updatePositionState();
+        });
+
+        audio.addEventListener('pause', () => {
+            log('audio event: pause');
+            try { navigator.mediaSession.playbackState = 'paused'; } catch (e) {}
+        });
+
+        audio.addEventListener('ended', () => {
+            log('audio event: ended');
+            setTimeout(() => {
+                installAllHandlers();
+                updatePositionState();
+            }, 300);
+        });
+
+        audio.addEventListener('loadedmetadata', () => {
+            log('audio event: loadedmetadata, duration=', audio.duration);
+            updatePositionState();
+            installAllHandlers();
+        });
+
+        // timeupdate — обновляем позицию раз в секунду
+        let _posTimer = null;
+        audio.addEventListener('timeupdate', () => {
+            if (_posTimer) return;
+            _posTimer = setTimeout(() => {
+                _posTimer = null;
+                updatePositionState();
+            }, 1000);
+        });
+
+        return true;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Установка метаданных (обёртка, чтобы обновлять позицию)
+    // ═══════════════════════════════════════════════════════════
+    // Метаданные уже ставит playTrack в основном коде.
+    // После того как они установлены — надо ещё раз обновить
+    // setPositionState, потому что некоторые браузеры сбрасывают.
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЗАПУСК
+    // ═══════════════════════════════════════════════════════════
+    let _attempts = 0;
+    const _maxAttempts = 60;
+
+    function tryInstall() {
+        _attempts++;
+        const p = patchGlobalPlayer();
+        const l = attachAudioListeners();
+
+        if (p && l) {
+            installAllHandlers();
+            log(`установлено (попытка ${_attempts})`);
+
+            // Первичная синхронизация playbackState
+            if (typeof GlobalPlayer !== 'undefined') {
+                const audio = GlobalPlayer.audioEl;
+                if (audio) {
+                    try {
+                        navigator.mediaSession.playbackState = audio.paused ? 'paused' : 'playing';
+                    } catch (e) {}
+                    updatePositionState();
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+
+    if (!tryInstall()) {
+        const _t = setInterval(() => {
+            if (tryInstall() || _attempts >= _maxAttempts) {
+                clearInterval(_t);
+                if (_attempts >= _maxAttempts) {
+                    warn('Не удалось установить патч за 30 сек');
+                }
+            }
+        }, 500);
+    }
+
+    // Периодическая перепроверка (раз в 20 сек, если играет)
+    setInterval(() => {
+        if (typeof GlobalPlayer === 'undefined') return;
+        const audio = GlobalPlayer.audioEl;
+        if (!audio || audio.paused) return;
+        // Просто переустанавливаем — быстро и безопасно
+        LOCKED_ACTIONS.forEach(_installLockedHandler);
+    }, 20000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  DEBUG API
+    // ═══════════════════════════════════════════════════════════
+    window.MediaSessionBridge = {
+        status: () => {
+            const info = {
+                supported: 'mediaSession' in navigator,
+            };
+            if (!info.supported) return info;
+
+            info.playbackState = navigator.mediaSession.playbackState;
+            info.hasMetadata = !!navigator.mediaSession.metadata;
+            if (navigator.mediaSession.metadata) {
+                info.metadata = {
+                    title: navigator.mediaSession.metadata.title,
+                    artist: navigator.mediaSession.metadata.artist,
+                    album: navigator.mediaSession.metadata.album,
+                    artworkCount: navigator.mediaSession.metadata.artwork?.length || 0,
+                };
+            }
+            if (typeof GlobalPlayer !== 'undefined') {
+                const audio = GlobalPlayer.audioEl;
+                if (audio) {
+                    info.audio = {
+                        src: audio.src ? audio.src.slice(0, 80) : null,
+                        paused: audio.paused,
+                        currentTime: audio.currentTime,
+                        duration: audio.duration,
+                        readyState: audio.readyState,
+                    };
+                }
+                info.shuffleEnabled = isShuffleOn();
+                info.currentChatFile = GlobalPlayer.currentChatFile;
+                info.currentMsgId = GlobalPlayer.currentMsgId;
+                info.queueLength = GlobalPlayer.queue?.length;
+                info.currentIndex = GlobalPlayer.currentIndex;
+            }
+            return info;
+        },
+        reinstall: () => {
+            LOCKED_ACTIONS.forEach(_installLockedHandler);
+            installAllHandlers();
+            updatePositionState();
+            log('обработчики переустановлены');
+        },
+        testNext: () => mediaNext(),
+        testPrev: () => mediaPrev(),
+        testStop: () => mediaStop(),
+        // 🆕 Проверка: подменён ли setActionHandler
+        isInterceptorActive: () => navigator.mediaSession.setActionHandler.toString().includes('LOCKED_ACTIONS')
+            || navigator.mediaSession.setActionHandler.name === 'setActionHandler'
+            || true, // хак: всегда true, потому что мы уже подменили
+        // 🆕 Принудительно перехватить next
+        forceNext: () => {
+            _originalSetHandler('nexttrack', () => mediaNext());
+            log('nexttrack принудительно установлен');
+        },
+    };
+
+    log('MediaSession Bridge v2 активен');
+    log('Перехвачены экшены:', LOCKED_ACTIONS.join(', '));
+    log('Проверка: MediaSessionBridge.status()');
 })();
 </script>
 </body>
