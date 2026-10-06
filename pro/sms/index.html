@@ -24431,6 +24431,337 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
     console.log('   • Кнопка 🎲 появится в плеере при его открытии');
     console.log('   • API: PlayerShuffle.toggle() / .inject()');
 })();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🩹 ПАТЧ ОФЛАЙН-КЭША: СИНХРОНИЗАЦИЯ ПРИ ВСЕХ МУТАЦИЯХ
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: OfflineCache сохранялся только при enterChat,
+//  renderHistory и appendMessages. Удаление, редактирование,
+//  реакции и комментарии — не синхронизировали кэш.
+//  Итог: после выхода из чата и захода офлайн — возвращались
+//  уже удалённые сообщения / пропадали свежие правки.
+//
+//  Решение: после каждой мутирующей операции вызываем
+//  OfflineCache.saveNow() (без дебаунса) с актуальным
+//  historyState.allMessages.
+//
+//  ВАЖНО: патч должен стоять ПОСЛЕ определения OfflineCache
+//  и ПОСЛЕ всех функций, которые мы патчим.
+// ═══════════════════════════════════════════════════════════════
+
+(function installOfflineCacheSyncPatch() {
+    'use strict';
+
+    // Проверяем, что модули на месте
+    if (typeof OfflineCache === 'undefined') {
+        console.warn('🩹 [OfflineCache patch] OfflineCache не найден — пропускаем');
+        return;
+    }
+    if (typeof historyState === 'undefined') {
+        console.warn('🩹 [OfflineCache patch] historyState не найден — пропускаем');
+        return;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЯДРО: единая функция синхронизации
+    // ═══════════════════════════════════════════════════════════
+    let _syncPending = false;
+    let _syncQueued = false;
+
+    /**
+     * Немедленно сохраняет текущее состояние чата в офлайн-кэш.
+     * Защищена от параллельных вызовов: если синк уже идёт —
+     * ставит флаг и повторяет один раз после завершения.
+     */
+    async function syncCacheNow(reason = '') {
+        // Нечего сохранять
+        if (!state || !state.chatFile) return;
+        if (!state.salt) return;                 // без соли ключ не восстановится
+        if (!Array.isArray(historyState.allMessages)) return;
+
+        // Защита от рекурсии / параллельных вызовов
+        if (_syncPending) {
+            _syncQueued = true;
+            return;
+        }
+        _syncPending = true;
+
+        const file = state.chatFile;
+        const messages = historyState.allMessages.slice();  // снапшот
+        const salt = state.salt;
+
+        try {
+            await OfflineCache.saveNow(file, messages, salt);
+            if (reason) {
+                console.log(`💾 [OfflineCache] синхронизировано (${reason}): ${messages.length} сообщ.`);
+            }
+        } catch (e) {
+            console.warn('💾 [OfflineCache] sync failed:', reason, e);
+        } finally {
+            _syncPending = false;
+            if (_syncQueued) {
+                _syncQueued = false;
+                // Повторяем ещё раз — данные могли измениться пока писали
+                setTimeout(() => syncCacheNow(reason + '+retry'), 0);
+            }
+        }
+    }
+
+    // Экспортируем — может пригодиться извне
+    window.offlineCacheSyncNow = syncCacheNow;
+
+    // ═══════════════════════════════════════════════════════════
+    //  1. УДАЛЕНИЕ ОДНОГО СООБЩЕНИЯ
+    // ═══════════════════════════════════════════════════════════
+    if (typeof deleteMessage === 'function') {
+        const _origDeleteMessage = deleteMessage;
+        deleteMessage = async function(messageId) {
+            const r = await _origDeleteMessage.call(this, messageId);
+            // historyState.allMessages уже отфильтрован внутри оригинала
+            await syncCacheNow('deleteMessage');
+            return r;
+        };
+        console.log('🩹 patched: deleteMessage');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  2. ПАКЕТНОЕ УДАЛЕНИЕ
+    // ═══════════════════════════════════════════════════════════
+    if (typeof performBatchDelete === 'function') {
+        const _origBatchDelete = performBatchDelete;
+        performBatchDelete = async function(messageIds) {
+            const r = await _origBatchDelete.call(this, messageIds);
+            await syncCacheNow('batchDelete');
+            return r;
+        };
+        console.log('🩹 patched: performBatchDelete');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. РЕДАКТИРОВАНИЕ СООБЩЕНИЯ
+    // ═══════════════════════════════════════════════════════════
+    if (typeof confirmEditMessage === 'function') {
+        const _origEditMessage = confirmEditMessage;
+        confirmEditMessage = async function() {
+            const r = await _origEditMessage.call(this);
+            // msg.text уже обновлён в historyState оригинала
+            await syncCacheNow('editMessage');
+            return r;
+        };
+        console.log('🩹 patched: confirmEditMessage');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  4. РЕАКЦИИ
+    //  toggleReaction() работает оптимистично: сначала меняет
+    //  локально, потом шлёт на сервер. При ошибке — откатывает.
+    //  Мы НЕ хотим сохранять откат в кэш, поэтому ловим успех/провал
+    //  через отслеживание — если после вызова reactions в msg
+    //  остались изменёнными, значит успех.
+    // ═══════════════════════════════════════════════════════════
+    if (typeof toggleReaction === 'function') {
+        const _origToggleReaction = toggleReaction;
+        toggleReaction = async function(msgId, emoji) {
+            // Запоминаем состояние ДО
+            const msgBefore = historyState.allMessages.find(m => m.id === msgId);
+            const reactionsBefore = msgBefore ? JSON.stringify(msgBefore.reactions || {}) : '';
+
+            const r = await _origToggleReaction.call(this, msgId, emoji);
+
+            // Проверяем, изменилось ли состояние (успех)
+            const msgAfter = historyState.allMessages.find(m => m.id === msgId);
+            const reactionsAfter = msgAfter ? JSON.stringify(msgAfter.reactions || {}) : '';
+
+            if (reactionsAfter !== reactionsBefore) {
+                await syncCacheNow('toggleReaction');
+            }
+            return r;
+        };
+        console.log('🩹 patched: toggleReaction');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  5. КОММЕНТАРИИ
+    // ═══════════════════════════════════════════════════════════
+    if (typeof submitComment === 'function') {
+        const _origSubmitComment = submitComment;
+        submitComment = async function(msgId, text) {
+            const r = await _origSubmitComment.call(this, msgId, text);
+            await syncCacheNow('submitComment');
+            return r;
+        };
+        console.log('🩹 patched: submitComment');
+    }
+
+    if (typeof deleteComment === 'function') {
+        const _origDeleteComment = deleteComment;
+        deleteComment = async function(msgId, commentId) {
+            const r = await _origDeleteComment.call(this, msgId, commentId);
+            await syncCacheNow('deleteComment');
+            return r;
+        };
+        console.log('🩹 patched: deleteComment');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  6. ВЫХОД ИЗ ЧАТА
+    //  ВАЖНО: syncCacheNow() вызывается ДО _origBackToChats(),
+    //  потому что оригинал сбрасывает state.chatFile = null.
+    // ═══════════════════════════════════════════════════════════
+    if (typeof backToChats === 'function') {
+        const _origBackToChats = backToChats;
+        backToChats = function() {
+            // Синхронизируем ДО сброса state
+            try {
+                if (state.chatFile && state.salt && historyState.allMessages.length >= 0) {
+                    // Не ждём результат — saveNow внутри self-contained
+                    OfflineCache.saveNow(
+                        state.chatFile,
+                        historyState.allMessages.slice(),
+                        state.salt
+                    ).then(() => {
+                        console.log('💾 [OfflineCache] финальный синк перед backToChats');
+                    }).catch(e => {
+                        console.warn('💾 [OfflineCache] финальный синк failed:', e);
+                    });
+                }
+            } catch (e) {}
+
+            return _origBackToChats.apply(this, arguments);
+        };
+        console.log('🩹 patched: backToChats');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  7. LOGOUT
+    //  При выходе из аккаунта — чистим весь кэш, чтобы чужой
+    //  пользователь, зашедший на это устройство, не увидел
+    //  старые сообщения.
+    // ═══════════════════════════════════════════════════════════
+    if (typeof logout === 'function') {
+        const _origLogout = logout;
+        logout = function() {
+            // Сначала синхронизируем (на случай если что-то не сохранилось),
+            // потом чистим — на выходе нам кэш не нужен.
+            const file = state.chatFile;
+            const messages = historyState.allMessages.slice();
+            const salt = state.salt;
+
+            if (file && salt && messages.length >= 0) {
+                // Финальный синк — асинхронно, не блокируем выход
+                OfflineCache.saveNow(file, messages, salt).catch(() => {});
+            }
+
+            // ⚠️ Не чистим кэш при logout: пользователь может снова войти
+            //    с тем же токеном и хочет видеть историю офлайн.
+            //    Если нужна политика «чистить при logout» — раскомментируй:
+            //
+            // OfflineCache.clearAll().catch(() => {});
+            //
+            console.log('💾 [OfflineCache] logout — финальный синк отправлен');
+
+            return _origLogout.apply(this, arguments);
+        };
+        console.log('🩹 patched: logout');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  8. ПОМЕТКА СОБЫТИЙ РАДАРА ПРОЧИТАННЫМИ
+    //  EventRadar помечает event.seen = true в памяти, но не
+    //  вызывает saveEvents() и saveSeen(). Патчим через
+    //  глобальный колбэк из handleEventClick.
+    // ═══════════════════════════════════════════════════════════
+    if (typeof EventRadar !== 'undefined' && typeof window.EventRadar === 'object') {
+        // Патчим handleEventClick — оборачиваем через MutationObserver
+        // не получится, поэтому патчим сам EventRadar.open и .close
+        // (в них есть renderList, который делает updateBadges,
+        //  но не сохраняет seen).
+
+        // Более чистое решение: патчим saveSeen/saveEvents через публичный API.
+        // EventRadar пока не экспортирует их. Используем хакинг через
+        // форс-сохранение: раз в 5 сек, если есть непрочитанные изменения.
+
+        // ⚠️ Проще всего: периодический save через localStorage API.
+        //    EventRadar хранит seen в Set и сам пишет в localStorage
+        //    только при явном клике в оверлее. Патчить извне сложно.
+
+        // Вместо этого — оборачиваем closeOverlay: при закрытии
+        // оверлея вызываем принудительное сохранение.
+
+        const _origEventRadarOpen = EventRadar.open;
+        EventRadar.open = function() {
+            const r = _origEventRadarOpen.apply(this, arguments);
+            // При открытии оверлея — синхронизируем кэш чата
+            // (пользователь мог удалить/изменить сообщения пока оверлей был закрыт)
+            if (state.chatFile) {
+                setTimeout(() => syncCacheNow('eventRadar.open'), 100);
+            }
+            return r;
+        };
+
+        const _origEventRadarClose = EventRadar.close;
+        EventRadar.close = function() {
+            const r = _origEventRadarClose.apply(this, arguments);
+            // При закрытии — форсим сохранение seen через хакинг localStorage.
+            // EventRadar хранит seen в 'radar2_seen_v2' — перезаписываем его
+            // актуальным состоянием из памяти.
+            try {
+                const events = EventRadar.getEvents();
+                // Set seen не экспортирован, но мы можем вычислить его из events
+                const seenKeys = events.filter(e => e.seen).map(e => e.key);
+                // А также добавить ключи, которые уже там были (из localStorage)
+                const raw = localStorage.getItem('radar2_seen_v2');
+                const existing = raw ? JSON.parse(raw) : [];
+                const merged = Array.from(new Set([...existing, ...seenKeys])).slice(-3000);
+                localStorage.setItem('radar2_seen_v2', JSON.stringify(merged));
+            } catch (e) {
+                console.warn('💾 [EventRadar seen] sync failed:', e);
+            }
+            return r;
+        };
+        console.log('🩹 patched: EventRadar.open/close');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  9. ДОПОЛНИТЕЛЬНАЯ СИНХРОНИЗАЦИЯ ПРИ visibilitychange
+    //  Когда пользователь сворачивает приложение — гарантированно
+    //  пишем актуальное состояние. Это спасает от потери данных
+    //  на Android, где beforeunload не срабатывает.
+    // ═══════════════════════════════════════════════════════════
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState !== 'hidden') return;
+        if (!state.chatFile || !state.salt) return;
+        // Не ждём завершения — fire and forget
+        syncCacheNow('visibilitychange:hidden');
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    //  10. ПЕРИОДИЧЕСКАЯ СТРАХОВКА (раз в 60 сек)
+    //  На случай, если какая-то мутация обошла патчи.
+    // ═══════════════════════════════════════════════════════════
+    setInterval(() => {
+        if (!state.chatFile || !state.salt) return;
+        if (document.hidden) return;   // не тратим батарею в фоне
+        syncCacheNow('periodic');
+    }, 60000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ИТОГ
+    // ═══════════════════════════════════════════════════════════
+    console.log('💾 [OfflineCache patch] Активирован:');
+    console.log('   • deleteMessage → saveNow');
+    console.log('   • performBatchDelete → saveNow');
+    console.log('   • confirmEditMessage → saveNow');
+    console.log('   • toggleReaction → saveNow (только при успехе)');
+    console.log('   • submitComment / deleteComment → saveNow');
+    console.log('   • backToChats → финальный синк перед сбросом');
+    console.log('   • logout → финальный синк перед выходом');
+    console.log('   • visibilitychange:hidden → синк (Android)');
+    console.log('   • Раз в 60 сек → страховочный синк');
+    console.log('');
+    console.log('   Проверить вручную: offlineCacheSyncNow("manual")');
+})();
 </script>
 </body>
 </html>
