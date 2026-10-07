@@ -26048,6 +26048,166 @@ markUnseen: (eventOrKey) => {
 
     console.log('🔐 Патч v5: тост «Сжато на X%» виден 500 мс перед шифрованием');
 })();
+
+// ═══════════════════════════════════════════════════════════════
+//  🖼️ ФИКС: ГАЛЕРЕЯ НЕ ВИДИТ ФОТО, КОТОРЫЕ ЕЩЁ НЕ ЗАГРУЖЕНЫ
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: buildGalleryWindow() собирает только те фото, у которых
+//  уже есть blob:URL в loadedSrcs. Если фото в DOM есть, но его
+//  blob:URL ещё не подгружен — галерея его пропускает.
+//
+//  Решение: при открытии галереи:
+//   1. Находим ВСЕ .image-container img в DOM
+//   2. Забираем их src (это blob:URL, уже готовые!)
+//   3. Сопоставляем с allImageMsgIds по msgId
+//   4. Догружаем недостающие из DOM в loadedSrcs
+// ═══════════════════════════════════════════════════════════════
+
+(function fixGalleryMissingDomImages() {
+    'use strict';
+
+    // ═══ 1. Патч collectAllImageMsgIds ═══
+    // Теперь она должна также смотреть в DOM и забирать blob:URL оттуда
+    const _origCollect = collectAllImageMsgIds;
+
+    collectAllImageMsgIds = function() {
+        // Сначала — стандартный сбор из allMessages
+        const list = _origCollect.call(this);
+
+        // 🆕 Дополнительно: обходим DOM и для каждого .message-wrapper[data-msg-id]
+        //    с картинкой проверяем, есть ли уже загруженный blob:URL
+        const wrappers = messagesInner.querySelectorAll('.message-wrapper[data-msg-id]');
+        const domSrcByMsgId = new Map();
+
+        wrappers.forEach(w => {
+            const msgId = parseInt(w.dataset.msgId);
+            if (!msgId) return;
+
+            const img = w.querySelector('.image-container img');
+            if (img && img.src && img.src.startsWith('blob:')) {
+                domSrcByMsgId.set(msgId, img.src);
+            }
+        });
+
+        // Переносим все найденные blob:URL в loadedSrcs галереи
+        domSrcByMsgId.forEach((src, msgId) => {
+            if (!galleryState.loadedSrcs[msgId]) {
+                galleryState.loadedSrcs[msgId] = src;
+            }
+        });
+
+        // Также на всякий случай — восстанавливаем те элементы из списка,
+        // у которых inlineSrc не задан, но attachName есть в кэше
+        for (const item of list) {
+            if (item.inlineSrc) continue;
+            if (galleryState.loadedSrcs[item.msgId]) continue;
+            if (!item.attachName) continue;
+
+            const cached = _attachmentCache.get(item.attachName);
+            if (cached) {
+                galleryState.loadedSrcs[item.msgId] = cached;
+            }
+        }
+
+        return list;
+    };
+
+    // ═══ 2. Патч openGallery ═══
+    // После сборки списка — принудительно догружаем все фото из DOM
+    // и запускаем фоновую загрузку соседних
+    const _origOpenGallery = openGallery;
+
+    openGallery = async function(imageUrl) {
+        // Перед сбором — пробегаем по DOM и забираем все blob:URL
+        // (это делает наш новый collectAllImageMsgIds)
+
+        const result = await _origOpenGallery.call(this, imageUrl);
+
+        // 🆕 После открытия — запускаем фоновую подгрузку фото,
+        //    которые есть в DOM, но ещё не в loadedSrcs (могут быть ещё не готовы blob:URL)
+        setTimeout(async () => {
+            if (!galleryState.isOpen) return;
+
+            // Ищем в DOM все .image-container img, у которых blob:URL
+            // появился ПОСЛЕ открытия галереи (мог подгрузиться асинхронно)
+            const wrappers = messagesInner.querySelectorAll('.message-wrapper[data-msg-id]');
+            let newFound = 0;
+
+            wrappers.forEach(w => {
+                const msgId = parseInt(w.dataset.msgId);
+                if (!msgId) return;
+                if (galleryState.loadedSrcs[msgId]) return;
+
+                const img = w.querySelector('.image-container img');
+                if (img && img.src && img.src.startsWith('blob:')) {
+                    galleryState.loadedSrcs[msgId] = img.src;
+                    newFound++;
+                }
+            });
+
+            if (newFound > 0) {
+                // Пересобираем окно галереи с сохранением текущего фото
+                const curMsgId = (galleryState._windowMsgIds || [])[galleryState.currentIndex];
+                rebuildGalleryWindow(curMsgId);
+                console.log(`🖼️ [Gallery fix] догружено из DOM: ${newFound}`);
+            }
+        }, 400);
+
+        // 🆕 Ещё раз через 1.5 сек — для медленных картинок
+        setTimeout(async () => {
+            if (!galleryState.isOpen) return;
+
+            const wrappers = messagesInner.querySelectorAll('.message-wrapper[data-msg-id]');
+            let newFound = 0;
+            wrappers.forEach(w => {
+                const msgId = parseInt(w.dataset.msgId);
+                if (!msgId || galleryState.loadedSrcs[msgId]) return;
+                const img = w.querySelector('.image-container img');
+                if (img && img.src && img.src.startsWith('blob:')) {
+                    galleryState.loadedSrcs[msgId] = img.src;
+                    newFound++;
+                }
+            });
+            if (newFound > 0) {
+                const curMsgId = (galleryState._windowMsgIds || [])[galleryState.currentIndex];
+                rebuildGalleryWindow(curMsgId);
+            }
+        }, 1500);
+
+        return result;
+    };
+
+    // ═══ 3. Патч loadAttachmentsIn — чтобы после подгрузки вложений
+    //    мы обновляли окно галереи, если она открыта ═══
+    const _origLoadAttachmentsIn = loadAttachmentsIn;
+
+    loadAttachmentsIn = async function(root) {
+        const result = await _origLoadAttachmentsIn.call(this, root);
+
+        // 🆕 Если галерея открыта — пересобираем окно с новыми blob:URL
+        if (galleryState.isOpen && root === messagesInner) {
+            const wrappers = messagesInner.querySelectorAll('.message-wrapper[data-msg-id]');
+            let newFound = 0;
+            wrappers.forEach(w => {
+                const msgId = parseInt(w.dataset.msgId);
+                if (!msgId || galleryState.loadedSrcs[msgId]) return;
+                const img = w.querySelector('.image-container img');
+                if (img && img.src && img.src.startsWith('blob:')) {
+                    galleryState.loadedSrcs[msgId] = img.src;
+                    newFound++;
+                }
+            });
+            if (newFound > 0) {
+                const curMsgId = (galleryState._windowMsgIds || [])[galleryState.currentIndex];
+                rebuildGalleryWindow(curMsgId);
+            }
+        }
+        return result;
+    };
+
+    console.log('🖼️ [Gallery fix] Галерея теперь видит фото из DOM, даже если blob:URL подгрузился позже');
+})();
+
 </script>
 </body>
 </html>
