@@ -25841,20 +25841,16 @@ markUnseen: (eventOrKey) => {
     log('Проверка: MediaSessionBridge.status()');
 })();
 
-
 // ═══════════════════════════════════════════════════════════════
-//  🔐 ПАТЧ v4: убираем "мёртвую зону" между сжатием и шифрованием
+//  🔐 ПАТЧ v5: тост «Сжато на X%» виден 500 мс, потом шифрование
 //  ─────────────────────────────────────────────────────────────
-//  Перехватывает handleVideoFileUpload и показывает оверлей
-//  СРАЗУ после сжатия — то есть в тот момент, когда появляется
-//  тост "Сжато на X%".
-//
-//  Оверлей держится до момента, когда uploadAttachmentAuto
-//  открывает свой прогресс-бар — то есть до старта реальной
-//  загрузки. Пользователь видит непрерывный процесс.
+//  Заменяет v4. Отличие:
+//   • После "✅ Сжато" тост живёт ещё 500 мс
+//   • Только потом появляется оверлей "🔐 Шифрование"
+//   • Если сжатия не было — оверлей сразу (как в v3)
 // ═══════════════════════════════════════════════════════════════
 
-(function patchVideoUploadNoGap() {
+(function patchVideoUploadWithReadableToast() {
     'use strict';
 
     if (typeof handleVideoFileUpload !== 'function') {
@@ -25862,13 +25858,11 @@ markUnseen: (eventOrKey) => {
         return;
     }
 
-    // ─── Общий оверлей (используем тот же ID, что в v3) ───
+    // ─── Оверлей ───
     function getOverlay() {
         let ov = document.getElementById('encryptionOverlay');
         if (ov) return ov;
 
-        // Если v3 уже создал — используем его.
-        // Если нет — создаём такой же.
         ov = document.createElement('div');
         ov.id = 'encryptionOverlay';
         ov.innerHTML = `
@@ -25881,7 +25875,6 @@ markUnseen: (eventOrKey) => {
         `;
         document.body.appendChild(ov);
 
-        // Стили на случай если v3 не подключён
         if (!document.getElementById('encryptionOverlayStyles')) {
             const style = document.createElement('style');
             style.id = 'encryptionOverlayStyles';
@@ -25949,26 +25942,41 @@ markUnseen: (eventOrKey) => {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ПЕРЕХВАТ handleVideoFileUpload
+    //  ПЕРЕХВАТ
     // ═══════════════════════════════════════════════════════════
     const _origHandleVideo = handleVideoFileUpload;
 
     handleVideoFileUpload = async function(file) {
-        // ─── Патчим UploadProgress.finish так, чтобы СРАЗУ после ───
-        // ─── закрытия прогресс-бара сжатия показать оверлей ───
         const origFinish = UploadProgress.finish;
+        let overlayScheduled = false;
         let overlayShown = false;
+        let overlayTimer = null;
 
+        // ─── Хелпер: показать оверлей один раз ───
+        const scheduleOverlay = (delay) => {
+            if (overlayScheduled) return;
+            overlayScheduled = true;
+            overlayTimer = setTimeout(() => {
+                overlayShown = true;
+                showOverlay(file.name, 'Файл шифруется перед отправкой');
+            }, delay);
+        };
+
+        // ─── Перехватываем finish ───
         UploadProgress.finish = function(successText, opts) {
             const r = origFinish.call(this, successText, opts);
-            // Сразу после закрытия прогресс-бара сжатия — открываем оверлей
-            if (!overlayShown && successText && successText.includes('Сжато')) {
-                overlayShown = true;
-                // Небольшая задержка, чтобы прогресс-бар успел исчезнуть
-                setTimeout(() => {
-                    showOverlay(file.name, 'Файл сжимается и шифруется перед отправкой');
-                }, opts?.delay || 700);
+
+            // Случай 1: было сжатие — показываем тост, ждём 500 мс, потом оверлей
+            if (!overlayScheduled && successText && successText.includes('Сжато')) {
+                // Даём тосту "✅ Сжато на X%" провисеть хотя бы 500 мс
+                // (сам тост уже показан в handleVideoFileUpload, здесь только таймер)
+                scheduleOverlay(500);
             }
+
+            // Случай 2: тост о сжатии НЕ удалось показать (маленький файл / ошибка сжатия)
+            // — в этом случае "Сжато" нет, но мы хотим оверлей показать при
+            // фактическом начале шифрования. Пробуем поймать это в uploadAttachmentAuto (см. ниже).
+
             return r;
         };
 
@@ -25976,15 +25984,69 @@ markUnseen: (eventOrKey) => {
             const result = await _origHandleVideo.apply(this, arguments);
             return result;
         } finally {
-            // Возвращаем оригинальный finish на место
             UploadProgress.finish = origFinish;
-            // Всё равно прячем оверлей — на случай, если uploadAttachmentAuto
-            // его не открыл (например, файл маленький)
-            setTimeout(() => hideOverlay(), 500);
+
+            // Если оверлей ещё не был запланирован (например, сжатие не происходило) —
+            // показываем его сейчас, но только если шифрование вот-вот пойдёт
+            // (то есть если файл большой и дошёл до uploadAttachmentAuto)
+            //
+            // Точнее: если overlayShown=false и overlayScheduled=false,
+            // а функция завершилась без ошибки — значит всё уже сделано.
+            // Ничего не показываем, чтобы не было "ложного" оверлея.
+            //
+            // Если overlay был запланирован но ещё не показан — даём ему сработать.
+
+            if (overlayScheduled && !overlayShown && overlayTimer) {
+                // уже стоит таймер — пусть отработает
+            } else if (!overlayScheduled) {
+                // оверлей не планировался — просто прячем на всякий случай
+                setTimeout(() => hideOverlay(), 500);
+            }
         }
     };
 
-    console.log('🔐 Патч v4: непрерывный оверлей между сжатием и шифрованием');
+    // ═══════════════════════════════════════════════════════════
+    //  Дополнительная защита: показываем оверлей и в uploadAttachmentAuto
+    //  (для случаев, когда сжатия не было — например, видео уже было < 1 МБ)
+    // ═══════════════════════════════════════════════════════════
+    const _origUploadAuto = uploadAttachmentAuto;
+
+    uploadAttachmentAuto = async function(chatFile, attachName, plainBuffer, mime, displayName) {
+        const size = plainBuffer.byteLength;
+        const bigEnough = size > 500 * 1024;
+
+        if (bigEnough) {
+            // Если оверлей ещё не показан — показываем с небольшой задержкой,
+            // чтобы текущий тост (если есть) успел прочитаться.
+            const ov = document.getElementById('encryptionOverlay');
+            const isOverlayVisible = ov && ov.classList.contains('show');
+
+            if (!isOverlayVisible) {
+                // Проверяем: виден ли сейчас тост?
+                const toastEl = document.getElementById('toast');
+                const toastVisible = toastEl && toastEl.style.display === 'block';
+
+                if (toastVisible) {
+                    // Тост есть — ждём 500 мс, чтобы его прочитали
+                    await new Promise(r => setTimeout(r, 500));
+                }
+                // Теперь показываем оверлей
+                showOverlay(displayName || attachName);
+                await new Promise(r => setTimeout(r, 80));
+            }
+        }
+
+        try {
+            const result = await _origUploadAuto.apply(this, arguments);
+            return result;
+        } finally {
+            if (bigEnough) {
+                setTimeout(() => hideOverlay(), 300);
+            }
+        }
+    };
+
+    console.log('🔐 Патч v5: тост «Сжато на X%» виден 500 мс перед шифрованием');
 })();
 </script>
 </body>
