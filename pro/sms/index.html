@@ -25840,6 +25840,152 @@ markUnseen: (eventOrKey) => {
     log('Перехвачены экшены:', LOCKED_ACTIONS.join(', '));
     log('Проверка: MediaSessionBridge.status()');
 })();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🔐 ПАТЧ v4: убираем "мёртвую зону" между сжатием и шифрованием
+//  ─────────────────────────────────────────────────────────────
+//  Перехватывает handleVideoFileUpload и показывает оверлей
+//  СРАЗУ после сжатия — то есть в тот момент, когда появляется
+//  тост "Сжато на X%".
+//
+//  Оверлей держится до момента, когда uploadAttachmentAuto
+//  открывает свой прогресс-бар — то есть до старта реальной
+//  загрузки. Пользователь видит непрерывный процесс.
+// ═══════════════════════════════════════════════════════════════
+
+(function patchVideoUploadNoGap() {
+    'use strict';
+
+    if (typeof handleVideoFileUpload !== 'function') {
+        console.error('🔐 handleVideoFileUpload не найдена!');
+        return;
+    }
+
+    // ─── Общий оверлей (используем тот же ID, что в v3) ───
+    function getOverlay() {
+        let ov = document.getElementById('encryptionOverlay');
+        if (ov) return ov;
+
+        // Если v3 уже создал — используем его.
+        // Если нет — создаём такой же.
+        ov = document.createElement('div');
+        ov.id = 'encryptionOverlay';
+        ov.innerHTML = `
+            <div class="enc-card">
+                <div class="enc-spinner"></div>
+                <div class="enc-title">🔐 Шифрование…</div>
+                <div class="enc-name" id="encFileName">файл</div>
+                <div class="enc-sub">Файл шифруется перед отправкой — это может занять несколько секунд</div>
+            </div>
+        `;
+        document.body.appendChild(ov);
+
+        // Стили на случай если v3 не подключён
+        if (!document.getElementById('encryptionOverlayStyles')) {
+            const style = document.createElement('style');
+            style.id = 'encryptionOverlayStyles';
+            style.textContent = `
+                #encryptionOverlay {
+                    position: fixed; inset: 0;
+                    background: rgba(0,0,0,0.75);
+                    backdrop-filter: blur(10px);
+                    -webkit-backdrop-filter: blur(10px);
+                    z-index: 3000; display: none;
+                    align-items: center; justify-content: center;
+                    padding: 20px; animation: encFadeIn 0.2s ease;
+                }
+                #encryptionOverlay.show { display: flex; }
+                @keyframes encFadeIn { from { opacity: 0; } to { opacity: 1; } }
+                #encryptionOverlay .enc-card {
+                    background: #1a1a2e;
+                    border: 1px solid rgba(108,92,231,0.5);
+                    border-radius: 20px; padding: 26px 24px;
+                    max-width: 360px; width: 100%; text-align: center;
+                    box-shadow: 0 20px 60px rgba(0,0,0,0.7),
+                                0 0 0 1px rgba(108,92,231,0.2);
+                }
+                #encryptionOverlay .enc-spinner {
+                    width: 48px; height: 48px; margin: 0 auto 16px;
+                    border: 3px solid rgba(108,92,231,0.2);
+                    border-top-color: #6c5ce7;
+                    border-right-color: #00b894;
+                    border-radius: 50%;
+                    animation: encSpin 0.9s linear infinite;
+                }
+                @keyframes encSpin { to { transform: rotate(360deg); } }
+                #encryptionOverlay .enc-title {
+                    font-size: 16px; font-weight: 700; color: #fff;
+                    margin-bottom: 6px;
+                    display: flex; align-items: center;
+                    justify-content: center; gap: 8px;
+                }
+                #encryptionOverlay .enc-name {
+                    font-size: 13px; color: #a78bfa; margin-bottom: 12px;
+                    word-break: break-word; line-height: 1.3;
+                    max-height: 3em; overflow: hidden;
+                }
+                #encryptionOverlay .enc-sub {
+                    font-size: 11px; color: #666; line-height: 1.5;
+                }
+            `;
+            document.head.appendChild(style);
+        }
+        return ov;
+    }
+
+    function showOverlay(fileName, subText) {
+        const ov = getOverlay();
+        const nameEl = ov.querySelector('#encFileName');
+        const subEl = ov.querySelector('.enc-sub');
+        if (nameEl) nameEl.textContent = fileName || 'файл';
+        if (subEl) subEl.textContent = subText || 'Файл шифруется перед отправкой — это может занять несколько секунд';
+        ov.classList.add('show');
+    }
+
+    function hideOverlay() {
+        const ov = document.getElementById('encryptionOverlay');
+        if (ov) ov.classList.remove('show');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ handleVideoFileUpload
+    // ═══════════════════════════════════════════════════════════
+    const _origHandleVideo = handleVideoFileUpload;
+
+    handleVideoFileUpload = async function(file) {
+        // ─── Патчим UploadProgress.finish так, чтобы СРАЗУ после ───
+        // ─── закрытия прогресс-бара сжатия показать оверлей ───
+        const origFinish = UploadProgress.finish;
+        let overlayShown = false;
+
+        UploadProgress.finish = function(successText, opts) {
+            const r = origFinish.call(this, successText, opts);
+            // Сразу после закрытия прогресс-бара сжатия — открываем оверлей
+            if (!overlayShown && successText && successText.includes('Сжато')) {
+                overlayShown = true;
+                // Небольшая задержка, чтобы прогресс-бар успел исчезнуть
+                setTimeout(() => {
+                    showOverlay(file.name, 'Файл сжимается и шифруется перед отправкой');
+                }, opts?.delay || 700);
+            }
+            return r;
+        };
+
+        try {
+            const result = await _origHandleVideo.apply(this, arguments);
+            return result;
+        } finally {
+            // Возвращаем оригинальный finish на место
+            UploadProgress.finish = origFinish;
+            // Всё равно прячем оверлей — на случай, если uploadAttachmentAuto
+            // его не открыл (например, файл маленький)
+            setTimeout(() => hideOverlay(), 500);
+        }
+    };
+
+    console.log('🔐 Патч v4: непрерывный оверлей между сжатием и шифрованием');
+})();
 </script>
 </body>
 </html>
