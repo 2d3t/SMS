@@ -9134,16 +9134,39 @@ async function loadOlderMessages() {
     // Мгновенно
     restoreAnchor();
 
-    // ═══ 4. Загружаем вложения ═══
-    await loadAttachmentsIn(messagesInner);
+    // ═══════════════════════════════════════════════════════════════
+//  ═══ 4. ПАУЗА: даём браузеру «устояться» перед вложениями ═══
+//  Два rAF + 60 мс — гарантия что layout пересчитан и кадр отрисован.
+//  Без этой паузы вставка 45 сообщений и загрузка картинок «слипаются»
+//  в один re-layout, что даёт микрофризы и «прыжки» скролла.
+// ═══════════════════════════════════════════════════════════════
+await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+await new Promise(r => setTimeout(r, 60));
 
-    // ═══ 5. Восстановление позиции после загрузки вложений ═══
-    // Каскад — картинки грузятся асинхронно
-    requestAnimationFrame(() => requestAnimationFrame(restoreAnchor));
-    setTimeout(restoreAnchor, 100);
-    setTimeout(restoreAnchor, 300);
-    setTimeout(restoreAnchor, 700);
-    setTimeout(restoreAnchor, 1500);
+
+// Восстанавливаем позицию ПОСЛЕ того, как layout устоялся
+restoreAnchor();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  ═══ 4.1. ЗАГРУЖАЕМ ВЛОЖЕНИЯ ═══
+// ═══════════════════════════════════════════════════════════════
+await loadAttachmentsIn(messagesInner);
+
+
+// ═══════════════════════════════════════════════════════════════
+//  ═══ 5. КАСКАДНОЕ ВОССТАНОВЛЕНИЕ ПОЗИЦИИ ═══
+//  Картинки/видео грузятся асинхронно и меняют высоту контейнера.
+//  Несколько вызовов restoreAnchor с разными задержками ловят
+//  изменения на разных этапах — так позиция остаётся стабильной.
+// ═══════════════════════════════════════════════════════════════
+requestAnimationFrame(() => requestAnimationFrame(restoreAnchor));
+setTimeout(restoreAnchor, 80);
+setTimeout(restoreAnchor, 200);
+setTimeout(restoreAnchor, 450);
+setTimeout(restoreAnchor, 900);
+setTimeout(restoreAnchor, 1600);
+setTimeout(restoreAnchor, 2500);
 
     // ═══ 6. Финализация ═══
     setTimeout(() => {
