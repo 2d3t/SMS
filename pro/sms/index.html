@@ -26510,6 +26510,145 @@ markUnseen: (eventOrKey) => {
     console.log('✅ Кнопка «Прочитать всё» в плашке автопоказа активна');
 })();
 
+
+// ═══════════════════════════════════════════════════════════════
+//  🚫 ЗАПРЕТ ВЫДЕЛЕНИЯ ТЕКСТА В СООБЩЕНИЯХ (кроме системных)
+//  Решает проблему: долгий тап на чужом сообщении в Chrome
+//  вызывает «толкование слов» и системное меню выделения,
+//  вместо нашего меню с «Копировать текст».
+// ═══════════════════════════════════════════════════════════════
+
+(function disableTextSelectionInMessages() {
+    'use strict';
+
+    // ─── Стили ───
+    if (!document.getElementById('messageNoSelectStyles')) {
+        const style = document.createElement('style');
+        style.id = 'messageNoSelectStyles';
+        style.textContent = `
+            /* Отключаем выделение текста во ВСЕХ сообщениях */
+            .message-wrapper[data-msg-id] .message,
+            .message-wrapper[data-msg-id] .message * {
+                -webkit-touch-callout: none !important;
+                -webkit-user-select: none !important;
+                -moz-user-select: none !important;
+                -ms-user-select: none !important;
+                user-select: none !important;
+                -webkit-tap-highlight-color: transparent !important;
+            }
+
+            /* Но оставляем возможность выделения в полях ввода,
+               если они вдруг окажутся внутри (на всякий случай) */
+            .message-wrapper[data-msg-id] .message input,
+            .message-wrapper[data-msg-id] .message textarea,
+            .message-wrapper[data-msg-id] .message [contenteditable="true"] {
+                -webkit-user-select: text !important;
+                user-select: text !important;
+            }
+
+            /* Системные сообщения (дата, «Начало истории») — не трогаем,
+               там нет data-msg-id, так что правило их не касается. */
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ─── Страховка: если браузер всё-таки начал выделение —
+    //     принудительно снимаем его во время долгого тапа ───
+
+    let _pressGuardTimer = null;
+    let _selectionGuard = null;
+
+    function clearSelectionNow() {
+        try {
+            const sel = window.getSelection();
+            if (sel && sel.rangeCount > 0) {
+                sel.removeAllRanges();
+            }
+        } catch (e) { /* ignore */ }
+    }
+
+    // Следим за selectionchange и снимаем выделение,
+    // если оно возникло внутри .message-wrapper[data-msg-id]
+    if (!_selectionGuard) {
+        _selectionGuard = () => {
+            const sel = window.getSelection();
+            if (!sel || sel.rangeCount === 0) return;
+            const node = sel.anchorNode;
+            if (!node) return;
+            const parent = node.nodeType === 1 ? node : node.parentElement;
+            if (!parent) return;
+            if (parent.closest && parent.closest('.message-wrapper[data-msg-id]')) {
+                // Не даём выделению жить — сразу снимаем
+                clearSelectionNow();
+            }
+        };
+        document.addEventListener('selectionchange', _selectionGuard, { passive: true });
+    }
+
+    // ─── Долгий тап: блокируем callout до того, как он появится ───
+    // Используем захват (capture) и passive: false,
+    // чтобы иметь право на preventDefault.
+    messagesInner.addEventListener('touchstart', (e) => {
+        const wrapper = e.target.closest && e.target.closest('.message-wrapper[data-msg-id]');
+        if (!wrapper) return;
+        // Игнорируем тапы по интерактивным элементам, у которых
+        // своё поведение (кнопки, ссылки, аудио)
+        if (e.target.closest('a, button, audio, video, input, textarea')) return;
+
+        // 🆕 preventDefault здесь НЕ ломает свайп, потому что
+        // мы разрешаем touchmove для свайпа в других обработчиках —
+        // они тоже с passive: false и успеют обработать движение.
+        //
+        // Однако preventDefault на touchstart убьёт и скролл.
+        // Поэтому НЕ вызываем e.preventDefault() здесь.
+        //
+        // Вместо этого — устанавливаем короткий таймер, который
+        // снимает выделение, как только оно появилось:
+        if (_pressGuardTimer) clearTimeout(_pressGuardTimer);
+        _pressGuardTimer = setTimeout(() => {
+            clearSelectionNow();
+        }, 350);
+    }, { passive: true, capture: true });
+
+    messagesInner.addEventListener('touchend', () => {
+        if (_pressGuardTimer) {
+            clearTimeout(_pressGuardTimer);
+            _pressGuardTimer = null;
+        }
+        // Финальная зачистка
+        clearSelectionNow();
+    }, { passive: true, capture: true });
+
+    messagesInner.addEventListener('touchcancel', () => {
+        if (_pressGuardTimer) {
+            clearTimeout(_pressGuardTimer);
+            _pressGuardTimer = null;
+        }
+        clearSelectionNow();
+    }, { passive: true, capture: true });
+
+    // ─── Для десктопа — запрещаем начало выделения мышью ───
+    messagesInner.addEventListener('mousedown', (e) => {
+        if (e.button !== 0) return;
+        const wrapper = e.target.closest && e.target.closest('.message-wrapper[data-msg-id]');
+        if (!wrapper) return;
+        if (e.target.closest('a, button, audio, video, input, textarea')) return;
+        // Не даём начать выделение — но только если это не двойной клик
+        // (двойной клик по слову тоже хочется блокировать)
+        e.preventDefault();
+    });
+
+    // ─── Контекстное меню (ПКМ) — уже обрабатывается в других местах,
+    //     но здесь на всякий случай глушим стандартное выделение ───
+    messagesInner.addEventListener('selectstart', (e) => {
+        const wrapper = e.target.closest && e.target.closest('.message-wrapper[data-msg-id]');
+        if (!wrapper) return;
+        if (e.target.closest('a, button, audio, video, input, textarea')) return;
+        e.preventDefault();
+    });
+
+    console.log('🚫 Выделение текста в сообщениях отключено — долгий тап работает корректно');
+})();
 </script>
 </body>
 </html>
