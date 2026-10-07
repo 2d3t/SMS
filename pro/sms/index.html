@@ -26650,5 +26650,373 @@ markUnseen: (eventOrKey) => {
     console.log('🚫 Выделение текста в сообщениях отключено — долгий тап работает корректно');
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  📝 ПОЛЬЗОВАТЕЛЬСКОЕ ИМЯ ЭКСПОРТИРУЕМОГО ФАЙЛА (патч v2)
+//  Работает через MutationObserver — ловит ЛЮБОЕ открытие модалки
+//  независимо от того, кто её открыл.
+// ═══════════════════════════════════════════════════════════════
+
+(function installCustomExportFileName() {
+    'use strict';
+
+    // ─── Утилиты ───
+    function sanitizeExportFileName(name, fallback = 'smschat') {
+        let s = String(name || '').trim();
+        s = s.replace(/\.smschat$/i, '');
+        s = s.replace(/\.json$/i, '');
+        s = s.replace(/[\\/:*?"<>|]/g, '_');
+        s = s.replace(/[\x00-\x1f\x7f]/g, '');
+        s = s.replace(/\s+/g, ' ');
+        s = s.replace(/_{2,}/g, '_');
+        s = s.trim().slice(0, 60);
+        if (!s) s = fallback;
+        return s;
+    }
+
+    function buildDefaultProfileFileName() {
+        const dateStr = new Date().toISOString().slice(0, 10);
+        const safeUser = (state.username || 'user').replace(/[^a-zA-Z0-9_-]/g, '');
+        return `smschat-${safeUser}-${dateStr}`;
+    }
+
+    function buildDefaultShareChatFileName(chatFile) {
+        const chat = state.chats.find(c => c.file === chatFile);
+        const dateStr = new Date().toISOString().slice(0, 10);
+        const safeName = (chat?.name || chatFile || 'chat')
+            .replace(/[^a-zA-Zа-яА-Я0-9_-]/g, '_')
+            .slice(0, 30);
+        return `smschat-share-${safeName}-${dateStr}`;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  1. ЭКСПОРТ ПРОФИЛЯ — рисуем поле при каждом открытии
+    // ═══════════════════════════════════════════════════════════
+
+    function injectExportFileField() {
+        const modal = document.getElementById('exportModal');
+        if (!modal) return;
+        const content = modal.querySelector('.form-modal-content');
+        if (!content) return;
+
+        // Уже есть поле?
+        if (content.querySelector('#exportFileNameInput')) {
+            // Просто обновим значение дефолтом
+            const inp = content.querySelector('#exportFileNameInput');
+            if (!inp.value) inp.value = buildDefaultProfileFileName();
+            return;
+        }
+
+        // Найти якорь — первый .file-preview или первый <label>
+        const anchor = content.querySelector('.file-preview') 
+                    || content.querySelector('label');
+        if (!anchor) return;
+
+        const block = document.createElement('div');
+        block.id = 'exportFileNameBlock';
+        block.innerHTML = `
+            <label style="display:block;font-size:13px;color:#999;margin-bottom:6px;font-weight:500;">📝 Имя файла</label>
+            <div style="display:flex;gap:8px;margin-bottom:6px;">
+                <input type="text" id="exportFileNameInput" placeholder="smschat-profile"
+                       spellcheck="false" autocomplete="off" maxlength="60"
+                       style="flex:1;padding:12px 14px;background:rgba(255,255,255,0.06);
+                              border:1px solid rgba(255,255,255,0.1);border-radius:12px;
+                              color:#fff;font-size:14px;outline:none;font-family:inherit;">
+                <button type="button" id="exportFileNameResetBtn" title="Сбросить на стандартное"
+                        style="width:44px;height:44px;border-radius:12px;border:1px solid rgba(0,184,148,0.25);
+                               background:rgba(0,184,148,0.15);color:#00b894;font-size:16px;cursor:pointer;
+                               display:flex;align-items:center;justify-content:center;flex-shrink:0;">🔄</button>
+            </div>
+            <div style="font-size:11px;color:#666;margin-bottom:14px;line-height:1.5;">
+                Расширение <code>.smschat</code> добавится автоматически
+            </div>
+        `;
+        anchor.parentNode.insertBefore(block, anchor);
+
+        const inp = block.querySelector('#exportFileNameInput');
+        inp.value = buildDefaultProfileFileName();
+
+        block.querySelector('#exportFileNameResetBtn').addEventListener('click', () => {
+            inp.value = buildDefaultProfileFileName();
+            soundManager.play('click');
+        });
+
+        inp.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                doDownloadProfile();
+            }
+        });
+    }
+
+    // ─── Своя функция скачивания профиля ───
+    function doDownloadProfile() {
+        const inp = document.getElementById('exportFileNameInput');
+        const rawName = inp ? inp.value : '';
+        const fileName = sanitizeExportFileName(rawName, buildDefaultProfileFileName());
+
+        const includePasswords = document.getElementById('exportIncludePasswords').checked;
+        const includeUsername = document.getElementById('exportIncludeUsername').checked;
+
+        const profile = buildProfileObject({ includePasswords, includeUsername });
+        const json = JSON.stringify(profile, null, 2);
+        const blob = new Blob([json], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+
+        const fullFileName = `${fileName}.smschat`;
+
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = fullFileName;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+        document.getElementById('exportModal').classList.remove('active');
+        showToast(`💾 Сохранено: ${fullFileName}`, 2500);
+        soundManager.play('click');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  2. ПОДЕЛИТЬСЯ ОДНИМ ЧАТОМ
+    // ═══════════════════════════════════════════════════════════
+
+    function injectShareChatFileField() {
+        const modal = document.getElementById('shareChatModal');
+        if (!modal) return;
+        const content = modal.querySelector('.form-modal-content');
+        if (!content) return;
+
+        if (content.querySelector('#shareChatFileNameInput')) {
+            const inp = content.querySelector('#shareChatFileNameInput');
+            if (!inp.value && _pendingShareFile) {
+                inp.value = buildDefaultShareChatFileName(_pendingShareFile);
+            }
+            return;
+        }
+
+        const anchor = content.querySelector('.file-preview') 
+                    || content.querySelector('label');
+        if (!anchor) return;
+
+        const block = document.createElement('div');
+        block.id = 'shareChatFileNameBlock';
+        block.innerHTML = `
+            <label style="display:block;font-size:13px;color:#999;margin-bottom:6px;font-weight:500;">📝 Имя файла</label>
+            <div style="display:flex;gap:8px;margin-bottom:6px;">
+                <input type="text" id="shareChatFileNameInput" placeholder="smschat-share"
+                       spellcheck="false" autocomplete="off" maxlength="60"
+                       style="flex:1;padding:12px 14px;background:rgba(255,255,255,0.06);
+                              border:1px solid rgba(255,255,255,0.1);border-radius:12px;
+                              color:#fff;font-size:14px;outline:none;font-family:inherit;">
+                <button type="button" id="shareChatFileNameResetBtn" title="Сбросить на стандартное"
+                        style="width:44px;height:44px;border-radius:12px;border:1px solid rgba(0,184,148,0.25);
+                               background:rgba(0,184,148,0.15);color:#00b894;font-size:16px;cursor:pointer;
+                               display:flex;align-items:center;justify-content:center;flex-shrink:0;">🔄</button>
+            </div>
+            <div style="font-size:11px;color:#666;margin-bottom:14px;line-height:1.5;">
+                Расширение <code>.smschat</code> добавится автоматически
+            </div>
+        `;
+        anchor.parentNode.insertBefore(block, anchor);
+
+        const inp = block.querySelector('#shareChatFileNameInput');
+        if (_pendingShareFile) {
+            inp.value = buildDefaultShareChatFileName(_pendingShareFile);
+        }
+
+        block.querySelector('#shareChatFileNameResetBtn').addEventListener('click', () => {
+            if (!_pendingShareFile) return;
+            inp.value = buildDefaultShareChatFileName(_pendingShareFile);
+            soundManager.play('click');
+        });
+
+        inp.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                doExportSingleChat();
+            }
+        });
+    }
+
+    function doExportSingleChat() {
+        if (!_pendingShareFile) return;
+        const inp = document.getElementById('shareChatFileNameInput');
+        const file = _pendingShareFile;
+        const chat = state.chats.find(c => c.file === file);
+        if (!chat) { showToast('❌ Чат не найден', 1500); return; }
+
+        const password = state.savedPasswords[file];
+        if (!password) {
+            showToast('🔐 Пароль чата не сохранён', 2500);
+            soundManager.play('error');
+            return;
+        }
+
+        const rawName = inp ? inp.value : '';
+        const fileName = sanitizeExportFileName(rawName, buildDefaultShareChatFileName(file));
+
+        const profile = {
+            app: PROFILE_FORMAT.APP,
+            version: PROFILE_FORMAT.VERSION,
+            type: 'single-chat',
+            exportedAt: new Date().toISOString(),
+            chat: {
+                name: chat.name || chat.file,
+                file: chat.file,
+                createdAt: chat.createdAt || null,
+            },
+            password: password,
+        };
+
+        const json = JSON.stringify(profile, null, 2);
+        const blob = new Blob([json], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+
+        const fullFileName = `${fileName}.smschat`;
+
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = fullFileName;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+        document.getElementById('shareChatModal').classList.remove('active');
+        _pendingShareFile = null;
+        showToast(`💾 Сохранено: ${fullFileName}`, 2500);
+        soundManager.play('send');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. ПРИГЛАШЕНИЕ В ЧАТ (prompt)
+    // ═══════════════════════════════════════════════════════════
+
+    const _origInviteToChat = inviteToChat;
+    inviteToChat = function() {
+        if (!state.chatFile) return;
+        const password = state.savedPasswords[state.chatFile];
+        if (!password) {
+            showToast('🔐 Сначала сохраните пароль чата (галочка «Запомнить» при входе)', 3500);
+            soundManager.play('error');
+            return;
+        }
+
+        const chat = state.chats.find(c => c.file === state.chatFile);
+        const chatName = chat?.name || state.chatName || state.chatFile;
+
+        const safeName = chatName.replace(/[^a-zA-Zа-яА-Я0-9_-]/g, '_').slice(0, 30);
+        const defaultName = `Приглашение в «${safeName}»`;
+
+        const userInput = prompt(
+            '📝 Введите имя файла приглашения\n\n(расширение .smschat добавится автоматически)',
+            defaultName
+        );
+
+        if (userInput === null) return;
+
+        const finalName = sanitizeExportFileName(userInput, defaultName);
+        const fileName = `${finalName}.smschat`;
+
+        const invite = {
+            app: 'sms-chat',
+            version: 1,
+            type: 'invite',
+            exportedAt: new Date().toISOString(),
+            invitedBy: state.username,
+            chat: {
+                name: chatName,
+                file: state.chatFile,
+                createdAt: chat?.createdAt || null,
+            },
+            password: password,
+        };
+
+        const json = JSON.stringify(invite, null, 2);
+        const blob = new Blob([json], { type: 'application/json' });
+
+        openShareToChatModal(blob, fileName, null);
+        soundManager.play('click');
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  4. MUTATION OBSERVER — перехват открытия модалок
+    // ═══════════════════════════════════════════════════════════
+
+    const modalObserver = new MutationObserver((mutations) => {
+        for (const mut of mutations) {
+            if (mut.type !== 'attributes' || mut.attributeName !== 'class') continue;
+            const el = mut.target;
+            if (!el.classList || !el.classList.contains('active')) continue;
+
+            if (el.id === 'exportModal') {
+                injectExportFileField();
+                // Фокус на поле
+                setTimeout(() => {
+                    const inp = document.getElementById('exportFileNameInput');
+                    if (inp) { inp.focus(); inp.select(); }
+                }, 120);
+            } else if (el.id === 'shareChatModal') {
+                injectShareChatFileField();
+                setTimeout(() => {
+                    const inp = document.getElementById('shareChatFileNameInput');
+                    if (inp && !document.getElementById('confirmShareChatBtn').disabled) {
+                        inp.focus(); inp.select();
+                    }
+                }, 120);
+            }
+        }
+    });
+
+    ['exportModal', 'shareChatModal'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) modalObserver.observe(el, { attributes: true, attributeFilter: ['class'] });
+    });
+
+    // Если модалок ещё нет в DOM — ждём
+    if (!document.getElementById('exportModal') || !document.getElementById('shareChatModal')) {
+        const waitObserver = new MutationObserver(() => {
+            ['exportModal', 'shareChatModal'].forEach(id => {
+                const el = document.getElementById(id);
+                if (el && !el._customNameObserved) {
+                    el._customNameObserved = true;
+                    modalObserver.observe(el, { attributes: true, attributeFilter: ['class'] });
+                }
+            });
+        });
+        waitObserver.observe(document.body, { childList: true, subtree: true });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  5. ПЕРЕХВАТ КЛИКОВ НА КНОПКАХ "СКАЧАТЬ"
+    //  Делаем это через addEventListener с capture:true —
+    //  перехватываем РАНЬШЕ оригинального обработчика.
+    // ═══════════════════════════════════════════════════════════
+
+    document.addEventListener('click', (e) => {
+        const btn = e.target.closest('#confirmExportBtn');
+        if (!btn) return;
+        e.stopImmediatePropagation();
+        e.preventDefault();
+        doDownloadProfile();
+    }, true);
+
+    document.addEventListener('click', (e) => {
+        const btn = e.target.closest('#confirmShareChatBtn');
+        if (!btn) return;
+        e.stopImmediatePropagation();
+        e.preventDefault();
+        doExportSingleChat();
+    }, true);
+
+    console.log('📝 Патч кастомного имени экспорта v2 активирован:');
+    console.log('   • Экспорт профиля: поле «Имя файла» в модалке');
+    console.log('   • Поделиться чатом: поле «Имя файла» в модалке');
+    console.log('   • Приглашение: prompt с готовым именем');
+    console.log('   • Перехват через MutationObserver + capture:true');
+})();
+</script>
 </body>
 </html>
