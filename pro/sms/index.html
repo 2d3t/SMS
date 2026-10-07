@@ -26208,6 +26208,308 @@ markUnseen: (eventOrKey) => {
     console.log('🖼️ [Gallery fix] Галерея теперь видит фото из DOM, даже если blob:URL подгрузился позже');
 })();
 
+
+// ═══════════════════════════════════════════════════════════════
+//  ✅ КНОПКА «ПРОЧИТАТЬ ВСЁ» В ПЛАШКЕ АВТОПОКАЗА СОБЫТИЙ
+//  ─────────────────────────────────────────────────────────────
+//  Помечает все оставшиеся непрочитанные события как прочитанные
+//  и закрывает режим автопоказа.
+// ═══════════════════════════════════════════════════════════════
+
+(function installReadAllButtonInAutoPlay() {
+    'use strict';
+
+    // ─── Стили для новой кнопки ───
+    if (!document.getElementById('readAllAutoPlayStyles')) {
+        const style = document.createElement('style');
+        style.id = 'readAllAutoPlayStyles';
+        style.textContent = `
+            #eventAutoPlayBar .ap-btn.ap-readall {
+                width: 42px;
+                height: 42px;
+                background: linear-gradient(135deg, rgba(0,184,148,0.25), rgba(108,92,231,0.2));
+                border: 1px solid rgba(0,184,148,0.5);
+                color: #00b894;
+                font-size: 18px;
+                border-radius: 50%;
+                position: relative;
+                transition: all 0.18s ease;
+            }
+            #eventAutoPlayBar .ap-btn.ap-readall:hover {
+                background: linear-gradient(135deg, rgba(0,184,148,0.45), rgba(108,92,231,0.35));
+                border-color: rgba(0,184,148,0.8);
+                color: #fff;
+                box-shadow: 0 0 14px rgba(0,184,148,0.5);
+            }
+            #eventAutoPlayBar .ap-btn.ap-readall:active {
+                transform: scale(0.88);
+            }
+            /* Маленький бейдж с количеством оставшихся */
+            #eventAutoPlayBar .ap-btn.ap-readall .ap-readall-count {
+                position: absolute;
+                top: -4px;
+                right: -4px;
+                min-width: 18px;
+                height: 18px;
+                padding: 0 4px;
+                border-radius: 9px;
+                background: #00b894;
+                color: #fff;
+                font-size: 10px;
+                font-weight: 700;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                border: 2px solid #1a1a2e;
+                line-height: 1;
+                pointer-events: none;
+            }
+            @media (max-width: 480px) {
+                #eventAutoPlayBar .ap-btn.ap-readall {
+                    width: 38px;
+                    height: 38px;
+                    font-size: 16px;
+                }
+                #eventAutoPlayBar .ap-btn.ap-readall .ap-readall-count {
+                    min-width: 16px;
+                    height: 16px;
+                    font-size: 9px;
+                }
+            }
+
+            /* Анимация «всё прочитано» */
+            @keyframes readAllPulse {
+                0%   { transform: scale(1); }
+                50%  { transform: scale(1.08); box-shadow: 0 0 20px rgba(0,184,148,0.7); }
+                100% { transform: scale(1); }
+            }
+            #eventAutoPlayBar .ap-btn.ap-readall.success {
+                animation: readAllPulse 0.5s ease;
+                background: linear-gradient(135deg, #00b894, #00cfa4);
+                color: #fff;
+                border-color: #00b894;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Устанавливаем observer на создание плашки
+    // ═══════════════════════════════════════════════════════════
+    function tryInjectReadAllButton() {
+        const bar = document.getElementById('eventAutoPlayBar');
+        if (!bar) return false;
+
+        // Уже вставлена?
+        if (bar.querySelector('#apReadAllBtn')) return true;
+
+        const controls = bar.querySelector('.ap-controls');
+        if (!controls) return false;
+
+        const nextBtn = bar.querySelector('#apNextBtn');
+        if (!nextBtn) return false;
+
+        // Создаём кнопку
+        const btn = document.createElement('button');
+        btn.className = 'ap-btn ap-readall';
+        btn.id = 'apReadAllBtn';
+        btn.title = 'Пометить все как прочитанные';
+        btn.innerHTML = `✓<span class="ap-readall-count" id="apReadAllCount">0</span>`;
+
+        // Вставляем перед кнопкой «›» (ap-next)
+        controls.insertBefore(btn, nextBtn);
+
+        // ─── Обработчик клика ───
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            handleReadAllClick(btn);
+        });
+
+        // Устанавливаем счётчик
+        updateReadAllCount();
+
+        console.log('✅ Кнопка «Прочитать всё» добавлена в плашку автопоказа');
+        return true;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Обновление счётчика на кнопке
+    // ═══════════════════════════════════════════════════════════
+    function updateReadAllCount() {
+        const countEl = document.getElementById('apReadAllCount');
+        if (!countEl) return;
+
+        // Считаем оставшиеся непрочитанные события
+        let remaining = 0;
+        try {
+            if (typeof window.EventRadar !== 'undefined'
+                && typeof window.EventRadar.getEvents === 'function') {
+                const events = window.EventRadar.getEvents();
+                remaining = events.filter(e => !e.seen).length;
+            }
+        } catch (e) { /* ignore */ }
+
+        if (remaining > 0) {
+            countEl.textContent = remaining > 99 ? '99+' : String(remaining);
+            countEl.style.display = 'flex';
+        } else {
+            countEl.style.display = 'none';
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Обработка нажатия «Прочитать всё»
+    // ═══════════════════════════════════════════════════════════
+    function handleReadAllClick(btn) {
+        try {
+            // Визуальный отклик
+            btn.classList.add('success');
+            setTimeout(() => btn.classList.remove('success'), 600);
+
+            if (navigator.vibrate) navigator.vibrate([20, 30, 20]);
+
+            // Собираем все непрочитанные
+            let events = [];
+            if (typeof window.EventRadar !== 'undefined'
+                && typeof window.EventRadar.getEvents === 'function') {
+                events = window.EventRadar.getEvents();
+            }
+
+            const unseen = events.filter(e => !e.seen);
+            const total = unseen.length;
+
+            if (total === 0) {
+                if (typeof window.showToast === 'function') {
+                    window.showToast('✅ Уже всё прочитано', 1500);
+                }
+                // Закрываем автоплей
+                if (typeof window.EventAutoPlay !== 'undefined'
+                    && typeof window.EventAutoPlay.stop === 'function') {
+                    window.EventAutoPlay.stop();
+                }
+                return;
+            }
+
+            // Помечаем все как прочитанные
+            let marked = 0;
+            for (const ev of unseen) {
+                try {
+                    if (typeof window.EventRadar.markSeen === 'function') {
+                        if (window.EventRadar.markSeen(ev)) marked++;
+                    } else {
+                        ev.seen = true;
+                        marked++;
+                    }
+                } catch (err) {
+                    console.warn('markSeen failed:', err);
+                }
+            }
+
+            // Обновляем счётчик
+            updateReadAllCount();
+
+            // Обновляем бейджи на колокольчиках
+            updateRadarBadges();
+
+            // Закрываем автоплей через небольшую задержку,
+            // чтобы пользователь увидел анимацию
+            setTimeout(() => {
+                if (typeof window.EventAutoPlay !== 'undefined'
+                    && typeof window.EventAutoPlay.stop === 'function') {
+                    window.EventAutoPlay.stop();
+                }
+
+                if (typeof window.showToast === 'function') {
+                    window.showToast(
+                        `✅ Прочитано: ${marked} ${plural(marked, 'событие', 'события', 'событий')}`,
+                        2200
+                    );
+                }
+            }, 400);
+
+            console.log(`✅ [AutoPlay] Помечено прочитанными: ${marked} событий`);
+        } catch (e) {
+            console.error('handleReadAllClick error:', e);
+            if (typeof window.showToast === 'function') {
+                window.showToast('❌ Не удалось пометить', 2000);
+            }
+        }
+    }
+
+    // ─── Склонение «событие / события / событий» ───
+    function plural(n, one, two, five) {
+        const mod10 = n % 10;
+        const mod100 = n % 100;
+        if (mod10 === 1 && mod100 !== 11) return one;
+        if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) return two;
+        return five;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Обновление бейджей на колокольчиках
+    // ═══════════════════════════════════════════════════════════
+    function updateRadarBadges() {
+        try {
+            let total = 0;
+            if (typeof window.EventRadar !== 'undefined'
+                && typeof window.EventRadar.getEvents === 'function') {
+                const events = window.EventRadar.getEvents();
+                total = events.filter(e => !e.seen).length;
+            }
+
+            ['radar2Badge', 'radar2BadgeChat'].forEach(id => {
+                const el = document.getElementById(id);
+                if (!el) return;
+                if (total > 0) {
+                    el.textContent = total > 99 ? '99+' : String(total);
+                    el.classList.add('show');
+                } else {
+                    el.textContent = '';
+                    el.classList.remove('show');
+                }
+            });
+        } catch (e) { /* ignore */ }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Наблюдаем за появлением/изменением плашки
+    // ═══════════════════════════════════════════════════════════
+    const observer = new MutationObserver(() => {
+        tryInjectReadAllButton();
+        // Обновляем счётчик при каждом изменении (могут добавляться/удаляться события)
+        setTimeout(updateReadAllCount, 50);
+    });
+
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    // Первая попытка (на случай если плашка уже есть)
+    setTimeout(tryInjectReadAllButton, 1000);
+
+    // Периодическая страховка
+    setInterval(() => {
+        const bar = document.getElementById('eventAutoPlayBar');
+        if (bar && bar.classList.contains('show')) {
+            tryInjectReadAllButton();
+            updateReadAllCount();
+        }
+    }, 800);
+
+    // ═══════════════════════════════════════════════════════════
+    //  Экспорт для отладки
+    // ═══════════════════════════════════════════════════════════
+    window.ReadAllInAutoPlay = {
+        inject: tryInjectReadAllButton,
+        updateCount: updateReadAllCount,
+        readAll: () => {
+            const btn = document.getElementById('apReadAllBtn');
+            if (btn) handleReadAllClick(btn);
+        },
+    };
+
+    console.log('✅ Кнопка «Прочитать всё» в плашке автопоказа активна');
+})();
+
 </script>
 </body>
 </html>
