@@ -30269,361 +30269,267 @@ await refreshTabContent(file);
 </script>
 <script>
 // ═══════════════════════════════════════════════════════════════
-//  🔄 АВТО-ОБНОВЛЕНИЕ ПРИ ПЕРЕХОДЕ НА ВКЛАДКУ С НОВЫМИ СООБЩЕНИЯМИ
+//  🔄 АВТО-ОБНОВЛЕНИЕ ПРИ ЛЮБОМ ПЕРЕХОДЕ НА ВКЛАДКУ (v2)
 //  ─────────────────────────────────────────────────────────────
-//  Когда пользователь кликает на вкладку, у которой:
-//   • _domDirty = true (есть новые сообщения), ИЛИ
-//   • hasLiveDom = false (DOM выгружен)
-//  — автоматически вызывается softReloadChat() после переключения.
+//  Отличие от v1:
+//   • Обновление запускается ВСЕГДА при переключении на вкладку,
+//     а не только когда _domDirty / hasLiveDom=false.
+//   • Перехватывает ВСЕ пути перехода:
+//       1. Клик по вкладке в полоске #chatTabsBar
+//       2. Клик «＋» → выбор чата в ChatTabsPickerModal
+//       3. Открытие чата из списка чатов (enterChat)
+//       4. Программный ChatTabs.switchTo()
+//   • Защита от двойного вызова (флаг _autoReloadInProgress).
+//   • Не трогает чат, если он был открыт только что (< 3 сек).
 // ═══════════════════════════════════════════════════════════════
 
-(function installAutoReloadOnTabSwitch() {
+(function installAutoReloadOnAnyTabSwitch() {
     'use strict';
 
-    // ─── Ждём пока ChatTabs будет готов ───
-    let _retryCount = 0;
-    const _maxRetries = 40;  // 20 секунд максимум
+    // ─── Защита от повторных запусков ───
+    const GUARD = {
+        inProgress: false,
+        lastReloadAt: 0,
+        lastReloadFile: null,
+        cooldownMs: 3000,   // не чаще раза в 3 сек на один файл
+    };
 
-    function tryInstall() {
-        _retryCount++;
-
-        if (typeof ChatTabs === 'undefined' || typeof ChatTabs.switchTo !== 'function') {
-            if (_retryCount < _maxRetries) {
-                setTimeout(tryInstall, 500);
-            } else {
-                console.warn('⚠️ [AutoReload] ChatTabs не найден — патч не установлен');
-            }
-            return;
-        }
-
-        console.log('🔄 [AutoReload] Устанавливаю патч на switchTo...');
-
-        // ═══════════════════════════════════════════════════════════
-        //  ПЕРЕХВАТ ChatTabs.switchTo
-        // ═══════════════════════════════════════════════════════════
-        const _origSwitchTo = ChatTabs.switchTo;
-
-        ChatTabs.switchTo = async function(file) {
-            // Запоминаем состояние вкладки ДО переключения
-            let needsReload = false;
-            let tabWasDirty = false;
-            let tabHadNoDom = false;
-
-            try {
-                const status = ChatTabs.status();
-                const tabInfo = status.tabs.find(t => t.file === file);
-
-                if (tabInfo) {
-                    // Проверяем флаги через внутреннее API (если доступно)
-                    // Используем markDomDirty как индикатор — если он был вызван,
-                    // значит вкладка помечена как "грязная"
-                    
-                    // Проверяем через публичный status — есть ли флаг
-                    // (добавим проверку через прямое обращение к внутреннему состоянию)
-                    if (typeof window._getTabInternalState === 'function') {
-                        const internal = window._getTabInternalState(file);
-                        if (internal) {
-                            tabWasDirty = internal._domDirty === true;
-                            tabHadNoDom = internal.hasLiveDom === false;
-                            needsReload = tabWasDirty || tabHadNoDom;
-                        }
-                    } else {
-                        // Fallback: если нет доступа к внутреннему состоянию,
-                        // проверяем hasLiveDom через status
-                        tabHadNoDom = tabInfo.hasLiveDom === false;
-                        // Для _domDirty используем эвристику: если unread > 0
-                        tabWasDirty = (tabInfo.unread || 0) > 0;
-                        needsReload = tabWasDirty || tabHadNoDom;
-                    }
-                }
-            } catch (e) {
-                console.warn('[AutoReload] Ошибка проверки состояния вкладки:', e);
-            }
-
-            // ═══ Вызываем оригинальный switchTo ═══
-            const result = await _origSwitchTo.call(this, file);
-
-            // ═══ После переключения — если нужна перезагрузка, запускаем ═══
-            if (needsReload && state.chatFile === file) {
-                console.log(`🔄 [AutoReload] Вкладка «${file}» требует обновления:`, {
-                    domDirty: tabWasDirty,
-                    noLiveDom: tabHadNoDom,
-                });
-
-                // Небольшая задержка, чтобы switchTo успел завершить рендер
-                setTimeout(() => {
-                    // Проверяем, что мы всё ещё в этой вкладке
-                    if (state.chatFile !== file) return;
-
-                    // Показываем индикатор на кнопке 🔄 в шапке
-                    const reloadBtn = document.getElementById('reloadChatBtn');
-                    if (reloadBtn) {
-                        reloadBtn.classList.add('spinning');
-                    }
-
-                    // Запускаем мягкую перезагрузку
-                    if (typeof ReloadSystem !== 'undefined' && ReloadSystem.softReloadChat) {
-                        ReloadSystem.softReloadChat()
-                            .finally(() => {
-                                if (reloadBtn) {
-                                    setTimeout(() => reloadBtn.classList.remove('spinning'), 500);
-                                }
-                            });
-                    } else if (typeof softReloadChat === 'function') {
-                        softReloadChat()
-                            .finally(() => {
-                                if (reloadBtn) {
-                                    setTimeout(() => reloadBtn.classList.remove('spinning'), 500);
-                                }
-                            });
-                    }
-
-                    // 🆕 Также запускаем перезагрузку сломанных вложений
-                    setTimeout(() => {
-                        if (typeof ReloadSystem !== 'undefined' && ReloadSystem.retryAllBroken) {
-                            ReloadSystem.retryAllBroken();
-                        }
-                    }, 1500);
-
-                }, 200);  // 200 мс — достаточно для завершения switchTo
-            }
-
-            return result;
-        };
-
-        console.log('✅ [AutoReload] Патч установлен: вкладки с новыми сообщениями будут авто-обновляться');
-    }
-
-    // ─── Запускаем установку ───
-    setTimeout(tryInstall, 1000);
-
-})();
-
-
-// ═══════════════════════════════════════════════════════════════
-//  🔧 ДОПОЛНЕНИЕ: экспорт внутреннего состояния вкладки
-//  Нужно для точной проверки _domDirty и hasLiveDom
-// ═══════════════════════════════════════════════════════════════
-
-(function exposeTabInternalState() {
-    'use strict';
-
-    // Ждём ChatTabs
-    let retries = 0;
-    const maxRetries = 40;
-
-    function tryExpose() {
-        retries++;
-
-        if (typeof ChatTabs === 'undefined') {
-            if (retries < maxRetries) setTimeout(tryExpose, 500);
-            return;
-        }
-
-        // ═══════════════════════════════════════════════════════════
-        //  Пытаемся получить доступ к TABS.list через замыкание
-        //  Проблема: TABS — внутри IIFE, недоступен извне.
-        //  Решение: добавляем геттер через ChatTabs API.
-        // ═══════════════════════════════════════════════════════════
-
-        // Патчим ChatTabs.status, чтобы он возвращал _domDirty и hasLiveDom
-        // (hasLiveDom уже возвращается, но _domDirty — нет)
-        const _origStatus = ChatTabs.status;
-
-        ChatTabs.status = function() {
-            const result = _origStatus.apply(this, arguments);
-
-            // Обогащаем tabs информацией _domDirty
-            // Но у нас нет прямого доступа к TABS.list...
-            // Используем хак: markDomDirty уже меняет tab._domDirty,
-            // поэтому если мы вызовем ChatTabs.list() — увидим hasLiveDom.
-            
-            // Для _domDirty — добавим отдельный метод ниже.
-            
-            return result;
-        };
-
-        // ═══════════════════════════════════════════════════════════
-        //  Добавляем публичный метод для получения внутреннего состояния
-        // ═══════════════════════════════════════════════════════════
-        
-        // Хак: переопределяем ChatTabs.switchTo, чтобы он перед переключением
-        // сохранял состояние в глобальную переменную
-        window._getTabInternalState = function(file) {
-            // Проверяем через DOM — есть ли парковка с этим файлом
-            const parking = document.querySelector(`.tab-parking[data-tab-file="${CSS.escape(file)}"]`);
-            const hasParking = !!parking;
-            const parkingNodes = parking ? parking.childNodes.length : 0;
-
-            // Проверяем через ChatTabs.status()
-            let hasLiveDom = false;
-            let unread = 0;
-            try {
-                const status = ChatTabs.status();
-                const tabInfo = status.tabs.find(t => t.file === file);
-                if (tabInfo) {
-                    hasLiveDom = tabInfo.hasLiveDom;
-                    unread = tabInfo.unread || 0;
-                }
-            } catch (e) {}
-
-            // _domDirty определяем по:
-            // 1. Наличию класса has-dirty на кнопке вкладки в DOM
-            // 2. Или по unread > 0
-            let domDirty = false;
-            const tabBtn = document.querySelector(`.ctb-tab[data-tab-file="${CSS.escape(file)}"]`);
-            if (tabBtn) {
-                domDirty = tabBtn.classList.contains('has-dirty');
-            }
-
-            // Fallback: если unread > 0 — считаем грязным
-            if (!domDirty && unread > 0) {
-                domDirty = true;
-            }
-
-            return {
-                file,
-                hasLiveDom,
-                _domDirty: domDirty,
-                unread,
-                hasParking,
-                parkingNodes,
-            };
-        };
-
-        console.log('✅ [AutoReload] window._getTabInternalState() доступен');
-    }
-
-    setTimeout(tryExpose, 1500);
-
-})();
-
-
-// ═══════════════════════════════════════════════════════════════
-//  🔧 АЛЬТЕРНАТИВНЫЙ ПОДХОД: перехват клика по вкладке
-//  Более надёжный — работает через DOM-события
-// ═══════════════════════════════════════════════════════════════
-
-(function installAutoReloadViaClick() {
-    'use strict';
-
-    // Флаг: идёт ли уже авто-обновление
-    let _autoReloadInProgress = false;
-
-    // ─── Обработчик клика по вкладке ───
-    function handleTabClick(e) {
-        const tabEl = e.target.closest('.ctb-tab');
-        if (!tabEl) return;
-        if (e.target.closest('.ctb-close')) return;  // клик по крестику — не наш случай
-
-        const file = tabEl.dataset.tabFile;
+    // ═══════════════════════════════════════════════════════════
+    //  ЯДРО: запуск обновления чата
+    // ═══════════════════════════════════════════════════════════
+    async function triggerReload(file, source = '') {
         if (!file) return;
+        if (state.chatFile !== file) return;   // мы не в этой вкладке — не трогаем
+        if (!state.isAuthorized) return;
 
-        // Проверяем: есть ли у вкладки пометка «грязная» или она без DOM
-        const isDirty = tabEl.classList.contains('has-dirty');
-        const hasLiveDom = tabEl.querySelector('.ctb-live-dot') !== null;
+        const now = Date.now();
 
-        // Также проверяем unread-бейдж
-        const unreadBadge = tabEl.querySelector('.ctb-badge');
-        const hasUnread = unreadBadge !== null;
+        // Кулдаун на тот же файл
+        if (GUARD.lastReloadFile === file
+            && (now - GUARD.lastReloadAt) < GUARD.cooldownMs) {
+            console.log(`🔄 [AutoReload v2] Кулдаун для «${file}» (${source})`);
+            return;
+        }
 
-        const needsReload = isDirty || !hasLiveDom || hasUnread;
+        if (GUARD.inProgress) {
+            console.log(`🔄 [AutoReload v2] Уже идёт обновление (${source})`);
+            return;
+        }
 
-        if (!needsReload) return;
+        GUARD.inProgress = true;
+        GUARD.lastReloadAt = now;
+        GUARD.lastReloadFile = file;
 
-        console.log(`🔄 [AutoReload via click] Вкладка «${file}» требует обновления:`, {
-            isDirty,
-            hasLiveDom,
-            hasUnread,
-        });
+        console.log(`🔄 [AutoReload v2] Обновление «${file}» (${source})`);
 
-        // Даём switchTo выполниться (он вешается на этот же клик)
-        // и через небольшую задержку запускаем обновление
-        setTimeout(() => {
-            // Проверяем, что мы действительно переключились на эту вкладку
-            if (state.chatFile !== file) return;
-            if (_autoReloadInProgress) return;
+        // Индикатор на кнопке ⟳
+        const reloadBtn = document.getElementById('reloadChatBtn');
+        if (reloadBtn) reloadBtn.classList.add('spinning');
 
-            _autoReloadInProgress = true;
+        try {
+            if (typeof ReloadSystem !== 'undefined' && ReloadSystem.softReloadChat) {
+                await ReloadSystem.softReloadChat();
+            } else if (typeof softReloadChat === 'function') {
+                await softReloadChat();
+            }
 
-            // Показываем индикатор
-            const reloadBtn = document.getElementById('reloadChatBtn');
-            if (reloadBtn) reloadBtn.classList.add('spinning');
-
-            // Запускаем мягкую перезагрузку
-            const doReload = async () => {
-                try {
-                    if (typeof ReloadSystem !== 'undefined' && ReloadSystem.softReloadChat) {
-                        await ReloadSystem.softReloadChat();
-                    } else if (typeof softReloadChat === 'function') {
-                        await softReloadChat();
-                    }
-                } catch (err) {
-                    console.warn('[AutoReload] softReloadChat error:', err);
-                } finally {
-                    if (reloadBtn) {
-                        setTimeout(() => reloadBtn.classList.remove('spinning'), 500);
-                    }
-                    _autoReloadInProgress = false;
-                }
-            };
-
-            doReload();
-
-            // Дополнительно — retry сломанных вложений
+            // После загрузки — retry сломанных вложений
             setTimeout(() => {
                 if (typeof ReloadSystem !== 'undefined' && ReloadSystem.retryAllBroken) {
                     ReloadSystem.retryAllBroken();
                 }
-            }, 1500);
+            }, 1200);
 
-        }, 250);  // 250 мс — даём switchTo завершиться
+        } catch (e) {
+            console.warn(`🔄 [AutoReload v2] Ошибка (${source}):`, e);
+        } finally {
+            if (reloadBtn) {
+                setTimeout(() => reloadBtn.classList.remove('spinning'), 500);
+            }
+            // Освобождаем флаг через небольшую задержку
+            setTimeout(() => {
+                GUARD.inProgress = false;
+            }, 300);
+        }
     }
 
-    // ─── Вешаем обработчик на полоску вкладок ───
-    function attachToTabsBar() {
+    // ═══════════════════════════════════════════════════════════
+    //  1. ПЕРЕХВАТ КЛИКОВ ПО ПОЛОСКЕ ВКЛАДОК
+    // ═══════════════════════════════════════════════════════════
+    function attachTabsBarHandler() {
         const tabsBar = document.getElementById('chatTabsBar');
         if (!tabsBar) return false;
-        if (tabsBar._autoReloadAttached) return true;
+        if (tabsBar._autoReloadV2) return true;
+        tabsBar._autoReloadV2 = true;
 
-        tabsBar._autoReloadAttached = true;
-
-        // Capture-фаза — срабатывает раньше основного обработчика
         tabsBar.addEventListener('click', (e) => {
-            // Не перехватываем — просто запоминаем, что нужно обновить
-            handleTabClick(e);
-        }, false);  // bubble-фаза — после основного
+            // Клик по крестику — игнорируем
+            if (e.target.closest('.ctb-close')) return;
+            // Клик по «＋» — обработаем в п.2
+            if (e.target.closest('#ctbAddBtn')) return;
 
-        console.log('✅ [AutoReload via click] Обработчик на полоске вкладок установлен');
+            const tabEl = e.target.closest('.ctb-tab');
+            if (!tabEl) return;
+
+            const file = tabEl.dataset.tabFile;
+            if (!file) return;
+
+            // Ждём, пока switchTo завершится, и запускаем обновление
+            // Даже если вкладка уже активна — всё равно обновим
+            // (пользователь явно кликнул по ней)
+            setTimeout(() => {
+                triggerReload(file, 'tab-click');
+            }, 300);
+        });
+
+        console.log('✅ [AutoReload v2] Обработчик полоски вкладок установлен');
         return true;
     }
 
-    // ─── Ждём появления полоски ───
+    // ═══════════════════════════════════════════════════════════
+    //  2. ПЕРЕХВАТ «＋» → выбор чата → открытие новой вкладки
+    // ═══════════════════════════════════════════════════════════
+    document.addEventListener('click', (e) => {
+        const item = e.target.closest('.chat-tabs-picker-item');
+        if (!item) return;
+
+        const file = item.dataset.file;
+        if (!file) return;
+
+        // Ждём, пока switchTo на новой вкладке завершится
+        setTimeout(() => {
+            triggerReload(file, 'picker');
+        }, 400);
+    }, true);   // capture — раньше внутренних обработчиков
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. ПЕРЕХВАТ enterChat — открытие чата из списка чатов
+    // ═══════════════════════════════════════════════════════════
+    //  Если чат уже был открыт ранее (есть вкладка с hasData=true),
+    //  но мы всё равно его переоткрываем — обновим.
+    //  Если это новый чат (первое открытие) — enterChat сам всё
+    //  загрузит с GitHub, обновление не нужно.
+    if (typeof enterChat === 'function') {
+        const _origEnterChat = enterChat;
+        enterChat = async function(file, name, password) {
+            const existedBefore = (typeof ChatTabs !== 'undefined')
+                && ChatTabs.status().tabs.some(t => t.file === file);
+
+            const result = await _origEnterChat.call(this, file, name, password);
+
+            // Если чат уже был в вкладках и мы переоткрыли его из списка —
+            // даём ему «освежиться»
+            if (existedBefore && state.chatFile === file) {
+                setTimeout(() => {
+                    triggerReload(file, 'enterChat-existing');
+                }, 500);
+            }
+
+            return result;
+        };
+        console.log('✅ [AutoReload v2] Патч enterChat установлен');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  4. ПАТЧ ChatTabs.switchTo — на случай программных вызовов
+    // ═══════════════════════════════════════════════════════════
+    function patchSwitchTo() {
+        if (typeof ChatTabs === 'undefined') return false;
+        if (typeof ChatTabs.switchTo !== 'function') return false;
+        if (ChatTabs.switchTo._autoReloadV2) return true;
+
+        const _origSwitchTo = ChatTabs.switchTo;
+        ChatTabs.switchTo = async function(file) {
+            const result = await _origSwitchTo.call(this, file);
+            setTimeout(() => {
+                triggerReload(file, 'switchTo-api');
+            }, 300);
+            return result;
+        };
+        ChatTabs.switchTo._autoReloadV2 = true;
+
+        console.log('✅ [AutoReload v2] Патч ChatTabs.switchTo установлен');
+        return true;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  5. ПАТЧ ChatTabs.open — программное открытие вкладки
+    // ═══════════════════════════════════════════════════════════
+    function patchTabsOpen() {
+        if (typeof ChatTabs === 'undefined') return false;
+        if (typeof ChatTabs.open !== 'function') return false;
+        if (ChatTabs.open._autoReloadV2) return true;
+
+        const _origOpen = ChatTabs.open;
+        ChatTabs.open = function(file) {
+            const result = _origOpen.call(this, file);
+            setTimeout(() => {
+                triggerReload(file, 'open-api');
+            }, 400);
+            return result;
+        };
+        ChatTabs.open._autoReloadV2 = true;
+
+        console.log('✅ [AutoReload v2] Патч ChatTabs.open установлен');
+        return true;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ИНИЦИАЛИЗАЦИЯ
+    // ═══════════════════════════════════════════════════════════
     let tries = 0;
-    const maxTries = 60;
+    const maxTries = 60;   // 30 секунд
 
     const waitTimer = setInterval(() => {
         tries++;
-        if (attachToTabsBar()) {
+        const a = attachTabsBarHandler();
+        const b = patchSwitchTo();
+        const c = patchTabsOpen();
+
+        if (a && b && c) {
             clearInterval(waitTimer);
+            console.log('✅ [AutoReload v2] Все патчи установлены');
         }
+
         if (tries >= maxTries) {
             clearInterval(waitTimer);
-            console.warn('⚠️ [AutoReload via click] Полоска вкладок не найдена');
+            console.warn('⚠️ [AutoReload v2] Таймаут ожидания ChatTabs');
         }
     }, 500);
 
-    // ─── Также переустанавливаем при смене экрана ───
-    const _origShowChatScreen = window.showChatScreen;
-    if (typeof _origShowChatScreen === 'function') {
-        window.showChatScreen = function() {
+    // ─── Переустанавливаем при смене экрана ───
+    if (typeof showChatScreen === 'function') {
+        const _origShowChatScreen = showChatScreen;
+        showChatScreen = function() {
             const r = _origShowChatScreen.apply(this, arguments);
-            setTimeout(attachToTabsBar, 200);
+            setTimeout(() => {
+                attachTabsBarHandler();
+                patchSwitchTo();
+                patchTabsOpen();
+            }, 200);
             return r;
         };
     }
 
-    console.log('🔄 [AutoReload via click] Модуль инициализирован');
+    // ═══════════════════════════════════════════════════════════
+    //  ЭКСПОРТ
+    // ═══════════════════════════════════════════════════════════
+    window.AutoReloadOnTabSwitch = {
+        trigger: (file) => triggerReload(file, 'manual'),
+        status: () => ({
+            inProgress: GUARD.inProgress,
+            lastReloadAt: GUARD.lastReloadAt,
+            lastReloadFile: GUARD.lastReloadFile,
+        }),
+        resetGuard: () => {
+            GUARD.inProgress = false;
+            GUARD.lastReloadAt = 0;
+            GUARD.lastReloadFile = null;
+            console.log('🔄 [AutoReload v2] Guard сброшен');
+        },
+    };
+
+    console.log('🔄 [AutoReload v2] Установлен — обновление при ЛЮБОМ переходе на вкладку');
 })();
 </script>
 </body>
