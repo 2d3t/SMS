@@ -30749,52 +30749,72 @@ await refreshTabContent(file);
 
 // ═══════════════════════════════════════════════════════════════
 //  🏷️ БЕЙДЖ ВЕРСИИ В МЕНЮ «⋯»
-//  ─────────────────────────────────────────────────────────────
-//  Читает версию из sw.js. Кэширует в localStorage на сутки.
-//  Показывается в самом низу меню действий на экране чатов.
+//  Читает sw.js → вытаскивает CACHE_NAME → парсит "sms-pwa-v109-zxc5v"
+//  Показывает "v109" (или полный хвост) в меню действий.
 // ═══════════════════════════════════════════════════════════════
 
 (function installVersionBadge() {
     'use strict';
 
     const CACHE_KEY = 'chathub_app_version';
-    const CACHE_TTL = 24 * 60 * 60 * 1000; // сутки
+    const CACHE_TTL = 6 * 60 * 60 * 1000; // 6 часов
 
-    // ─── Чтение версии из sw.js ───
-    async function fetchVersionFromSW() {
-        try {
-            const res = await fetch('sw.js', { cache: 'no-store' });
-            if (!res.ok) throw new Error('sw.js недоступен');
-            const text = await res.text();
-
-            // Пробуем несколько типовых паттернов
-            const patterns = [
-                /CACHE_VERSION\s*=\s*['"]([^'"]+)['"]/,
-                /CACHE_NAME\s*=\s*['"]([^'"]*?)([\d]+\.[\d]+\.[\d]+[^'"]*)['"]/,
-                /VERSION\s*=\s*['"]([^'"]+)['"]/,
-                /version\s*:\s*['"]([^'"]+)['"]/,
-                /const\s+CACHE\w*\s*=\s*['"]([^'"]+)['"]/,
-            ];
-
-            for (const re of patterns) {
-                const m = text.match(re);
-                if (m && m[1]) {
-                    return m[1].trim();
-                }
-            }
-
-            // Fallback: пробуем выдернуть что-то типа v1.2.3
-            const vMatch = text.match(/['"]([vV]?\d+\.\d+(?:\.\d+)?)['"]/);
-            if (vMatch) return vMatch[1];
-
-            return null;
-        } catch (e) {
-            console.warn('🏷️ [Version] sw.js недоступен:', e.message);
-            return null;
-        }
+    // ─── Извлечь версию из строки CACHE_NAME ───
+    // 'sms-pwa-v109-zxc5v'  →  'v109'
+    // 'sms-pwa-v109'        →  'v109'
+    // 'sms-chat-v1.0.42'    →  'v1.0.42'
+    // 'any-name-v3-abc'     →  'v3'
+    function extractVersion(cacheName) {
+        if (!cacheName) return null;
+        // Ищем "v<цифры>.<цифры>.<цифры>" или "v<цифры>.<цифры>" или "v<цифры>"
+        const m = cacheName.match(/v(\d+(?:\.\d+){0,2})/i);
+        if (m) return 'v' + m[1];
+        return null;
     }
 
-    // ─── Получить версию (с кэшем) ───
+    // ─── Загрузка sw.js и парсинг CACHE_NAME ───
+    async function fetchVersionFromSW() {
+        const paths = ['sw.js', './sw.js', '/sw.js'];
+
+        for (const path of paths) {
+            try {
+                const res = await fetch(path, {
+                    cache: 'no-store',
+                    // Service Worker может перехватить — обходим через параметр
+                    // (если sw настроен игнорировать query — ок, если нет — тоже попробуем)
+                });
+                if (!res.ok) continue;
+                const text = await res.text();
+
+                // Ищем CACHE_NAME = '...'
+                const cacheMatch = text.match(
+                    /(?:const|let|var)\s+CACHE_NAME\s*=\s*['"`]([^'"`]+)['"`]/
+                );
+                if (cacheMatch && cacheMatch[1]) {
+                    const rawName = cacheMatch[1];
+                    const version = extractVersion(rawName);
+                    console.log(`🏷️ [Version] Найдено в sw.js: CACHE_NAME="${rawName}" → версия "${version}"`);
+                    if (version) return version;
+                    return rawName; // покажем как есть
+                }
+
+                // Fallback: ищем любые другие паттерны версии
+                const altPatterns = [
+                    /CACHE_VERSION\s*=\s*['"`]([^'"`]+)['"`]/,
+                    /VERSION\s*=\s*['"`]([^'"`]+)['"`]/,
+                ];
+                for (const re of altPatterns) {
+                    const m = text.match(re);
+                    if (m) return extractVersion(m[1]) || m[1];
+                }
+            } catch (e) {
+                console.warn(`🏷️ [Version] fetch ${path} failed:`, e.message);
+            }
+        }
+        return null;
+    }
+
+    // ─── С кэшем в localStorage ───
     async function getVersion() {
         try {
             const raw = localStorage.getItem(CACHE_KEY);
@@ -30815,29 +30835,43 @@ await refreshTabContent(file);
                 }));
             } catch (e) {}
         }
-        return version;
+        return version || 'unknown';
     }
 
-    // ─── Вставка бейджа в меню «⋯» ───
+    // ─── HTML-escape ───
+    function esc(s) {
+        const d = document.createElement('div');
+        d.textContent = s == null ? '' : String(s);
+        return d.innerHTML;
+    }
+
+    // ─── Вставка бейджа ───
+    let _injectedFor = null;  // версия, для которой уже вставили (защита от дублей)
+
     async function injectBadge() {
         const menu = document.getElementById('chatsActionsMenu');
         if (!menu) return false;
-
-        // Уже есть?
-        if (menu.querySelector('.ucm-version-badge')) return true;
+        if (!menu.classList.contains('show')) return false;
 
         const version = await getVersion();
         if (!version) return false;
 
-        // Находим последний divider или конец меню
+        // Уже есть с той же версией?
+        const existing = menu.querySelector('.ucm-version-badge');
+        if (existing && _injectedFor === version) return true;
+        if (existing) existing.remove();
+
+        // Находим последний .ucm-divider — вставим ПОСЛЕ него
+        // Если divider нет — в самый конец
         const lastDivider = Array.from(menu.querySelectorAll('.ucm-divider')).pop();
 
         const badge = document.createElement('div');
         badge.className = 'ucm-version-badge';
+        badge.dataset.version = version;
         badge.innerHTML = `
             <span class="ucm-version-icon">🏷️</span>
             <span class="ucm-version-text">Версия</span>
-            <span class="ucm-version-value">${escapeHtmlSafe(version)}</span>
+            <span class="ucm-version-value">${esc(version)}</span>
         `;
 
         if (lastDivider) {
@@ -30846,14 +30880,9 @@ await refreshTabContent(file);
             menu.appendChild(badge);
         }
 
-        console.log(`🏷️ [Version] Бейдж версии установлен: ${version}`);
+        _injectedFor = version;
+        console.log(`🏷️ [Version] Бейдж установлен: ${version}`);
         return true;
-    }
-
-    function escapeHtmlSafe(s) {
-        const d = document.createElement('div');
-        d.textContent = s == null ? '' : String(s);
-        return d.innerHTML;
     }
 
     // ─── Стили ───
@@ -30865,13 +30894,18 @@ await refreshTabContent(file);
                 display: flex;
                 align-items: center;
                 gap: 8px;
-                padding: 8px 14px 10px;
+                padding: 10px 14px 8px;
                 font-size: 11px;
                 color: #666;
                 user-select: none;
                 pointer-events: none;
                 border-top: 1px solid rgba(255,255,255,0.06);
                 margin-top: 4px;
+                animation: versionBadgeFadeIn 0.25s ease;
+            }
+            @keyframes versionBadgeFadeIn {
+                from { opacity: 0; transform: translateY(-4px); }
+                to   { opacity: 1; transform: translateY(0); }
             }
             #chatsActionsMenu .ucm-version-badge .ucm-version-icon {
                 font-size: 12px;
@@ -30893,43 +30927,71 @@ await refreshTabContent(file);
                 padding: 2px 8px;
                 border-radius: 6px;
                 letter-spacing: 0.3px;
+                font-weight: 600;
             }
         `;
         document.head.appendChild(style);
     }
 
-    // ─── Следим за открытием меню «⋯» ───
-    const observer = new MutationObserver(() => {
-        const menu = document.getElementById('chatsActionsMenu');
-        if (menu && menu.classList.contains('show')) {
-            injectBadge();
+    // ─── Следим за открытием меню ───
+    // Используем observer на class-attribute — точнее, чем childList
+    const observer = new MutationObserver((mutations) => {
+        for (const mut of mutations) {
+            if (mut.type !== 'attributes') continue;
+            const el = mut.target;
+            if (el.id === 'chatsActionsMenu' && el.classList.contains('show')) {
+                injectBadge();
+                return;
+            }
         }
     });
-    observer.observe(document.body, {
-        childList: true,
-        subtree: true,
-        attributes: true,
-        attributeFilter: ['class'],
-    });
 
-    // Также пробуем сразу (на случай, если меню уже существует)
-    setTimeout(injectBadge, 2000);
+    function attachMenuObserver() {
+        const menu = document.getElementById('chatsActionsMenu');
+        if (!menu) return false;
+        if (menu._versionBadgeObserved) return true;
+        menu._versionBadgeObserved = true;
+        observer.observe(menu, {
+            attributes: true,
+            attributeFilter: ['class'],
+        });
+        console.log('🏷️ [Version] Observer на меню «⋯» установлен');
+        return true;
+    }
 
-    // Экспорт для отладки
+    // Ждём появления меню в DOM
+    if (!attachMenuObserver()) {
+        const t = setInterval(() => {
+            if (attachMenuObserver()) clearInterval(t);
+        }, 500);
+        setTimeout(() => clearInterval(t), 30000);
+    }
+
+    // ─── Экспорт для отладки ───
     window.VersionBadge = {
         get: getVersion,
+        extract: extractVersion,
         clearCache: () => {
             localStorage.removeItem(CACHE_KEY);
-            console.log('🏷️ [Version] Кэш версии очищен');
+            _injectedFor = null;
+            console.log('🏷️ [Version] Кэш очищен');
         },
         refresh: async () => {
             localStorage.removeItem(CACHE_KEY);
-            return await getVersion();
+            _injectedFor = null;
+            const v = await getVersion();
+            console.log(`🏷️ [Version] Обновлено: ${v}`);
+            return v;
         },
+        test: (name) => extractVersion(name),
     };
 
+    // Прогреваем кэш сразу при загрузке
+    setTimeout(() => getVersion(), 1500);
+
     console.log('🏷️ [Version] Бейдж версии активен');
-    console.log('   • API: VersionBadge.get() / .refresh() / .clearCache()');
+    console.log('   • API: VersionBadge.get() / .refresh()');
+    console.log('   • Проверка парсера: VersionBadge.test("sms-pwa-v109-zxc5v")');
 })();
 
 </script>
