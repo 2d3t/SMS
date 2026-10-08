@@ -27128,13 +27128,12 @@ markUnseen: (eventOrKey) => {
             draft: '',
             scrollTop: 0,
             wasAtBottom: true,
-            unreadCount: 0,
-
-            // Флаги
-            hasData: false,
-            hasLiveDom: false,
-        };
-    }
+            unreadCount: 0,        // Флаги
+        hasData: false,
+        hasLiveDom: false,
+        _domDirty: false,   // 🆕 DOM устарел (есть неподгруженные сообщения)
+    };
+}
 
     // ═══════════════════════════════════════════════════════════
     //  ПАРКОВКА: получить/создать парковочный элемент вкладки
@@ -27371,25 +27370,30 @@ markUnseen: (eventOrKey) => {
      * Полная выгрузка: данные + DOM + ключ.
      */
     function unloadTabFully(file) {
-        const tab = TABS.list.get(file);
-        if (!tab) return;
+    const tab = TABS.list.get(file);
+    if (!tab) return;
 
-        unloadTabDom(file);
 
-        tab.messages = [];
-        tab.historyState = null;
-        tab.cryptoKey = null;
-        tab.salt = null;
-        tab.chatPassword = '';
-        tab.sha = null;
-        tab.lastCommitSha = null;
-        tab.lastMetaVersion = null;
-        tab.metaEtag = null;
-        tab.lastMessageCount = 0;
-        tab.hasData = false;
+    unloadTabDom(file);
 
-        console.log(`[Tabs v3] 🗑️ полностью выгружена «${tab.name}»`);
-    }
+
+    tab.messages = [];
+    tab.historyState = null;
+    tab.cryptoKey = null;
+    tab.salt = null;
+    tab.chatPassword = '';
+    tab.sha = null;
+    tab.lastCommitSha = null;
+    tab.lastMetaVersion = null;
+    tab.metaEtag = null;
+    tab.lastMessageCount = 0;
+    tab.hasData = false;
+    // 🆕 Сбрасываем флаг «грязного» DOM
+    tab._domDirty = false;
+
+
+    console.log(`[Tabs v3] 🗑️ полностью выгружена «${tab.name}»`);
+}
 
     /**
      * LRU-очистка: если живых вкладок больше лимита — выгружаем самые старые.
@@ -27458,9 +27462,11 @@ markUnseen: (eventOrKey) => {
             }
 
             // ═══ 2. Ставим новую активной ═══
-            TABS.activeFile = file;
-            tab.lastActiveAt = Date.now();
-            tab.unreadCount = 0;
+TABS.activeFile = file;
+tab.lastActiveAt = Date.now();
+tab.unreadCount = 0;
+// 🆕 Сбрасываем «грязный» флаг — вкладка сейчас покажется
+tab._domDirty = false;
 
             // ═══ 3. Показываем экран чата (если ещё не) ═══
             if (state.currentScreen !== 'chat') {
@@ -27468,7 +27474,7 @@ markUnseen: (eventOrKey) => {
             }
 
             // ═══ 4. Пробуем восстановить из живого кэша ═══
-            if (tab.hasData && tab.hasLiveDom && tab.parkingEl) {
+if (tab.hasData && tab.hasLiveDom && tab.parkingEl && !tab._domDirty) {
                 // Подменяем глобальные данные
                 restoreGlobalsFromTab(tab);
 
@@ -27498,12 +27504,17 @@ markUnseen: (eventOrKey) => {
             }
 
             // ═══ 5. Есть данные, но нет DOM → рендерим из данных ═══
-            if (tab.hasData && tab.cryptoKey) {
-                // Подменяем глобальные данные
-                restoreGlobalsFromTab(tab);
+if (tab.hasData && tab.cryptoKey) {
+    // 🆕 Сбрасываем флаг «грязного DOM»
+    tab._domDirty = false;
 
-                // Очищаем #messagesInner (там пусто, но на всякий)
-                messagesInner.innerHTML = '';
+
+    // Подменяем глобальные данные
+    restoreGlobalsFromTab(tab);
+
+
+    // Очищаем #messagesInner (там пусто, но на всякий)
+    messagesInner.innerHTML = '';
 
                 // Рендерим историю из данных
                 if (typeof renderHistory === 'function') {
@@ -27581,23 +27592,84 @@ markUnseen: (eventOrKey) => {
         // ⚠️ ВАЖНО: к моменту этого вызова #messagesInner ПУСТ,
         //    потому что предыдущая вкладка уже уехала в парковку.
         //    Вызываем _origEnterChat — он загрузит данные и отрендерит.
-        await _origEnterChat.call(this, file, name, password);
+        await _origEnterChat.call(this, file, name, password);    // После загрузки — снимок
+    if (state.chatFile === file) {
+        snapshotActiveTab();
+        tab.lastActiveAt = Date.now();
+        tab.unreadCount = 0;
+        tab.hasLiveDom = true;
 
-        // После загрузки — снимок
-        if (state.chatFile === file) {
-            snapshotActiveTab();
-            tab.lastActiveAt = Date.now();
-            tab.unreadCount = 0;
-            tab.hasLiveDom = true;
+        renderTabsBar();
+        saveTabsToStorage();
+    }
+}
 
-            renderTabsBar();
-            saveTabsToStorage();
-        }
+// ═══════════════════════════════════════════════════════════
+//  🆕 ТИХАЯ ПЕРЕЗАГРУЗКА НЕАКТИВНОЙ ВКЛАДКИ
+//  Читает чат с GitHub, расшифровывает сообщения,
+//  обновляет данные вкладки (без захода в чат).
+//  DOM не трогаем — помечаем вкладку «грязной»,
+//  она перерисуется при следующем переключении.
+// ═══════════════════════════════════════════════════════════
+async function _reloadTabSilently(file, password) {
+    const tab = TABS.list.get(file);
+    if (!tab) return;
+
+    const path = getChatPath(file);
+    const res = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
+    if (!res.exists || !res.content) return;
+
+    const content = res.content;
+    if (content.v !== CRYPTO.VERSION || !content.salt) return;
+
+    // Деривируем ключ
+    const key = await deriveKey(password, content.salt);
+
+    // Расшифровываем все сообщения
+    const decrypted = [];
+    for (const enc of (content.messages || [])) {
+        try {
+            const iv = new Uint8Array(base64ToArrayBuffer(enc.iv));
+            const cipher = base64ToArrayBuffer(enc.data);
+            const plain = await crypto.subtle.decrypt(
+                { name: 'AES-GCM', iv }, key, cipher
+            );
+            const payload = JSON.parse(new TextDecoder().decode(plain));
+            decrypted.push({
+                id: enc.id,
+                time: enc.time,
+                username: payload.username,
+                text: payload.text || '',
+                ...payload,
+            });
+        } catch (e) { /* пропускаем битые */ }
     }
 
-    // ═══════════════════════════════════════════════════════════
-    //  🔧 ПАТЧИ СУЩЕСТВУЮЩИХ ФУНКЦИЙ
-    // ═══════════════════════════════════════════════════════════
+    // Обновляем данные вкладки
+    tab.messages = decrypted;
+    tab.historyState = {
+        allMessages: decrypted.slice(),
+        startIndex: 0,
+        renderedCount: decrypted.length,
+        hasMoreOnServer: false,
+    };
+    tab.cryptoKey = key;
+    tab.salt = content.salt;
+    tab.chatPassword = password;
+    tab.sha = res.sha;
+    tab.lastCommitSha = res.commitSha;
+    tab.lastMessageCount = decrypted.length;
+    tab.hasData = true;
+
+    // ⚠️ Помечаем DOM как «грязный» — при переключении он перерисуется
+    tab._domDirty = true;
+
+    console.log(`🔔 [Tabs] «${tab.name}»: тихо подгружено ${decrypted.length} сообщ.`);
+}
+
+// ═══════════════════════════════════════════════════════════
+//  🔧 ПАТЧИ СУЩЕСТВУЮЩИХ ФУНКЦИЙ
+// ═══════════════════════════════════════════════════════════
 
     // ═══════════════════════════════════════════════════════════
     //  1. enterChat — автодобавление вкладки + обход сброса
@@ -27894,18 +27966,24 @@ markUnseen: (eventOrKey) => {
             const liveMark = tab.hasLiveDom
                 ? `<span class="ctb-live-dot" title="DOM в памяти"></span>` : '';
 
-            html += `
-                <div class="ctb-tab ${isActive ? 'active' : ''}"
-                     data-tab-file="${escapeTabHtml(file)}"
-                     title="${escapeTabHtml(tab.name)}">
-                    <div class="ctb-avatar">${avatarHtml}${liveMark}</div>
-                    <div class="ctb-name">${escapeTabHtml(tab.name)}</div>
-                    ${draftMark}
-                    ${playingHtml}
-                    ${badgeHtml}
-                    <button class="ctb-close" data-close-file="${escapeTabHtml(file)}" title="Закрыть">✕</button>
-                </div>
-            `;
+            // 🆕 Пометка «грязного» DOM — кружок справа от имени
+const dirtyMark = tab._domDirty
+    ? `<span class="ctb-dirty-dot" title="Есть новые сообщения">●</span>` : '';
+
+
+html += `
+    <div class="ctb-tab ${isActive ? 'active' : ''}${tab._domDirty ? ' has-dirty' : ''}"
+         data-tab-file="${escapeTabHtml(file)}"
+         title="${escapeTabHtml(tab.name)}">
+        <div class="ctb-avatar">${avatarHtml}${liveMark}</div>
+        <div class="ctb-name">${escapeTabHtml(tab.name)}</div>
+        ${draftMark}
+        ${playingHtml}
+        ${badgeHtml}
+        ${dirtyMark}
+        <button class="ctb-close" data-close-file="${escapeTabHtml(file)}" title="Закрыть">✕</button>
+    </div>
+`;
         }
 
         const canAdd = TABS.order.length < CFG.maxTabs;
@@ -28062,8 +28140,30 @@ markUnseen: (eventOrKey) => {
                 0%, 100% { opacity: 0.6; transform: scale(1); }
                 50%      { opacity: 1; transform: scale(1.15); }
             }
-            #chatTabsBar .ctb-tab .ctb-close {
-                width: 20px; height: 20px;
+            /* 🆕 Точка «есть новые сообщения» на вкладке */
+#chatTabsBar .ctb-tab .ctb-dirty-dot {
+    font-size: 8px;
+    color: #00b894;
+    line-height: 1;
+    flex-shrink: 0;
+    animation: ctbDirtyPulse 1.6s ease-in-out infinite;
+    text-shadow: 0 0 6px rgba(0,184,148,0.8);
+}
+@keyframes ctbDirtyPulse {
+    0%, 100% { opacity: 0.6; transform: scale(0.9); }
+    50%      { opacity: 1; transform: scale(1.1); }
+}
+/* Лёгкая подсветка всей вкладки, если в ней что-то новое */
+#chatTabsBar .ctb-tab.has-dirty:not(.active) {
+    border-color: rgba(0,184,148,0.4);
+    background: linear-gradient(135deg,
+        rgba(0,184,148,0.08),
+        rgba(255,255,255,0.04));
+}
+
+
+#chatTabsBar .ctb-tab .ctb-close {
+    width: 20px; height: 20px;
                 border-radius: 50%; border: none;
                 background: rgba(255,255,255,0.06);
                 color: #666; font-size: 11px;
@@ -28504,8 +28604,34 @@ markUnseen: (eventOrKey) => {
             }),
         }),
         unloadDom: (file) => unloadTabDom(file),
-        unloadFully: (file) => unloadTabFully(file),
-        snapshot: () => snapshotActiveTab(),
+unloadFully: (file) => unloadTabFully(file),
+snapshot: () => snapshotActiveTab(),
+
+// 🆕 Увеличить счётчик непрочитанных на вкладке
+bumpUnread: (file) => {
+    const tab = TABS.list.get(file);
+    if (!tab) return;
+    tab.unreadCount = (tab.unreadCount || 0) + 1;
+    renderTabsBar();
+    saveTabsToStorage();
+},
+
+// 🆕 Точечная перезагрузка содержимого неактивной вкладки
+refreshTabInBackground: async (file) => {
+    const tab = TABS.list.get(file);
+    if (!tab || !tab.hasData || !tab.cryptoKey) return;
+
+    const password = state.savedPasswords[file] || tab.chatPassword;
+    if (!password) return;
+
+    try {
+        if (typeof _reloadTabSilently === 'function') {
+            await _reloadTabSilently(file, password);
+        }
+    } catch (e) {
+        console.warn('[Tabs] background refresh failed:', file, e);
+    }
+},
         // 🆕 Отладка: посмотреть, что в парковках
         debugParking: () => {
             const root = ensureParkingRoot();
@@ -28528,6 +28654,26 @@ markUnseen: (eventOrKey) => {
     console.log('   • Blob:URL, <audio>, <video>, listeners — остаются живы');
     console.log(`   • LRU: ${CFG.maxLiveTabs} свежих вкладок, старые — выгрузка DOM`);
     console.log('   • API: ChatTabs.status() / .debugParking() / .unloadDom("chat_x")');
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🔔 ФОНОВЫЙ ОПРОС ВКЛАДОК + БЕЙДЖИ НА НИХ
+//  Решает проблему: сообщение приходит в неактивную вкладку,
+//  но она не обновляется и бейджа нет.
+//  (основной патч — вставлен вами ранее, здесь только запуск)
+// ═══════════════════════════════════════════════════════════════
+(function autoStartTabBackgroundPolling() {
+    let tries = 0;
+    const t = setInterval(() => {
+        tries++;
+        if (window.TabBackgroundPolling && typeof window.TabBackgroundPolling.start === 'function') {
+            window.TabBackgroundPolling.start();
+            clearInterval(t);
+            console.log('🔔 [TabPolling] Автозапуск выполнен');
+        }
+        if (tries > 40) clearInterval(t);   // 20 сек максимум
+    }, 500);
 })();
 </script>
 <script>
@@ -29804,6 +29950,177 @@ markUnseen: (eventOrKey) => {
     console.log('🔔 Бейдж непрочитанных на кнопке «Назад» активен');
 })();
 
+// ═══════════════════════════════════════════════════════════════
+//  🔔 ФОНОВЫЙ ОПРОС ВКЛАДОК + БЕЙДЖИ НА НИХ
+//  Решает проблему: сообщение приходит в неактивную вкладку,
+//  но она не обновляется и бейджа нет.
+// ═══════════════════════════════════════════════════════════════
+
+(function installTabBackgroundPolling() {
+    'use strict';
+
+    if (typeof ChatTabs === 'undefined' || typeof ChatTabs.status !== 'function') {
+        console.warn('🔔 ChatTabs не найден — патч фонового опроса пропущен');
+        return;
+    }
+
+    const POLL_INTERVAL = 8000;   // раз в 8 сек для неактивных вкладок
+    const _etags = {};            // file -> etag meta.json
+    const _versions = {};         // file -> version
+    let _timer = null;
+    let _busy = false;
+
+    // ─── Узнаём список вкладок ───
+    function getTabFiles() {
+        try {
+            return ChatTabs.status().tabs.map(t => t.file);
+        } catch (e) { return []; }
+    }
+
+    function getActiveFile() {
+        try { return ChatTabs.active(); } catch (e) { return null; }
+    }
+
+    // ─── Опрос одной вкладки ───
+    async function pollOneTab(file) {
+        const metaPath = `chats/${file}.meta.json`;
+        const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${metaPath}`;
+
+        const headers = {
+            'Authorization': `token ${state.token}`,
+            'Accept': 'application/vnd.github.v3+json',
+        };
+        if (_etags[file]) headers['If-None-Match'] = _etags[file];
+
+        try {
+            const res = await fetch(url, { headers, cache: 'no-store' });
+
+            if (res.status === 304) return;             // не изменилось
+            if (res.status === 404) return;
+            if (!res.ok) return;
+
+            const data = await res.json();
+            const newEtag = res.headers.get('ETag') || res.headers.get('etag');
+            if (newEtag) _etags[file] = newEtag;
+
+            const meta = JSON.parse(base64ToUtf8((data.content || '').replace(/\n/g, '')));
+            const newVersion = meta.version;
+
+            // Первый скан — только запоминаем версию
+            if (_versions[file] === undefined) {
+                _versions[file] = newVersion;
+                return;
+            }
+
+            if (newVersion === _versions[file]) return;   // без изменений
+
+            // 🆕 В чате прилетело новое сообщение
+            const delta = Math.max(1, (meta.count || 0) - (_versions[file] ? 0 : 0));
+            _versions[file] = newVersion;
+
+            // ─── Обновляем счётчик непрочитанных ───
+            bumpUnreadOnTab(file);
+
+            // ─── Догружаем сообщения в парковку вкладки ───
+            await refreshTabContent(file);
+
+        } catch (e) {
+            // тихо игнорируем — это фоновый опрос
+        }
+    }
+
+    // ─── Увеличиваем бейдж на вкладке ───
+    function bumpUnreadOnTab(file) {
+        try {
+            const status = ChatTabs.status();
+            const tab = status.tabs.find(t => t.file === file);
+            if (!tab) return;
+
+            // Внутри ChatTabs счётчик unreadCount хранится в TABS.list
+            // Достучаться можно через API — но у нас его нет.
+            // Поэтому дёргаем публичный метод (добавлен ниже).
+            if (typeof ChatTabs.bumpUnread === 'function') {
+                ChatTabs.bumpUnread(file);
+            }
+        } catch (e) { /* ignore */ }
+    }
+
+    // ─── Перезагрузка содержимого неактивной вкладки ───
+    async function refreshTabContent(file) {
+        const activeFile = getActiveFile();
+        if (file === activeFile) return;   // активный чат и так поллится своим механизмом
+
+        // Если вкладка не имеет живого DOM — не тратим ресурсы,
+        // при переключении всё равно грузим с нуля
+        const status = ChatTabs.status();
+        const tabInfo = status.tabs.find(t => t.file === file);
+        if (!tabInfo || !tabInfo.hasLiveDom) return;
+
+        // Иначе — используем публичный API для точечной перезагрузки
+        if (typeof ChatTabs.refreshTabInBackground === 'function') {
+            await ChatTabs.refreshTabInBackground(file);
+        }
+    }
+
+    // ─── Цикл опроса ───
+    async function pollAll() {
+        if (_busy) return;
+        if (!state.isAuthorized || !state.token) return;
+        if (document.hidden) return;
+        if (state.currentScreen !== 'chat') return;
+
+        _busy = true;
+        try {
+            const files = getTabFiles();
+            const activeFile = getActiveFile();
+
+            // Опрашиваем ТОЛЬКО неактивные вкладки
+            for (const file of files) {
+                if (file === activeFile) continue;
+                await pollOneTab(file);
+                await new Promise(r => setTimeout(r, 150));   // пауза между запросами
+            }
+        } finally {
+            _busy = false;
+        }
+    }
+
+    // ─── Запуск ───
+    function start() {
+        if (_timer) clearInterval(_timer);
+        _timer = setInterval(pollAll, POLL_INTERVAL);
+        setTimeout(pollAll, 3000);   // первый скан чуть позже
+        console.log('🔔 Фоновый опрос вкладок запущен (раз в ' + (POLL_INTERVAL / 1000) + ' сек)');
+    }
+
+    function stop() {
+        if (_timer) { clearInterval(_timer); _timer = null; }
+    }
+
+    // Следим за активностью
+    document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) {
+            setTimeout(pollAll, 800);
+        }
+    });
+
+    window.addEventListener('online', () => {
+        setTimeout(pollAll, 1500);
+    });
+
+    // Запускаем
+    start();
+
+    // Экспорт для отладки
+    window.TabBackgroundPolling = {
+        start,
+        stop,
+        pollNow: pollAll,
+        status: () => ({ etags: { ..._etags }, versions: { ..._versions } }),
+    };
+
+    console.log('🔔 [TabPolling] Готово. API: TabBackgroundPolling.status()');
+})();
 </script>
 </body>
 </html>
