@@ -5094,8 +5094,20 @@ async function checkUnreadForAllChats() {
     return result;
 }
 
-async function refreshUnreadBadges() {
-    if (state.currentScreen !== 'chats') return;
+// 🆕 Троттлинг: не чаще раза в 10 сек (в чате — 15 сек)
+let _lastRefreshUnreadTs = 0;
+
+
+async function refreshUnreadBadges(force = false) {
+    if (!state.isAuthorized) return;
+
+
+    const interval = state.currentScreen === 'chat' ? 15000 : 10000;
+    const now = Date.now();
+    if (!force && now - _lastRefreshUnreadTs < interval) return;
+    _lastRefreshUnreadTs = now;
+
+
     const unread = await checkUnreadForAllChats();
     state.chats.forEach(c => {
         const u = unread[c.file];
@@ -5103,9 +5115,13 @@ async function refreshUnreadBadges() {
         else { delete c.hasUnread; delete c.unreadCount; }
     });
     saveChatsList();
-    renderChatsList();
 
-    const totalUnread = state.chats.reduce((sum, c) => sum + (c.unreadCount || 0), 0);
+// 🆕 Перерисовываем список только если он видим
+if (state.currentScreen === 'chats') {
+    renderChatsList();
+}
+
+const totalUnread = state.chats.reduce((sum, c) => sum + (c.unreadCount || 0), 0);
     updateAppBadge(totalUnread);
 
     const totalCount = state.chats.reduce(
@@ -12836,11 +12852,13 @@ console.log('🚫 Спиннер отправки отключён в офлай
 // ===================================================================
 restoreSession();
 
+// 🆕 Теперь работает и в чате (для бейджа на «Назад»),
+//    но фактический запрос — не чаще 1 раза в 10-15 сек (троттлинг внутри)
 setInterval(() => {
-    if (state.currentScreen === 'chats' && state.isAuthorized) {
+    if (state.isAuthorized) {
         refreshUnreadBadges();
     }
-}, 3000);// ═══════════════════════════════════════════════════════════════
+}, 5000);// ═══════════════════════════════════════════════════════════════
 //  🆕 Живое обновление бейджа «играет» в списке чатов
 // ═══════════════════════════════════════════════════════════════
 let _lastPlayingState = {
@@ -29608,6 +29626,202 @@ markUnseen: (eventOrKey) => {
     console.log('   • ♻️ «Перезагрузить приложение» в меню «⋯»');
     console.log('   • API: ReloadSystem.softReloadChat() / .retryAllBroken()');
 })();
+
+// ═══════════════════════════════════════════════════════════════
+//  🔔 БЕЙДЖ НЕПРОЧИТАННЫХ НА КНОПКЕ «НАЗАД»
+//  Показывает количество новых сообщений в других чатах,
+//  пока пользователь находится внутри одного из них.
+// ═══════════════════════════════════════════════════════════════
+
+(function installBackButtonUnreadBadge() {
+    'use strict';
+
+    // ─── Стили ───
+    if (!document.getElementById('backBadgeStyles')) {
+        const style = document.createElement('style');
+        style.id = 'backBadgeStyles';
+        style.textContent = `
+            #backToChatsBtn {
+                position: relative !important;
+            }
+
+            #backToChatsBtn .bb-badge {
+                position: absolute;
+                top: -5px;
+                right: -5px;
+                min-width: 18px;
+                height: 18px;
+                padding: 0 5px;
+                border-radius: 9px;
+                background: linear-gradient(135deg, #00b894, #00a884);
+                color: #fff;
+                font-size: 10px;
+                font-weight: 700;
+                display: none;
+                align-items: center;
+                justify-content: center;
+                box-shadow: 0 2px 8px rgba(0,184,148,0.6);
+                border: 2px solid #0a0a0f;
+                line-height: 1;
+                pointer-events: none;
+                z-index: 2;
+                animation: bbPopIn 0.3s cubic-bezier(0.22, 0.61, 0.36, 1);
+            }
+
+            #backToChatsBtn .bb-badge.show {
+                display: flex;
+            }
+
+            /* Много непрочитанных — красный */
+            #backToChatsBtn .bb-badge.many {
+                background: linear-gradient(135deg, #ff6b6b, #ee5253);
+                box-shadow: 0 2px 8px rgba(255,107,107,0.6);
+                animation: bbPopIn 0.3s cubic-bezier(0.22, 0.61, 0.36, 1),
+                           bbPulse 1.8s ease-in-out infinite;
+            }
+
+            @keyframes bbPopIn {
+                0%   { transform: scale(0); opacity: 0; }
+                60%  { transform: scale(1.2); }
+                100% { transform: scale(1); opacity: 1; }
+            }
+
+            @keyframes bbPulse {
+                0%, 100% { box-shadow: 0 2px 8px rgba(255,107,107,0.6); }
+                50%      { box-shadow: 0 2px 14px rgba(255,107,107,0.95); }
+            }
+
+            @media (max-width: 480px) {
+                #backToChatsBtn .bb-badge {
+                    min-width: 16px;
+                    height: 16px;
+                    font-size: 9px;
+                    top: -4px;
+                    right: -4px;
+                }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ─── Получаем кнопку «Назад» ───
+    const backBtn = document.getElementById('backToChatsBtn');
+    if (!backBtn) {
+        console.warn('⚠️ Кнопка #backToChatsBtn не найдена');
+        return;
+    }
+
+    // ─── Создаём бейдж, если нет ───
+    let badgeEl = backBtn.querySelector('.bb-badge');
+    if (!badgeEl) {
+        badgeEl = document.createElement('span');
+        badgeEl.className = 'bb-badge';
+        backBtn.appendChild(badgeEl);
+    }
+
+    // ─── Подсчёт непрочитанных ───
+    // 1) Сумма unreadCount по всем чатам, КРОМЕ текущего (мы в нём)
+    // 2) Плюс чаты без точного счётчика (hasUnread = true, count = 0) — считаем за 1
+    function countUnreadInOtherChats() {
+        if (!state.chats || state.chats.length === 0) return 0;
+
+        let total = 0;
+        for (const chat of state.chats) {
+            // Пропускаем текущий открытый чат
+            if (chat.file === state.chatFile) continue;
+
+            if (chat.unreadCount > 0) {
+                total += chat.unreadCount;
+            } else if (chat.hasUnread) {
+                // Есть непрочитанные, но точное число неизвестно (нет пароля) — считаем как 1
+                total += 1;
+            }
+        }
+        return total;
+    }
+
+    // ─── Обновление бейджа ───
+    // 🆕 Храним предыдущее значение, чтобы понимать — стало больше или меньше
+let _prevOtherUnreadCount = 0;
+
+
+function updateBackBadge() {
+    if (state.currentScreen !== 'chat') {
+        // Не в чате — бейдж не нужен
+        badgeEl.classList.remove('show', 'many');
+        _prevOtherUnreadCount = 0;
+        return;
+    }
+
+
+    const count = countUnreadInOtherChats();
+
+
+    if (count > 0) {
+        badgeEl.textContent = count > 99 ? '99+' : String(count);
+        badgeEl.classList.add('show');
+        badgeEl.classList.toggle('many', count > 10);
+
+
+        // 🆕 Звук + вибрация ТОЛЬКО когда счётчик УВЕЛИЧИЛСЯ
+        //    (новое сообщение в другом чате)
+        if (count > _prevOtherUnreadCount && !document.hidden) {
+            // Звук уведомления — как при получении сообщения
+            if (typeof soundManager !== 'undefined') {
+                soundManager.play('notification');
+            }
+            if (navigator.vibrate) {
+                navigator.vibrate([80, 40, 80]);
+            }
+        }
+
+
+        _prevOtherUnreadCount = count;
+        badgeEl._wasShown = true;
+    } else {
+        badgeEl.classList.remove('show', 'many');
+        badgeEl._wasShown = false;
+        _prevOtherUnreadCount = 0;
+    }
+}
+
+    // ─── Периодическое обновление ───
+    // Обновляем раз в 1 секунду — быстро и незаметно
+    setInterval(updateBackBadge, 1000);
+
+    // ─── Также обновляем при смене экрана ───
+    const _origShowChatScreen = window.showChatScreen;
+    if (typeof _origShowChatScreen === 'function') {
+        window.showChatScreen = function() {
+            const r = _origShowChatScreen.apply(this, arguments);
+            setTimeout(updateBackBadge, 100);
+            return r;
+        };
+    }
+
+    const _origShowChatsScreen = window.showChatsScreen;
+    if (typeof _origShowChatsScreen === 'function') {
+        window.showChatsScreen = function() {
+            const r = _origShowChatsScreen.apply(this, arguments);
+            // На экране чатов бейдж скрыт
+            badgeEl.classList.remove('show', 'many');
+            return r;
+        };
+    }
+
+    
+
+    // ─── Хук на pollUpdates — когда в текущий чат приходит сообщение,
+    //     а также при обновлении данных другого чата ───
+    //     (если сообщение пришло в другой чат — pollUpdates его не увидит,
+    //      но refreshUnreadBadges, который бежит раз в 3 сек, обновит бейджи)
+    
+    // ─── Первичная отрисовка ───
+    setTimeout(updateBackBadge, 500);
+
+    console.log('🔔 Бейдж непрочитанных на кнопке «Назад» активен');
+})();
+
 </script>
 </body>
 </html>
