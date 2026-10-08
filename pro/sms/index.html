@@ -11989,83 +11989,35 @@ btn.addEventListener('click', async () => {
 // ===================================================================
 //  ВОССТАНОВЛЕНИЕ СЕССИИ
 // ===================================================================
-
 async function restoreSession() {
     const savedUsername = localStorage.getItem('chathub_username');
     const remember = localStorage.getItem('chathub_remember') === '1';
     const savedToken = remember ? localStorage.getItem('chathub_token') : null;
-
     if (savedUsername) usernameInput.value = savedUsername;
-
-    // ─── 🆕 Если сети нет, но есть сохранённая сессия ───
-    if (!navigator.onLine) {
-        if (savedUsername && savedToken && remember) {
-            console.log('📴 [restoreSession] Офлайн — восстанавливаем сессию');
-            try {
-                state.username = savedUsername;
-                state.token = savedToken.trim();
-                state.isAuthorized = true;
-                loadChatsList();
-                loadSavedPasswords();
-
-                if (typeof OfflineMode !== 'undefined') {
-                    OfflineMode.activate('restore-offline');
-                }
-
-                showChatsScreen();
-                tokenInput.classList.add('valid');
-                return;
-            } catch (e) {
-                console.warn('restoreSession offline failed:', e);
-            }
-        }
-        // Нет сохранённой сессии — просто показываем экран логина
-        return;
-    }
-
-    // ─── Онлайн-ветка (как было) ───
     if (!remember || !savedToken) return;
-
     tokenInput.value = savedToken;
     rememberMeInput.checked = true;
     rememberWarning.style.display = 'block';
-
     const formatCheck = validateTokenFormat(savedToken);
-    if (!formatCheck.ok) {
-        localStorage.removeItem('chathub_token');
-        return;
-    }
-
+    if (!formatCheck.ok) { localStorage.removeItem('chathub_token'); return; }
     try {
         const accessCheck = await validateTokenAccess(savedToken.trim());
-        if (!accessCheck.ok) {
-            setTokenHint('Сохранённый токен недействителен', 'error');
-            return;
-        }
-    } catch (e) {
-        // 🆕 Сетевой сбой при валидации — не убиваем сессию
-        console.warn('validateTokenAccess failed — оставляем токен');
-        return;
-    }
-
+        if (!accessCheck.ok) { setTokenHint('Сохранённый токен недействителен', 'error'); return; }
+    } catch (e) { return; }
     state.username = savedUsername;
     state.token = savedToken.trim();
     state.isAuthorized = true;
     loadChatsList();
     loadSavedPasswords();
-
     const autorunFile = getAutorunChat();
     if (autorunFile) {
         const launched = await tryAutostartChat();
-        if (launched) {
-            tokenInput.classList.add('valid');
-            return;
-        }
+        if (launched) { tokenInput.classList.add('valid'); return; }
     }
-
     showChatsScreen();
     tokenInput.classList.add('valid');
 }
+
 // ===================================================================
 //  🆕 МЕНЮ ДЕЙСТВИЙ НА ЭКРАНЕ ЧАТОВ
 // ===================================================================
@@ -31621,317 +31573,5 @@ await refreshTabContent(file);
     console.log('   • API: AboutApp.open() / .close()');
 })();
 </script>
-<script>
-// ═══════════════════════════════════════════════════════════════
-//  🚀 SERVICE WORKER + ХОЛОДНЫЙ ОФЛАЙН-СТАРТ
-// ═══════════════════════════════════════════════════════════════
-
-(function installServiceWorker() {
-    if (!('serviceWorker' in navigator)) {
-        console.warn('⚠️ Service Worker не поддерживается');
-        return;
-    }
-
-    // Регистрируем
-    window.addEventListener('load', () => {
-        navigator.serviceWorker.register('sw.js', { scope: './' })
-            .then((reg) => {
-                console.log('✅ SW зарегистрирован:', reg.scope);
-
-                // Проверка обновлений при возврате в сеть
-                reg.addEventListener('updatefound', () => {
-                    const nw = reg.installing;
-                    if (!nw) return;
-                    nw.addEventListener('statechange', () => {
-                        if (nw.state === 'installed' && navigator.serviceWorker.controller) {
-                            console.log('🔄 Доступна новая версия — перезагрузите страницу');
-                        }
-                    });
-                });
-            })
-            .catch((err) => {
-                console.warn('❌ SW регистрация не удалась:', err);
-            });
-    });
-})();
-
-
-// ═══════════════════════════════════════════════════════════════
-//  📴 ХОЛОДНЫЙ ОФЛАЙН-СТАРТ
-//  Если при загрузке страницы сети нет, но есть сохранённый токен —
-//  сразу восстанавливаем сессию и показываем офлайн-режим.
-// ═══════════════════════════════════════════════════════════════
-
-(function installColdOfflineStart() {
-    'use strict';
-
-    const COLD_START_KEY = 'chathub_cold_offline_started';
-
-    // Ждём, пока основные модули определятся
-    function waitForModules(cb) {
-        let tries = 0;
-        const t = setInterval(() => {
-            tries++;
-            if (typeof OfflineMode !== 'undefined'
-                && typeof OfflineCache !== 'undefined'
-                && typeof loadChatsList === 'function'
-                && typeof loadSavedPasswords === 'function') {
-                clearInterval(t);
-                cb();
-            }
-            if (tries > 100) {   // 10 сек
-                clearInterval(t);
-                console.warn('⚠️ [ColdOffline] Модули не дождались');
-            }
-        }, 100);
-    }
-
-    waitForModules(async () => {
-        // ─── 1. Проверяем: сети реально нет? ───
-        if (navigator.onLine) {
-            console.log('🌐 [ColdOffline] Сеть есть — обычный старт');
-            return;
-        }
-
-        console.log('📴 [ColdOffline] Сети нет — пробуем холодный офлайн-старт');
-
-        // ─── 2. Есть ли сохранённая сессия? ───
-        const savedUsername = localStorage.getItem('chathub_username');
-        const savedToken = localStorage.getItem('chathub_token');
-        const remember = localStorage.getItem('chathub_remember') === '1';
-
-        if (!savedUsername || !savedToken || !remember) {
-            console.log('📴 [ColdOffline] Нет сохранённой сессии — показываем авторизацию');
-            // Тут можно показать красивую плашку «нет сети» на экране логина
-            showNoNetworkNotice();
-            return;
-        }
-
-        // ─── 3. Восстанавливаем состояние ───
-        try {
-            state.username = savedUsername;
-            state.token = savedToken.trim();
-            state.isAuthorized = true;
-
-            loadChatsList();
-            loadSavedPasswords();
-
-            // Активируем офлайн-режим
-            if (typeof OfflineMode !== 'undefined') {
-                OfflineMode.activate('cold-start');
-            }
-
-            // Показываем список чатов
-            if (typeof showChatsScreen === 'function') {
-                showChatsScreen();
-            }
-
-            // Метка, что мы уже делали холодный старт в этой сессии
-            sessionStorage.setItem(COLD_START_KEY, '1');
-
-            console.log('✅ [ColdOffline] Офлайн-сессия восстановлена:', savedUsername);
-            console.log('   Доступные чаты:', state.chats.length);
-            console.log('   Пароли сохранены для:', Object.keys(state.savedPasswords).length);
-
-            // Показываем подсказку
-            setTimeout(() => {
-                if (typeof showToast === 'function') {
-                    showToast('📴 Офлайн-режим — только чтение', 3000);
-                }
-            }, 500);
-
-            // ═══ Автозаход в чат (если настроен автовход) ═══
-            const autorunFile = localStorage.getItem('chathub_autorun');
-            if (autorunFile && state.savedPasswords[autorunFile]) {
-                const chat = state.chats.find(c => c.file === autorunFile);
-                if (chat) {
-                    // Пробуем открыть из офлайн-кэша
-                    setTimeout(async () => {
-                        try {
-                            await openChatFromOfflineCache(autorunFile, chat.name || autorunFile);
-                        } catch (e) {
-                            console.warn('📴 [ColdOffline] Автозаход не удался:', e);
-                        }
-                    }, 800);
-                }
-            }
-
-        } catch (e) {
-            console.error('📴 [ColdOffline] Ошибка восстановления:', e);
-            // Fallback — показываем авторизацию
-            if (typeof showAuthScreen === 'function') {
-                showAuthScreen();
-            }
-            showNoNetworkNotice();
-        }
-    });
-
-    // ─── Красивое уведомление «нет сети» ───
-    function showNoNetworkNotice() {
-        const notice = document.getElementById('coldOfflineNotice');
-        if (notice) return;
-
-        const el = document.createElement('div');
-        el.id = 'coldOfflineNotice';
-        el.innerHTML = `
-            <div class="con-card">
-                <div class="con-icon">📴</div>
-                <div class="con-title">Нет подключения</div>
-                <div class="con-text">
-                    Приложение не может связаться с сервером.<br>
-                    Проверьте сеть и попробуйте ещё раз.
-                </div>
-                <button class="con-retry" id="conRetryBtn">⟳ Повторить</button>
-            </div>
-        `;
-        el.style.cssText = `
-            position: fixed;
-            inset: 0;
-            background: rgba(10,10,15,0.92);
-            backdrop-filter: blur(12px);
-            -webkit-backdrop-filter: blur(12px);
-            z-index: 9999;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 20px;
-            animation: conFadeIn 0.25s ease;
-        `;
-
-        if (!document.getElementById('coldOfflineNoticeStyles')) {
-            const style = document.createElement('style');
-            style.id = 'coldOfflineNoticeStyles';
-            style.textContent = `
-                @keyframes conFadeIn { from { opacity: 0; } to { opacity: 1; } }
-                #coldOfflineNotice .con-card {
-                    background: #1a1a2e;
-                    border: 1px solid rgba(255,159,67,0.4);
-                    border-radius: 22px;
-                    padding: 28px 24px;
-                    max-width: 380px;
-                    width: 100%;
-                    text-align: center;
-                    box-shadow: 0 24px 70px rgba(0,0,0,0.75);
-                }
-                #coldOfflineNotice .con-icon {
-                    font-size: 56px;
-                    margin-bottom: 14px;
-                    line-height: 1;
-                }
-                #coldOfflineNotice .con-title {
-                    font-size: 20px;
-                    font-weight: 700;
-                    color: #fff;
-                    margin-bottom: 10px;
-                }
-                #coldOfflineNotice .con-text {
-                    font-size: 14px;
-                    color: #999;
-                    line-height: 1.55;
-                    margin-bottom: 22px;
-                }
-                #coldOfflineNotice .con-retry {
-                    width: 100%;
-                    padding: 14px;
-                    background: linear-gradient(135deg, #ff9f43, #feca57);
-                    border: none;
-                    border-radius: 12px;
-                    color: #1a1a2e;
-                    font-size: 15px;
-                    font-weight: 700;
-                    font-family: inherit;
-                    cursor: pointer;
-                    transition: transform 0.15s;
-                }
-                #coldOfflineNotice .con-retry:active {
-                    transform: scale(0.96);
-                }
-            `;
-            document.head.appendChild(style);
-        }
-
-        document.body.appendChild(el);
-
-        el.querySelector('#conRetryBtn').addEventListener('click', async () => {
-            const btn = el.querySelector('#conRetryBtn');
-            btn.textContent = '⏳ Проверяем…';
-            btn.disabled = true;
-
-            try {
-                const res = await fetch('https://api.github.com/rate_limit', {
-                    method: 'HEAD',
-                    cache: 'no-store',
-                });
-                if (res.ok || res.status === 403 || res.status === 401) {
-                    // Сеть появилась — перезагружаем
-                    location.reload();
-                    return;
-                }
-            } catch (e) {
-                // Всё ещё нет
-            }
-
-            btn.textContent = '⟳ Повторить';
-            btn.disabled = false;
-        });
-    }
-
-    // ─── Открытие чата из офлайн-кэша ───
-    async function openChatFromOfflineCache(file, name) {
-        const cached = await OfflineCache.getChat(file);
-        if (!cached || !cached.messages || cached.messages.length === 0) {
-            if (typeof showToast === 'function') {
-                showToast(`📴 Нет кэша для чата «${name}»`, 2500);
-            }
-            return;
-        }
-
-        const password = state.savedPasswords[file];
-        if (!password) {
-            if (typeof showToast === 'function') {
-                showToast(`🔐 Нужен пароль чата «${name}»`, 2500);
-            }
-            return;
-        }
-
-        // Восстанавливаем сессию чата
-        state.chatFile = file;
-        state.chatName = name;
-        state.chatPassword = password;
-        state.salt = cached.salt || null;
-        state.messages = cached.messages.slice();
-        state.lastMessageCount = cached.messages.length;
-        state._lastCommitSha = null;
-        state._lastMetaVersion = null;
-        state._metaEtag = null;
-        state._chatEntered = false;
-
-        historyState.allMessages = cached.messages.slice();
-        historyState.startIndex = 0;
-        historyState.renderedCount = cached.messages.length;
-
-        // UI
-        chatTitle.textContent = name;
-        userAvatar.textContent = getInitials(state.username);
-        messagesInner.dataset.lastDate = '';
-        if (typeof showChatScreen === 'function') showChatScreen();
-        if (typeof showInputBar === 'function') showInputBar();
-
-        // Рендерим
-        if (typeof renderHistory === 'function') renderHistory();
-
-        // Блокируем ввод
-        messageInput.disabled = true;
-        messageInput.placeholder = '📵 Офлайн — только чтение';
-        sendBtn.disabled = true;
-        micBtn.disabled = true;
-
-        if (typeof showToast === 'function') {
-            showToast(`📴 «${name}» открыт из кэша`, 2500);
-        }
-    }
-})();
-</script>
-
 </body>
 </html>
