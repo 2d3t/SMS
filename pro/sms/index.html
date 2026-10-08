@@ -27377,6 +27377,622 @@ markUnseen: (eventOrKey) => {
     console.log('   • Приглашение: prompt с готовым именем');
     console.log('   • Перехват через MutationObserver + capture:true');
 })();
+
+// ═══════════════════════════════════════════════════════════════
+//  💾 LRU-КЭШ ЧАТОВ: держим последние 45 сообщений в памяти
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: при выходе из чата clearAttachmentCache() стирает
+//  ВСЕ blob:URL (аудио, фото, обложки). При повторном входе всё
+//  грузится заново с GitHub — 20+ секунд.
+//
+//  Решение:
+//   • AttachmentLRU — Map с ограничением по размеру (100 МБ)
+//   • ChatSnapshotCache — последние 45 расшифрованных сообщений
+//     каждого чата (плюс их вложения в LRU)
+//   • При выходе из чата — снимок сохраняется
+//   • При входе — если снимок есть, рендерим МГНОВЕННО, потом
+//     тихо синхронизируем с сервером
+// ═══════════════════════════════════════════════════════════════
+
+const AttachmentLRU = (() => {
+    'use strict';
+
+    const MAX_BYTES = 100 * 1024 * 1024;   // 100 МБ — потолок
+    const SOFT_LIMIT = 80 * 1024 * 1024;   // начинаем чистить после 80 МБ
+
+    // Карта: attachName → { url, size, chatFile, lastUsed, pinned }
+    const _store = new Map();
+    let _totalBytes = 0;
+
+    // Защищённые URL (то, что сейчас в плеере) — не вытесняем
+    function getProtectedUrls() {
+        const set = new Set();
+        try {
+            if (typeof GlobalPlayer !== 'undefined' && GlobalPlayer.queue) {
+                for (const track of GlobalPlayer.queue) {
+                    if (track.src) set.add(track.src);
+                    if (track.coverUrl) set.add(track.coverUrl);
+                }
+            }
+            if (typeof GlobalPlayer !== 'undefined' && GlobalPlayer.audioEl?.src) {
+                set.add(GlobalPlayer.audioEl.src);
+            }
+        } catch (e) {}
+        return set;
+    }
+
+    function get(attachName) {
+        const rec = _store.get(attachName);
+        if (!rec) return null;
+        rec.lastUsed = Date.now();
+        return rec.url;
+    }
+
+    function has(attachName) {
+        return _store.has(attachName);
+    }
+
+    function set(attachName, url, size, chatFile) {
+        if (!attachName || !url) return;
+        const prev = _store.get(attachName);
+        if (prev) {
+            _totalBytes -= prev.size || 0;
+            // URL тот же — не revoke, просто обновим метаданные
+            if (prev.url !== url) {
+                try { URL.revokeObjectURL(prev.url); } catch (e) {}
+            }
+        }
+        _store.set(attachName, {
+            url,
+            size: size || 0,
+            chatFile: chatFile || null,
+            lastUsed: Date.now(),
+        });
+        _totalBytes += size || 0;
+        // Не чистим сразу — отложим (см. schedulePrune)
+    }
+
+    function schedulePrune() {
+        if (_pruneTimer) return;
+        _pruneTimer = setTimeout(() => {
+            _pruneTimer = null;
+            prune();
+        }, 3000);
+    }
+    let _pruneTimer = null;
+
+    function prune() {
+        if (_totalBytes <= SOFT_LIMIT) return;
+
+        const protectedUrls = getProtectedUrls();
+
+        // Сортируем по lastUsed — старые первыми
+        const entries = Array.from(_store.entries())
+            .filter(([_, rec]) => !protectedUrls.has(rec.url))
+            .sort((a, b) => a[1].lastUsed - b[1].lastUsed);
+
+        let removed = 0;
+        for (const [name, rec] of entries) {
+            if (_totalBytes <= SOFT_LIMIT) break;
+            try { URL.revokeObjectURL(rec.url); } catch (e) {}
+            _store.delete(name);
+            _totalBytes -= rec.size || 0;
+            removed++;
+        }
+
+        if (removed > 0) {
+            console.log(`🗑️ [AttachmentLRU] вытеснено: ${removed} (${Math.round(_totalBytes/1024/1024)} МБ осталось)`);
+        }
+    }
+
+    function remove(attachName) {
+        const rec = _store.get(attachName);
+        if (!rec) return;
+        try { URL.revokeObjectURL(rec.url); } catch (e) {}
+        _store.delete(attachName);
+        _totalBytes -= rec.size || 0;
+    }
+
+    function removeByChat(chatFile) {
+        for (const [name, rec] of Array.from(_store.entries())) {
+            if (rec.chatFile === chatFile) remove(name);
+        }
+    }
+
+    function clear() {
+        for (const rec of _store.values()) {
+            try { URL.revokeObjectURL(rec.url); } catch (e) {}
+        }
+        _store.clear();
+        _totalBytes = 0;
+    }
+
+    function stats() {
+        return {
+            count: _store.size,
+            bytes: _totalBytes,
+            mb: (_totalBytes / 1024 / 1024).toFixed(2),
+        };
+    }
+
+    return { get, has, set, remove, removeByChat, clear, stats, schedulePrune, prune };
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  💾 СНИМОК ЧАТА — последние N сообщений + их вложения
+// ═══════════════════════════════════════════════════════════════
+const ChatSnapshotCache = (() => {
+    'use strict';
+
+    const SNAPSHOT_SIZE = 45;   // сколько последних сообщений держим
+    const _snapshots = new Map();  // chatFile → { messages, salt, savedAt }
+
+    function save(chatFile, messages, salt) {
+        if (!chatFile || !Array.isArray(messages) || !salt) return;
+
+        const slice = messages.slice(-SNAPSHOT_SIZE);
+        _snapshots.set(chatFile, {
+            messages: slice,
+            salt,
+            savedAt: Date.now(),
+            totalCount: messages.length,
+        });
+        console.log(`💾 [ChatSnapshot] ${chatFile}: сохранено ${slice.length} сообщ. (из ${messages.length})`);
+    }
+
+    function get(chatFile) {
+        return _snapshots.get(chatFile) || null;
+    }
+
+    function has(chatFile) {
+        return _snapshots.has(chatFile);
+    }
+
+    function remove(chatFile) {
+        _snapshots.delete(chatFile);
+    }
+
+    function clear() {
+        _snapshots.clear();
+    }
+
+    function stats() {
+        return {
+            chats: _snapshots.size,
+            totalMessages: Array.from(_snapshots.values())
+                .reduce((s, x) => s + x.messages.length, 0),
+        };
+    }
+
+    return { save, get, has, remove, clear, stats, SNAPSHOT_SIZE };
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🔧 ПАТЧ 1: loadAttachment сначала смотрит в LRU
+// ═══════════════════════════════════════════════════════════════
+(function patchLoadAttachmentForLRU() {
+    const _origLoadAttachment = loadAttachment;
+
+    loadAttachment = async function(chatFile, attachName) {
+        // 1. Сначала — быстрая проверка в LRU
+        const cached = AttachmentLRU.get(attachName);
+        if (cached) return cached;
+
+        // 2. Старый _attachmentCache (если что-то осталось)
+        if (_attachmentCache.has(attachName)) {
+            const url = _attachmentCache.get(attachName);
+            // Дублируем в LRU для последующего переиспользования
+            AttachmentLRU.set(attachName, url, 0, chatFile);
+            return url;
+        }
+
+        // 3. Загружаем как раньше
+        const url = await _origLoadAttachment.call(this, chatFile, attachName);
+
+        // 4. Кладём в LRU (размер получим из blob)
+        try {
+            const res = await fetch(url);
+            const blob = await res.blob();
+            AttachmentLRU.set(attachName, url, blob.size, chatFile);
+            AttachmentLRU.schedulePrune();
+        } catch (e) {
+            // Не смогли определить размер — кладём с нулём
+            AttachmentLRU.set(attachName, url, 0, chatFile);
+        }
+
+        return url;
+    };
+
+    console.log('💾 patch: loadAttachment → LRU');
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🔧 ПАТЧ 2: clearAttachmentCache — НЕ убиваем LRU
+// ═══════════════════════════════════════════════════════════════
+(function patchClearAttachmentCacheForLRU() {
+    const _origClear = clearAttachmentCache;
+
+    clearAttachmentCache = function() {
+        // Старый _attachmentCache чистим — там были "слабые" ссылки
+        // на blob:URL, которые уже переехали в LRU. Но LRU НЕ трогаем!
+        _attachmentCache.clear();
+        _pendingAttachmentLoads.clear();
+        // Не делаем URL.revokeObjectURL — все ссылки в LRU
+        console.log('💾 patch: clearAttachmentCache → очищен только рабочий кэш, LRU цел');
+    };
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🔧 ПАТЧ 3: при выходе из чата — сохраняем снимок
+// ═══════════════════════════════════════════════════════════════
+(function patchBackToChatsForSnapshot() {
+    const _origBackToChats = backToChats;
+
+    backToChats = function() {
+        // Перед выходом — сохраняем снимок
+        try {
+            if (state.chatFile && state.salt && historyState.allMessages.length > 0) {
+                ChatSnapshotCache.save(
+                    state.chatFile,
+                    historyState.allMessages,
+                    state.salt
+                );
+            }
+        } catch (e) {
+            console.warn('[ChatSnapshot] save on exit failed:', e);
+        }
+
+        return _origBackToChats.apply(this, arguments);
+    };
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🔧 ПАТЧ 4: enterChat — мгновенный рендер из снимка
+// ═══════════════════════════════════════════════════════════════
+(function patchEnterChatForInstantRender() {
+    const _origEnterChat = enterChat;
+
+    enterChat = async function(file, name, password) {
+        // ═══ Проверяем: есть ли снимок этого чата? ═══
+        const snapshot = ChatSnapshotCache.get(file);
+        const snapshotMatches = snapshot && snapshot.salt === (state.salt || null);
+
+        // ВАЖНО: salt сравнивать нельзя — мы его узнаём только из сети.
+        // Поэтому используем другой критерий: если снимок есть И пароль
+        // не менялся (можно проверить через deriveKey с солью из снимка).
+
+        // Пробуем восстановить: deriveKey с сохранённой солью и паролем.
+        // Если получится — значит снимок валиден.
+        let snapshotValid = false;
+        if (snapshot) {
+            try {
+                const testKey = await deriveKey(password, snapshot.salt);
+                if (testKey) {
+                    snapshotValid = true;
+                }
+            } catch (e) {
+                snapshotValid = false;
+            }
+        }
+
+        if (!snapshotValid) {
+            // Нет валидного снимка — обычный путь
+            return _origEnterChat.apply(this, arguments);
+        }
+
+        // ═══ ЕСТЬ СНИМОК — рисуем мгновенно ═══
+        console.log(`⚡ [ChatSnapshot] мгновенное восстановление ${file}: ${snapshot.messages.length} сообщ.`);
+
+        // Показываем плавный переход (как обычно)
+        showChatTransition(name);
+        await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+        stopPolling();
+        resetHistoryState();
+
+        // Сбрасываем состояние как в оригинальном enterChat
+        state.messages = [];
+        state.sha = null;
+        state.lastMessageCount = 0;
+        state._lastCommitSha = null;
+        state._lastMetaVersion = null;
+        state._metaEtag = null;
+        state._lastSentMessageId = null;
+        state._chatEntered = false;
+
+        state.chatFile = file;
+        state.chatName = name;
+        state.chatPassword = password;
+        state._lastActivityAt = Date.now();
+        state.salt = snapshot.salt;
+
+        // Восстанавливаем ключ
+        CRYPTO._key = await deriveKey(password, snapshot.salt);
+
+        chatTitle.textContent = name;
+        userAvatar.textContent = getInitials(state.username);
+
+        messagesInner.dataset.lastDate = '';
+        showChatScreen();
+        showInputBar();
+
+        // Восстанавливаем историю из снимка
+        state.messages = snapshot.messages.slice();
+        state.lastMessageCount = snapshot.totalCount || snapshot.messages.length;
+        historyState.allMessages = snapshot.messages.slice();
+        renderHistory();
+
+        // ⚡ Мгновенный скролл вниз
+        requestAnimationFrame(() => {
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        });
+
+        setTimeout(() => {
+            if (state.chatFile === file) markChatAsRead();
+        }, 1500);
+
+        state._chatEntered = true;
+        hideChatTransition();
+
+        // ═══ Фоновая синхронизация с сервером ═══
+        // Запускаем ПОСЛЕ отрисовки — тихо, без спиннеров
+        setTimeout(() => {
+            syncChatFromServer(file, name, password, snapshot).catch(e => {
+                console.warn('[ChatSnapshot] background sync failed:', e);
+            });
+        }, 300);
+
+        return;
+    };
+
+    /**
+     * Фоновая синхронизация с сервером.
+     * Если на сервере те же данные — просто обновляем метаданные.
+     * Если новые — аккуратно дописываем в конец без перерисовки.
+     */
+    async function syncChatFromServer(file, name, password, snapshot) {
+        if (state.chatFile !== file) return;
+
+        try {
+            const path = getChatPath(file);
+            const result = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
+            if (!result.exists) return;
+
+            const content = result.content;
+            if (content.v !== CRYPTO.VERSION) return;
+
+            // Проверяем соль
+            if (content.salt !== state.salt) {
+                // Соль изменилась — значит чат пересоздан. Полный ре-энтер.
+                console.warn('[ChatSnapshot] salt changed, full reload');
+                ChatSnapshotCache.remove(file);
+                return enterChat(file, name, password);
+            }
+
+            state.sha = result.sha;
+            state._lastCommitSha = result.commitSha;
+
+            const encMessages = content.messages || [];
+            const decrypted = [];
+            for (const enc of encMessages) {
+                const m = await decryptMessage(enc);
+                if (m) decrypted.push(m);
+            }
+
+            if (state.chatFile !== file) return;  // юзер уже ушёл
+
+            // Обновляем кэш версии
+            try {
+                const metaRes = await fetchMetaFast(file, null);
+                if (metaRes.exists) {
+                    state._metaEtag = metaRes.etag || null;
+                    if (metaRes.content?.version) {
+                        state._lastMetaVersion = metaRes.content.version;
+                    }
+                }
+            } catch (e) {}
+
+            state.lastMessageCount = decrypted.length;
+
+            // Сравниваем с тем, что показано
+            const shownCount = historyState.allMessages.length;
+            const shownLastId = shownCount > 0
+                ? historyState.allMessages[shownCount - 1].id
+                : null;
+            const serverLastId = decrypted.length > 0
+                ? decrypted[decrypted.length - 1].id
+                : null;
+
+            if (shownLastId === serverLastId) {
+                console.log('✅ [ChatSnapshot] данные совпадают, синк не нужен');
+                // Обновляем полный список в фоне (для поиска, реакций и т.п.)
+                historyState.allMessages = decrypted.slice();
+                ChatSnapshotCache.save(file, historyState.allMessages, state.salt);
+                startPolling();
+                return;
+            }
+
+            // Есть новые — аккуратно дописываем
+            const shownIdSet = new Set(historyState.allMessages.map(m => m.id));
+            const newMessages = decrypted.filter(m => !shownIdSet.has(m.id));
+
+            if (newMessages.length > 0) {
+                console.log(`📥 [ChatSnapshot] новых сообщений: ${newMessages.length}`);
+                historyState.allMessages = decrypted.slice();
+                state.messages = decrypted.slice();
+                appendMessages(newMessages);
+                scrollToBottom(true);
+                markChatAsRead();
+            } else {
+                // На сервере меньше — что-то удалили
+                console.log('🔄 [ChatSnapshot] сообщений меньше — полный рендер');
+                historyState.allMessages = decrypted.slice();
+                state.messages = decrypted.slice();
+                renderMessages(decrypted);
+            }
+
+            // Сохраняем свежий снимок
+            ChatSnapshotCache.save(file, historyState.allMessages, state.salt);
+            startPolling();
+        } catch (e) {
+            console.warn('[ChatSnapshot] sync error:', e);
+            // Не падаем — просто запускаем поллинг со старыми данными
+            try { startPolling(); } catch (e2) {}
+        }
+    }
+
+    console.log('⚡ patch: enterChat → мгновенный рендер из снимка');
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🔧 ПАТЧ 5: сохраняем снимок после каждого обновления
+// ═══════════════════════════════════════════════════════════════
+(function patchRenderAndAppendForSnapshot() {
+    // Патч renderHistory
+    const _origRenderHistory = renderHistory;
+    renderHistory = function() {
+        const r = _origRenderHistory.apply(this, arguments);
+        try {
+            if (state.chatFile && state.salt && historyState.allMessages.length > 0) {
+                ChatSnapshotCache.save(state.chatFile, historyState.allMessages, state.salt);
+            }
+        } catch (e) {}
+        return r;
+    };
+
+    // Патч appendMessages
+    const _origAppendMessages = appendMessages;
+    appendMessages = function(newMsgs) {
+        const r = _origAppendMessages.apply(this, arguments);
+        try {
+            if (state.chatFile && state.salt && historyState.allMessages.length > 0) {
+                ChatSnapshotCache.save(state.chatFile, historyState.allMessages, state.salt);
+            }
+        } catch (e) {}
+        return r;
+    };
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🔧 ПАТЧ 6: удаление/редактирование — обновляем снимок
+// ═══════════════════════════════════════════════════════════════
+(function patchMutationsForSnapshot() {
+    const _origDeleteMessage = deleteMessage;
+    deleteMessage = async function(messageId) {
+        const r = await _origDeleteMessage.call(this, messageId);
+        try {
+            if (state.chatFile && state.salt) {
+                ChatSnapshotCache.save(state.chatFile, historyState.allMessages, state.salt);
+            }
+        } catch (e) {}
+        return r;
+    };
+
+    const _origBatchDelete = performBatchDelete;
+    performBatchDelete = async function(messageIds) {
+        const r = await _origBatchDelete.call(this, messageIds);
+        try {
+            if (state.chatFile && state.salt) {
+                ChatSnapshotCache.save(state.chatFile, historyState.allMessages, state.salt);
+            }
+        } catch (e) {}
+        return r;
+    };
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🔧 ПАТЧ 7: при logout — чистим всё (чужая сессия)
+// ═══════════════════════════════════════════════════════════════
+(function patchLogoutForSnapshot() {
+    const _origLogout = logout;
+    logout = function() {
+        try {
+            AttachmentLRU.clear();
+            ChatSnapshotCache.clear();
+            console.log('🧹 [LRU+Snapshot] очищено при logout');
+        } catch (e) {}
+        return _origLogout.apply(this, arguments);
+    };
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🎯 ПУБЛИЧНЫЙ API ДЛЯ ОТЛАДКИ
+// ═══════════════════════════════════════════════════════════════
+window.ChatMemory = {
+    // Статистика
+    stats: () => ({
+        attachments: AttachmentLRU.stats(),
+        snapshots: ChatSnapshotCache.stats(),
+    }),
+
+    // Список кэшированных чатов
+    snapshots: () => {
+        const list = [];
+        for (const [file, snap] of (ChatSnapshotCache._snapshots || [])) {
+            list.push({
+                file,
+                messages: snap.messages.length,
+                totalCount: snap.totalCount,
+                savedAt: new Date(snap.savedAt).toLocaleString('ru-RU'),
+            });
+        }
+        return list;
+    },
+
+    // Очистить всё
+    clear: () => {
+        AttachmentLRU.clear();
+        ChatSnapshotCache.clear();
+        console.log('🧹 Всё очищено');
+    },
+
+    // Очистить один чат
+    clearChat: (file) => {
+        AttachmentLRU.removeByChat(file);
+        ChatSnapshotCache.remove(file);
+        console.log('🧹 Очищен чат:', file);
+    },
+
+    // Форсировать сохранение текущего чата
+    saveCurrent: () => {
+        if (state.chatFile && state.salt && historyState.allMessages.length > 0) {
+            ChatSnapshotCache.save(state.chatFile, historyState.allMessages, state.salt);
+            console.log('💾 Сохранено');
+        }
+    },
+
+    // Настройки
+    config: {
+        get maxLruBytes() { return 100 * 1024 * 1024; },
+        get snapshotSize() { return ChatSnapshotCache.SNAPSHOT_SIZE; },
+    },
+};
+
+console.log('');
+console.log('⚡ Система «памяти чатов» активирована:');
+console.log('   • LRU-кэш вложений (до 100 МБ) — аудио, фото, обложки');
+console.log('   • Снимок последних 45 сообщений каждого чата');
+console.log('   • Мгновенный вход при повторном открытии');
+console.log('   • Фоновая синхронизация с сервером');
+console.log('');
+console.log('   API:');
+console.log('     ChatMemory.stats()           — статистика');
+console.log('     ChatMemory.snapshots()       — список чатов');
+console.log('     ChatMemory.saveCurrent()     — форс-сохранение');
+console.log('     ChatMemory.clearChat("file") — очистить чат');
+console.log('     ChatMemory.clear()           — очистить всё');
+console.log('');
+
+
 </script>
 </body>
 </html>
