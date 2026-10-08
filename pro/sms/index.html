@@ -27272,13 +27272,15 @@ markUnseen: (eventOrKey) => {
         }
 
         // ─── 🆕 Подменяем содержимое глобальных Map на кэш вкладки ───
-        // ⚠️ Меняем СОДЕРЖИМОЕ существующих Map, потому что все ссылки
-        //    в коде — на эти объекты. Пересоздавать нельзя.
-        _attachmentCache.clear();
-        tab.attachmentCache.forEach((v, k) => _attachmentCache.set(k, v));
+// ⚠️ Меняем СОДЕРЖИМОЕ существующих Map, потому что все ссылки
+//    в коде — на эти объекты. Пересоздавать нельзя.
+_attachmentCache.clear();
+tab.attachmentCache.forEach((v, k) => _attachmentCache.set(k, v));
 
-        _pendingAttachmentLoads.clear();
-        tab.pendingLoads.forEach((v, k) => _pendingAttachmentLoads.set(k, v));
+// ⚠️ НЕ перезаписываем _pendingAttachmentLoads — промисы из другой
+//    вкладки могут быть "зависшими" и заблокируют загрузку.
+//    Просто очищаем.
+_pendingAttachmentLoads.clear();
 
         // ─── UI: черновик ───
         if (messageInput) {
@@ -27459,9 +27461,7 @@ markUnseen: (eventOrKey) => {
 
                 // LRU
                 enforceLRU();
-            }
-
-            // ═══ 2. Ставим новую активной ═══
+            }// ═══ 2. Ставим новую активной ═══
 TABS.activeFile = file;
 tab.lastActiveAt = Date.now();
 tab.unreadCount = 0;
@@ -27477,80 +27477,99 @@ if (chatInList) {
     if (typeof saveChatsList === 'function') saveChatsList();
 }
 
+// 🆕 Также сохраняем «прочитано до последнего сообщения»
+if (tab.messages && tab.messages.length > 0) {
+    const lastId = tab.messages[tab.messages.length - 1].id;
+    try {
+        if (typeof setLastReadId === 'function') {
+            setLastReadId(file, lastId);
+        }
+    } catch (e) { /* ignore */ }
+}
+
             // ═══ 3. Показываем экран чата (если ещё не) ═══
             if (state.currentScreen !== 'chat') {
                 showChatScreen();
             }
-
-            // ═══ 4. Пробуем восстановить из живого кэша ═══
+// ═══ 4. Пробуем восстановить из живого кэша ═══
+// 🆕 Проверяем: DOM действительно актуален?
+//    Если вкладка была «грязной» (пришло новое сообщение
+//    пока мы были в другой вкладке) — идём в ветку 5.
 if (tab.hasData && tab.hasLiveDom && tab.parkingEl && !tab._domDirty) {
-                // Подменяем глобальные данные
-                restoreGlobalsFromTab(tab);
+    // Подменяем глобальные данные
+    restoreGlobalsFromTab(tab);
 
-                // Перекладываем DOM из парковки в #messagesInner
-                attachDOMFromParking(tab);
+    // Перекладываем DOM из парковки в #messagesInner
+    attachDOMFromParking(tab);
 
-                // Восстанавливаем скролл — после того, как DOM в дереве
-                restoreScrollForTab(tab);
+    // 🆕 На всякий случай подгружаем вложения, которые могли
+    //    не успеть загрузиться до ухода вкладки в парковку
+    setTimeout(() => forceReloadAttachmentsAfterSwitch(), 50);
 
-                // Перезапускаем поллинг
-                if (typeof startPolling === 'function') {
-                    setTimeout(() => startPolling(), 100);
-                }
+    // Восстанавливаем скролл — после того, как DOM в дереве
+    restoreScrollForTab(tab);
 
-                // Синхронизируем инлайн-плееры
-                setTimeout(() => {
-                    if (typeof syncInlineWithGlobal === 'function') {
-                        syncInlineWithGlobal();
-                    }
-                }, 150);
+    // Перезапускаем поллинг
+    if (typeof startPolling === 'function') {
+        setTimeout(() => startPolling(), 100);
+    }
 
-                renderTabsBar();
-                saveTabsToStorage();
-                soundManager.play('click');
-                console.log(`[Tabs v3] ✅ переключено из live-кэша «${tab.name}»`);
-                return;
-            }
+    // Синхронизируем инлайн-плееры
+    setTimeout(() => {
+        if (typeof syncInlineWithGlobal === 'function') {
+            syncInlineWithGlobal();
+        }
+    }, 150);
 
-            // ═══ 5. Есть данные, но нет DOM → рендерим из данных ═══
+    renderTabsBar();
+    saveTabsToStorage();
+    soundManager.play('click');
+    console.log(`[Tabs v3] ✅ переключено из live-кэша «${tab.name}»`);
+    return;
+}
+// ═══ 5. Есть данные, но нет DOM → рендерим из данных ═══
 if (tab.hasData && tab.cryptoKey) {
     // 🆕 Сбрасываем флаг «грязного DOM»
     tab._domDirty = false;
 
-
     // Подменяем глобальные данные
     restoreGlobalsFromTab(tab);
-
 
     // Очищаем #messagesInner (там пусто, но на всякий)
     messagesInner.innerHTML = '';
 
-                // Рендерим историю из данных
-                if (typeof renderHistory === 'function') {
-                    renderHistory();
-                }
+    // Рендерим историю из данных
+    if (typeof renderHistory === 'function') {
+        renderHistory();
+    }
 
-                tab.hasLiveDom = true;
+    tab.hasLiveDom = true;
 
-                // Восстанавливаем скролл после рендера
-                restoreScrollForTab(tab);
+    // 🆕 ФОРСИРУЕМ ПЕРЕЗАГРУЗКУ ВЛОЖЕНИЙ:
+    // renderHistory вызвал loadAttachmentsIn, но для вложений,
+    // у которых в _attachmentCache лежат "пустые" blob:URL
+    // из другой вкладки, плейсхолдеры останутся ⏳.
+    setTimeout(() => forceReloadAttachmentsAfterSwitch(), 50);
 
-                if (typeof startPolling === 'function') {
-                    setTimeout(() => startPolling(), 100);
-                }
+    // Восстанавливаем скролл после рендера
+    restoreScrollForTab(tab);
 
-                setTimeout(() => {
-                    if (typeof syncInlineWithGlobal === 'function') {
-                        syncInlineWithGlobal();
-                    }
-                }, 250);
+    if (typeof startPolling === 'function') {
+        setTimeout(() => startPolling(), 100);
+    }
 
-                renderTabsBar();
-                saveTabsToStorage();
-                soundManager.play('click');
-                console.log(`[Tabs v3] ♻️ переключено (пересборка DOM) «${tab.name}»`);
-                return;
-            }
+    setTimeout(() => {
+        if (typeof syncInlineWithGlobal === 'function') {
+            syncInlineWithGlobal();
+        }
+    }, 250);
+
+    renderTabsBar();
+    saveTabsToStorage();
+    soundManager.play('click');
+    console.log(`[Tabs v3] ♻️ переключено (пересборка DOM) «${tab.name}»`);
+    return;
+}
 
             // ═══ 6. Нет данных → грузим с GitHub ═══
             await loadTabFromScratch(file);
@@ -27567,20 +27586,87 @@ if (tab.hasData && tab.cryptoKey) {
      * Восстанавливаем скролл вкладки после того, как DOM смонтирован.
      */
     function restoreScrollForTab(tab) {
-        if (TABS._restoreScrollTimer) clearTimeout(TABS._restoreScrollTimer);
-        TABS._restoreScrollTimer = setTimeout(() => {
-            if (!messagesContainer) return;
-            if (tab.wasAtBottom) {
-                messagesContainer.scrollTop = messagesContainer.scrollHeight;
-            } else if (tab.scrollTop > 0) {
-                messagesContainer.scrollTop = tab.scrollTop;
-            } else {
-                messagesContainer.scrollTop = messagesContainer.scrollHeight;
-            }
-            scrollState.isAtBottom = tab.wasAtBottom !== false;
-            if (typeof updateScrollButton === 'function') updateScrollButton();
-        }, 80);
+    if (TABS._restoreScrollTimer) clearTimeout(TABS._restoreScrollTimer);
+    TABS._restoreScrollTimer = setTimeout(() => {
+        if (!messagesContainer) return;
+        if (tab.wasAtBottom) {
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        } else if (tab.scrollTop > 0) {
+            messagesContainer.scrollTop = tab.scrollTop;
+        } else {
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        }
+        scrollState.isAtBottom = tab.wasAtBottom !== false;
+        if (typeof updateScrollButton === 'function') updateScrollButton();
+    }, 80);
+}
+
+/**
+ * 🆕 ФОРСИРУЕТ подгрузку вложений после переключения вкладки.
+ * Проблема: renderHistory() вызвал loadAttachmentsIn(), но если в
+ * _attachmentCache лежат "пустые" blob:URL из другой вкладки,
+ * плейсхолдеры останутся в виде ⏳ навсегда.
+ */
+async function forceReloadAttachmentsAfterSwitch() {
+    if (!state.chatFile) return;
+
+    // Снимаем data-loaded со ВСЕХ плейсхолдеров — чтобы loadAttachmentsIn
+    // их точно подхватил
+    messagesInner.querySelectorAll('[data-attach][data-loaded], [data-video-attach][data-loaded]')
+        .forEach(el => delete el.dataset.loaded);
+
+    // Очищаем "зависшие" промисы от предыдущей вкладки
+    _pendingAttachmentLoads.clear();
+
+    // Запускаем loadAttachmentsIn
+    if (typeof loadAttachmentsIn === 'function') {
+        try {
+            await loadAttachmentsIn(messagesInner);
+        } catch (e) {
+            console.warn('[Tabs v3] forceReload error:', e);
+        }
     }
+
+    // Повтор через 1.5 сек — если что-то осталось, ревакаем и грузим заново
+    setTimeout(() => {
+        const stillStuck = messagesInner.querySelectorAll(
+            '[data-attach]:not([data-loaded]), ' +
+            '[data-video-attach]:not([data-loaded])'
+        );
+        if (stillStuck.length > 0 && state.chatFile) {
+            console.log(`[Tabs v3] ⏳ Повторная попытка: ${stillStuck.length} вложений`);
+            stillStuck.forEach(el => {
+                const name = el.dataset.attach || el.dataset.videoAttach;
+                if (name && _attachmentCache.has(name)) {
+                    try { URL.revokeObjectURL(_attachmentCache.get(name)); } catch (e) {}
+                    _attachmentCache.delete(name);
+                }
+            });
+            _pendingAttachmentLoads.clear();
+            loadAttachmentsIn(messagesInner);
+        }
+    }, 1500);
+
+    // Финальный повтор через 3.5 сек
+    setTimeout(() => {
+        const stillStuck = messagesInner.querySelectorAll(
+            '[data-attach]:not([data-loaded]), ' +
+            '[data-video-attach]:not([data-loaded])'
+        );
+        if (stillStuck.length > 0 && state.chatFile) {
+            console.log(`[Tabs v3] ⏳ Финальная попытка: ${stillStuck.length} вложений`);
+            stillStuck.forEach(el => {
+                const name = el.dataset.attach || el.dataset.videoAttach;
+                if (name && _attachmentCache.has(name)) {
+                    try { URL.revokeObjectURL(_attachmentCache.get(name)); } catch (e) {}
+                    _attachmentCache.delete(name);
+                }
+            });
+            _pendingAttachmentLoads.clear();
+            loadAttachmentsIn(messagesInner);
+        }
+    }, 3500);
+}
 
     /**
      * Загрузка вкладки с GitHub (первый вход или после полной выгрузки).
@@ -27654,26 +27740,38 @@ async function _reloadTabSilently(file, password) {
         } catch (e) { /* пропускаем битые */ }
     }
 
-    // Обновляем данные вкладки
-    tab.messages = decrypted;
-    tab.historyState = {
-        allMessages: decrypted.slice(),
-        startIndex: 0,
-        renderedCount: decrypted.length,
-        hasMoreOnServer: false,
-    };
-    tab.cryptoKey = key;
-    tab.salt = content.salt;
-    tab.chatPassword = password;
-    tab.sha = res.sha;
-    tab.lastCommitSha = res.commitSha;
-    tab.lastMessageCount = decrypted.length;
-    tab.hasData = true;
+    // 🆕 Проверяем: реально ли изменилось количество сообщений?
+const prevCount = tab.messages ? tab.messages.length : 0;
+const newCount = decrypted.length;
+const countChanged = newCount !== prevCount;
 
-    // ⚠️ Помечаем DOM как «грязный» — при переключении он перерисуется
-    tab._domDirty = true;
+// Обновляем данные вкладки
+tab.messages = decrypted;
+tab.historyState = {
+    allMessages: decrypted.slice(),
+    startIndex: 0,
+    renderedCount: decrypted.length,
+    hasMoreOnServer: false,
+};
+tab.cryptoKey = key;
+tab.salt = content.salt;
+tab.chatPassword = password;
+tab.sha = res.sha;
+tab.lastCommitSha = res.commitSha;
+tab.lastMessageCount = decrypted.length;
+tab.hasData = true;
 
-    console.log(`🔔 [Tabs] «${tab.name}»: тихо подгружено ${decrypted.length} сообщ.`);
+// ⚠️ Помечаем DOM как «грязный» — при переключении он перерисуется
+tab._domDirty = true;
+
+// 🆕 Если реально пришло новое сообщение — увеличиваем счётчик
+if (countChanged && newCount > prevCount) {
+    const delta = newCount - prevCount;
+    tab.unreadCount = (tab.unreadCount || 0) + delta;
+    console.log(`🔔 [Tabs] «${tab.name}»: +${delta} новых сообщений`);
+}
+
+console.log(`🔔 [Tabs] «${tab.name}»: тихо подгружено ${decrypted.length} сообщ.`);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -28614,9 +28712,7 @@ html += `
         }),
         unloadDom: (file) => unloadTabDom(file),
 unloadFully: (file) => unloadTabFully(file),
-snapshot: () => snapshotActiveTab(),
-
-// 🆕 Увеличить счётчик непрочитанных на вкладке
+snapshot: () => snapshotActiveTab(),        // 🆕 Увеличить счётчик непрочитанных на вкладке
 bumpUnread: (file) => {
     const tab = TABS.list.get(file);
     if (!tab) return;
@@ -28625,13 +28721,43 @@ bumpUnread: (file) => {
     saveTabsToStorage();
 },
 
+// 🆕 Пометить DOM вкладки как «грязный» — при переключении перерисуется
+markDomDirty: (file) => {
+    const tab = TABS.list.get(file);
+    if (!tab) return false;
+    tab._domDirty = true;
+    renderTabsBar();
+    return true;
+},
+
+// 🆕 Отметить вкладку прочитанной (сбросить бейдж)
+markRead: (file) => {
+    const tab = TABS.list.get(file);
+    if (!tab) return;
+    tab.unreadCount = 0;
+    // 🆕 Также сбрасываем счётчики в списке чатов
+    const chatInList = state.chats.find(c => c.file === file);
+    if (chatInList) {
+        delete chatInList.hasUnread;
+        delete chatInList.unreadCount;
+        if (typeof saveChatsList === 'function') saveChatsList();
+    }
+    renderTabsBar();
+    saveTabsToStorage();
+},
+
 // 🆕 Точечная перезагрузка содержимого неактивной вкладки
 refreshTabInBackground: async (file) => {
     const tab = TABS.list.get(file);
-    if (!tab || !tab.hasData || !tab.cryptoKey) return;
+    if (!tab) return;
 
     const password = state.savedPasswords[file] || tab.chatPassword;
-    if (!password) return;
+    if (!password) {
+        // Нет пароля — всё равно помечаем грязным, чтобы при переключении
+        // пользователь увидел попытку загрузки
+        tab._domDirty = true;
+        return;
+    }
 
     try {
         if (typeof _reloadTabSilently === 'function') {
@@ -28639,6 +28765,8 @@ refreshTabInBackground: async (file) => {
         }
     } catch (e) {
         console.warn('[Tabs] background refresh failed:', file, e);
+        // 🆕 Даже при ошибке помечаем грязным — вдруг сеть отвалилась
+        tab._domDirty = true;
     }
 },
         // 🆕 Отладка: посмотреть, что в парковках
@@ -30023,15 +30151,23 @@ refreshTabInBackground: async (file) => {
 
             if (newVersion === _versions[file]) return;   // без изменений
 
-            // 🆕 В чате прилетело новое сообщение
-            const delta = Math.max(1, (meta.count || 0) - (_versions[file] ? 0 : 0));
-            _versions[file] = newVersion;
+// 🆕 В чате прилетело новое сообщение
+_versions[file] = newVersion;
 
-            // ─── Обновляем счётчик непрочитанных ───
-            bumpUnreadOnTab(file);
+// ─── Обновляем счётчик непрочитанных ───
+bumpUnreadOnTab(file);
 
-            // ─── Догружаем сообщения в парковку вкладки ───
-            await refreshTabContent(file);
+// ─── 🆕 ПРИНУДИТЕЛЬНО помечаем DOM как «грязный» ───
+// Это гарантирует, что при переключении вкладка перерисуется
+// из tab.messages, а не покажет старый DOM из парковки.
+try {
+    if (typeof ChatTabs !== 'undefined' && ChatTabs.markDomDirty) {
+        ChatTabs.markDomDirty(file);
+    }
+} catch (e) { /* ignore */ }
+
+// ─── Догружаем сообщения в парковку вкладки ───
+await refreshTabContent(file);
 
         } catch (e) {
             // тихо игнорируем — это фоновый опрос
