@@ -30749,72 +30749,52 @@ await refreshTabContent(file);
 
 // ═══════════════════════════════════════════════════════════════
 //  🏷️ БЕЙДЖ ВЕРСИИ В МЕНЮ «⋯»
-//  Читает sw.js → вытаскивает CACHE_NAME → парсит "sms-pwa-v109-zxc5v"
-//  Показывает "v109" (или полный хвост) в меню действий.
+//  ─────────────────────────────────────────────────────────────
+//  Читает версию из sw.js. Кэширует в localStorage на сутки.
+//  Показывается в самом низу меню действий на экране чатов.
 // ═══════════════════════════════════════════════════════════════
 
 (function installVersionBadge() {
     'use strict';
 
     const CACHE_KEY = 'chathub_app_version';
-    const CACHE_TTL = 6 * 60 * 60 * 1000; // 6 часов
+    const CACHE_TTL = 24 * 60 * 60 * 1000; // сутки
 
-    // ─── Извлечь версию из строки CACHE_NAME ───
-    // 'sms-pwa-v109-zxc5v'  →  'v109'
-    // 'sms-pwa-v109'        →  'v109'
-    // 'sms-chat-v1.0.42'    →  'v1.0.42'
-    // 'any-name-v3-abc'     →  'v3'
-    function extractVersion(cacheName) {
-        if (!cacheName) return null;
-        // Ищем "v<цифры>.<цифры>.<цифры>" или "v<цифры>.<цифры>" или "v<цифры>"
-        const m = cacheName.match(/v(\d+(?:\.\d+){0,2})/i);
-        if (m) return 'v' + m[1];
-        return null;
-    }
-
-    // ─── Загрузка sw.js и парсинг CACHE_NAME ───
+    // ─── Чтение версии из sw.js ───
     async function fetchVersionFromSW() {
-        const paths = ['sw.js', './sw.js', '/sw.js'];
+        try {
+            const res = await fetch('sw.js', { cache: 'no-store' });
+            if (!res.ok) throw new Error('sw.js недоступен');
+            const text = await res.text();
 
-        for (const path of paths) {
-            try {
-                const res = await fetch(path, {
-                    cache: 'no-store',
-                    // Service Worker может перехватить — обходим через параметр
-                    // (если sw настроен игнорировать query — ок, если нет — тоже попробуем)
-                });
-                if (!res.ok) continue;
-                const text = await res.text();
+            // Пробуем несколько типовых паттернов
+            const patterns = [
+                /CACHE_VERSION\s*=\s*['"]([^'"]+)['"]/,
+                /CACHE_NAME\s*=\s*['"]([^'"]*?)([\d]+\.[\d]+\.[\d]+[^'"]*)['"]/,
+                /VERSION\s*=\s*['"]([^'"]+)['"]/,
+                /version\s*:\s*['"]([^'"]+)['"]/,
+                /const\s+CACHE\w*\s*=\s*['"]([^'"]+)['"]/,
+            ];
 
-                // Ищем CACHE_NAME = '...'
-                const cacheMatch = text.match(
-                    /(?:const|let|var)\s+CACHE_NAME\s*=\s*['"`]([^'"`]+)['"`]/
-                );
-                if (cacheMatch && cacheMatch[1]) {
-                    const rawName = cacheMatch[1];
-                    const version = extractVersion(rawName);
-                    console.log(`🏷️ [Version] Найдено в sw.js: CACHE_NAME="${rawName}" → версия "${version}"`);
-                    if (version) return version;
-                    return rawName; // покажем как есть
+            for (const re of patterns) {
+                const m = text.match(re);
+                if (m && m[1]) {
+                    return m[1].trim();
                 }
-
-                // Fallback: ищем любые другие паттерны версии
-                const altPatterns = [
-                    /CACHE_VERSION\s*=\s*['"`]([^'"`]+)['"`]/,
-                    /VERSION\s*=\s*['"`]([^'"`]+)['"`]/,
-                ];
-                for (const re of altPatterns) {
-                    const m = text.match(re);
-                    if (m) return extractVersion(m[1]) || m[1];
-                }
-            } catch (e) {
-                console.warn(`🏷️ [Version] fetch ${path} failed:`, e.message);
             }
+
+            // Fallback: пробуем выдернуть что-то типа v1.2.3
+            const vMatch = text.match(/['"]([vV]?\d+\.\d+(?:\.\d+)?)['"]/);
+            if (vMatch) return vMatch[1];
+
+            return null;
+        } catch (e) {
+            console.warn('🏷️ [Version] sw.js недоступен:', e.message);
+            return null;
         }
-        return null;
     }
 
-    // ─── С кэшем в localStorage ───
+    // ─── Получить версию (с кэшем) ───
     async function getVersion() {
         try {
             const raw = localStorage.getItem(CACHE_KEY);
@@ -30835,43 +30815,29 @@ await refreshTabContent(file);
                 }));
             } catch (e) {}
         }
-        return version || 'unknown';
+        return version;
     }
 
-    // ─── HTML-escape ───
-    function esc(s) {
-        const d = document.createElement('div');
-        d.textContent = s == null ? '' : String(s);
-        return d.innerHTML;
-    }
-
-    // ─── Вставка бейджа ───
-    let _injectedFor = null;  // версия, для которой уже вставили (защита от дублей)
-
+    // ─── Вставка бейджа в меню «⋯» ───
     async function injectBadge() {
         const menu = document.getElementById('chatsActionsMenu');
         if (!menu) return false;
-        if (!menu.classList.contains('show')) return false;
+
+        // Уже есть?
+        if (menu.querySelector('.ucm-version-badge')) return true;
 
         const version = await getVersion();
         if (!version) return false;
 
-        // Уже есть с той же версией?
-        const existing = menu.querySelector('.ucm-version-badge');
-        if (existing && _injectedFor === version) return true;
-        if (existing) existing.remove();
-
-        // Находим последний .ucm-divider — вставим ПОСЛЕ него
-        // Если divider нет — в самый конец
+        // Находим последний divider или конец меню
         const lastDivider = Array.from(menu.querySelectorAll('.ucm-divider')).pop();
 
         const badge = document.createElement('div');
         badge.className = 'ucm-version-badge';
-        badge.dataset.version = version;
         badge.innerHTML = `
             <span class="ucm-version-icon">🏷️</span>
             <span class="ucm-version-text">Версия</span>
-            <span class="ucm-version-value">${esc(version)}</span>
+            <span class="ucm-version-value">${escapeHtmlSafe(version)}</span>
         `;
 
         if (lastDivider) {
@@ -30880,9 +30846,14 @@ await refreshTabContent(file);
             menu.appendChild(badge);
         }
 
-        _injectedFor = version;
-        console.log(`🏷️ [Version] Бейдж установлен: ${version}`);
+        console.log(`🏷️ [Version] Бейдж версии установлен: ${version}`);
         return true;
+    }
+
+    function escapeHtmlSafe(s) {
+        const d = document.createElement('div');
+        d.textContent = s == null ? '' : String(s);
+        return d.innerHTML;
     }
 
     // ─── Стили ───
@@ -30894,18 +30865,13 @@ await refreshTabContent(file);
                 display: flex;
                 align-items: center;
                 gap: 8px;
-                padding: 10px 14px 8px;
+                padding: 8px 14px 10px;
                 font-size: 11px;
                 color: #666;
                 user-select: none;
                 pointer-events: none;
                 border-top: 1px solid rgba(255,255,255,0.06);
                 margin-top: 4px;
-                animation: versionBadgeFadeIn 0.25s ease;
-            }
-            @keyframes versionBadgeFadeIn {
-                from { opacity: 0; transform: translateY(-4px); }
-                to   { opacity: 1; transform: translateY(0); }
             }
             #chatsActionsMenu .ucm-version-badge .ucm-version-icon {
                 font-size: 12px;
@@ -30927,73 +30893,685 @@ await refreshTabContent(file);
                 padding: 2px 8px;
                 border-radius: 6px;
                 letter-spacing: 0.3px;
-                font-weight: 600;
             }
         `;
         document.head.appendChild(style);
     }
 
-    // ─── Следим за открытием меню ───
-    // Используем observer на class-attribute — точнее, чем childList
-    const observer = new MutationObserver((mutations) => {
-        for (const mut of mutations) {
-            if (mut.type !== 'attributes') continue;
-            const el = mut.target;
-            if (el.id === 'chatsActionsMenu' && el.classList.contains('show')) {
-                injectBadge();
-                return;
-            }
+    // ─── Следим за открытием меню «⋯» ───
+    const observer = new MutationObserver(() => {
+        const menu = document.getElementById('chatsActionsMenu');
+        if (menu && menu.classList.contains('show')) {
+            injectBadge();
         }
     });
+    observer.observe(document.body, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['class'],
+    });
 
-    function attachMenuObserver() {
-        const menu = document.getElementById('chatsActionsMenu');
-        if (!menu) return false;
-        if (menu._versionBadgeObserved) return true;
-        menu._versionBadgeObserved = true;
-        observer.observe(menu, {
-            attributes: true,
-            attributeFilter: ['class'],
-        });
-        console.log('🏷️ [Version] Observer на меню «⋯» установлен');
-        return true;
-    }
+    // Также пробуем сразу (на случай, если меню уже существует)
+    setTimeout(injectBadge, 2000);
 
-    // Ждём появления меню в DOM
-    if (!attachMenuObserver()) {
-        const t = setInterval(() => {
-            if (attachMenuObserver()) clearInterval(t);
-        }, 500);
-        setTimeout(() => clearInterval(t), 30000);
-    }
-
-    // ─── Экспорт для отладки ───
+    // Экспорт для отладки
     window.VersionBadge = {
         get: getVersion,
-        extract: extractVersion,
         clearCache: () => {
             localStorage.removeItem(CACHE_KEY);
-            _injectedFor = null;
-            console.log('🏷️ [Version] Кэш очищен');
+            console.log('🏷️ [Version] Кэш версии очищен');
         },
         refresh: async () => {
             localStorage.removeItem(CACHE_KEY);
-            _injectedFor = null;
-            const v = await getVersion();
-            console.log(`🏷️ [Version] Обновлено: ${v}`);
-            return v;
+            return await getVersion();
         },
-        test: (name) => extractVersion(name),
     };
 
-    // Прогреваем кэш сразу при загрузке
-    setTimeout(() => getVersion(), 1500);
-
     console.log('🏷️ [Version] Бейдж версии активен');
-    console.log('   • API: VersionBadge.get() / .refresh()');
-    console.log('   • Проверка парсера: VersionBadge.test("sms-pwa-v109-zxc5v")');
+    console.log('   • API: VersionBadge.get() / .refresh() / .clearCache()');
 })();
 
+</script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  ℹ️ ПУНКТ «О ПРИЛОЖЕНИИ» В МЕНЮ «⋯»
+//  ─────────────────────────────────────────────────────────────
+//  • Добавляет пункт «О приложении» в меню действий на экране чатов
+//  • Открывает модалку с краткой инструкцией и описанием
+//  • Показывает версию приложения
+// ═══════════════════════════════════════════════════════════════
+
+(function installAboutApp() {
+    'use strict';
+
+    // ═══════════════════════════════════════════════════════════
+    //  СТИЛИ
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('aboutAppStyles')) {
+        const style = document.createElement('style');
+        style.id = 'aboutAppStyles';
+        style.textContent = `
+            #aboutAppModal {
+                position: fixed;
+                inset: 0;
+                background: rgba(0,0,0,0.75);
+                backdrop-filter: blur(12px);
+                -webkit-backdrop-filter: blur(12px);
+                z-index: 5100;
+                display: none;
+                align-items: center;
+                justify-content: center;
+                padding: 20px;
+                animation: aboutFadeIn 0.25s ease;
+            }
+            #aboutAppModal.show { display: flex; }
+            @keyframes aboutFadeIn {
+                from { opacity: 0; }
+                to   { opacity: 1; }
+            }
+
+            #aboutAppModal .about-card {
+                background: #1a1a2e;
+                border: 1px solid rgba(255,255,255,0.12);
+                border-radius: 22px;
+                max-width: 460px;
+                width: 100%;
+                max-height: 88vh;
+                overflow: hidden;
+                display: flex;
+                flex-direction: column;
+                box-shadow: 0 24px 70px rgba(0,0,0,0.75);
+                animation: aboutSlideUp 0.3s cubic-bezier(0.22, 0.61, 0.36, 1);
+            }
+            @keyframes aboutSlideUp {
+                from { opacity: 0; transform: translateY(24px) scale(0.96); }
+                to   { opacity: 1; transform: translateY(0) scale(1); }
+            }
+
+            /* ─── Шапка ─── */
+            #aboutAppModal .about-header {
+                display: flex;
+                align-items: center;
+                gap: 14px;
+                padding: 20px 22px 16px;
+                background: linear-gradient(135deg,
+                    rgba(108,92,231,0.18),
+                    rgba(0,184,148,0.1));
+                border-bottom: 1px solid rgba(255,255,255,0.08);
+                flex-shrink: 0;
+                position: relative;
+            }
+            #aboutAppModal .about-logo {
+                width: 54px;
+                height: 54px;
+                border-radius: 16px;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 28px;
+                flex-shrink: 0;
+                box-shadow: 0 6px 20px rgba(108,92,231,0.4);
+            }
+            #aboutAppModal .about-title-block {
+                flex: 1;
+                min-width: 0;
+            }
+            #aboutAppModal .about-app-name {
+                font-size: 20px;
+                font-weight: 800;
+                color: #fff;
+                margin-bottom: 3px;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                flex-wrap: wrap;
+            }
+            #aboutAppModal .about-version-chip {
+                font-size: 10px;
+                font-weight: 700;
+                font-family: 'SF Mono', 'Courier New', monospace;
+                color: #a78bfa;
+                background: rgba(108,92,231,0.15);
+                border: 1px solid rgba(108,92,231,0.35);
+                padding: 2px 7px;
+                border-radius: 7px;
+                letter-spacing: 0.4px;
+            }
+            #aboutAppModal .about-tagline {
+                font-size: 12px;
+                color: #888;
+                line-height: 1.4;
+            }
+            #aboutAppModal .about-close {
+                position: absolute;
+                top: 14px;
+                right: 14px;
+                width: 34px;
+                height: 34px;
+                border-radius: 50%;
+                background: rgba(255,255,255,0.08);
+                border: none;
+                color: #aaa;
+                font-size: 16px;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                transition: all 0.15s;
+                flex-shrink: 0;
+            }
+            #aboutAppModal .about-close:hover {
+                background: rgba(255,107,107,0.2);
+                color: #ff6b6b;
+            }
+            #aboutAppModal .about-close:active { transform: scale(0.9); }
+
+            /* ─── Тело ─── */
+            #aboutAppModal .about-body {
+                padding: 16px 20px 22px;
+                overflow-y: auto;
+                flex: 1;
+                min-height: 0;
+                -webkit-overflow-scrolling: touch;
+            }
+            #aboutAppModal .about-body::-webkit-scrollbar { width: 4px; }
+            #aboutAppModal .about-body::-webkit-scrollbar-thumb {
+                background: rgba(255,255,255,0.15);
+                border-radius: 2px;
+            }
+
+            /* ─── Секции ─── */
+            #aboutAppModal .about-section {
+                margin-bottom: 18px;
+            }
+            #aboutAppModal .about-section:last-child { margin-bottom: 0; }
+
+            #aboutAppModal .about-section-title {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                font-size: 12px;
+                font-weight: 700;
+                color: #a78bfa;
+                text-transform: uppercase;
+                letter-spacing: 0.6px;
+                margin-bottom: 10px;
+                padding-bottom: 6px;
+                border-bottom: 1px solid rgba(167,139,250,0.15);
+            }
+            #aboutAppModal .about-section-title .icon {
+                font-size: 14px;
+            }
+
+            #aboutAppModal .about-text {
+                font-size: 13.5px;
+                color: #ccc;
+                line-height: 1.6;
+            }
+            #aboutAppModal .about-text strong {
+                color: #fff;
+                font-weight: 600;
+            }
+            #aboutAppModal .about-text code {
+                background: rgba(108,92,231,0.12);
+                color: #a78bfa;
+                padding: 1px 6px;
+                border-radius: 5px;
+                font-size: 12px;
+                font-family: 'SF Mono', 'Courier New', monospace;
+            }
+
+            /* ─── Список фич ─── */
+            #aboutAppModal .about-features {
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+            }
+            #aboutAppModal .about-feature {
+                display: flex;
+                align-items: flex-start;
+                gap: 10px;
+                padding: 9px 12px;
+                background: rgba(255,255,255,0.03);
+                border: 1px solid rgba(255,255,255,0.06);
+                border-radius: 10px;
+                font-size: 13px;
+                color: #ccc;
+                line-height: 1.45;
+            }
+            #aboutAppModal .about-feature .fi {
+                font-size: 16px;
+                flex-shrink: 0;
+                margin-top: 1px;
+            }
+            #aboutAppModal .about-feature .ft strong {
+                color: #fff;
+                display: block;
+                margin-bottom: 2px;
+                font-size: 13px;
+            }
+            #aboutAppModal .about-feature .ft span {
+                color: #999;
+                font-size: 12px;
+            }
+
+            /* ─── Шаги инструкции ─── */
+            #aboutAppModal .about-steps {
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+                counter-reset: step;
+            }
+            #aboutAppModal .about-step {
+                display: flex;
+                gap: 12px;
+                align-items: flex-start;
+                padding: 10px 12px;
+                background: linear-gradient(135deg,
+                    rgba(108,92,231,0.06),
+                    rgba(0,184,148,0.04));
+                border: 1px solid rgba(108,92,231,0.15);
+                border-radius: 12px;
+                font-size: 13px;
+                color: #ccc;
+                line-height: 1.5;
+            }
+            #aboutAppModal .about-step::before {
+                counter-increment: step;
+                content: counter(step);
+                width: 24px;
+                height: 24px;
+                border-radius: 50%;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                color: #fff;
+                font-size: 12px;
+                font-weight: 700;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                flex-shrink: 0;
+            }
+            #aboutAppModal .about-step .st strong {
+                color: #fff;
+                display: block;
+                margin-bottom: 2px;
+            }
+            #aboutAppModal .about-step .st span {
+                color: #999;
+                font-size: 12px;
+            }
+
+            /* ─── Предупреждение ─── */
+            #aboutAppModal .about-warn {
+                display: flex;
+                gap: 10px;
+                padding: 12px 14px;
+                background: rgba(254,202,87,0.08);
+                border: 1px solid rgba(254,202,87,0.25);
+                border-radius: 12px;
+                font-size: 12px;
+                color: #feca57;
+                line-height: 1.55;
+                margin-top: 8px;
+            }
+            #aboutAppModal .about-warn .wi {
+                font-size: 16px;
+                flex-shrink: 0;
+            }
+
+            /* ─── Подвал ─── */
+            #aboutAppModal .about-footer {
+                padding: 14px 20px 18px;
+                border-top: 1px solid rgba(255,255,255,0.06);
+                background: rgba(0,0,0,0.2);
+                text-align: center;
+                flex-shrink: 0;
+            }
+            #aboutAppModal .about-footer-text {
+                font-size: 11px;
+                color: #666;
+                line-height: 1.6;
+            }
+            #aboutAppModal .about-footer-text a {
+                color: #a78bfa;
+                text-decoration: none;
+                font-weight: 600;
+            }
+            #aboutAppModal .about-footer-text a:hover { text-decoration: underline; }
+
+            @media (max-width: 480px) {
+                #aboutAppModal { padding: 12px; }
+                #aboutAppModal .about-header { padding: 16px 18px 14px; }
+                #aboutAppModal .about-logo { width: 46px; height: 46px; font-size: 24px; }
+                #aboutAppModal .about-app-name { font-size: 17px; }
+                #aboutAppModal .about-body { padding: 14px 16px 18px; }
+                #aboutAppModal .about-text { font-size: 13px; }
+                #aboutAppModal .about-feature { font-size: 12.5px; padding: 8px 10px; }
+                #aboutAppModal .about-step { font-size: 12.5px; padding: 9px 10px; }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОЗДАНИЕ МОДАЛКИ
+    // ═══════════════════════════════════════════════════════════
+    function ensureModal() {
+        let modal = document.getElementById('aboutAppModal');
+        if (modal) return modal;
+
+        modal = document.createElement('div');
+        modal.id = 'aboutAppModal';
+        modal.innerHTML = `
+            <div class="about-card" onclick="event.stopPropagation()">
+                <div class="about-header">
+                    <div class="about-logo">📱</div>
+                    <div class="about-title-block">
+                        <div class="about-app-name">
+                            SMS Чат
+                            <span class="about-version-chip" id="aboutVersionChip">v…</span>
+                        </div>
+                        <div class="about-tagline">Приватный E2E-мессенджер на GitHub</div>
+                    </div>
+                    <button class="about-close" id="aboutCloseBtn" title="Закрыть">✕</button>
+                </div>
+
+                <div class="about-body">
+
+                    <!-- ОПИСАНИЕ -->
+                    <div class="about-section">
+                        <div class="about-section-title">
+                            <span class="icon">💡</span>
+                            <span>Что это</span>
+                        </div>
+                        <div class="about-text">
+                            <strong>SMS Чат</strong> — приватный мессенджер, который хранит
+                            все переписки в вашем личном <strong>GitHub-репозитории</strong>.
+                            Сообщения, фото, видео и файлы <strong>шифруются на устройстве</strong>
+                            (AES-256-GCM) и никуда не отправляются, кроме вашего репозитория.
+                            Никаких серверов-посредников — только вы и GitHub.
+                        </div>
+                    </div>
+
+                    <!-- ВОЗМОЖНОСТИ -->
+                    <div class="about-section">
+                        <div class="about-section-title">
+                            <span class="icon">✨</span>
+                            <span>Возможности</span>
+                        </div>
+                        <div class="about-features">
+                            <div class="about-feature">
+                                <span class="fi">🔐</span>
+                                <div class="ft">
+                                    <strong>Сквозное шифрование</strong>
+                                    <span>AES-256-GCM + PBKDF2 (200 000 итераций). Ключи никогда не покидают устройство.</span>
+                                </div>
+                            </div>
+                            <div class="about-feature">
+                                <span class="fi">💬</span>
+                                <div class="ft">
+                                    <strong>Текст, фото, видео, аудио, файлы</strong>
+                                    <span>До 25 МБ на файл, пакетная отправка до 20 фото за раз.</span>
+                                </div>
+                            </div>
+                            <div class="about-feature">
+                                <span class="fi">🎵</span>
+                                <div class="ft">
+                                    <strong>Встроенный плеер</strong>
+                                    <span>Глобальный мини-плеер, shuffle, направление воспроизведения, чтение обложек из ID3.</span>
+                                </div>
+                            </div>
+                            <div class="about-feature">
+                                <span class="fi">📴</span>
+                                <div class="ft">
+                                    <strong>Офлайн-режим</strong>
+                                    <span>Расшифрованная история кэшируется локально. Читайте чаты без интернета.</span>
+                                </div>
+                            </div>
+                            <div class="about-feature">
+                                <span class="fi">🔔</span>
+                                <div class="ft">
+                                    <strong>Радар событий</strong>
+                                    <span>Реакции и комментарии к вашим сообщениям в одном месте, с последовательным просмотром.</span>
+                                </div>
+                            </div>
+                            <div class="about-feature">
+                                <span class="fi">🗂️</span>
+                                <div class="ft">
+                                    <strong>Вкладки чатов</strong>
+                                    <span>До 5 чатов одновременно с живым DOM. Мгновенное переключение.</span>
+                                </div>
+                            </div>
+                            <div class="about-feature">
+                                <span class="fi">💾</span>
+                                <div class="ft">
+                                    <strong>Экспорт и импорт</strong>
+                                    <span>Бэкап профиля, приглашения в чат через файлы <code>.smschat</code>.</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- КРАТКАЯ ИНСТРУКЦИЯ -->
+                    <div class="about-section">
+                        <div class="about-section-title">
+                            <span class="icon">🚀</span>
+                            <span>Как начать</span>
+                        </div>
+                        <div class="about-steps">
+                            <div class="about-step">
+                                <div class="st">
+                                    <strong>Получите GitHub-токен</strong>
+                                    <span>Зайдите в настройки GitHub → Developer settings → Personal access tokens. Создайте токен с правом <code>repo</code>.</span>
+                                </div>
+                            </div>
+                            <div class="about-step">
+                                <div class="st">
+                                    <strong>Войдите в приложение</strong>
+                                    <span>Введите своё имя и вставьте токен. По желанию поставьте галочку «Запомнить меня».</span>
+                                </div>
+                            </div>
+                            <div class="about-step">
+                                <div class="st">
+                                    <strong>Создайте чат</strong>
+                                    <span>Нажмите <strong>➕ Создать чат</strong>. Придумайте название, скопируйте пароль (он сгенерируется автоматически) и передайте его тому, с кем хотите общаться.</span>
+                                </div>
+                            </div>
+                            <div class="about-step">
+                                <div class="st">
+                                    <strong>Пригласите собеседника</strong>
+                                    <span>Нажмите <strong>💌</strong> в шапке чата — сформируется файл-приглашение. Отправьте его собеседнику любым способом: через Telegram, почту или другим мессенджером.</span>
+                                </div>
+                            </div>
+                            <div class="about-step">
+                                <div class="st">
+                                    <strong>Собеседник добавляет чат</strong>
+                                    <span>Он открывает файл-приглашение — чат автоматически появляется в его списке с готовым паролем.</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- ПОДСКАЗКИ -->
+                    <div class="about-section">
+                        <div class="about-section-title">
+                            <span class="icon">💡</span>
+                            <span>Полезные жесты</span>
+                        </div>
+                        <div class="about-features">
+                            <div class="about-feature">
+                                <span class="fi">👆</span>
+                                <div class="ft">
+                                    <strong>Долгий тап на сообщении</strong>
+                                    <span>Меню действий: ответить, копировать, редактировать, удалить, выбрать несколько.</span>
+                                </div>
+                            </div>
+                            <div class="about-feature">
+                                <span class="fi">👉</span>
+                                <div class="ft">
+                                    <strong>Свайп вправо по сообщению</strong>
+                                    <span>Быстрый ответ на сообщение. Работает на любых сообщениях.</span>
+                                </div>
+                            </div>
+                            <div class="about-feature">
+                                <span class="fi">🖼️</span>
+                                <div class="ft">
+                                    <strong>Долгий тап на фото в галерее</strong>
+                                    <span>Информация о снимке: размер, разрешение, отправитель, дата.</span>
+                                </div>
+                            </div>
+                            <div class="about-feature">
+                                <span class="fi">🖱️</span>
+                                <div class="ft">
+                                    <strong>Клик по кружку рядом с именем</strong>
+                                    <span>Установить свою аватарку для этого человека. Локально, только для вас.</span>
+                                </div>
+                            </div>
+                            <div class="about-feature">
+                                <span class="fi">⋯</span>
+                                <div class="ft">
+                                    <strong>Долгий тап на ⟳ в шапке чата</strong>
+                                    <span>Меню перезагрузки: обновить чат, обновить вложения, перезагрузить приложение.</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- ВАЖНОЕ ПРЕДУПРЕЖДЕНИЕ -->
+                    <div class="about-section">
+                        <div class="about-section-title">
+                            <span class="icon">⚠️</span>
+                            <span>Безопасность</span>
+                        </div>
+                        <div class="about-warn">
+                            <span class="wi">🔑</span>
+                            <div>
+                                <strong style="color:#feca57;">Пароль чата восстановить невозможно.</strong>
+                                Если вы его забудете, все сообщения в этом чате станут нечитаемыми навсегда.
+                                Сохраните пароль в надёжном месте или воспользуйтесь экспортом профиля.
+                            </div>
+                        </div>
+                        <div class="about-warn" style="background:rgba(255,107,107,0.08);border-color:rgba(255,107,107,0.25);color:#ff9a9a;margin-top:10px;">
+                            <span class="wi">🔐</span>
+                            <div>
+                                <strong style="color:#ff8a8a;">GitHub-токен = полный доступ к вашим репозиториям.</strong>
+                                Не вводите его на чужих устройствах. При подозрении на утечку — сразу отзовите токен в настройках GitHub.
+                            </div>
+                        </div>
+                    </div>
+
+                </div>
+
+                <div class="about-footer">
+                    <div class="about-footer-text">
+                        Приложение работает полностью в вашем браузере.<br>
+                        Исходный код открыт: <a href="https://github.com/2d3t/SMS" target="_blank" rel="noopener">github.com/2d3t/SMS</a>
+                    </div>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(modal);
+
+        // Закрытие
+        modal.querySelector('#aboutCloseBtn').addEventListener('click', closeAboutModal);
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) closeAboutModal();
+        });
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && modal.classList.contains('show')) {
+                closeAboutModal();
+            }
+        });
+
+        return modal;
+    }
+
+    function openAboutModal() {
+        const modal = ensureModal();
+        modal.classList.add('show');
+        if (navigator.vibrate) navigator.vibrate(10);
+
+        // Подгружаем версию асинхронно
+        if (window.VersionBadge && typeof window.VersionBadge.get === 'function') {
+            window.VersionBadge.get().then(v => {
+                const chip = document.getElementById('aboutVersionChip');
+                if (chip && v) chip.textContent = 'v' + String(v).replace(/^v/i, '');
+            }).catch(() => {});
+        }
+    }
+
+    function closeAboutModal() {
+        const modal = document.getElementById('aboutAppModal');
+        if (modal) modal.classList.remove('show');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ДОБАВЛЕНИЕ ПУНКТА В МЕНЮ «⋯»
+    // ═══════════════════════════════════════════════════════════
+    function addMenuItem() {
+        const menu = document.getElementById('chatsActionsMenu');
+        if (!menu) return false;
+
+        // Уже есть?
+        if (menu.querySelector('[data-action="about"]')) return true;
+
+        // Находим последний divider
+        const lastDivider = Array.from(menu.querySelectorAll('.ucm-divider')).pop();
+
+        const item = document.createElement('div');
+        item.className = 'ucm-item';
+        item.dataset.action = 'about';
+        item.innerHTML = `
+            <span class="ucm-icon">ℹ️</span>
+            <span class="ucm-label">О приложении</span>
+        `;
+
+        if (lastDivider) {
+            lastDivider.parentNode.insertBefore(item, lastDivider);
+        } else {
+            menu.appendChild(item);
+        }
+
+        // Обработчик клика
+        item.addEventListener('click', (e) => {
+            e.stopPropagation();
+            menu.classList.remove('show');
+            setTimeout(() => openAboutModal(), 200);
+        });
+
+        console.log('ℹ️ [About] Пункт «О приложении» добавлен в меню «⋯»');
+        return true;
+    }
+
+    // MutationObserver — ловим, когда меню появляется/перерисовывается
+    const observer = new MutationObserver(() => {
+        addMenuItem();
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    // Периодическая страховка
+    setInterval(addMenuItem, 2000);
+
+    // Первая попытка
+    setTimeout(addMenuItem, 1000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЭКСПОРТ
+    // ═══════════════════════════════════════════════════════════
+    window.AboutApp = {
+        open: openAboutModal,
+        close: closeAboutModal,
+        inject: addMenuItem,
+    };
+
+    console.log('ℹ️ AboutApp активен:');
+    console.log('   • Меню «⋯» на экране чатов → «О приложении»');
+    console.log('   • API: AboutApp.open() / .close()');
+})();
 </script>
 </body>
 </html>
