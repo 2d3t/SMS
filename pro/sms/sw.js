@@ -1,5 +1,5 @@
 // sw.js - Универсальный кеш + уведомления
-const CACHE_NAME = 'sms-pwa-v111-rovnobystrobacknorm';
+const CACHE_NAME = 'sms-pwa-v11-hyumusicstart';
 
 const FILES_TO_CACHE = [
     '/SMS/pro/sms/index.html',
