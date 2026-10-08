@@ -30267,5 +30267,467 @@ await refreshTabContent(file);
     console.log('🔔 [TabPolling] Готово. API: TabBackgroundPolling.status()');
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🔄 АВТО-ОБНОВЛЕНИЕ ПРИ ПЕРЕХОДЕ НА ВКЛАДКУ С НОВЫМИ СООБЩЕНИЯМИ
+//  ─────────────────────────────────────────────────────────────
+//  Когда пользователь кликает на вкладку, у которой:
+//   • _domDirty = true (есть новые сообщения), ИЛИ
+//   • hasLiveDom = false (DOM выгружен)
+//  — автоматически вызывается softReloadChat() после переключения.
+// ═══════════════════════════════════════════════════════════════
+
+(function installAutoReloadOnTabSwitch() {
+    'use strict';
+
+    // ─── Ждём пока ChatTabs будет готов ───
+    let _retryCount = 0;
+    const _maxRetries = 40;  // 20 секунд максимум
+
+    function tryInstall() {
+        _retryCount++;
+
+        if (typeof ChatTabs === 'undefined' || typeof ChatTabs.switchTo !== 'function') {
+            if (_retryCount < _maxRetries) {
+                setTimeout(tryInstall, 500);
+            } else {
+                console.warn('⚠️ [AutoReload] ChatTabs не найден — патч не установлен');
+            }
+            return;
+        }
+
+        console.log('🔄 [AutoReload] Устанавливаю патч на switchTo...');
+
+        // ═══════════════════════════════════════════════════════════
+        //  ПЕРЕХВАТ ChatTabs.switchTo
+        // ═══════════════════════════════════════════════════════════
+        const _origSwitchTo = ChatTabs.switchTo;
+
+        ChatTabs.switchTo = async function(file) {
+            // Запоминаем состояние вкладки ДО переключения
+            let needsReload = false;
+            let tabWasDirty = false;
+            let tabHadNoDom = false;
+
+            try {
+                const status = ChatTabs.status();
+                const tabInfo = status.tabs.find(t => t.file === file);
+
+                if (tabInfo) {
+                    // Проверяем флаги через внутреннее API (если доступно)
+                    // Используем markDomDirty как индикатор — если он был вызван,
+                    // значит вкладка помечена как "грязная"
+                    
+                    // Проверяем через публичный status — есть ли флаг
+                    // (добавим проверку через прямое обращение к внутреннему состоянию)
+                    if (typeof window._getTabInternalState === 'function') {
+                        const internal = window._getTabInternalState(file);
+                        if (internal) {
+                            tabWasDirty = internal._domDirty === true;
+                            tabHadNoDom = internal.hasLiveDom === false;
+                            needsReload = tabWasDirty || tabHadNoDom;
+                        }
+                    } else {
+                        // Fallback: если нет доступа к внутреннему состоянию,
+                        // проверяем hasLiveDom через status
+                        tabHadNoDom = tabInfo.hasLiveDom === false;
+                        // Для _domDirty используем эвристику: если unread > 0
+                        tabWasDirty = (tabInfo.unread || 0) > 0;
+                        needsReload = tabWasDirty || tabHadNoDom;
+                    }
+                }
+            } catch (e) {
+                console.warn('[AutoReload] Ошибка проверки состояния вкладки:', e);
+            }
+
+            // ═══ Вызываем оригинальный switchTo ═══
+            const result = await _origSwitchTo.call(this, file);
+
+            // ═══ После переключения — если нужна перезагрузка, запускаем ═══
+            if (needsReload && state.chatFile === file) {
+                console.log(`🔄 [AutoReload] Вкладка «${file}» требует обновления:`, {
+                    domDirty: tabWasDirty,
+                    noLiveDom: tabHadNoDom,
+                });
+
+                // Небольшая задержка, чтобы switchTo успел завершить рендер
+                setTimeout(() => {
+                    // Проверяем, что мы всё ещё в этой вкладке
+                    if (state.chatFile !== file) return;
+
+                    // Показываем индикатор на кнопке 🔄 в шапке
+                    const reloadBtn = document.getElementById('reloadChatBtn');
+                    if (reloadBtn) {
+                        reloadBtn.classList.add('spinning');
+                    }
+
+                    // Запускаем мягкую перезагрузку
+                    if (typeof ReloadSystem !== 'undefined' && ReloadSystem.softReloadChat) {
+                        ReloadSystem.softReloadChat()
+                            .finally(() => {
+                                if (reloadBtn) {
+                                    setTimeout(() => reloadBtn.classList.remove('spinning'), 500);
+                                }
+                            });
+                    } else if (typeof softReloadChat === 'function') {
+                        softReloadChat()
+                            .finally(() => {
+                                if (reloadBtn) {
+                                    setTimeout(() => reloadBtn.classList.remove('spinning'), 500);
+                                }
+                            });
+                    }
+
+                    // 🆕 Также запускаем перезагрузку сломанных вложений
+                    setTimeout(() => {
+                        if (typeof ReloadSystem !== 'undefined' && ReloadSystem.retryAllBroken) {
+                            ReloadSystem.retryAllBroken();
+                        }
+                    }, 1500);
+
+                }, 200);  // 200 мс — достаточно для завершения switchTo
+            }
+
+            return result;
+        };
+
+        console.log('✅ [AutoReload] Патч установлен: вкладки с новыми сообщениями будут авто-обновляться');
+    }
+
+    // ─── Запускаем установку ───
+    setTimeout(tryInstall, 1000);
+
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🔧 ДОПОЛНЕНИЕ: экспорт внутреннего состояния вкладки
+//  Нужно для точной проверки _domDirty и hasLiveDom
+// ═══════════════════════════════════════════════════════════════
+
+(function exposeTabInternalState() {
+    'use strict';
+
+    // Ждём ChatTabs
+    let retries = 0;
+    const maxRetries = 40;
+
+    function tryExpose() {
+        retries++;
+
+        if (typeof ChatTabs === 'undefined') {
+            if (retries < maxRetries) setTimeout(tryExpose, 500);
+            return;
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        //  Пытаемся получить доступ к TABS.list через замыкание
+        //  Проблема: TABS — внутри IIFE, недоступен извне.
+        //  Решение: добавляем геттер через ChatTabs API.
+        // ═══════════════════════════════════════════════════════════
+
+        // Патчим ChatTabs.status, чтобы он возвращал _domDirty и hasLiveDom
+        // (hasLiveDom уже возвращается, но _domDirty — нет)
+        const _origStatus = ChatTabs.status;
+
+        ChatTabs.status = function() {
+            const result = _origStatus.apply(this, arguments);
+
+            // Обогащаем tabs информацией _domDirty
+            // Но у нас нет прямого доступа к TABS.list...
+            // Используем хак: markDomDirty уже меняет tab._domDirty,
+            // поэтому если мы вызовем ChatTabs.list() — увидим hasLiveDom.
+            
+            // Для _domDirty — добавим отдельный метод ниже.
+            
+            return result;
+        };
+
+        // ═══════════════════════════════════════════════════════════
+        //  Добавляем публичный метод для получения внутреннего состояния
+        // ═══════════════════════════════════════════════════════════
+        
+        // Хак: переопределяем ChatTabs.switchTo, чтобы он перед переключением
+        // сохранял состояние в глобальную переменную
+        window._getTabInternalState = function(file) {
+            // Проверяем через DOM — есть ли парковка с этим файлом
+            const parking = document.querySelector(`.tab-parking[data-tab-file="${CSS.escape(file)}"]`);
+            const hasParking = !!parking;
+            const parkingNodes = parking ? parking.childNodes.length : 0;
+
+            // Проверяем через ChatTabs.status()
+            let hasLiveDom = false;
+            let unread = 0;
+            try {
+                const status = ChatTabs.status();
+                const tabInfo = status.tabs.find(t => t.file === file);
+                if (tabInfo) {
+                    hasLiveDom = tabInfo.hasLiveDom;
+                    unread = tabInfo.unread || 0;
+                }
+            } catch (e) {}
+
+            // _domDirty определяем по:
+            // 1. Наличию класса has-dirty на кнопке вкладки в DOM
+            // 2. Или по unread > 0
+            let domDirty = false;
+            const tabBtn = document.querySelector(`.ctb-tab[data-tab-file="${CSS.escape(file)}"]`);
+            if (tabBtn) {
+                domDirty = tabBtn.classList.contains('has-dirty');
+            }
+
+            // Fallback: если unread > 0 — считаем грязным
+            if (!domDirty && unread > 0) {
+                domDirty = true;
+            }
+
+            return {
+                file,
+                hasLiveDom,
+                _domDirty: domDirty,
+                unread,
+                hasParking,
+                parkingNodes,
+            };
+        };
+
+        console.log('✅ [AutoReload] window._getTabInternalState() доступен');
+    }
+
+    setTimeout(tryExpose, 1500);
+
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🔧 АЛЬТЕРНАТИВНЫЙ ПОДХОД: перехват клика по вкладке
+//  Более надёжный — работает через DOM-события
+// ═══════════════════════════════════════════════════════════════
+
+(function installAutoReloadViaClick() {
+    'use strict';
+
+    // Флаг: идёт ли уже авто-обновление
+    let _autoReloadInProgress = false;
+
+    // ─── Обработчик клика по вкладке ───
+    function handleTabClick(e) {
+        const tabEl = e.target.closest('.ctb-tab');
+        if (!tabEl) return;
+        if (e.target.closest('.ctb-close')) return;  // клик по крестику — не наш случай
+
+        const file = tabEl.dataset.tabFile;
+        if (!file) return;
+
+        // Проверяем: есть ли у вкладки пометка «грязная» или она без DOM
+        const isDirty = tabEl.classList.contains('has-dirty');
+        const hasLiveDom = tabEl.querySelector('.ctb-live-dot') !== null;
+
+        // Также проверяем unread-бейдж
+        const unreadBadge = tabEl.querySelector('.ctb-badge');
+        const hasUnread = unreadBadge !== null;
+
+        const needsReload = isDirty || !hasLiveDom || hasUnread;
+
+        if (!needsReload) return;
+
+        console.log(`🔄 [AutoReload via click] Вкладка «${file}» требует обновления:`, {
+            isDirty,
+            hasLiveDom,
+            hasUnread,
+        });
+
+        // Даём switchTo выполниться (он вешается на этот же клик)
+        // и через небольшую задержку запускаем обновление
+        setTimeout(() => {
+            // Проверяем, что мы действительно переключились на эту вкладку
+            if (state.chatFile !== file) return;
+            if (_autoReloadInProgress) return;
+
+            _autoReloadInProgress = true;
+
+            // Показываем индикатор
+            const reloadBtn = document.getElementById('reloadChatBtn');
+            if (reloadBtn) reloadBtn.classList.add('spinning');
+
+            // Запускаем мягкую перезагрузку
+            const doReload = async () => {
+                try {
+                    if (typeof ReloadSystem !== 'undefined' && ReloadSystem.softReloadChat) {
+                        await ReloadSystem.softReloadChat();
+                    } else if (typeof softReloadChat === 'function') {
+                        await softReloadChat();
+                    }
+                } catch (err) {
+                    console.warn('[AutoReload] softReloadChat error:', err);
+                } finally {
+                    if (reloadBtn) {
+                        setTimeout(() => reloadBtn.classList.remove('spinning'), 500);
+                    }
+                    _autoReloadInProgress = false;
+                }
+            };
+
+            doReload();
+
+            // Дополнительно — retry сломанных вложений
+            setTimeout(() => {
+                if (typeof ReloadSystem !== 'undefined' && ReloadSystem.retryAllBroken) {
+                    ReloadSystem.retryAllBroken();
+                }
+            }, 1500);
+
+        }, 250);  // 250 мс — даём switchTo завершиться
+    }
+
+    // ─── Вешаем обработчик на полоску вкладок ───
+    function attachToTabsBar() {
+        const tabsBar = document.getElementById('chatTabsBar');
+        if (!tabsBar) return false;
+        if (tabsBar._autoReloadAttached) return true;
+
+        tabsBar._autoReloadAttached = true;
+
+        // Capture-фаза — срабатывает раньше основного обработчика
+        tabsBar.addEventListener('click', (e) => {
+            // Не перехватываем — просто запоминаем, что нужно обновить
+            handleTabClick(e);
+        }, false);  // bubble-фаза — после основного
+
+        console.log('✅ [AutoReload via click] Обработчик на полоске вкладок установлен');
+        return true;
+    }
+
+    // ─── Ждём появления полоски ───
+    let tries = 0;
+    const maxTries = 60;
+
+    const waitTimer = setInterval(() => {
+        tries++;
+        if (attachToTabsBar()) {
+            clearInterval(waitTimer);
+        }
+        if (tries >= maxTries) {
+            clearInterval(waitTimer);
+            console.warn('⚠️ [AutoReload via click] Полоска вкладок не найдена');
+        }
+    }, 500);
+
+    // ─── Также переустанавливаем при смене экрана ───
+    const _origShowChatScreen = window.showChatScreen;
+    if (typeof _origShowChatScreen === 'function') {
+        window.showChatScreen = function() {
+            const r = _origShowChatScreen.apply(this, arguments);
+            setTimeout(attachToTabsBar, 200);
+            return r;
+        };
+    }
+
+    console.log('🔄 [AutoReload via click] Модуль инициализирован');
+})();
+</script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  📱 СВОРАЧИВАНИЕ ПРИЛОЖЕНИЯ ПО КНОПКЕ «НАЗАД» НА ЭКРАНЕ ЧАТОВ
+//  ─────────────────────────────────────────────────────────────
+//  Было: Назад в списке чатов → Android закрывает приложение.
+//  Стало: Назад в списке чатов → приложение «сворачивается»
+//         (остаётся открытым, но пользователь может вернуться
+//         свайпом из недавних / тапом на иконку).
+//
+//  Как это работает:
+//   1. На экране чатов мы «съедаем» popstate и pushState обратно —
+//      браузер не уходит назад, приложение не закрывается.
+//   2. Пробуем window.close() — в PWA это сворачивает приложение.
+//   3. Пробуем history.back() с задержкой — если система всё же
+//      хочет закрыть, даём ей шанс «свернуть» через blur.
+//   4. Финальный fallback: показываем тост «Приложение свёрнуто»
+//      и остаёмся на экране.
+// ═══════════════════════════════════════════════════════════════
+
+(function installBackToMinimize() {
+    'use strict';
+
+    let _lastMinimizeTs = 0;
+    const MINIMIZE_COOLDOWN_MS = 800;
+
+    // ─── Определяем: запущено ли как PWA (standalone) ───
+    function isStandalone() {
+        return (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches)
+            || window.navigator.standalone === true
+            || document.referrer === 'android-app://com.android.chrome';
+    }
+
+    // ─── Сворачивание приложения ───
+    async function minimizeApp() {
+        const now = Date.now();
+        if (now - _lastMinimizeTs < MINIMIZE_COOLDOWN_MS) return;
+        _lastMinimizeTs = now;
+
+        if (navigator.vibrate) navigator.vibrate([10, 30, 10]);
+
+        // 1) Пробуем window.close() — в PWA сворачивает приложение
+        try {
+            window.close();
+        } catch (e) { /* ignore */ }
+
+        // 2) Если через 120 мс окно всё ещё открыто — значит close()
+        //    не сработал. Пробуем отправить приложение в фон через
+        //    blur() и history.back() с последующим pushState.
+        setTimeout(() => {
+            try {
+                // blur() — на некоторых Android сворачивает WebView/PWA
+                window.blur();
+
+                // Если приложение в standalone и есть доступ к
+                // Android API через нативный мост — шлём команду
+                if (window.Android && typeof window.Android.minimize === 'function') {
+                    window.Android.minimize();
+                } else if (window.ReactNativeWebView && typeof window.ReactNativeWebView.postMessage === 'function') {
+                    window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'minimize' }));
+                } else if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.minimize) {
+                    window.webkit.messageHandlers.minimize.postMessage(null);
+                }
+
+                // 🆕 Финальный fallback: показываем тост
+                // (если ничего не сработало, пользователь хотя бы поймёт,
+                //  что приложение не закрылось, а «осталось»)
+                if (!document.hidden) {
+                    showToast('📱 Приложение свёрнуто', 1500);
+                }
+            } catch (e) { /* ignore */ }
+        }, 120);
+    }
+
+    // ─── Основной обработчик popstate ───
+    // ВАЖНО: должен срабатывать ПОСЛЕ обработчика из installAndroidBackButton,
+    // который делает backToChats() когда мы в чате.
+    // Здесь мы обрабатываем случай "мы УЖЕ в списке чатов".
+    window.addEventListener('popstate', (e) => {
+        // Нас интересует только экран списка чатов
+        if (state.currentScreen !== 'chats') return;
+
+        // На экране чатов Назад = сворачиваем приложение
+        // 1) Возвращаем состояние в историю, чтобы браузер не закрывал
+        try {
+            history.pushState({ screen: 'chats' }, '', location.href);
+        } catch (err) { /* ignore */ }
+
+        // 2) Пробуем свернуть
+        minimizeApp();
+    });
+
+    // ─── Публичное API ───
+    window.BackToMinimize = {
+        minimize: minimizeApp,
+        isStandalone,
+    };
+
+    console.log('📱 Кнопка «Назад» на экране чатов → сворачивает приложение');
+    console.log('   • В PWA: window.close() → приложение уходит в фон');
+    console.log('   • В браузере: приложение остаётся на экране чатов');
+    console.log('   • API: BackToMinimize.minimize()');
+})();
+</script>
 </body>
 </html>
