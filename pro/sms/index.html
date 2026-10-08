@@ -3822,7 +3822,7 @@ body.player-active .messages-container { padding-bottom: 68px; }
 <div id="chatScreen">
     <div class="chat-header">
         <div class="left">
-            <div class="avatar" id="userAvatar">?</div>
+            <div class="avatar" id="userAvatar" data-avatar-file="">?</div>
             <div class="info">
                 <h2 id="chatTitle">Чат</h2>
             </div>
@@ -27977,6 +27977,7 @@ window.ChatMemory = {
     },
 };
 
+
 console.log('');
 console.log('⚡ Система «памяти чатов» активирована:');
 console.log('   • LRU-кэш вложений (до 100 МБ) — аудио, фото, обложки');
@@ -27992,6 +27993,130 @@ console.log('     ChatMemory.clearChat("file") — очистить чат');
 console.log('     ChatMemory.clear()           — очистить всё');
 console.log('');
 
+// ═══════════════════════════════════════════════════════════════
+//  🖼️ ФИНАЛЬНЫЙ ПАТЧ АВАТАРОК — накладывается ПОСЛЕ всех
+//  перезаписей renderChatsList (в т.ч. из installUnifiedChatSystem)
+// ═══════════════════════════════════════════════════════════════
+
+(function installFinalAvatarPatch() {
+    'use strict';
+
+    // ─── 1. Патчим renderChatsList (ФИНАЛЬНО) ───
+    const _prevRenderChatsList = renderChatsList;
+    renderChatsList = function() {
+        const r = _prevRenderChatsList.apply(this, arguments);
+
+        // Применяем аватарки ко всем элементам списка
+        document.querySelectorAll('#chatsList .chat-list-item').forEach(item => {
+            const file = item.dataset.file;
+            const avatar = item.querySelector('.chat-avatar');
+            if (avatar && file) {
+                avatar.dataset.avatarFile = file;   // 🆕 для refreshAllAvatarsForChat
+                applyAvatarToElement(avatar, file);
+            }
+        });
+
+        return r;
+    };
+
+    // ─── 2. Патчим enterChat (ФИНАЛЬНО) ───
+    const _prevEnterChat = enterChat;
+    enterChat = async function(file, name, password) {
+        const r = await _prevEnterChat.apply(this, arguments);
+
+        if (state.chatFile === file) {
+            // Убеждаемся, что у userAvatar есть data-avatar-file
+            userAvatar.dataset.avatarFile = file;
+            applyAvatarToElement(userAvatar, file);
+
+            // 🆕 Двойная страховка — на случай, если enterChat
+            // завершился, но DOM ещё не устоялся
+            requestAnimationFrame(() => {
+                if (state.chatFile === file) {
+                    applyAvatarToElement(userAvatar, file);
+                }
+            });
+            setTimeout(() => {
+                if (state.chatFile === file) {
+                    applyAvatarToElement(userAvatar, file);
+                }
+            }, 200);
+        }
+        return r;
+    };
+
+    // ─── 3. Патчим backToChats — сбрасываем аватарку шапки ───
+    const _prevBackToChats = backToChats;
+    backToChats = function() {
+        userAvatar.classList.remove('has-custom-avatar');
+        userAvatar.dataset.avatarFile = '';
+        userAvatar.textContent = '?';
+        return _prevBackToChats.apply(this, arguments);
+    };
+
+    // ─── 4. Применяем аватарки ко всем СУЩЕСТВУЮЩИМ элементам ───
+    //     (могли быть отрисованы до этого патча)
+    function refreshAllExistingAvatars() {
+        // Список чатов
+        document.querySelectorAll('#chatsList .chat-list-item').forEach(item => {
+            const file = item.dataset.file;
+            const avatar = item.querySelector('.chat-avatar');
+            if (avatar && file) {
+                avatar.dataset.avatarFile = file;
+                applyAvatarToElement(avatar, file);
+            }
+        });
+
+        // Шапка открытого чата
+        if (state.chatFile && userAvatar) {
+            userAvatar.dataset.avatarFile = state.chatFile;
+            applyAvatarToElement(userAvatar, state.chatFile);
+        }
+    }
+
+    // Применяем сразу и через паузы (на случай асинхронной отрисовки)
+    refreshAllExistingAvatars();
+    setTimeout(refreshAllExistingAvatars, 500);
+    setTimeout(refreshAllExistingAvatars, 1500);
+
+    // ─── 5. MutationObserver — следим за появлением новых карточек ───
+    const chatsListEl = document.getElementById('chatsList');
+    if (chatsListEl) {
+        const obs = new MutationObserver(() => {
+            document.querySelectorAll('#chatsList .chat-list-item').forEach(item => {
+                const file = item.dataset.file;
+                const avatar = item.querySelector('.chat-avatar');
+                if (avatar && file && avatar.dataset.avatarFile !== file) {
+                    avatar.dataset.avatarFile = file;
+                    applyAvatarToElement(avatar, file);
+                }
+            });
+        });
+        obs.observe(chatsListEl, { childList: true, subtree: true });
+    }
+
+    // ─── 6. Патчим refreshAllAvatarsForChat — чтобы искал и по data-avatar-file ───
+    const _prevRefreshAll = refreshAllAvatarsForChat;
+    refreshAllAvatarsForChat = function(chatFile) {
+        if (!chatFile) return;
+
+        // Список чатов
+        document.querySelectorAll(`.chat-avatar[data-avatar-file="${chatFile}"]`).forEach(el => {
+            applyAvatarToElement(el, chatFile);
+        });
+
+        // Шапка открытого чата
+        if (state.chatFile === chatFile && userAvatar) {
+            userAvatar.dataset.avatarFile = chatFile;
+            applyAvatarToElement(userAvatar, chatFile);
+        }
+
+        // Также вызываем оригинал (для совместимости)
+        try { _prevRefreshAll.call(this, chatFile); } catch (e) {}
+    };
+
+    console.log('🖼️ Финальный патч аватарок установлен');
+})();
 
 </script>
 </body>
