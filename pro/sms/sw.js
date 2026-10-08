@@ -1,5 +1,5 @@
 // sw.js - Универсальный кеш + уведомления
-const CACHE_NAME = 'sms-pwa-v109-backkeystandartbeep';
+const CACHE_NAME = 'sms-pwa-v109-backkeystandartbeepzxvkladki';
 
 const FILES_TO_CACHE = [
     '/SMS/pro/sms/index.html',
