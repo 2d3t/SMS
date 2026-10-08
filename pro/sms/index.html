@@ -27018,5 +27018,750 @@ markUnseen: (eventOrKey) => {
     console.log('   • Перехват через MutationObserver + capture:true');
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🗂️ CHAT CONTEXT STORE — keep-alive контексты чатов (v1)
+//  ─────────────────────────────────────────────────────────────
+//  Идея: при выходе из чата НЕ уничтожаем всё, а сохраняем в память
+//  «горячий контекст» — расшифрованную историю, CryptoKey (без
+//  повторного PBKDF2), blob:URL вложений, позицию скролла.
+//
+//  При возврате в тот же чат — мгновенное восстановление.
+//  При заходе в другой чат — старое поведение.
+//
+//  Ограничения:
+//   • MAX 5 контекстов (LRU)
+//   • TTL 30 минут без активности
+//   • Blob:URL защищены от clearAttachmentCache()
+//   • При logout / закрытии — всё очищается
+// ═══════════════════════════════════════════════════════════════
+
+(function installChatContextStore() {
+    'use strict';
+
+    // Проверяем, что все зависимости на месте
+    if (typeof state === 'undefined' || typeof historyState === 'undefined') {
+        console.warn('🗂️ [ChatContext] базовые модули не найдены — патч пропущен');
+        return;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  КОНФИГ
+    // ═══════════════════════════════════════════════════════════
+    const CFG = {
+        maxContexts: 5,
+        maxAgeMs: 30 * 60 * 1000,     // 30 мин
+        gcIntervalMs: 2 * 60 * 1000,   // проверка раз в 2 мин
+        debug: true,
+    };
+
+    const log = (...a) => CFG.debug && console.log('🗂️ [ChatContext]', ...a);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХРАНИЛИЩЕ
+    // ═══════════════════════════════════════════════════════════
+    const Store = (() => {
+        const map = new Map();   // file → context
+
+        /**
+         * Сохранить текущий чат в контекст.
+         * Вызывается ПЕРЕД сбросом state.
+         */
+        function save() {
+            if (!state.chatFile) return false;
+            if (!state.salt) {
+                log('save: нет соли — чат ещё не был полностью загружен');
+                return false;
+            }
+            if (!state.chatPassword) {
+                log('save: нет пароля');
+                return false;
+            }
+
+            const file = state.chatFile;
+
+            // Защищаем blob:URL — нужны, чтобы не отозвать при clearAttachmentCache
+            const protectedUrls = new Set();
+            if (typeof _attachmentCache !== 'undefined') {
+                _attachmentCache.forEach((url) => {
+                    if (typeof url === 'string' && url.startsWith('blob:')) {
+                        protectedUrls.add(url);
+                    }
+                });
+            }
+
+            // Клонируем attachmentCache — чтобы не зависеть от глобального
+            const attachmentSnapshot = new Map();
+            if (typeof _attachmentCache !== 'undefined') {
+                _attachmentCache.forEach((url, name) => {
+                    attachmentSnapshot.set(name, url);
+                });
+            }
+
+            // Снапшот scroll position
+            let scrollPosition = 0;
+            let wasAtBottom = true;
+            try {
+                scrollPosition = messagesContainer.scrollTop || 0;
+                wasAtBottom = (typeof scrollState !== 'undefined')
+                    ? scrollState.isAtBottom
+                    : true;
+            } catch (e) {}
+
+            const ctx = {
+                file,
+                name: state.chatName,
+                password: state.chatPassword,
+                salt: state.salt,
+
+                // 🎯 ГЛАВНОЕ — CryptoKey. Не сериализуется, но живёт в памяти.
+                cryptoKey: CRYPTO._key,
+
+                // История
+                messages: Array.isArray(state.messages) ? state.messages.slice() : [],
+                allMessages: Array.isArray(historyState.allMessages)
+                    ? historyState.allMessages.slice()
+                    : [],
+                startIndex: historyState.startIndex || 0,
+                renderedCount: historyState.renderedCount || 0,
+
+                // Синхронизация с GitHub
+                sha: state.sha,
+                lastCommitSha: state._lastCommitSha,
+                lastMetaVersion: state._lastMetaVersion,
+                metaEtag: state._metaEtag,
+                lastSentMessageId: state._lastSentMessageId,
+
+                // Blob:URL
+                attachmentSnapshot,
+                protectedUrls,
+
+                // UI
+                scrollPosition,
+                wasAtBottom,
+
+                // Служебное
+                savedAt: Date.now(),
+                lastActivity: Date.now(),
+                hits: 0,
+            };
+
+            // Если контекст уже был — перезаписываем, но сохраняем счётчик
+            const prev = map.get(file);
+            if (prev) {
+                ctx.hits = prev.hits || 0;
+                // Отзываем blob:URL предыдущего снапшота, которых нет в новом
+                prev.protectedUrls.forEach(url => {
+                    if (!protectedUrls.has(url)) {
+                        try { URL.revokeObjectURL(url); } catch (e) {}
+                    }
+                });
+            }
+
+            map.set(file, ctx);
+            log(`save: «${ctx.name}» (${ctx.messages.length} сообщ., ${protectedUrls.size} blob:URL)`);
+
+            pruneLRU();
+            return true;
+        }
+
+        /**
+         * Попытаться восстановить контекст.
+         * @returns {object|null}
+         */
+        function restore(file) {
+            const ctx = map.get(file);
+            if (!ctx) return null;
+
+            const age = Date.now() - ctx.lastActivity;
+            if (age > CFG.maxAgeMs) {
+                log(`restore: «${ctx.name}» устарел (${Math.round(age / 60000)} мин)`);
+                drop(file);
+                return null;
+            }
+
+            // Проверяем, что CryptoKey ещё жив (бывает, что он became detached)
+            if (!ctx.cryptoKey) {
+                log(`restore: «${ctx.name}» потерял CryptoKey`);
+                drop(file);
+                return null;
+            }
+
+            ctx.lastActivity = Date.now();
+            ctx.hits = (ctx.hits || 0) + 1;
+            log(`restore: «${ctx.name}» (hit #${ctx.hits})`);
+            return ctx;
+        }
+
+        /**
+         * Есть ли контекст?
+         */
+        function has(file) {
+            const ctx = map.get(file);
+            if (!ctx) return false;
+            if (Date.now() - ctx.lastActivity > CFG.maxAgeMs) {
+                drop(file);
+                return false;
+            }
+            return true;
+        }
+
+        /**
+         * Удалить контекст.
+         */
+        function drop(file) {
+            const ctx = map.get(file);
+            if (!ctx) return;
+            ctx.protectedUrls.forEach(url => {
+                try { URL.revokeObjectURL(url); } catch (e) {}
+            });
+            map.delete(file);
+            log(`drop: ${file}`);
+        }
+
+        /**
+         * Полная очистка.
+         */
+        function clear() {
+            map.forEach(ctx => {
+                ctx.protectedUrls.forEach(url => {
+                    try { URL.revokeObjectURL(url); } catch (e) {}
+                });
+            });
+            const count = map.size;
+            map.clear();
+            log(`clear: удалено ${count} контекстов`);
+        }
+
+        /**
+         * LRU-обрезка.
+         */
+        function pruneLRU() {
+            if (map.size <= CFG.maxContexts) return;
+            const sorted = [...map.entries()]
+                .sort((a, b) => a[1].lastActivity - b[1].lastActivity);
+            while (map.size > CFG.maxContexts) {
+                const [oldest] = sorted.shift();
+                drop(oldest);
+            }
+        }
+
+        /**
+         * Список всех закэшированных файлов (для отладки / UI).
+         */
+        function list() {
+            return [...map.values()].map(ctx => ({
+                file: ctx.file,
+                name: ctx.name,
+                messages: ctx.messages.length,
+                blobs: ctx.protectedUrls.size,
+                ageSec: Math.round((Date.now() - ctx.savedAt) / 1000),
+                idleSec: Math.round((Date.now() - ctx.lastActivity) / 1000),
+                hits: ctx.hits || 0,
+            }));
+        }
+
+        /**
+         * Получить множество защищённых blob:URL (для clearAttachmentCache).
+         */
+        function getAllProtectedUrls() {
+            const set = new Set();
+            map.forEach(ctx => {
+                ctx.protectedUrls.forEach(url => set.add(url));
+            });
+            return set;
+        }
+
+        function size() { return map.size; }
+
+        return {
+            save, restore, has, drop, clear, list,
+            getAllProtectedUrls, size,
+            _map: map,
+        };
+    })();
+
+    // Периодическая чистка устаревших
+    setInterval(() => {
+        if (Store.size() === 0) return;
+        // restore() сам выкидывает устаревшие при обращении,
+        // но проактивно тоже полезно
+        const now = Date.now();
+        const toDrop = [];
+        Store._map.forEach((ctx, file) => {
+            if (now - ctx.lastActivity > CFG.maxAgeMs) toDrop.push(file);
+        });
+        toDrop.forEach(f => Store.drop(f));
+        if (toDrop.length > 0) log(`gc: удалено ${toDrop.length} устаревших`);
+    }, CFG.gcIntervalMs);
+
+    // ═══════════════════════════════════════════════════════════
+    //  1. ПАТЧ clearAttachmentCache
+    //  Не отзываем blob:URL, которые используются в живых контекстах
+    //  или в GlobalPlayer
+    // ═══════════════════════════════════════════════════════════
+    if (typeof clearAttachmentCache === 'function') {
+        const _origClearAttachmentCache = clearAttachmentCache;
+
+        clearAttachmentCache = function() {
+            // Собираем защищённые URL из контекстов
+            const contextProtected = Store.getAllProtectedUrls();
+
+            // Дополняем защиту от GlobalPlayer (оригинал это тоже делает, но
+            // мы переопределяем функцию целиком, поэтому делаем сами)
+            const playerProtected = new Set();
+            if (typeof GlobalPlayer !== 'undefined') {
+                if (GlobalPlayer.queue) {
+                    for (const track of GlobalPlayer.queue) {
+                        if (track.src) playerProtected.add(track.src);
+                        if (track.coverUrl) playerProtected.add(track.coverUrl);
+                    }
+                }
+                if (GlobalPlayer.audioEl && GlobalPlayer.audioEl.src) {
+                    playerProtected.add(GlobalPlayer.audioEl.src);
+                }
+            }
+
+            const allProtected = new Set([
+                ...contextProtected,
+                ...playerProtected,
+            ]);
+
+            // Обходим кэш и отзываем только незащищённые
+            if (typeof _attachmentCache !== 'undefined') {
+                _attachmentCache.forEach((url, name) => {
+                    if (allProtected.has(url)) return;
+                    try { URL.revokeObjectURL(url); } catch (e) {}
+                });
+
+                // Удаляем из кэша только незащищённые
+                for (const name of Array.from(_attachmentCache.keys())) {
+                    const url = _attachmentCache.get(name);
+                    if (allProtected.has(url)) continue;
+                    _attachmentCache.delete(name);
+                }
+            }
+
+            if (typeof _pendingAttachmentLoads !== 'undefined') {
+                _pendingAttachmentLoads.clear();
+            }
+
+            log(`clearAttachmentCache: защищено ${allProtected.size} blob:URL`);
+        };
+
+        log('патч: clearAttachmentCache защищает контексты');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  2. ПАТЧ backToChats — сохраняем контекст ПЕРЕД сбросом
+    // ═══════════════════════════════════════════════════════════
+    const _origBackToChats = backToChats;
+
+    backToChats = function() {
+        // 🎯 Главное: сохраняем контекст до того, как state сбросится
+        if (state.chatFile && state.salt && CRYPTO._key) {
+            try {
+                Store.save();
+            } catch (e) {
+                console.warn('🗂️ [ChatContext] save failed:', e);
+            }
+        }
+
+        // Вызываем оригинал — он всё сбросит, но контекст уже в памяти
+        const result = _origBackToChats.apply(this, arguments);
+
+        // Не забываем вернуть UI в нормальное состояние
+        return result;
+    };
+
+    log('патч: backToChats сохраняет контекст');
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. ПАТЧ enterChat — быстрое восстановление из контекста
+    // ═══════════════════════════════════════════════════════════
+    const _origEnterChat = enterChat;
+
+    enterChat = async function(file, name, password) {
+        // Пробуем восстановить из контекста
+        const ctx = Store.restore(file);
+
+        if (ctx && ctx.password === password) {
+            log(`enterChat: быстрое восстановление «${ctx.name}»`);
+            try {
+                return await fastRestore(ctx);
+            } catch (e) {
+                console.error('🗂️ [ChatContext] fast restore failed:', e);
+                // Фолбэк — обычная загрузка
+                Store.drop(file);
+                showToast('⚠️ Быстрое восстановление не удалось', 2000);
+            }
+        }
+
+        // Медленный путь — оригинальный
+        return await _origEnterChat.apply(this, arguments);
+    };
+
+    // ─── Быстрое восстановление ───
+    async function fastRestore(ctx) {
+        const file = ctx.file;
+        const name = ctx.name;
+
+        showChatTransition(name);
+        await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+        stopPolling();
+
+        // ⚠️ ВАЖНО: НЕ трогаем GlobalPlayer
+        // Музыка из других чатов продолжает играть
+
+        // НЕ вызываем clearAttachmentCache — он и так защищает контексты,
+        // но и не нужен, т.к. восстанавливаем снапшот
+
+        // Сбрасываем историю-контейнеры
+        resetHistoryState();
+
+        // ═══ ВОССТАНОВЛЕНИЕ STATE ═══
+        state.chatFile = file;
+        state.chatName = name;
+        state.chatPassword = ctx.password;
+        state.salt = ctx.salt;
+
+        // 🎯 Самое важное: CryptoKey восстановлен — PBKDF2 НЕ выполняется
+        CRYPTO._key = ctx.cryptoKey;
+
+        state.messages = ctx.messages.slice();
+        state.sha = ctx.sha;
+        state._lastCommitSha = ctx.lastCommitSha;
+        state._lastMetaVersion = ctx.lastMetaVersion;
+        state._metaEtag = ctx.metaEtag;
+        state._lastSentMessageId = ctx.lastSentMessageId;
+        state.lastMessageCount = ctx.messages.length;
+        state._lastActivityAt = Date.now();
+        state._chatEntered = false;
+        state.isPolling = false;
+        state.isSending = false;
+
+        // ═══ ВОССТАНОВЛЕНИЕ BLOB:URL ═══
+        // Очищаем текущий кэш, но НЕ отзываем URL — они принадлежат контексту
+        if (typeof _attachmentCache !== 'undefined') {
+            _attachmentCache.clear();
+            ctx.attachmentSnapshot.forEach((url, name) => {
+                _attachmentCache.set(name, url);
+            });
+        }
+        if (typeof _pendingAttachmentLoads !== 'undefined') {
+            _pendingAttachmentLoads.clear();
+        }
+
+        // ═══ ВОССТАНОВЛЕНИЕ ИСТОРИИ ═══
+        historyState.allMessages = ctx.allMessages.slice();
+        historyState.startIndex = ctx.startIndex;
+        historyState.renderedCount = ctx.allMessages.length;
+        historyState.hasMoreOnServer = ctx.startIndex > 0;
+
+        // ═══ UI ═══
+        chatTitle.textContent = name;
+        userAvatar.textContent = getInitials(state.username);
+        messagesInner.dataset.lastDate = '';
+
+        // Аватарка чата (если есть)
+        if (typeof applyAvatarToElement === 'function') {
+            try { applyAvatarToElement(userAvatar, file); } catch (e) {}
+        }
+
+        showChatScreen();
+        showInputBar();
+
+        // ═══ РЕНДЕР ═══
+        // Blob:URL уже в кэше — вложения отобразятся сразу
+        renderHistory();
+
+        // ═══ ВОССТАНОВЛЕНИЕ СКРОЛЛА ═══
+        requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+                try {
+                    if (ctx.wasAtBottom) {
+                        messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                        scrollState.isAtBottom = true;
+                    } else {
+                        messagesContainer.scrollTop = ctx.scrollPosition;
+                        scrollState.isAtBottom = false;
+                    }
+                    updateScrollButton();
+                } catch (e) {}
+            });
+        });
+
+        // ═══ ЗАПУСК ПОЛЛИНГА ═══
+        startPolling();
+
+        // ═══ СИНХРОНИЗАЦИЯ ПЛЕЕРА ═══
+        if (typeof syncInlineWithGlobal === 'function') {
+            [100, 300, 600, 1000].forEach(delay => {
+                setTimeout(() => {
+                    if (state.chatFile === file) syncInlineWithGlobal();
+                }, delay);
+            });
+        }
+
+        state._chatEntered = true;
+        hideChatTransition();
+        markChatAsRead();
+
+        // ═══ ФОНОВАЯ ПРОВЕРКА ОБНОВЛЕНИЙ ═══
+        // Могли прийти новые сообщения пока чат был в стороне
+        setTimeout(async () => {
+            if (state.chatFile !== file) return;
+            try {
+                await pollUpdates();
+            } catch (e) {
+                console.warn('🗂️ [ChatContext] post-restore poll failed:', e);
+            }
+        }, 400);
+
+        showToast(`⚡ «${name}» восстановлен`, 1200);
+
+        log(`fastRestore: «${name}» за ${Date.now() - ctx.lastActivity + '?'}мс`);
+    }
+
+    log('патч: enterChat с быстрым восстановлением');
+
+    // ═══════════════════════════════════════════════════════════
+    //  4. ПАТЧ logout — полная очистка контекстов
+    // ═══════════════════════════════════════════════════════════
+    const _origLogout = logout;
+
+    logout = function() {
+        Store.clear();
+        log('logout: контексты очищены');
+        return _origLogout.apply(this, arguments);
+    };
+
+    log('патч: logout очищает контексты');
+
+    // ═══════════════════════════════════════════════════════════
+    //  5. ПАТЧ removeChatFromList — удаление контекста при удалении чата
+    // ═══════════════════════════════════════════════════════════
+    if (typeof removeChatFromList === 'function') {
+        const _origRemoveChat = removeChatFromList;
+        removeChatFromList = function(file) {
+            const r = _origRemoveChat.apply(this, arguments);
+            // Если чат удалили из списка — контекст больше не нужен
+            if (Store.has(file)) Store.drop(file);
+            return r;
+        };
+        log('патч: removeChatFromList удаляет контекст');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  6. ПАТЧ saveChatsList / импорта — если чат убрали из списка
+    //  отслеживаем через переопределение renderChatsList
+    // ═══════════════════════════════════════════════════════════
+    if (typeof renderChatsList === 'function') {
+        const _origRenderChatsList = renderChatsList;
+        renderChatsList = function() {
+            const r = _origRenderChatsList.apply(this, arguments);
+
+            // Проверяем, все ли контексты ещё релевантны
+            // (нет чата в списке → удалить контекст)
+            if (Store.size() > 0) {
+                const validFiles = new Set(state.chats.map(c => c.file));
+                Store._map.forEach((ctx, file) => {
+                    if (!validFiles.has(file)) {
+                        log(`renderChatsList: чат ${file} пропал из списка — drop`);
+                        Store.drop(file);
+                    }
+                });
+            }
+            return r;
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  7. БЕЙДЖ ⚡ НА КАРТОЧКЕ ЧАТА В СПИСКЕ
+    //  Показываем «горячий» чат
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('chatContextStyles')) {
+        const style = document.createElement('style');
+        style.id = 'chatContextStyles';
+        style.textContent = `
+            .chat-hot-badge {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                height: 18px;
+                padding: 0 6px;
+                border-radius: 9px;
+                background: linear-gradient(135deg, rgba(108,92,231,0.3), rgba(0,184,148,0.25));
+                border: 1px solid rgba(108,92,231,0.5);
+                color: #a78bfa;
+                font-size: 10px;
+                font-weight: 700;
+                margin-left: 6px;
+                flex-shrink: 0;
+                letter-spacing: 0.3px;
+                animation: hotBadgePulse 2.4s ease-in-out infinite;
+                pointer-events: none;
+            }
+            @keyframes hotBadgePulse {
+                0%, 100% { box-shadow: 0 0 4px rgba(108,92,231,0.3); }
+                50%      { box-shadow: 0 0 10px rgba(108,92,231,0.7); }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // Перехватываем renderChatsList для добавления бейджа «горячий»
+    if (typeof renderChatsList === 'function') {
+        const _origRenderChatsList2 = renderChatsList;
+        renderChatsList = function() {
+            const r = _origRenderChatsList2.apply(this, arguments);
+
+            // Добавляем бейдж ⚡ на карточки, для которых есть живой контекст
+            try {
+                const items = document.querySelectorAll('#chatsList .chat-list-item');
+                items.forEach(item => {
+                    const file = item.dataset.file;
+                    if (!file) return;
+
+                    const hasCtx = Store.has(file);
+                    const nameRow = item.querySelector('.chat-name-row');
+                    if (!nameRow) return;
+
+                    const existing = nameRow.querySelector('.chat-hot-badge');
+
+                    if (hasCtx && !existing) {
+                        const badge = document.createElement('span');
+                        badge.className = 'chat-hot-badge';
+                        badge.title = 'Чат в памяти — откроется мгновенно';
+                        badge.textContent = '⚡';
+                        const nameEl = nameRow.querySelector('.chat-name');
+                        if (nameEl) {
+                            nameEl.insertAdjacentElement('afterend', badge);
+                        } else {
+                            nameRow.prepend(badge);
+                        }
+                    } else if (!hasCtx && existing) {
+                        existing.remove();
+                    }
+                });
+            } catch (e) { /* ignore */ }
+
+            return r;
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  8. ОЧИСТКА ПРИ ЗАКРЫТИИ ВКЛАДКИ
+    //  Браузер и так всё освободит, но так чище и быстрее
+    // ═══════════════════════════════════════════════════════════
+    window.addEventListener('beforeunload', () => {
+        // Не вызываем Store.clear() — это может занять время,
+        // но если успеем — чище
+        try {
+            // Освобождаем только blob:URL
+            Store.getAllProtectedUrls().forEach(url => {
+                try { URL.revokeObjectURL(url); } catch (e) {}
+            });
+        } catch (e) {}
+    });
+
+    // При сворачивании PWA — снижаем шанс утечки
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') {
+            // Не чистим контексты, но помечаем, что вкладка может быть убита
+            // (в Android WebView бывает, что вкладка пересоздаётся)
+            log('visibilitychange:hidden — контексты сохранены в памяти');
+        }
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    //  9. ПУБЛИЧНЫЙ API
+    // ═══════════════════════════════════════════════════════════
+    window.ChatContext = {
+        // Информация
+        list: () => Store.list(),
+        size: () => Store.size(),
+
+        // Управление
+        save: () => Store.save(),
+        drop: (file) => Store.drop(file),
+        clear: () => Store.clear(),
+
+        // Быстрая проверка: «горячий» ли чат?
+        isHot: (file) => Store.has(file),
+
+        // Отладка
+        status: () => {
+            const items = Store.list();
+            const totalBlobs = items.reduce((s, i) => s + i.blobs, 0);
+            const totalMessages = items.reduce((s, i) => s + i.messages, 0);
+            return {
+                contexts: items.length,
+                maxContexts: CFG.maxContexts,
+                maxAgeMin: Math.round(CFG.maxAgeMs / 60000),
+                totalMessages,
+                totalBlobs,
+                items,
+            };
+        },
+
+        // Принудительно «прогреть» чат (полезно после перезагрузки)
+        warmUp: async (file) => {
+            if (!state.isAuthorized) {
+                console.warn('Нужна авторизация');
+                return false;
+            }
+            const password = state.savedPasswords[file];
+            if (!password) {
+                console.warn('Нет пароля для', file);
+                return false;
+            }
+            const chat = state.chats.find(c => c.file === file);
+            if (!chat) {
+                console.warn('Чат не найден');
+                return false;
+            }
+
+            const currentFile = state.chatFile;
+            const currentName = state.chatName;
+            const currentPassword = state.chatPassword;
+
+            try {
+                await enterChat(file, chat.name || file, password);
+                // Сразу возвращаемся (контекст сохранён)
+                if (currentFile) {
+                    // Вернёмся в исходный чат
+                    setTimeout(() => {
+                        backToChats();
+                    }, 100);
+                } else {
+                    backToChats();
+                }
+                return true;
+            } catch (e) {
+                console.error('warmUp failed:', e);
+                return false;
+            }
+        },
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЛОГИ
+    // ═══════════════════════════════════════════════════════════
+    console.log('🗂️ Chat Context Store активен:');
+    console.log(`   • MAX контекстов: ${CFG.maxContexts}`);
+    console.log(`   • TTL: ${CFG.maxAgeMs / 60000} мин без активности`);
+    console.log('   • При выходе из чата — сохраняется контекст (CryptoKey, история, blob:URL)');
+    console.log('   • При возврате — мгновенное восстановление');
+    console.log('');
+    console.log('   API:');
+    console.log('     ChatContext.status()          — статус хранилища');
+    console.log('     ChatContext.list()            — список горячих чатов');
+    console.log('     ChatContext.isHot("chat_xxx") — проверка');
+    console.log('     ChatContext.clear()           — очистить всё');
+    console.log('     ChatContext.warmUp("chat_xxx") — прогреть чат');
+})();
+</script>
 </body>
 </html>
