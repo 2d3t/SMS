@@ -1,126 +1,109 @@
-// sw.js - Универсальный кеш + уведомления
-const CACHE_NAME = 'sms-pwa-v111- stable';
+// ═══════════════════════════════════════════════════════════════
+//  sw.js — Service Worker для офлайн-старта SMS Чата
+//  Кэширует оболочку приложения (HTML, манифест, иконки)
+//  и отдаёт её из кэша, когда сети нет.
+// ═══════════════════════════════════════════════════════════════
 
-const FILES_TO_CACHE = [
-    '/SMS/pro/sms/index.html',
-    '/SMS/pro/sms/manifest.json',
-    '/SMS/pro/sms/icon-192.png',
-    '/SMS/pro/sms/icon-512.png'
+const CACHE_VERSION = 'smschat-v1.0.0';   // ← меняй при обновлении
+const CACHE_NAME = `smschat-shell-${CACHE_VERSION}`;
+
+// Всё, что нужно для холодного старта без сети
+const SHELL_URLS = [
+    './',
+    './Cashrldmin.html',
+    './manifest.json',
+    './icon-192.png',
+    './icon-512.png',
 ];
 
-// ═══════════════════════════════════════════════════════════════
-//  УСТАНОВКА И АКТИВАЦИЯ
-// ═══════════════════════════════════════════════════════════════
+// ═══ Установка: кладём оболочку в кэш ═══
 self.addEventListener('install', (event) => {
+    console.log('[SW] install', CACHE_VERSION);
     event.waitUntil(
-        caches.open(CACHE_NAME)
-            .then(cache => {
-                console.log('[SW] Кэшируем ProX...');
-                return cache.addAll(FILES_TO_CACHE);
-            })
-            .then(() => self.skipWaiting())
+        caches.open(CACHE_NAME).then((cache) => {
+            return cache.addAll(SHELL_URLS).catch((err) => {
+                console.warn('[SW] Не удалось закэшировать всё:', err);
+                // Кэшируем по одному — какие-то файлы могут отсутствовать
+                return Promise.allSettled(
+                    SHELL_URLS.map((url) =>
+                        cache.add(url).catch(() => {})
+                    )
+                );
+            });
+        })
     );
+    self.skipWaiting();
 });
 
+// ═══ Активация: чистим старые кэши ═══
 self.addEventListener('activate', (event) => {
+    console.log('[SW] activate', CACHE_VERSION);
     event.waitUntil(
-        caches.keys().then(cacheNames => {
+        caches.keys().then((keys) => {
             return Promise.all(
-                cacheNames.map(name => {
-                    if (name !== CACHE_NAME) {
-                        console.log('[SW] Удаляем старый кэш:', name);
-                        return caches.delete(name);
+                keys.map((key) => {
+                    if (key.startsWith('smschat-shell-') && key !== CACHE_NAME) {
+                        console.log('[SW] удаляю старый кэш', key);
+                        return caches.delete(key);
                     }
+                    return null;
                 })
             );
         }).then(() => self.clients.claim())
     );
 });
 
-// ═══════════════════════════════════════════════════════════════
-//  КЭШИРОВАНИЕ ЗАПРОСОВ
-// ═══════════════════════════════════════════════════════════════
+// ═══ Fetch: стратегия "Network-first, но с офлайн-fallback" ═══
 self.addEventListener('fetch', (event) => {
-    // Не кэшируем запросы к GitHub API — они всегда должны быть свежими
-    if (event.request.url.includes('api.github.com')) return;
+    const req = event.request;
 
+    // Пропускаем всё, что не GET
+    if (req.method !== 'GET') return;
+
+    const url = new URL(req.url);
+
+    // Пропускаем запросы к GitHub API и сторонним ресурсам —
+    // их не кэшируем здесь (это делает сама программа через IndexedDB)
+    if (url.hostname === 'api.github.com') return;
+    if (url.hostname.endsWith('githubusercontent.com')) return;
+    if (url.hostname !== self.location.hostname) return;
+
+    // ═══ Стратегия для оболочки: Cache-first с фоновым обновлением ═══
+    //  HTML, manifest, иконки — отдаём из кэша мгновенно,
+    //  и параллельно пытаемся обновить из сети.
     event.respondWith(
-        caches.match(event.request)
-            .then(cachedResponse => {
-                if (cachedResponse) {
-                    // Фоновое обновление кэша
-                    fetch(event.request)
-                        .then(response => {
-                            if (response && response.status === 200) {
-                                const clone = response.clone();
-                                caches.open(CACHE_NAME).then(cache => {
-                                    cache.put(event.request, clone);
-                                });
-                            }
-                        })
-                        .catch(() => {});
-                    return cachedResponse;
-                }
-
-                return fetch(event.request)
-                    .then(response => {
-                        if (response && response.status === 200) {
-                            const clone = response.clone();
-                            caches.open(CACHE_NAME).then(cache => {
-                                cache.put(event.request, clone);
-                            });
-                        }
-                        return response;
-                    })
-                    .catch(() => {
-                        // Fallback на главную страницу при офлайне
-                        return caches.match('/SMS/pro/sms/index.html');
-                    });
-            })
-    );
-});
-
-// ═══════════════════════════════════════════════════════════════
-//  УВЕДОМЛЕНИЯ
-// ═══════════════════════════════════════════════════════════════
-
-// Клик по уведомлению — открываем/фокусируем приложение
-self.addEventListener('notificationclick', (event) => {
-    event.notification.close();
-
-    event.waitUntil(
-        clients.matchAll({ type: 'window', includeUncontrolled: true })
-            .then(clientList => {
-                // Если приложение уже открыто — фокусируем
-                for (const client of clientList) {
-                    if (client.url.includes('/SMS/pro/sms/') && 'focus' in client) {
-                        return client.focus();
+        caches.match(req).then((cached) => {
+            const networkPromise = fetch(req)
+                .then((response) => {
+                    // Обновляем кэш, если ответ валиден
+                    if (response && response.status === 200) {
+                        const cloned = response.clone();
+                        caches.open(CACHE_NAME).then((cache) => {
+                            cache.put(req, cloned).catch(() => {});
+                        });
                     }
-                }
-                // Иначе — открываем новое окно
-                if (clients.openWindow) {
-                    return clients.openWindow('/SMS/pro/sms/index.html');
-                }
-            })
-    );
-});
+                    return response;
+                })
+                .catch(() => null);
 
-// Push от сервера (пригодится, если позже добавишь Web Push)
-self.addEventListener('push', (event) => {
-    let data = { title: 'SMS Чат', body: 'Новое сообщение' };
-    try {
-        if (event.data) data = event.data.json();
-    } catch (e) {
-        if (event.data) data.body = event.data.text();
-    }
+            // Если есть в кэше — отдаём сразу, сеть догоняет
+            if (cached) {
+                networkPromise.catch(() => {});
+                return cached;
+            }
 
-    event.waitUntil(
-        self.registration.showNotification(data.title, {
-            body: data.body,
-            icon: '/SMS/pro/sms/icon-192.png',
-            badge: '/SMS/pro/sms/icon-192.png',
-            tag: data.tag || 'sms-chat',
-            renotify: true,
+            // Нет в кэше — ждём сеть
+            return networkPromise.then((response) => {
+                if (response) return response;
+
+                // Совсем нет ни кэша, ни сети — для HTML отдаём
+                // сохранённую оболочку
+                if (req.mode === 'navigate' || req.destination === 'document') {
+                    return caches.match('./Cashrldmin.html');
+                }
+
+                return new Response('Offline', { status: 503 });
+            });
         })
     );
 });
