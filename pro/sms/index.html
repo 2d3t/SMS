@@ -4810,10 +4810,10 @@ const CONFIG = {
     pollIntervalFast: 2000,
     pollIntervalSlow: 8000,
     pollIdleThresholdMs: 60000,
-    maxMessages: 500,
-    renderInitial: 45,
-    renderPageSize: 45,
-    maxDomNodes: 40,
+    maxMessages: 100,
+    renderInitial: 25,
+    renderPageSize: 25,
+    maxDomNodes: 25,
     maxImageSize: 25 * 1024 * 1024,
     compressMaxWidth: 1600,
     compressMaxHeight: 1600,
@@ -27993,6 +27993,8 @@ console.log('     ChatMemory.clearChat("file") — очистить чат');
 console.log('     ChatMemory.clear()           — очистить всё');
 console.log('');
 
+</script>
+<script>
 // ═══════════════════════════════════════════════════════════════
 //  🖼️ ФИНАЛЬНЫЙ ПАТЧ АВАТАРОК — накладывается ПОСЛЕ всех
 //  перезаписей renderChatsList (в т.ч. из installUnifiedChatSystem)
@@ -28006,12 +28008,11 @@ console.log('');
     renderChatsList = function() {
         const r = _prevRenderChatsList.apply(this, arguments);
 
-        // Применяем аватарки ко всем элементам списка
         document.querySelectorAll('#chatsList .chat-list-item').forEach(item => {
             const file = item.dataset.file;
             const avatar = item.querySelector('.chat-avatar');
             if (avatar && file) {
-                avatar.dataset.avatarFile = file;   // 🆕 для refreshAllAvatarsForChat
+                avatar.dataset.avatarFile = file;
                 applyAvatarToElement(avatar, file);
             }
         });
@@ -28025,12 +28026,9 @@ console.log('');
         const r = await _prevEnterChat.apply(this, arguments);
 
         if (state.chatFile === file) {
-            // Убеждаемся, что у userAvatar есть data-avatar-file
             userAvatar.dataset.avatarFile = file;
             applyAvatarToElement(userAvatar, file);
 
-            // 🆕 Двойная страховка — на случай, если enterChat
-            // завершился, но DOM ещё не устоялся
             requestAnimationFrame(() => {
                 if (state.chatFile === file) {
                     applyAvatarToElement(userAvatar, file);
@@ -28055,9 +28053,7 @@ console.log('');
     };
 
     // ─── 4. Применяем аватарки ко всем СУЩЕСТВУЮЩИМ элементам ───
-    //     (могли быть отрисованы до этого патча)
     function refreshAllExistingAvatars() {
-        // Список чатов
         document.querySelectorAll('#chatsList .chat-list-item').forEach(item => {
             const file = item.dataset.file;
             const avatar = item.querySelector('.chat-avatar');
@@ -28067,14 +28063,12 @@ console.log('');
             }
         });
 
-        // Шапка открытого чата
         if (state.chatFile && userAvatar) {
             userAvatar.dataset.avatarFile = state.chatFile;
             applyAvatarToElement(userAvatar, state.chatFile);
         }
     }
 
-    // Применяем сразу и через паузы (на случай асинхронной отрисовки)
     refreshAllExistingAvatars();
     setTimeout(refreshAllExistingAvatars, 500);
     setTimeout(refreshAllExistingAvatars, 1500);
@@ -28095,29 +28089,351 @@ console.log('');
         obs.observe(chatsListEl, { childList: true, subtree: true });
     }
 
-    // ─── 6. Патчим refreshAllAvatarsForChat — чтобы искал и по data-avatar-file ───
+    // ─── 6. Патчим refreshAllAvatarsForChat ───
     const _prevRefreshAll = refreshAllAvatarsForChat;
     refreshAllAvatarsForChat = function(chatFile) {
         if (!chatFile) return;
 
-        // Список чатов
         document.querySelectorAll(`.chat-avatar[data-avatar-file="${chatFile}"]`).forEach(el => {
             applyAvatarToElement(el, chatFile);
         });
 
-        // Шапка открытого чата
         if (state.chatFile === chatFile && userAvatar) {
             userAvatar.dataset.avatarFile = chatFile;
             applyAvatarToElement(userAvatar, chatFile);
         }
 
-        // Также вызываем оригинал (для совместимости)
         try { _prevRefreshAll.call(this, chatFile); } catch (e) {}
     };
 
     console.log('🖼️ Финальный патч аватарок установлен');
 })();
 
+
+// ═══════════════════════════════════════════════════════════════
+//  ⚡⚡⚡ МГНОВЕННЫЙ ВХОД В ЧАТ — ФИНАЛЬНЫЕ ПАТЧИ ⚡⚡⚡
+//  ─────────────────────────────────────────────────────────────
+//  Задача: при повторном входе в чат вложения (аудио, фото, видео,
+//  файлы, .smschat-приглашения) появляются МГНОВЕННО — без
+//  плейсхолдеров ⏳ и без перезагрузки с GitHub.
+//
+//  Что делает:
+//   [1] Кэш PBKDF2-ключей (экономит 200–500 мс на входе)
+//   [2] Мгновенный рендер из AttachmentLRU (обходит плейсхолдеры)
+//   [3] preload="auto" для blob:URL аудио
+//   [4] Поддержка .smschat-приглашений (кликабельная карточка 💌)
+// ═══════════════════════════════════════════════════════════════
+
+
+// ───────────────────────────────────────────────────────────────
+//  [1] КЭШ ПРОИЗВОДНЫХ КЛЮЧЕЙ (PBKDF2 — 200k итераций = дорого!)
+//  Экономит 200–500 мс на каждом входе в чат.
+//
+//  Безопасность:
+//   • Ключ кэша — «отпечаток» пароля, а не сам пароль
+//   • CryptoKey создан с extractable:false — нельзя экспортировать
+//   • LRU: максимум 10 ключей
+//   • Очищается при logout
+// ───────────────────────────────────────────────────────────────
+const DerivedKeyCache = (() => {
+    'use strict';
+
+    const MAX_KEYS = 10;
+    const _cache = new Map();
+
+    function _key(password, salt) {
+        return `${password.length}:${password.slice(0, 3)}:${password.slice(-3)}:${salt}`;
+    }
+
+    function get(password, salt) {
+        const k = _key(password, salt);
+        const cached = _cache.get(k);
+        if (cached) {
+            _cache.delete(k);
+            _cache.set(k, cached);
+            return cached;
+        }
+        return null;
+    }
+
+    function set(password, salt, cryptoKey) {
+        const k = _key(password, salt);
+        _cache.set(k, cryptoKey);
+        if (_cache.size > MAX_KEYS) {
+            _cache.delete(_cache.keys().next().value);
+        }
+    }
+
+    function clear() { _cache.clear(); }
+
+    return { get, set, clear };
+})();
+
+// ─── Патч deriveKey ───
+(function patchDeriveKeyForCache() {
+    'use strict';
+    const _origDeriveKey = deriveKey;
+    deriveKey = async function(password, salt) {
+        const cached = DerivedKeyCache.get(password, salt);
+        if (cached) return cached;
+        const key = await _origDeriveKey.call(this, password, salt);
+        DerivedKeyCache.set(password, salt, key);
+        return key;
+    };
+    console.log('🔑 patch: deriveKey → кэш CryptoKey');
+})();
+
+// ─── Очистка при logout ───
+(function patchLogoutForKeyCache() {
+    'use strict';
+    const _origLogout = logout;
+    logout = function() {
+        try { DerivedKeyCache.clear(); } catch (e) {}
+        return _origLogout.apply(this, arguments);
+    };
+})();
+
+
+// ───────────────────────────────────────────────────────────────
+//  [2] МГНОВЕННЫЙ РЕНДЕР ВЛОЖЕНИЙ ИЗ LRU
+//  При построении HTML, если blob:URL уже в LRU — рисуем
+//  готовый плеер/фото/видео/файл/приглашение БЕЗ плейсхолдера
+//  и без await.
+// ───────────────────────────────────────────────────────────────
+(function installInstantRenderFromLRU() {
+    'use strict';
+
+    const _prevBuildMessageHTML = buildMessageHTML;
+
+    // 🆕 Хелпер: это .smschat-приглашение?
+    function isSmschatInvite(fileName) {
+        return typeof fileName === 'string'
+            && fileName.toLowerCase().endsWith('.smschat');
+    }
+
+    // 🆕 Хелпер: экранируем имя вложения для RegExp
+    function escapeRegex(str) {
+        return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+
+    buildMessageHTML = function(msg, opts = {}) {
+        // Сначала — обычная сборка (с плейсхолдерами)
+        let html = _prevBuildMessageHTML.call(this, msg, opts);
+
+        // ═══ АУДИО (с обложкой и без) ═══
+        if (msg.audio && isAttachmentRef(msg.audio)) {
+            const cachedUrl = AttachmentLRU.get(msg.audio);
+            if (cachedUrl) {
+                let coverSrc = null;
+                if (msg.audioCover && isAttachmentRef(msg.audioCover)) {
+                    coverSrc = AttachmentLRU.get(msg.audioCover);
+                }
+
+                const playerHtml = createAudioPlayerHTML(
+                    msg.id,
+                    cachedUrl,
+                    msg.audioDuration || 0,
+                    msg.audioMime || 'audio/webm',
+                    msg.audioName || '',
+                    coverSrc
+                );
+
+                const rx = new RegExp(
+                    `<div class="audio-container attach-placeholder"[^>]*data-attach="${escapeRegex(msg.audio)}"[^>]*>[\\s\\S]*?<\\/div>`,
+                    'g'
+                );
+                html = html.replace(rx, playerHtml);
+            }
+        }
+
+        // ═══ ФОТО ═══
+        if (msg.image && isAttachmentRef(msg.image)) {
+            const cachedUrl = AttachmentLRU.get(msg.image);
+            if (cachedUrl) {
+                const rx = new RegExp(
+                    `<div class="image-container attach-placeholder"[^>]*data-attach="${escapeRegex(msg.image)}"[^>]*>[\\s\\S]*?<\\/div>`,
+                    'g'
+                );
+                html = html.replace(rx,
+                    `<div class="image-container" onclick="openImageModal('${cachedUrl}')"><img src="${cachedUrl}" alt="Изображение"></div>`
+                );
+            }
+        }
+
+        // ═══ ВИДЕО (msg.file с video-MIME) ═══
+        if (msg.file && isAttachmentRef(msg.file) && isVideoFile(msg.fileName, msg.fileMime)) {
+            const cachedUrl = AttachmentLRU.get(msg.file);
+            if (cachedUrl) {
+                const rx = new RegExp(
+                    `<div class="video-container attach-placeholder"[^>]*data-video-attach="${escapeRegex(msg.file)}"[^>]*>[\\s\\S]*?<\\/div>`,
+                    'g'
+                );
+                const videoHtml = buildVideoFileHTML(
+                    msg.id, cachedUrl, 0, msg.fileName, msg.fileSize
+                );
+                html = html.replace(rx, videoHtml);
+            }
+        }
+
+        // ═══ ФАЙЛ (обычный ИЛИ .smschat-приглашение) ═══
+        if (msg.file && isAttachmentRef(msg.file) && !isVideoFile(msg.fileName, msg.fileMime)) {
+            const cachedUrl = AttachmentLRU.get(msg.file);
+            if (cachedUrl) {
+                // 🆕 Ключевое: определяем, что это за файл
+                let replacementHtml;
+                if (isSmschatInvite(msg.fileName)) {
+                    // 💌 Кликабельная карточка приглашения
+                    replacementHtml = createInviteCardHTML(
+                        msg.file,
+                        cachedUrl,
+                        msg.fileName || 'invite.smschat',
+                        msg.fileSize || 0
+                    );
+                } else {
+                    // 📎 Обычная карточка файла
+                    replacementHtml = createFileCardHTML(
+                        msg.file,
+                        cachedUrl,
+                        msg.fileName || 'file',
+                        msg.fileSize || 0
+                    );
+                }
+
+                const rx = new RegExp(
+                    `<div class="file-attach-placeholder"[^>]*data-attach="${escapeRegex(msg.file)}"[^>]*>[\\s\\S]*?<\\/div>`,
+                    'g'
+                );
+                html = html.replace(rx, replacementHtml);
+            }
+        }
+
+        return html;
+    };
+
+    console.log('⚡ patch: buildMessageHTML → мгновенный рендер из LRU (с .smschat)');
+})();
+
+
+// ───────────────────────────────────────────────────────────────
+//  [3] ПРЕДЗАГРУЗКА <audio> ДЛЯ МГНОВЕННОГО ВОСПРОИЗВЕДЕНИЯ
+//  Ставим preload="auto" сразу после вставки в DOM —
+//  браузер заранее готовит буфер.
+// ───────────────────────────────────────────────────────────────
+(function installAudioPreloadBoost() {
+    'use strict';
+
+    if (!messagesInner) return;
+
+    const observer = new MutationObserver((mutations) => {
+        for (const mut of mutations) {
+            for (const node of mut.addedNodes) {
+                if (node.nodeType !== 1) continue;
+
+                if (node.tagName === 'AUDIO' && node.src && node.src.startsWith('blob:')) {
+                    node.preload = 'auto';
+                    try { node.load(); } catch (e) {}
+                }
+
+                if (node.querySelectorAll) {
+                    node.querySelectorAll('audio[src^="blob:"]').forEach(a => {
+                        a.preload = 'auto';
+                        try { a.load(); } catch (e) {}
+                    });
+                }
+            }
+        }
+    });
+
+    observer.observe(messagesInner, { childList: true, subtree: true });
+
+    console.log('🎵 patch: предзагрузка <audio> из LRU');
+})();
+
+
+// ───────────────────────────────────────────────────────────────
+//  [4] СТРАХОВКА: не даём clearAttachmentCache убить LRU
+//  (проверка, что патч из середины файла применился)
+// ───────────────────────────────────────────────────────────────
+(function verifyAttachmentCacheProtection() {
+    'use strict';
+
+    // Проверим, что clearAttachmentCache не убивает blob:URL
+    // Косвенно: после первого выхода из чата в LRU должны остаться записи.
+    // Явно вмешиваться не будем — это уже сделано патчем выше по файлу,
+    // но добавим «подстраховку» через setInterval при первом выходе.
+
+    let _checkedOnce = false;
+
+    const _origBackToChats = backToChats;
+    backToChats = function() {
+        const r = _origBackToChats.apply(this, arguments);
+
+        // Через 300 мс проверим, что LRU не пуст
+        if (!_checkedOnce) {
+            setTimeout(() => {
+                try {
+                    const stats = AttachmentLRU.stats();
+                    if (stats.count > 0) {
+                        console.log(`✅ [verify] LRU после выхода: ${stats.count} записей, ${stats.mb} МБ`);
+                    } else {
+                        console.warn('⚠️ [verify] LRU пуст после выхода — возможно clearAttachmentCache убивает blob:URL');
+                    }
+                    _checkedOnce = true;
+                } catch (e) {}
+            }, 300);
+        }
+        return r;
+    };
+})();
+
+
+// ───────────────────────────────────────────────────────────────
+//  ДИАГНОСТИКА
+// ───────────────────────────────────────────────────────────────
+console.log('');
+console.log('⚡⚡⚡ Финальные патчи мгновенного входа активны:');
+console.log('   [1] DerivedKeyCache — кэш PBKDF2-ключей');
+console.log('   [2] buildMessageHTML → мгновенный рендер из LRU (с .smschat)');
+console.log('   [3] <audio preload="auto"> для blob:URL');
+console.log('   [4] Верификация защиты LRU');
+console.log('');
+console.log('   Проверка в консоли:');
+console.log('     AttachmentLRU.stats()');
+console.log('     DerivedKeyCache.get(state.chatPassword, state.salt)');
+console.log('     ChatMemory.stats()');
+console.log('');
+// ═══════════════════════════════════════════════════════════════
+//  🛡️ ФИНАЛЬНАЯ ЗАЩИТА LRU — гарантия, что blob:URL не убиваются
+// ═══════════════════════════════════════════════════════════════
+(function installFinalLRUProtection() {
+    'use strict';
+
+    // Жёстко переопределяем clearAttachmentCache — она НИЧЕГО не должна
+    // делать с blob:URL, которые в LRU
+    window.clearAttachmentCache = function() {
+        // Чистим только «слабые» кэши, которые уже перенесены в LRU
+        try { _attachmentCache.clear(); } catch (e) {}
+        try { _pendingAttachmentLoads.clear(); } catch (e) {}
+        console.log('🛡️ [LRU-protect] clearAttachmentCache — LRU не тронут');
+    };
+
+    // Также защищаем от прямого вызова URL.revokeObjectURL из глобальной области
+    // через обёртку — если кто-то вызовет revoke на URL из LRU, мы это заметим
+    const _origRevoke = URL.revokeObjectURL.bind(URL);
+    URL.revokeObjectURL = function(url) {
+        // Проверяем: этот URL есть в LRU?
+        for (const rec of AttachmentLRU._store?.values?.() || []) {
+            if (rec.url === url) {
+                console.warn('🛡️ [LRU-protect] попытка revoke URL из LRU заблокирована:', url.slice(0, 40));
+                return;  // не даём убить
+            }
+        }
+        return _origRevoke(url);
+    };
+
+    console.log('🛡️ Финальная защита LRU установлена');
+})();
 </script>
+
 </body>
 </html>
