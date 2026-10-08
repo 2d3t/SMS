@@ -30532,5 +30532,220 @@ await refreshTabContent(file);
     console.log('🔄 [AutoReload v2] Установлен — обновление при ЛЮБОМ переходе на вкладку');
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🩹 ФИКС ЛОЖНОГО ОФЛАЙН-РЕЖИМА
+//  Проблема: программа уходит в офлайн при малейшей задержке сети,
+//  хотя соединение есть.
+//  Решение:
+//   1. Вводим «мягкий офлайн» — состояние сомнительности сети.
+//   2. Считаем устройство офлайн только если:
+//      • navigator.onLine === false (жёсткий признак), ИЛИ
+//      • Несколько подряд checkNetwork() провалились.
+//   3. Единичный сбой / AbortError — НЕ повод уходить в офлайн.
+// ═══════════════════════════════════════════════════════════════
+
+(function fixFalseOfflineMode() {
+    'use strict';
+
+    // ─── Счётчик подряд провалившихся проверок ───
+    const NET = {
+        consecutiveFailures: 0,
+        consecutiveSuccesses: 0,
+        FAILURES_TO_OFFLINE: 3,     // нужно 3 провала подряд, чтобы уйти в офлайн
+        SUCCESSES_TO_ONLINE: 1,     // 1 успех — возвращаемся в онлайн
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  1. Патч checkNetwork — увеличиваем таймаут, считаем серии
+    // ═══════════════════════════════════════════════════════════
+    if (typeof checkNetwork === 'function') {
+        const _origCheckNetwork = checkNetwork;
+
+        checkNetwork = async function() {
+            // Жёсткое правило: если браузер сам говорит «нет сети» — доверяем
+            if (!navigator.onLine) {
+                NET.consecutiveFailures++;
+                NET.consecutiveSuccesses = 0;
+                networkState.isOnline = false;
+                return false;
+            }
+
+            try {
+                const controller = new AbortController();
+                // 🆕 Увеличиваем таймаут с 5 до 12 секунд
+                const timeoutId = setTimeout(() => controller.abort(), 12000);
+
+                const response = await fetch('https://api.github.com/rate_limit', {
+                    method: 'GET',
+                    signal: controller.signal,
+                    cache: 'no-store',
+                });
+
+                clearTimeout(timeoutId);
+
+                // Даже 401/403 означают, что сеть работает
+                if (response.ok || response.status === 403 || response.status === 401) {
+                    NET.consecutiveFailures = 0;
+                    NET.consecutiveSuccesses++;
+                    networkState.isOnline = true;
+                    return true;
+                }
+
+                // Странный статус — считаем как провал, но не выходим в офлайн сразу
+                NET.consecutiveFailures++;
+                NET.consecutiveSuccesses = 0;
+                console.log(`📡 [NET] checkNetwork: необычный статус ${response.status}, провалов: ${NET.consecutiveFailures}`);
+                return true;   // ← ВАЖНО: возвращаем true, чтобы НЕ уходить в офлайн
+            } catch (error) {
+                // 🆕 Ошибку считаем провалом, но только если их много — уходим в офлайн
+                NET.consecutiveFailures++;
+                NET.consecutiveSuccesses = 0;
+
+                const isAbort = error.name === 'AbortError';
+                console.log(`📡 [NET] checkNetwork: ошибка "${error.name}" (${error.message}), провалов подряд: ${NET.consecutiveFailures}`);
+
+                // 🆕 Мягкое поведение: не сразу офлайн
+                if (NET.consecutiveFailures >= NET.FAILURES_TO_OFFLINE) {
+                    networkState.isOnline = false;
+                    console.warn('📡 [NET] Уходим в офлайн-режим (много провалов подряд)');
+                    return false;
+                }
+
+                // Мало провалов — считаем, что сеть ещё есть (просто сбой)
+                return true;
+            }
+        };
+
+        console.log('✅ [NET fix] checkNetwork запatchен — нужен 3 провала подряд для офлайна');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  2. Патч OfflineMode.isOffline — добавляем проверку серии провалов
+    // ═══════════════════════════════════════════════════════════
+    if (typeof OfflineMode !== 'undefined') {
+        const _origIsOffline = OfflineMode.isOffline;
+
+        OfflineMode.isOffline = function() {
+            // Жёсткий признак от браузера — доверяем
+            if (!navigator.onLine) return true;
+
+            // Принудительный офлайн (через API) — доверяем
+            if (typeof _forced !== 'undefined' && _forced) return true;
+
+            // 🆕 Мягкая проверка: считаем офлайном только при множественных провалах
+            if (NET.consecutiveFailures >= NET.FAILURES_TO_OFFLINE) {
+                return true;
+            }
+
+            // Если мало провалов — считаем, что сеть есть
+            return !networkState.isOnline && NET.consecutiveFailures >= NET.FAILURES_TO_OFFLINE;
+        };
+
+        console.log('✅ [NET fix] OfflineMode.isOffline запatchен');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. Патч pollUpdates — не уходить в офлайн из-за одной ошибки
+    // ═══════════════════════════════════════════════════════════
+    if (typeof pollUpdates === 'function') {
+        const _origPollUpdates = pollUpdates;
+
+        pollUpdates = async function() {
+            try {
+                return await _origPollUpdates.apply(this, arguments);
+            } catch (e) {
+                // Если это НЕ жёсткий признак офлайна — не даём pollUpdates
+                // сбросить networkState в false. Просто логируем.
+                if (navigator.onLine && NET.consecutiveFailures < NET.FAILURES_TO_OFFLINE) {
+                    console.log('📡 [NET fix] pollUpdates: мягкая ошибка, оставляем online', e.name);
+                    networkState.isOnline = true;
+                }
+                throw e;
+            }
+        };
+
+        console.log('✅ [NET fix] pollUpdates запatchен');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  4. Авто-восстановление сети: при следующем успешном запросе
+    //     сразу возвращаем isOnline = true
+    // ═══════════════════════════════════════════════════════════
+    window.addEventListener('online', () => {
+        NET.consecutiveFailures = 0;
+        NET.consecutiveSuccesses = 1;
+        networkState.isOnline = true;
+        console.log('📡 [NET fix] Браузер сообщил online — сброс провалов');
+    });
+
+    window.addEventListener('offline', () => {
+        // Жёсткий офлайн от браузера — доверяем сразу
+        NET.consecutiveFailures = NET.FAILURES_TO_OFFLINE;
+        networkState.isOnline = false;
+        console.log('📡 [NET fix] Браузер сообщил offline');
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    //  5. Периодическая мягкая проверка (раз в 20 сек)
+    //     — только для того, чтобы разбудить систему, если залипли
+    // ═══════════════════════════════════════════════════════════
+    setInterval(async () => {
+        if (!state.isAuthorized) return;
+        if (navigator.onLine && !networkState.isOnline) {
+            // Система считает, что офлайн, но браузер говорит online.
+            // Пробуем проверить.
+            console.log('📡 [NET fix] Периодическая проверка: система думает «офлайн», пробуем восстановить');
+            try {
+                const ok = await checkNetwork();
+                if (ok && typeof OfflineMode !== 'undefined') {
+                    OfflineMode.deactivate();
+                }
+            } catch (e) {}
+        }
+    }, 20000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  6. 🆕 Защита от ложного офлайна в restoreSession
+    // ═══════════════════════════════════════════════════════════
+    //  Если пометка remember слетела, но токен есть — не уходим в офлайн.
+    const _savedToken = localStorage.getItem('chathub_token');
+    const _savedUser = localStorage.getItem('chathub_username');
+    if (_savedToken && _savedUser && !localStorage.getItem('chathub_remember')) {
+        // Восстанавливаем пометку remember
+        localStorage.setItem('chathub_remember', '1');
+        console.log('📡 [NET fix] Восстановлена пометка remember (был токен, но флаг слетел)');
+    }
+
+    // Экспорт для отладки
+    window.NetFix = {
+        status: () => ({
+            navigatorOnline: navigator.onLine,
+            networkStateOnline: networkState.isOnline,
+            consecutiveFailures: NET.consecutiveFailures,
+            consecutiveSuccesses: NET.consecutiveSuccesses,
+            offlineModeActive: document.body.classList.contains('offline-mode'),
+        }),
+        forceOnline: () => {
+            NET.consecutiveFailures = 0;
+            NET.consecutiveSuccesses = 1;
+            networkState.isOnline = true;
+            if (typeof OfflineMode !== 'undefined') OfflineMode.deactivate();
+            console.log('📡 [NET fix] Принудительно online');
+        },
+        resetCounters: () => {
+            NET.consecutiveFailures = 0;
+            NET.consecutiveSuccesses = 0;
+            console.log('📡 [NET fix] Счётчики сброшены');
+        },
+    };
+
+    console.log('📡 [NET fix] Патч ложного офлайн-режима установлен:');
+    console.log('   • checkNetwork: 12 сек таймаут, мягкое поведение');
+    console.log('   • Офлайн только после 3 провалов подряд');
+    console.log('   • Проверка: NetFix.status()');
+    console.log('   • Форс online: NetFix.forceOnline()');
+})();
+</script>
 </body>
 </html>
