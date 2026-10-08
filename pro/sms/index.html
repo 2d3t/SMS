@@ -30746,6 +30746,192 @@ await refreshTabContent(file);
     console.log('   • Проверка: NetFix.status()');
     console.log('   • Форс online: NetFix.forceOnline()');
 })();
+
+// ═══════════════════════════════════════════════════════════════
+//  🏷️ БЕЙДЖ ВЕРСИИ В МЕНЮ «⋯»
+//  ─────────────────────────────────────────────────────────────
+//  Читает версию из sw.js. Кэширует в localStorage на сутки.
+//  Показывается в самом низу меню действий на экране чатов.
+// ═══════════════════════════════════════════════════════════════
+
+(function installVersionBadge() {
+    'use strict';
+
+    const CACHE_KEY = 'chathub_app_version';
+    const CACHE_TTL = 24 * 60 * 60 * 1000; // сутки
+
+    // ─── Чтение версии из sw.js ───
+    async function fetchVersionFromSW() {
+        try {
+            const res = await fetch('sw.js', { cache: 'no-store' });
+            if (!res.ok) throw new Error('sw.js недоступен');
+            const text = await res.text();
+
+            // Пробуем несколько типовых паттернов
+            const patterns = [
+                /CACHE_VERSION\s*=\s*['"]([^'"]+)['"]/,
+                /CACHE_NAME\s*=\s*['"]([^'"]*?)([\d]+\.[\d]+\.[\d]+[^'"]*)['"]/,
+                /VERSION\s*=\s*['"]([^'"]+)['"]/,
+                /version\s*:\s*['"]([^'"]+)['"]/,
+                /const\s+CACHE\w*\s*=\s*['"]([^'"]+)['"]/,
+            ];
+
+            for (const re of patterns) {
+                const m = text.match(re);
+                if (m && m[1]) {
+                    return m[1].trim();
+                }
+            }
+
+            // Fallback: пробуем выдернуть что-то типа v1.2.3
+            const vMatch = text.match(/['"]([vV]?\d+\.\d+(?:\.\d+)?)['"]/);
+            if (vMatch) return vMatch[1];
+
+            return null;
+        } catch (e) {
+            console.warn('🏷️ [Version] sw.js недоступен:', e.message);
+            return null;
+        }
+    }
+
+    // ─── Получить версию (с кэшем) ───
+    async function getVersion() {
+        try {
+            const raw = localStorage.getItem(CACHE_KEY);
+            if (raw) {
+                const data = JSON.parse(raw);
+                if (data.ts && (Date.now() - data.ts) < CACHE_TTL) {
+                    return data.version;
+                }
+            }
+        } catch (e) {}
+
+        const version = await fetchVersionFromSW();
+        if (version) {
+            try {
+                localStorage.setItem(CACHE_KEY, JSON.stringify({
+                    version,
+                    ts: Date.now(),
+                }));
+            } catch (e) {}
+        }
+        return version;
+    }
+
+    // ─── Вставка бейджа в меню «⋯» ───
+    async function injectBadge() {
+        const menu = document.getElementById('chatsActionsMenu');
+        if (!menu) return false;
+
+        // Уже есть?
+        if (menu.querySelector('.ucm-version-badge')) return true;
+
+        const version = await getVersion();
+        if (!version) return false;
+
+        // Находим последний divider или конец меню
+        const lastDivider = Array.from(menu.querySelectorAll('.ucm-divider')).pop();
+
+        const badge = document.createElement('div');
+        badge.className = 'ucm-version-badge';
+        badge.innerHTML = `
+            <span class="ucm-version-icon">🏷️</span>
+            <span class="ucm-version-text">Версия</span>
+            <span class="ucm-version-value">${escapeHtmlSafe(version)}</span>
+        `;
+
+        if (lastDivider) {
+            lastDivider.parentNode.insertBefore(badge, lastDivider.nextSibling);
+        } else {
+            menu.appendChild(badge);
+        }
+
+        console.log(`🏷️ [Version] Бейдж версии установлен: ${version}`);
+        return true;
+    }
+
+    function escapeHtmlSafe(s) {
+        const d = document.createElement('div');
+        d.textContent = s == null ? '' : String(s);
+        return d.innerHTML;
+    }
+
+    // ─── Стили ───
+    if (!document.getElementById('versionBadgeStyles')) {
+        const style = document.createElement('style');
+        style.id = 'versionBadgeStyles';
+        style.textContent = `
+            #chatsActionsMenu .ucm-version-badge {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                padding: 8px 14px 10px;
+                font-size: 11px;
+                color: #666;
+                user-select: none;
+                pointer-events: none;
+                border-top: 1px solid rgba(255,255,255,0.06);
+                margin-top: 4px;
+            }
+            #chatsActionsMenu .ucm-version-badge .ucm-version-icon {
+                font-size: 12px;
+                opacity: 0.5;
+            }
+            #chatsActionsMenu .ucm-version-badge .ucm-version-text {
+                flex: 1;
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
+                font-weight: 600;
+                opacity: 0.6;
+            }
+            #chatsActionsMenu .ucm-version-badge .ucm-version-value {
+                font-family: 'SF Mono', 'Courier New', monospace;
+                font-size: 11px;
+                color: #a78bfa;
+                background: rgba(108,92,231,0.1);
+                border: 1px solid rgba(108,92,231,0.25);
+                padding: 2px 8px;
+                border-radius: 6px;
+                letter-spacing: 0.3px;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ─── Следим за открытием меню «⋯» ───
+    const observer = new MutationObserver(() => {
+        const menu = document.getElementById('chatsActionsMenu');
+        if (menu && menu.classList.contains('show')) {
+            injectBadge();
+        }
+    });
+    observer.observe(document.body, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['class'],
+    });
+
+    // Также пробуем сразу (на случай, если меню уже существует)
+    setTimeout(injectBadge, 2000);
+
+    // Экспорт для отладки
+    window.VersionBadge = {
+        get: getVersion,
+        clearCache: () => {
+            localStorage.removeItem(CACHE_KEY);
+            console.log('🏷️ [Version] Кэш версии очищен');
+        },
+        refresh: async () => {
+            localStorage.removeItem(CACHE_KEY);
+            return await getVersion();
+        },
+    };
+
+    console.log('🏷️ [Version] Бейдж версии активен');
+    console.log('   • API: VersionBadge.get() / .refresh() / .clearCache()');
+})();
+
 </script>
 </body>
 </html>
