@@ -29741,49 +29741,31 @@ markUnseen: (eventOrKey) => {
     }
 
     // ─── Обновление бейджа ───
-    // 🆕 Храним предыдущее значение, чтобы понимать — стало больше или меньше
-let _prevOtherUnreadCount = 0;
-
-
-function updateBackBadge() {
-    if (state.currentScreen !== 'chat') {
-        // Не в чате — бейдж не нужен
-        badgeEl.classList.remove('show', 'many');
-        _prevOtherUnreadCount = 0;
-        return;
-    }
-
-
-    const count = countUnreadInOtherChats();
-
-
-    if (count > 0) {
-        badgeEl.textContent = count > 99 ? '99+' : String(count);
-        badgeEl.classList.add('show');
-        badgeEl.classList.toggle('many', count > 10);
-
-
-        // 🆕 Звук + вибрация ТОЛЬКО когда счётчик УВЕЛИЧИЛСЯ
-        //    (новое сообщение в другом чате)
-        if (count > _prevOtherUnreadCount && !document.hidden) {
-            // Звук уведомления — как при получении сообщения
-            if (typeof soundManager !== 'undefined') {
-                soundManager.play('notification');
-            }
-            if (navigator.vibrate) {
-                navigator.vibrate([80, 40, 80]);
-            }
+    function updateBackBadge() {
+        if (state.currentScreen !== 'chat') {
+            // Не в чате — бейдж не нужен
+            badgeEl.classList.remove('show', 'many');
+            return;
         }
 
+        const count = countUnreadInOtherChats();
 
-        _prevOtherUnreadCount = count;
-        badgeEl._wasShown = true;
-    } else {
-        badgeEl.classList.remove('show', 'many');
-        badgeEl._wasShown = false;
-        _prevOtherUnreadCount = 0;
+        if (count > 0) {
+            badgeEl.textContent = count > 99 ? '99+' : String(count);
+            badgeEl.classList.add('show');
+            // Если больше 10 — красный и пульсирующий
+            badgeEl.classList.toggle('many', count > 10);
+
+            // Лёгкая вибрация, когда появились новые
+            if (!badgeEl._wasShown && navigator.vibrate) {
+                navigator.vibrate(10);
+            }
+            badgeEl._wasShown = true;
+        } else {
+            badgeEl.classList.remove('show', 'many');
+            badgeEl._wasShown = false;
+        }
     }
-}
 
     // ─── Периодическое обновление ───
     // Обновляем раз в 1 секунду — быстро и незаметно
