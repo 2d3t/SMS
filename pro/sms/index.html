@@ -27019,46 +27019,52 @@ markUnseen: (eventOrKey) => {
 })();
 
 // ═══════════════════════════════════════════════════════════════
-//  🔴 БЕЙДЖ НЕПРОЧИТАННЫХ НА КНОПКЕ «НАЗАД»
-//  Показывает, сколько новых сообщений пришло в ДРУГИЕ чаты,
-//  пока пользователь находится в текущем.
+//  🔴 БЕЙДЖ НЕПРОЧИТАННЫХ НА КНОПКЕ «НАЗАД» (v2)
+//  Работает В ФОНЕ, пока пользователь находится в любом чате.
+//  Каждые 5 секунд проверяет meta.json всех ОСТАЛЬНЫХ чатов
+//  и показывает на кнопке «Назад» количество новых сообщений.
 // ═══════════════════════════════════════════════════════════════
 
-(function installBackButtonUnreadBadge() {
+(function installBackButtonUnreadBadgeV2() {
     'use strict';
 
     // ─── Состояние ───
-    // Хранит счётчик непрочитанных «чужих» сообщений, накопившихся
-    // с момента последнего пребывания в списке чатов.
     let _unreadBadgeCount = 0;
-
-    // Файл текущего открытого чата (чтобы не считать его сообщения)
     let _currentChatFile = null;
 
-    // Кэш известного количества сообщений по каждому чату
-    // (чтобы вычислять дельту при появлении новых)
-    const _knownMsgCounts = new Map();
+    // Кэш последнего известного count для каждого чата
+    // { [file]: number }
+    const _knownCounts = new Map();
 
-    // ─── DOM-элемент бейджа ───
+    // Кэш lastMessageId (чтобы точнее определять «новые»)
+    // { [file]: id }
+    const _knownLastIds = new Map();
+
+    // Флаг «мы уже сделали первичный замер для текущей сессии»
+    let _primed = false;
+
+    // DOM-элемент бейджа
     let _badgeEl = null;
 
+    // Таймеры
+    let _watchTimer = null;
+    let _visibilityBound = false;
+
     // ═══════════════════════════════════════════════════════════
-    //  Создание / обновление / удаление бейджа
+    //  БЕЙДЖ
     // ═══════════════════════════════════════════════════════════
     function ensureBadge() {
-        if (_badgeEl) return _badgeEl;
+        if (_badgeEl && _badgeEl.isConnected) return _badgeEl;
 
         const backBtn = document.getElementById('backToChatsBtn');
         if (!backBtn) return null;
 
-        // Кнопка назад должна быть position:relative для абсолютного бейджа
         backBtn.style.position = 'relative';
         backBtn.style.overflow = 'visible';
 
-        // Стиль бейджа (добавим один раз)
-        if (!document.getElementById('backBtnBadgeStyles')) {
+        if (!document.getElementById('backBtnBadgeStylesV2')) {
             const style = document.createElement('style');
-            style.id = 'backBtnBadgeStyles';
+            style.id = 'backBtnBadgeStylesV2';
             style.textContent = `
                 #backToChatsBtn .back-unread-badge {
                     position: absolute;
@@ -27080,21 +27086,21 @@ markUnseen: (eventOrKey) => {
                     line-height: 1;
                     pointer-events: none;
                     z-index: 5;
-                    animation: backBadgePop 0.25s cubic-bezier(0.22, 0.61, 0.36, 1);
                 }
                 #backToChatsBtn .back-unread-badge.show {
                     display: flex;
+                    animation: backBadgePopV2 0.25s cubic-bezier(0.22, 0.61, 0.36, 1);
                 }
                 #backToChatsBtn .back-unread-badge.pulse {
-                    animation: backBadgePulse 0.6s ease;
+                    animation: backBadgePulseV2 0.55s ease;
                 }
-                @keyframes backBadgePop {
+                @keyframes backBadgePopV2 {
                     from { transform: scale(0.3); opacity: 0; }
                     to   { transform: scale(1); opacity: 1; }
                 }
-                @keyframes backBadgePulse {
+                @keyframes backBadgePulseV2 {
                     0%   { transform: scale(1); }
-                    40%  { transform: scale(1.35); }
+                    40%  { transform: scale(1.4); }
                     100% { transform: scale(1); }
                 }
             `;
@@ -27103,9 +27109,8 @@ markUnseen: (eventOrKey) => {
 
         const badge = document.createElement('span');
         badge.className = 'back-unread-badge';
-        badge.id = 'backUnreadBadge';
+        badge.id = 'backUnreadBadgeV2';
         backBtn.appendChild(badge);
-
         _badgeEl = badge;
         return badge;
     }
@@ -27115,11 +27120,8 @@ markUnseen: (eventOrKey) => {
         if (!badge) return;
 
         if (_unreadBadgeCount > 0) {
-            badge.textContent = _unreadBadgeCount > 99
-                ? '99+'
-                : String(_unreadBadgeCount);
+            badge.textContent = _unreadBadgeCount > 99 ? '99+' : String(_unreadBadgeCount);
             badge.classList.add('show');
-            // Перезапускаем pop-анимацию
             badge.classList.remove('pulse');
             void badge.offsetWidth;
             badge.classList.add('pulse');
@@ -27134,194 +27136,328 @@ markUnseen: (eventOrKey) => {
         _unreadBadgeCount = Math.max(0, n | 0);
         renderBadge();
 
-        // Вибрируем, если число увеличилось
+        // Вибрируем при увеличении
         if (_unreadBadgeCount > prev && navigator.vibrate) {
             navigator.vibrate(15);
         }
+
+        // Обновляем title кнопки — приятный бонус
+        try {
+            const backBtn = document.getElementById('backToChatsBtn');
+            if (backBtn) {
+                backBtn.title = _unreadBadgeCount > 0
+                    ? `К списку чатов · Новых: ${_unreadBadgeCount}`
+                    : 'К списку чатов';
+            }
+        } catch (e) {}
     }
 
-    function increment(n = 1) {
-        setCount(_unreadBadgeCount + n);
-    }
+    function reset() { setCount(0); }
 
-    function reset() {
-        setCount(0);
+    // ═══════════════════════════════════════════════════════════
+    //  ЕДИНИЧНАЯ ПРОВЕРКА ОДНОГО ЧАТА
+    //  Возвращает { count, lastId } или null при ошибке
+    // ═══════════════════════════════════════════════════════════
+    async function fetchChatMeta(file) {
+        try {
+            const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/chats/${file}.meta.json`;
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 8000);
+
+            const res = await fetch(url, {
+                headers: {
+                    'Authorization': `token ${state.token}`,
+                    'Accept': 'application/vnd.github.v3+json',
+                },
+                cache: 'no-store',
+                signal: controller.signal,
+            });
+            clearTimeout(timeoutId);
+
+            if (!res.ok) return null;
+            const data = await res.json();
+            const meta = JSON.parse(base64ToUtf8((data.content || '').replace(/\n/g, '')));
+            if (!meta) return null;
+
+            return {
+                count: typeof meta.count === 'number' ? meta.count : 0,
+                lastId: typeof meta.version === 'number' ? meta.version : null,
+            };
+        } catch (e) {
+            return null;
+        }
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  Слежение за чатами
-    //  Раз в 3 секунды проверяем каждый чат (кроме текущего):
-    //  сравниваем meta.json версию с последней известной.
+    //  ПЕРВИЧНЫЙ ЗАМЕР — заполняем _knownCounts для всех чужих чатов
+    //  без инкремента. Вызывается один раз при входе в чат.
     // ═══════════════════════════════════════════════════════════
-    let _watchTimer = null;
-
-    async function watchOtherChats() {
-        // Не работаем, если не в чате или нет авторизации
-        if (!state.isAuthorized || !state.chatFile) return;
-        if (!state.token) return;
-        if (!navigator.onLine) return;
-
-        const currentFile = state.chatFile;
-        if (_currentChatFile !== currentFile) {
-            // Перешли в другой чат — сбрасываем счётчик
-            _currentChatFile = currentFile;
-            _knownMsgCounts.clear();
-            reset();
+    async function primeAllOtherChats(currentFile) {
+        const others = state.chats.filter(c => c.file !== currentFile);
+        if (others.length === 0) {
+            _primed = true;
+            return;
         }
 
-        // Ограничим количество чатов, чтобы не спамить API
-        const chatsToCheck = state.chats
-            .filter(c => c.file !== currentFile)
-            .slice(0, 30);
+        console.log(`🔴 [BackBadge] Первичный замер ${others.length} чатов…`);
 
-        if (chatsToCheck.length === 0) return;
-
-        const tasks = chatsToCheck.map(async (chat) => {
-            try {
-                // Запрашиваем meta.json — это маленький файл
-                const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/chats/${chat.file}.meta.json`;
-                const res = await fetch(url, {
-                    headers: {
-                        'Authorization': `token ${state.token}`,
-                        'Accept': 'application/vnd.github.v3+json',
-                    },
-                    cache: 'no-store',
-                });
-                if (!res.ok) return;
-
-                const data = await res.json();
-                const meta = JSON.parse(base64ToUtf8((data.content || '').replace(/\n/g, '')));
-                if (!meta || typeof meta.count !== 'number') return;
-
-                const prevCount = _knownMsgCounts.get(chat.file);
-
-                // Первый замер — запоминаем, но не считаем «новым»
-                if (prevCount === undefined) {
-                    _knownMsgCounts.set(chat.file, meta.count);
-                    return;
-                }
-
-                // Появились новые сообщения?
-                if (meta.count > prevCount) {
-                    const delta = meta.count - prevCount;
-                    _knownMsgCounts.set(chat.file, meta.count);
-                    increment(delta);
-                }
-                // Уменьшение (удаление) — просто обновляем счётчик без инкремента
-                else if (meta.count < prevCount) {
-                    _knownMsgCounts.set(chat.file, meta.count);
-                }
-            } catch (e) {
-                // Тихо игнорируем ошибки сети
+        // Ограничим пачками по 4, чтобы не спамить API
+        const BATCH = 4;
+        for (let i = 0; i < others.length; i += BATCH) {
+            const batch = others.slice(i, i + BATCH);
+            await Promise.all(batch.map(async (chat) => {
+                const meta = await fetchChatMeta(chat.file);
+                if (!meta) return;
+                _knownCounts.set(chat.file, meta.count);
+                if (meta.lastId != null) _knownLastIds.set(chat.file, meta.lastId);
+            }));
+            // Небольшая пауза между пачками
+            if (i + BATCH < others.length) {
+                await new Promise(r => setTimeout(r, 150));
             }
-        });
+        }
 
-        await Promise.allSettled(tasks);
+        _primed = true;
+        console.log(`🔴 [BackBadge] Первичный замер завершён. Известно чатов: ${_knownCounts.size}`);
     }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРИОДИЧЕСКАЯ ПРОВЕРКА
+    // ═══════════════════════════════════════════════════════════
+    let _isChecking = false;
+
+    async function watchOtherChats() {
+        // Отсекаем всё, что не должно триггерить запросы
+        if (_isChecking) return;
+        if (!state.isAuthorized || !state.chatFile) return;
+        if (state.currentScreen !== 'chat') return;
+        if (!state.token) return;
+        if (!navigator.onLine) return;
+        if (document.hidden) return;
+
+        _isChecking = true;
+
+        try {
+            const currentFile = state.chatFile;
+
+            // Если сменился чат — сбрасываем всё и делаем первичный замер
+            if (_currentChatFile !== currentFile) {
+                _currentChatFile = currentFile;
+                _knownCounts.clear();
+                _knownLastIds.clear();
+                reset();
+                _primed = false;
+                await primeAllOtherChats(currentFile);
+                return;
+            }
+
+            // Если первичный замер ещё не сделан — сделаем и выйдем
+            if (!_primed) {
+                await primeAllOtherChats(currentFile);
+                return;
+            }
+
+            // Основной цикл: обходим все чаты, кроме текущего
+            const others = state.chats.filter(c => c.file !== currentFile);
+            if (others.length === 0) return;
+
+            let delta = 0;
+            const BATCH = 4;
+
+            for (let i = 0; i < others.length; i += BATCH) {
+                const batch = others.slice(i, i + BATCH);
+                const results = await Promise.all(batch.map(async (chat) => {
+                    const meta = await fetchChatMeta(chat.file);
+                    if (!meta) return 0;
+
+                    const prevCount = _knownCounts.get(chat.file);
+                    const prevLastId = _knownLastIds.get(chat.file);
+
+                    // Первый замер этого чата в текущей сессии —
+                    // запоминаем без инкремента.
+                    if (prevCount === undefined) {
+                        _knownCounts.set(chat.file, meta.count);
+                        if (meta.lastId != null) _knownLastIds.set(chat.file, meta.lastId);
+                        return 0;
+                    }
+
+                    // Считаем дельту
+                    let added = 0;
+                    if (meta.count > prevCount) {
+                        added = meta.count - prevCount;
+                    }
+
+                    // Дополнительно проверяем lastId — если он изменился,
+                    // но count остался прежним (например, удалили одно
+                    // и добавили одно), всё равно сигналим о «новом».
+                    // Такое редко бывает, но пусть будет.
+                    if (added === 0 && meta.lastId != null && prevLastId != null
+                        && meta.lastId > prevLastId && meta.count === prevCount) {
+                        added = 1;
+                    }
+
+                    // Обновляем кэш
+                    _knownCounts.set(chat.file, meta.count);
+                    if (meta.lastId != null) _knownLastIds.set(chat.file, meta.lastId);
+
+                    return added;
+                }));
+
+                for (const a of results) delta += a;
+
+                if (i + BATCH < others.length) {
+                    await new Promise(r => setTimeout(r, 100));
+                }
+            }
+
+            if (delta > 0) {
+                const total = _unreadBadgeCount + delta;
+                setCount(total);
+
+                console.log(`🔴 [BackBadge] +${delta} новых. Итого: ${total}`);
+
+                // Лёгкий звук при первом «новом» (только если не на паузе у юзера)
+                if (delta > 0 && _unreadBadgeCount - delta === 0) {
+                    // Только что был 0 → стал >0. Сыграем сигнал.
+                    try { soundManager.play('notification'); } catch (e) {}
+                }
+            }
+        } finally {
+            _isChecking = false;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  УПРАВЛЕНИЕ WATCHER
+    // ═══════════════════════════════════════════════════════════
+    const POLL_INTERVAL_MS = 5000;
 
     function startWatcher() {
         stopWatcher();
-        _watchTimer = setInterval(watchOtherChats, 3000);
+        // Первый запуск — через 1.5 сек (дадим чату прогрузиться)
+        _watchTimer = setTimeout(() => {
+            watchOtherChats();
+            _watchTimer = setInterval(watchOtherChats, POLL_INTERVAL_MS);
+        }, 1500);
     }
 
     function stopWatcher() {
         if (_watchTimer) {
+            clearTimeout(_watchTimer);
             clearInterval(_watchTimer);
             _watchTimer = null;
         }
     }
 
-    // ═══════════════════════════════════════════════════════════
-    //  ХУКИ НА ПЕРЕХОДЫ
-    // ═══════════════════════════════════════════════════════════
-
-    // При входе в чат — стартуем watcher, сбрасываем состояние
-    if (typeof enterChat === 'function') {
-        const _origEnterChat = enterChat;
-        enterChat = async function(file, name, password) {
-            const result = await _origEnterChat.call(this, file, name, password);
-
-            // Если успешно вошли в чат
-            if (state.chatFile === file && state.currentScreen === 'chat') {
-                _currentChatFile = file;
-                _knownMsgCounts.clear();
-                reset();
-                // Дадим 1.5 секунды на инициализацию, потом стартуем
-                setTimeout(startWatcher, 1500);
-            }
-            return result;
-        };
-    }
-
-    // При возврате в список чатов — сбрасываем бейдж и тормозим watcher
-    if (typeof backToChats === 'function') {
-        const _origBackToChats = backToChats;
-        backToChats = function() {
-            stopWatcher();
-            _currentChatFile = null;
-            _knownMsgCounts.clear();
-            reset();
-            return _origBackToChats.apply(this, arguments);
-        };
-    }
-
-    // При показе списка чатов — тоже сбрасываем
-    if (typeof showChatsScreen === 'function') {
-        const _origShowChatsScreen = showChatsScreen;
-        showChatsScreen = function() {
-            stopWatcher();
-            _currentChatFile = null;
-            _knownMsgCounts.clear();
-            reset();
-            return _origShowChatsScreen.apply(this, arguments);
-        };
-    }
-
-    // При logout — тоже убираем всё
-    if (typeof logout === 'function') {
-        const _origLogout = logout;
-        logout = function() {
-            stopWatcher();
-            _currentChatFile = null;
-            _knownMsgCounts.clear();
-            reset();
-            return _origLogout.apply(this, arguments);
-        };
-    }
-
-    // При показе экрана чата — на всякий случай создаём бейдж
-    if (typeof showChatScreen === 'function') {
-        const _origShowChatScreen = showChatScreen;
-        showChatScreen = function() {
-            const r = _origShowChatScreen.apply(this, arguments);
-            setTimeout(ensureBadge, 50);
-            return r;
-        };
+    function hardReset() {
+        stopWatcher();
+        _currentChatFile = null;
+        _knownCounts.clear();
+        _knownLastIds.clear();
+        _primed = false;
+        _isChecking = false;
+        reset();
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ПУБЛИЧНОЕ API (для отладки)
+    //  ХУКИ
+    // ═══════════════════════════════════════════════════════════
+
+    // ─── Вход в чат ───
+    const _origEnterChat = enterChat;
+    enterChat = async function(file, name, password) {
+        const result = await _origEnterChat.call(this, file, name, password);
+
+        if (state.chatFile === file && state.currentScreen === 'chat') {
+            _currentChatFile = file;
+            _knownCounts.clear();
+            _knownLastIds.clear();
+            _primed = false;
+            reset();
+            startWatcher();
+        }
+        return result;
+    };
+
+    // ─── Возврат в список чатов ───
+    const _origBackToChats = backToChats;
+    backToChats = function() {
+        hardReset();
+        return _origBackToChats.apply(this, arguments);
+    };
+
+    // ─── Показ списка чатов (на всякий случай, если backToChats
+    //     вызвали не напрямую — например, через showChatsScreen) ───
+    const _origShowChatsScreen = showChatsScreen;
+    showChatsScreen = function() {
+        hardReset();
+        return _origShowChatsScreen.apply(this, arguments);
+    };
+
+    // ─── Logout ───
+    const _origLogout = logout;
+    logout = function() {
+        hardReset();
+        return _origLogout.apply(this, arguments);
+    };
+
+    // ─── Появление экрана чата — на случай, если бейдж не создан ───
+    const _origShowChatScreen = showChatScreen;
+    showChatScreen = function() {
+        const r = _origShowChatScreen.apply(this, arguments);
+        setTimeout(ensureBadge, 50);
+        return r;
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  РЕАКЦИЯ НА ВИДИМОСТЬ ДОКУМЕНТА
+    //  Когда юзер вернулся в приложение — сразу проверяем,
+    //  что там новенького.
+    // ═══════════════════════════════════════════════════════════
+    if (!_visibilityBound) {
+        _visibilityBound = true;
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) return;
+            if (!state.isAuthorized || !state.chatFile) return;
+            if (state.currentScreen !== 'chat') return;
+            // Мгновенная проверка
+            watchOtherChats();
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СИНХРОНИЗАЦИЯ С EVENT RADAR (опционально)
+    //  Если Radar обнаружил событие — увеличим счётчик на 1,
+    //  чтобы бейдж на «Назад» не отставал.
+    // ═══════════════════════════════════════════════════════════
+    // (мы не трогаем EventRadar напрямую, просто отметим факт)
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API
     // ═══════════════════════════════════════════════════════════
     window.BackButtonBadge = {
         get: () => _unreadBadgeCount,
         set: setCount,
         reset,
-        increment,
-        // Ручной запуск проверки (не дожидаясь таймера)
+        increment: (n = 1) => setCount(_unreadBadgeCount + n),
         check: () => watchOtherChats(),
-        // Диагностика
         status: () => ({
             count: _unreadBadgeCount,
             currentChat: _currentChatFile,
             watching: !!_watchTimer,
-            knownChats: _knownMsgCounts.size,
-            entries: Object.fromEntries(_knownMsgCounts),
+            checking: _isChecking,
+            primed: _primed,
+            knownChats: _knownCounts.size,
+            counts: Object.fromEntries(_knownCounts),
+            lastIds: Object.fromEntries(_knownLastIds),
         }),
+        forceReset: hardReset,
     };
 
-    console.log('🔴 Бейдж непрочитанных на кнопке «Назад» активен');
-    console.log('   • Проверка чатов раз в 3 сек, пока вы в чате');
-    console.log('   • Считает новые сообщения в ДРУГИХ чатах');
+    console.log('🔴 [BackBadge v2] Бейдж непрочитанных на «Назад» активен');
+    console.log(`   • Опрос чужих чатов раз в ${POLL_INTERVAL_MS / 1000} сек`);
+    console.log('   • Первичный замер без инкремента');
+    console.log('   • Реагирует на возврат приложения из фона');
     console.log('   • API: BackButtonBadge.status() / .check() / .reset()');
 })();
 </script>
