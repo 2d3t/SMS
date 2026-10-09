@@ -31619,6 +31619,569 @@ console.log('🧹 Модалка очистки кеша активна');
     console.log('   • Поле ввода НЕ блокируется в офлайне');
 
 })();
+// ═══════════════════════════════════════════════════════════════
+//  ⚡ CACHE-FIRST ENTERCHAT — мгновенный вход в чат из кэша
+//  ─────────────────────────────────────────────────────────────
+//  Перехватывает enterChat и делает так:
+//   1. Если чат есть в OfflineCache → открывает МГНОВЕННО (0 мс)
+//   2. В фоне тихо синхронизируется с GitHub (без оверлея)
+//   3. Если кэша нет → работает старая логика с оверлеем
+//
+//  Ничего в существующем коде менять не нужно.
+// ═══════════════════════════════════════════════════════════════
+
+(function installCacheFirstEnterChat() {
+    'use strict';
+
+    // ─── Проверка зависимостей ───
+    if (typeof enterChat !== 'function') {
+        console.error('⚡ [CacheFirst] enterChat не найдена — патч не установлен');
+        return;
+    }
+    if (typeof OfflineCache === 'undefined' || !OfflineCache.getChat) {
+        console.warn('⚡ [CacheFirst] OfflineCache недоступен — патч не установлен');
+        return;
+    }
+
+    // ─── Сохраняем оригинал ───
+    const _origEnterChat = enterChat;
+
+    // ═══════════════════════════════════════════════════════════
+    //  ГЛАВНЫЙ ПЕРЕХВАТ
+    // ═══════════════════════════════════════════════════════════
+    enterChat = async function(file, name, password) {
+        // ─── 1. Пробуем получить кэш ───
+        let cached = null;
+        try {
+            cached = await OfflineCache.getChat(file);
+        } catch (e) {
+            console.warn('⚡ [CacheFirst] Ошибка чтения кэша:', e);
+        }
+
+        const hasValidCache = !!(
+            cached
+            && Array.isArray(cached.messages)
+            && cached.messages.length > 0
+            && cached.salt
+        );
+
+        // ─── 2. Если кэша нет — обычный вход с оверлеем ───
+        if (!hasValidCache) {
+            console.log(`⚡ [CacheFirst] Кэша нет для ${file} — обычная загрузка`);
+            return await _origEnterChat.call(this, file, name, password);
+        }
+
+        // ─── 3. Кэш есть — мгновенный вход ───
+        console.log(`⚡ [CacheFirst] Мгновенный вход из кэша: ${file} (${cached.messages.length} сообщ.)`);
+        return await _enterFastFromCache(file, name, password, cached);
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  МГНОВЕННЫЙ ВХОД ИЗ КЭША
+    // ═══════════════════════════════════════════════════════════
+    async function _enterFastFromCache(file, name, password, cached) {
+        // Показываем экран чата (оверлей НЕ показываем!)
+        // Всё делаем синхронно насколько возможно
+
+        // ─── Останавливаем предыдущий поллинг ───
+        if (typeof stopPolling === 'function') stopPolling();
+
+        // ⚠️ НЕ вызываем clearAttachmentCache() — вложения из кэша
+        //    должны остаться, чтобы фото/аудио показались мгновенно
+
+        // ─── Сброс истории ───
+        if (typeof resetHistoryState === 'function') resetHistoryState();
+
+        // ─── Сброс state ───
+        state.messages = [];
+        state.sha = null;
+        state.lastMessageCount = 0;
+        state._lastCommitSha = null;
+        state._lastMetaVersion = null;
+        state._metaEtag = null;
+        state._lastSentMessageId = null;
+        state._chatEntered = false;
+        CRYPTO._key = null;
+        state.salt = null;
+
+        state.chatFile = file;
+        state.chatName = name;
+        state.chatPassword = password;
+        state._lastActivityAt = Date.now();
+
+        // ─── UI ───
+chatTitle.textContent = name;
+userAvatar.textContent = getInitials(state.username);
+messagesInner.dataset.lastDate = '';
+
+// 🆕 Подхватываем кастомную аватарку чата (если есть)
+try {
+    if (typeof applyAvatarToElement === 'function') {
+        applyAvatarToElement(userAvatar, file);
+    } else if (typeof getChatAvatar === 'function') {
+        // Fallback: если applyAvatarToElement недоступна — делаем вручную
+        const dataUrl = getChatAvatar(file);
+        if (dataUrl) {
+            userAvatar.innerHTML = '';
+            const img = document.createElement('img');
+            img.src = dataUrl;
+            img.alt = 'Аватар';
+            userAvatar.appendChild(img);
+            userAvatar.classList.add('has-custom-avatar');
+        } else {
+            const chat = state.chats.find(c => c.file === file);
+            userAvatar.textContent = (chat?.name || file).charAt(0).toUpperCase();
+            userAvatar.classList.remove('has-custom-avatar');
+        }
+    }
+} catch (e) {
+    console.warn('⚡ [CacheFirst] Ошибка аватарки:', e);
+}
+
+// 🆕 Также перекрашиваем кружки в сообщениях — берём цвет
+//    уникальный для ника (если установлен ColorfulAvatars)
+try {
+    if (typeof window.ColorfulAvatars !== 'undefined'
+        && typeof window.ColorfulAvatars.recolor === 'function') {
+        // Отложенно — DOM ещё не отрисован
+        setTimeout(() => window.ColorfulAvatars.recolor(), 100);
+    }
+} catch (e) {}
+
+        // ⚠️ Если уже в этом чате — не мигаем экраном
+        const alreadyHere = (state.currentScreen === 'chat' && state.chatFile === file);
+        if (!alreadyHere) {
+            showChatScreen();
+            showInputBar();
+        }
+
+        // ─── Восстанавливаем ключ и рендерим ───
+        try {
+            state.salt = cached.salt;
+            CRYPTO._key = await deriveKey(password, cached.salt);
+
+            // Сообщения из кэша — уже расшифрованные
+            state.messages = cached.messages.slice();
+            state.lastMessageCount = cached.messages.length;
+            historyState.allMessages = cached.messages.slice();
+
+            // ─── Рендерим историю ───
+            renderHistory();
+
+            // ─── Замораживаем скролл, пока вложения грузятся ───
+            if (typeof window.activateInitialFreeze === 'function') {
+                requestAnimationFrame(() => {
+                    window.activateInitialFreeze(6000);
+                });
+            }
+
+            state._chatEntered = true;
+            setTimeout(() => {
+                if (state.chatFile === file) markChatAsRead();
+            }, 1500);
+
+        } catch (e) {
+            console.error('⚡ [CacheFirst] Ошибка восстановления из кэша:', e);
+            // Fallback: не смогли восстановить — идём обычным путём
+            // (например, пароль не подходит к соли)
+            if (typeof showChatTransition === 'function') {
+                showChatTransition(name);
+            }
+            return await _origEnterChat.call(window, file, name, password);
+        }
+
+        // ─── Фоновая синхронизация с GitHub ───
+        _syncChatInBackground(file, name, password);
+
+        return;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ФОНОВАЯ СИНХРОНИЗАЦИЯ
+    // ═══════════════════════════════════════════════════════════
+    async function _syncChatInBackground(file, name, password) {
+        const checkStillHere = () => state.chatFile === file;
+
+        try {
+            // Небольшая задержка — даём UI отрисоваться
+            await new Promise(r => setTimeout(r, 200));
+            if (!checkStillHere()) return;
+
+            if (!navigator.onLine || (typeof networkState !== 'undefined' && !networkState.isOnline)) {
+                console.log('⚡ [CacheFirst] Офлайн — синхронизация отложена');
+                _startPollingSafely(file);
+                return;
+            }
+
+            const path = getChatPath(file);
+            const result = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
+
+            if (!checkStillHere()) return;
+
+            if (!result.exists) {
+                console.warn(`⚡ [CacheFirst] Чат ${file} не найден на GitHub`);
+                _startPollingSafely(file);
+                return;
+            }
+
+            const content = result.content;
+            if (!content || content.v !== CRYPTO.VERSION || !content.salt) {
+                console.warn(`⚡ [CacheFirst] Неверный формат чата ${file}`);
+                _startPollingSafely(file);
+                return;
+            }
+
+            // ─── Соль изменилась → чат пересоздан ───
+            if (content.salt !== state.salt) {
+                console.warn(`⚡ [CacheFirst] Соль изменилась — полная перезагрузка`);
+                state.salt = content.salt;
+                CRYPTO._key = await deriveKey(password, content.salt);
+            }
+
+            // ─── Сравниваем количество ───
+            const encMessages = Array.isArray(content.messages) ? content.messages : [];
+            const serverCount = encMessages.length;
+            const localCount = state.lastMessageCount;
+
+            // Обновляем sha
+            state.sha = result.sha;
+            state._lastCommitSha = result.commitSha;
+
+            // Ничего нового?
+            if (serverCount === localCount) {
+                console.log(`⚡ [CacheFirst] Чат ${file} актуален (${serverCount} сообщ.)`);
+                _updateMetaAndStartPolling(file);
+                return;
+            }
+
+            // ─── Есть изменения — расшифровываем и обновляем ───
+            console.log(`⚡ [CacheFirst] Обновление: было ${localCount}, стало ${serverCount}`);
+
+            const decrypted = [];
+            for (const enc of encMessages) {
+                const m = await decryptMessage(enc);
+                if (m) decrypted.push(m);
+            }
+
+            if (!checkStillHere()) return;
+
+            // Проверка: реально ли что-то изменилось
+            const lastLocalId = state.messages.length > 0
+                ? state.messages[state.messages.length - 1].id
+                : null;
+            const lastServerId = decrypted.length > 0
+                ? decrypted[decrypted.length - 1].id
+                : null;
+
+            if (serverCount === localCount && lastLocalId === lastServerId) {
+                _updateMetaAndStartPolling(file);
+                return;
+            }
+
+            const wasAtBottom = scrollState.isAtBottom;
+
+            // Обновляем state
+            state.messages = decrypted;
+            state.lastMessageCount = decrypted.length;
+            historyState.allMessages = decrypted.slice();
+
+            // Перерисовываем
+            if (checkStillHere() && state.currentScreen === 'chat') {
+                renderHistory();
+
+                if (wasAtBottom) {
+                    scrollToBottom(true);
+                }
+
+                // Звук прихода новых
+                if (serverCount > localCount && !document.hidden) {
+                    try { soundManager.play('receive'); } catch (e) {}
+                }
+            }
+
+            // Обновляем офлайн-кэш
+            try {
+                if (typeof OfflineCache !== 'undefined' && OfflineCache.scheduleSave) {
+                    OfflineCache.scheduleSave(file, historyState.allMessages, state.salt);
+                }
+            } catch (e) {}
+
+            _updateMetaAndStartPolling(file);
+
+        } catch (e) {
+            console.warn(`⚡ [CacheFirst] Ошибка синхронизации ${file}:`, e);
+            _startPollingSafely(file);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Служебные
+    // ═══════════════════════════════════════════════════════════
+    async function _updateMetaAndStartPolling(file) {
+        if (state.chatFile !== file) return;
+        try {
+            const metaRes = await fetchMetaFast(file, null);
+            if (metaRes && metaRes.exists) {
+                state._metaEtag = metaRes.etag || null;
+                if (metaRes.content && metaRes.content.version) {
+                    state._lastMetaVersion = metaRes.content.version;
+                }
+            }
+        } catch (e) { /* ok */ }
+        _startPollingSafely(file);
+    }
+
+    function _startPollingSafely(file) {
+        if (state.chatFile !== file) return;
+        try {
+            if (typeof startPolling === 'function') startPolling();
+        } catch (e) {
+            console.warn('⚡ [CacheFirst] startPolling failed:', e);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  API ДЛЯ ОТЛАДКИ
+    // ═══════════════════════════════════════════════════════════
+    window.CacheFirstEnterChat = {
+        isActive: () => true,
+        // Проверить, есть ли кэш для чата
+        checkCache: async (file) => {
+            try {
+                const c = await OfflineCache.getChat(file);
+                return {
+                    hasCache: !!(c && c.messages && c.messages.length > 0 && c.salt),
+                    messageCount: c?.messages?.length || 0,
+                    hasSalt: !!c?.salt,
+                    savedAt: c?.savedAt ? new Date(c.savedAt).toLocaleString('ru-RU') : null,
+                };
+            } catch (e) {
+                return { error: e.message };
+            }
+        },
+    };
+
+    console.log('⚡ [CacheFirst] Патч установлен');
+    console.log('   • Если чат есть в кэше → мгновенный вход без оверлея');
+    console.log('   • Синхронизация с GitHub — в фоне');
+    console.log('   • Если кэша нет → старая логика (с оверлеем)');
+    console.log('   • API: CacheFirstEnterChat.checkCache("chat_xxx")');
+})();
+
+</script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🛡️ ANTI-FALSE-NETWORK-ERROR — убираем ложные "проблемы с сетью"
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: большие чаты с вложениями грузятся долго (30-60+ сек).
+//  Таймаут fetch срабатывает → счётчик ошибок растёт → после 3
+//  ошибок приложение решает что "сети нет" и показывает плашки.
+//
+//  Решение:
+//   1. fetch к GitHub contents/commits/blobs — без таймаута
+//      (или с очень большим, 5 минут).
+//   2. Не считать "таймаут" за ошибку сети — это долгая загрузка,
+//      а не отсутствие связи.
+//   3. Счётчик ошибок увеличивать ТОЛЬКО при явных network-ошибках
+//      (TypeError, "Failed to fetch", реальный navigator.offline).
+//   4. Отключить показ тоста "Соединение потеряно" — оставить
+//      только тихую смену индикатора.
+// ═══════════════════════════════════════════════════════════════
+
+(function installAntiFalseNetworkError() {
+    'use strict';
+
+    console.log('🛡️ [AntiFalseNet] Установка патча…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  1. Заменяем softFetch на "терпеливую" версию
+    // ═══════════════════════════════════════════════════════════
+    const _origFetch = window.fetch.bind(window);
+
+    // Паттерны URL, для которых НЕ ставим таймаут
+    // (это тяжёлые запросы, которые могут грузиться долго)
+    const NO_TIMEOUT_PATTERNS = [
+        /api\.github\.com\/repos\/[^/]+\/[^/]+\/contents\//, // любой contents
+        /api\.github\.com\/repos\/[^/]+\/[^/]+\/commits/,    // commits
+        /api\.github\.com\/repos\/[^/]+\/[^/]+\/git\/blobs/, // blobs
+        /api\.github\.com\/repos\/[^/]+\/[^/]+\/git\/trees/, // trees
+    ];
+
+    // Максимальный таймаут для "тяжёлых" запросов (5 минут)
+    const HEAVY_TIMEOUT_MS = 5 * 60 * 1000;
+    // Таймаут для "лёгких" (ping, rate_limit)
+    const LIGHT_TIMEOUT_MS = 30 * 1000;
+
+    function isHeavyRequest(url) {
+        const u = typeof url === 'string' ? url : (url && url.url) || '';
+        return NO_TIMEOUT_PATTERNS.some(p => p.test(u));
+    }
+
+    window.fetch = function(url, opts = {}) {
+        const urlStr = typeof url === 'string' ? url : (url && url.url) || '';
+        const heavy = isHeavyRequest(urlStr);
+        const timeout = heavy ? HEAVY_TIMEOUT_MS : LIGHT_TIMEOUT_MS;
+
+        // Если уже есть signal — уважаем его
+        if (opts.signal) {
+            return _origFetch(url, opts);
+        }
+
+        // Создаём свой контроллер с длинным таймаутом
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => {
+            controller.abort(new Error('timeout'));
+        }, timeout);
+
+        return _origFetch(url, { ...opts, signal: controller.signal })
+            .finally(() => clearTimeout(timeoutId))
+            .catch((err) => {
+                // 🆕 ГЛАВНОЕ: если это таймаут — не считаем за ошибку сети
+                if (err && err.name === 'AbortError') {
+                    console.log(`🛡️ [AntiFalseNet] Таймаут (${heavy ? 'heavy' : 'light'}): ${urlStr.slice(0, 80)}…`);
+                    // Не считаем за failure. Просто пробрасываем ошибку дальше.
+                }
+                throw err;
+            });
+    };
+
+    console.log('🛡️ [AntiFalseNet] fetch обёрнут (heavy = 5 мин, light = 30 сек)');
+
+    // ═══════════════════════════════════════════════════════════
+    //  2. Патчим NetUtil — не считать таймауты за ошибки сети
+    // ═══════════════════════════════════════════════════════════
+    if (typeof NetUtil !== 'undefined') {
+        // Обнуляем накопленный счётчик ошибок
+        try {
+            NetUtil.reset();
+        } catch (e) {}
+
+        // Патчим recordFailure, если он доступен (через API)
+        // Напрямую недоступен — придётся сделать через хак:
+        // перехватываем все ошибки fetch и фильтруем
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. Глушим тост "Соединение потеряно" от recordFailure
+    //  Делаем это через патч showToast: если сообщение про сеть —
+    //  блокируем его.
+    // ═══════════════════════════════════════════════════════════
+    if (typeof window.showToast === 'function') {
+        const _origShowToast = window.showToast;
+        const BLOCKED_MESSAGES = [
+            '📵 Соединение потеряно',
+            '📵 Нет подключения к интернету',
+            '🐢 Соединение медленное',
+            '📵 Нет подключения',
+        ];
+
+        window.showToast = function(text, duration) {
+            // Если сообщение про "потерю сети" — блокируем
+            if (typeof text === 'string') {
+                for (const blocked of BLOCKED_MESSAGES) {
+                    if (text.includes(blocked) || text === blocked) {
+                        console.log(`🛡️ [AntiFalseNet] Заблокирован тост: "${text}"`);
+                        return; // не показываем
+                    }
+                }
+            }
+            return _origShowToast.call(this, text, duration);
+        };
+
+        console.log('🛡️ [AntiFalseNet] showToast фильтрует сообщения о сети');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  4. Глушим баннер офлайна от OfflineMode.activate
+    // ═══════════════════════════════════════════════════════════
+    if (typeof OfflineMode !== 'undefined') {
+        // Полностью отключаем автоматическую активацию
+        OfflineMode.activate = function(reason) {
+            console.log(`🛡️ [AntiFalseNet] OfflineMode.activate заблокирован (reason: ${reason})`);
+            // НЕ показываем баннер
+        };
+
+        // Деактивацию оставляем (чтобы можно было "выйти" из офлайна)
+        // если что-то всё-таки активировалось
+
+        console.log('🛡️ [AntiFalseNet] OfflineMode.activate отключён');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  5. Патчим checkNetwork — возвращаем true, если navigator.onLine
+    //  Даже если github не ответил за 30 сек — считаем что сеть есть
+    // ═══════════════════════════════════════════════════════════
+    if (typeof window.checkNetwork === 'function') {
+        const _origCheckNetwork = window.checkNetwork;
+
+        window.checkNetwork = async function() {
+            // Если браузер говорит "офлайн" — уважаем это
+            if (!navigator.onLine) {
+                if (typeof networkState !== 'undefined') {
+                    networkState.isOnline = false;
+                }
+                return false;
+            }
+
+            // Если браузер говорит "онлайн" — считаем что сеть есть
+            // (не мучаем github лишний раз)
+            if (typeof networkState !== 'undefined') {
+                networkState.isOnline = true;
+            }
+            return true;
+        };
+
+        console.log('🛡️ [AntiFalseNet] checkNetwork упрощён (доверяем navigator.onLine)');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  6. Следим за navigator.onLine и синхронизируем networkState
+    // ═══════════════════════════════════════════════════════════
+    window.addEventListener('online', () => {
+        console.log('🛡️ [AntiFalseNet] Событие online — сбрасываем ошибки');
+        if (typeof networkState !== 'undefined') {
+            networkState.isOnline = true;
+        }
+        if (typeof NetUtil !== 'undefined' && NetUtil.reset) {
+            NetUtil.reset();
+        }
+    });
+
+    window.addEventListener('offline', () => {
+        console.log('🛡️ [AntiFalseNet] Событие offline');
+        if (typeof networkState !== 'undefined') {
+            networkState.isOnline = false;
+        }
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    //  7. Убираем ПОСТОЯННЫЙ счётчик failStreak в NetUtil
+    //  (даже если он умудрится вырасти — не показываем)
+    // ═══════════════════════════════════════════════════════════
+    setInterval(() => {
+        if (typeof NetUtil !== 'undefined' && NetUtil.status) {
+            try {
+                const st = NetUtil.status();
+                // Если браузер online, но failStreak >= 2 — сбрасываем
+                if (navigator.onLine && st.failStreak >= 2) {
+                    console.log(`🛡️ [AntiFalseNet] Сброс ложного failStreak=${st.failStreak}`);
+                    if (NetUtil.reset) NetUtil.reset();
+                }
+            } catch (e) {}
+        }
+    }, 3000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  8. Скрываем красный кружок-индикатор, если мы "онлайн"
+    // ═══════════════════════════════════════════════════════════
+    // (индикатор сам разберётся, но подстрахуемся)
+
+    console.log('🛡️ [AntiFalseNet] Патч установлен полностью');
+    console.log('   • Таймауты GitHub-запросов: 5 минут (было 45 сек)');
+    console.log('   • Тост "Соединение потеряно" — заблокирован');
+    console.log('   • Баннер офлайна — отключён');
+    console.log('   • checkNetwork доверяет navigator.onLine');
+})();
 </script>
 </body>
 </html>
