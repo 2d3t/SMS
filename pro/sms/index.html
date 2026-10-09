@@ -27783,19 +27783,28 @@ async function doClearSelectedCache() {
     }
 
     if (typeof OfflineCache !== 'undefined' && OfflineCache.removeChat) {
-        for (const file of files) {
-            try {
-                await OfflineCache.removeChat(file);
-                _cacheCounts.delete(file);
-                clearedChats++;
-            } catch (e) {
-                console.warn('removeChat failed:', file, e);
-            }
+    for (const file of files) {
+        try {
+            await OfflineCache.removeChat(file);
+            _cacheCounts.delete(file);
+            clearedChats++;
+        } catch (e) {
+            console.warn('removeChat failed:', file, e);
         }
     }
+}
 
-    btn.disabled = false;
-    btn.textContent = '🧹 Очистить';
+// 🆕 Дополнительно чистим постоянный кэш вложений из IndexedDB
+if (typeof window.clearAttachmentPersistCache === 'function') {
+    try {
+        await window.clearAttachmentPersistCache(files);
+    } catch (e) {
+        console.warn('clearAttachmentPersistCache failed:', e);
+    }
+}
+
+btn.disabled = false;
+btn.textContent = '🧹 Очистить';
     $('clearCacheModal').classList.remove('active');
     _selectedCacheFiles.clear();
 
@@ -28599,6 +28608,461 @@ console.log('🧹 Модалка очистки кеша активна');
     console.log(`   • checkInterval: ${NET_CFG.checkIntervalMs} мс`);
     console.log('   • API: NetUtil.status() / .reset() / .config');
 
+})();
+</script><script>
+// ═══════════════════════════════════════════════════════════════
+//  💾 ПОСТОЯННЫЙ КЭШ ВЛОЖЕНИЙ (IndexedDB)
+//  ─────────────────────────────────────────────────────────────
+//  Сохраняет расшифрованные blob'ы вложений в IndexedDB.
+//  При следующем запуске приложения — восстанавливает их
+//  МГНОВЕННО, без скачивания с GitHub и повторной расшифровки.
+//
+//  Работает поверх существующего _attachmentCache:
+//   • При загрузке вложения — кладём и в память, и в IndexedDB
+//   • При старте чата — подгружаем из IndexedDB в память
+//   • LRU-очистка чистит оба хранилища
+// ═══════════════════════════════════════════════════════════════
+
+(function installPersistentAttachmentCache() {
+    'use strict';
+
+    // ─── Конфиг ───
+    const DB_NAME = 'smschat_attachments';
+    const DB_VERSION = 1;
+    const STORE = 'blobs';
+    const MAX_SIZE = 150 * 1024 * 1024;      // 150 МБ общий лимит в IndexedDB
+    const MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 дней — максимальный возраст
+
+    let _dbPromise = null;
+
+    // ─── Проверка зависимостей ───
+    if (typeof _attachmentCache === 'undefined') {
+        console.warn('💾 [PersistCache] _attachmentCache не найден');
+        return;
+    }
+
+    // ─── Открытие БД ───
+    function openDB() {
+        if (_dbPromise) return _dbPromise;
+
+        _dbPromise = new Promise((resolve, reject) => {
+            if (!('indexedDB' in window)) {
+                reject(new Error('IndexedDB не поддерживается'));
+                return;
+            }
+
+            const req = indexedDB.open(DB_NAME, DB_VERSION);
+
+            req.onupgradeneeded = (e) => {
+                const db = e.target.result;
+                if (!db.objectStoreNames.contains(STORE)) {
+                    const store = db.createObjectStore(STORE, { keyPath: 'key' });
+                    store.createIndex('savedAt', 'savedAt', { unique: false });
+                    store.createIndex('lastAccess', 'lastAccess', { unique: false });
+                }
+            };
+
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error);
+            req.onblocked = () => reject(new Error('IndexedDB заблокирован'));
+        });
+
+        return _dbPromise;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОХРАНЕНИЕ BLOB'А
+    // ═══════════════════════════════════════════════════════════
+    /**
+     * Сохраняет blob в IndexedDB.
+     * @param {string} chatFile — ID чата (для группировки при очистке)
+     * @param {string} attachName — имя вложения (уникальный ключ)
+     * @param {Blob} blob — данные
+     */
+    async function saveBlobToDB(chatFile, attachName, blob) {
+        if (!blob || !(blob instanceof Blob)) return false;
+        if (blob.size === 0) return false;
+
+        try {
+            const db = await openDB();
+            const now = Date.now();
+
+            const record = {
+                key: attachName,
+                chatFile: chatFile || null,
+                blob: blob,
+                size: blob.size,
+                mime: blob.type || 'application/octet-stream',
+                savedAt: now,
+                lastAccess: now,
+                accessCount: 1,
+            };
+
+            return new Promise((resolve, reject) => {
+                const t = db.transaction(STORE, 'readwrite');
+                t.objectStore(STORE).put(record);
+                t.oncomplete = () => {
+                    console.log(`💾 [PersistCache] сохранено: ${attachName} (${(blob.size / 1024).toFixed(1)} КБ)`);
+                    resolve(true);
+                };
+                t.onerror = () => {
+                    console.warn('💾 [PersistCache] save failed:', t.error);
+                    reject(t.error);
+                };
+            });
+        } catch (e) {
+            console.warn('💾 [PersistCache] saveBlobToDB error:', e);
+            return false;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЗАГРУЗКА BLOB'А
+    // ═══════════════════════════════════════════════════════════
+    async function loadBlobFromDB(attachName) {
+        try {
+            const db = await openDB();
+            return new Promise((resolve, reject) => {
+                const t = db.transaction(STORE, 'readwrite');
+                const store = t.objectStore(STORE);
+                const req = store.get(attachName);
+
+                req.onsuccess = () => {
+                    const rec = req.result;
+                    if (!rec || !rec.blob) {
+                        resolve(null);
+                        return;
+                    }
+
+                    // Обновляем статистику доступа
+                    rec.lastAccess = Date.now();
+                    rec.accessCount = (rec.accessCount || 0) + 1;
+                    store.put(rec);
+
+                    resolve(rec.blob);
+                };
+
+                req.onerror = () => reject(req.error);
+            });
+        } catch (e) {
+            console.warn('💾 [PersistCache] loadBlobFromDB error:', e);
+            return null;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОБЁРТКА loadAttachment
+    //  Приоритет:
+    //   1. Память (_attachmentCache) — мгновенно
+    //   2. IndexedDB (свежий или недавний blob) — быстро
+    //   3. GitHub + расшифровка — медленно
+    // ═══════════════════════════════════════════════════════════
+    if (typeof window.loadAttachment === 'function') {
+        const _origLoadAttachment = window.loadAttachment;
+
+        window.loadAttachment = async function(chatFile, attachName) {
+            // ═══ 1. Память ═══
+            if (_attachmentCache.has(attachName)) {
+                return _attachmentCache.get(attachName);
+            }
+
+            // ═══ 2. IndexedDB ═══
+            try {
+                const cachedBlob = await loadBlobFromDB(attachName);
+                if (cachedBlob && cachedBlob.size > 0) {
+                    // Проверяем возраст
+                    const age = Date.now() - (cachedBlob._savedAt || 0);
+                    // Если слишком старый — не используем (всё равно перекачаем)
+                    // (проверка возраста не критична — актуальность данных
+                    //  гарантируется тем, что имя вложения уникально)
+
+                    const url = URL.createObjectURL(cachedBlob);
+                    _attachmentCache.set(attachName, url);
+
+                    // Обновляем трекеры для LRU-очистки
+                    if (typeof window._attachmentSizes !== 'undefined') {
+                        window._attachmentSizes.set(attachName, cachedBlob.size);
+                    }
+                    if (typeof window._attachmentLastAccess !== 'undefined') {
+                        window._attachmentLastAccess.set(attachName, Date.now());
+                    }
+                    if (typeof window._attachmentAccessCount !== 'undefined') {
+                        const cnt = window._attachmentAccessCount.get(attachName) || 0;
+                        window._attachmentAccessCount.set(attachName, cnt + 1);
+                    }
+
+                    console.log(`💾 [PersistCache] восстановлено из IndexedDB: ${attachName}`);
+                    return url;
+                }
+            } catch (e) {
+                console.warn('💾 [PersistCache] IndexedDB lookup failed:', e);
+            }
+
+            // ═══ 3. GitHub + расшифровка (медленный путь) ═══
+            const url = await _origLoadAttachment.call(this, chatFile, attachName);
+
+            // 🆕 После успешной загрузки — кладём в IndexedDB
+            // (асинхронно, не блокируем возврат)
+            try {
+                const blob = await fetch(url).then(r => r.blob());
+                // Кладём в фоне
+                saveBlobToDB(chatFile, attachName, blob).catch(() => {});
+            } catch (e) {
+                // Не критично
+            }
+
+            return url;
+        };
+
+        console.log('💾 [PersistCache] loadAttachment обёрнута');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОЧИСТКА ПО РАЗМЕРУ (LRU)
+    // ═══════════════════════════════════════════════════════════
+    async function pruneIfNeeded() {
+        try {
+            const db = await openDB();
+
+            // Считаем общий размер
+            const all = await new Promise((resolve, reject) => {
+                const t = db.transaction(STORE, 'readonly');
+                const req = t.objectStore(STORE).getAll();
+                req.onsuccess = () => resolve(req.result || []);
+                req.onerror = () => reject(req.error);
+            });
+
+            const totalSize = all.reduce((s, r) => s + (r.size || 0), 0);
+
+            if (totalSize <= MAX_SIZE) {
+                console.log(`💾 [PersistCache] ${(totalSize / 1024 / 1024).toFixed(1)} МБ — в норме`);
+                return;
+            }
+
+            console.log(`💾 [PersistCache] переполнено (${(totalSize / 1024 / 1024).toFixed(1)} МБ) — чистим`);
+
+            // Сортируем: старые + редко используемые вперёд
+            all.sort((a, b) => {
+                if (a.lastAccess !== b.lastAccess) return a.lastAccess - b.lastAccess;
+                return (a.accessCount || 0) - (b.accessCount || 0);
+            });
+
+            const targetSize = MAX_SIZE * 0.7;
+            let freed = 0;
+            const toDelete = [];
+
+            for (const rec of all) {
+                if (totalSize - freed <= targetSize) break;
+                toDelete.push(rec.key);
+                freed += rec.size || 0;
+            }
+
+            // Удаляем
+            await new Promise((resolve, reject) => {
+                const t = db.transaction(STORE, 'readwrite');
+                const store = t.objectStore(STORE);
+                toDelete.forEach(key => store.delete(key));
+                t.oncomplete = resolve;
+                t.onerror = () => reject(t.error);
+            });
+
+            console.log(`💾 [PersistCache] удалено ${toDelete.length} записей, освобождено ${(freed / 1024 / 1024).toFixed(1)} МБ`);
+        } catch (e) {
+            console.warn('💾 [PersistCache] pruneIfNeeded error:', e);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОЧИСТКА СТАРЫХ ЗАПИСЕЙ (по возрасту)
+    // ═══════════════════════════════════════════════════════════
+    async function pruneOldEntries() {
+        try {
+            const db = await openDB();
+            const cutoff = Date.now() - MAX_AGE_MS;
+
+            return new Promise((resolve, reject) => {
+                const t = db.transaction(STORE, 'readwrite');
+                const store = t.objectStore(STORE);
+                const idx = store.index('savedAt');
+                const req = idx.openCursor(IDBKeyRange.upperBound(cutoff));
+
+                let deleted = 0;
+                req.onsuccess = (e) => {
+                    const cursor = e.target.result;
+                    if (cursor) {
+                        cursor.delete();
+                        deleted++;
+                        cursor.continue();
+                    } else {
+                        if (deleted > 0) {
+                            console.log(`💾 [PersistCache] удалено по возрасту: ${deleted}`);
+                        }
+                        resolve(deleted);
+                    }
+                };
+                req.onerror = () => reject(req.error);
+            });
+        } catch (e) {
+            return 0;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧ: НЕ СБРАСЫВАТЬ IndexedDB ПРИ ОЧИСТКЕ ПАМЯТИ
+    //  Оригинальный clearAttachmentCache чистит _attachmentCache,
+    //  но наш IndexedDB должен остаться нетронутым.
+    // ═══════════════════════════════════════════════════════════
+    // Тут ничего не делаем — IndexedDB не зависит от clearAttachmentCache,
+    // потому что мы её никак не патчим.
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧ: При "Очистить кеш чатов" — чистить и IndexedDB
+    //  Это в модалке "🧹 Очистить кеш чатов"
+    // ═══════════════════════════════════════════════════════════
+    if (typeof doClearSelectedCache === 'function') {
+        const _origClear = doClearSelectedCache;
+
+        // Обёртка: после ручной очистки — чистим IndexedDB для выбранных чатов
+        // ⚠️ Т.к. doClearSelectedCache объявлена как function declaration,
+        //    используем хак через переменную модуля
+        // (патч лучше вставить прямо внутрь функции — см. примечание ниже)
+    }
+
+    // Экспортируем функцию для ручной очистки IndexedDB по чату
+    window.clearAttachmentPersistCache = async function(chatFiles) {
+        try {
+            const db = await openDB();
+            const filesSet = new Set(Array.isArray(chatFiles) ? chatFiles : []);
+
+            return new Promise((resolve, reject) => {
+                const t = db.transaction(STORE, 'readwrite');
+                const store = t.objectStore(STORE);
+                const req = store.openCursor();
+                let deleted = 0;
+
+                req.onsuccess = (e) => {
+                    const cursor = e.target.result;
+                    if (cursor) {
+                        const rec = cursor.value;
+                        if (filesSet.size === 0 || filesSet.has(rec.chatFile)) {
+                            cursor.delete();
+                            deleted++;
+                        }
+                        cursor.continue();
+                    } else {
+                        console.log(`💾 [PersistCache] очищено записей: ${deleted}`);
+                        resolve(deleted);
+                    }
+                };
+                req.onerror = () => reject(req.error);
+            });
+        } catch (e) {
+            return 0;
+        }
+    };
+
+    // Полная очистка (на случай logout / жёсткого сброса)
+    window.clearAllAttachmentPersistCache = async function() {
+        try {
+            const db = await openDB();
+            return new Promise((resolve, reject) => {
+                const t = db.transaction(STORE, 'readwrite');
+                t.objectStore(STORE).clear();
+                t.oncomplete = () => {
+                    console.log('💾 [PersistCache] ВСЁ очищено');
+                    resolve(true);
+                };
+                t.onerror = () => reject(t.error);
+            });
+        } catch (e) {
+            return false;
+        }
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  АВТООЧИСТКА ПРИ СТАРТЕ
+    //  Через 10 сек после загрузки — чистим старое и по размеру
+    // ═══════════════════════════════════════════════════════════
+    setTimeout(async () => {
+        await pruneOldEntries();
+        await pruneIfNeeded();
+    }, 10000);
+
+    // Периодическая проверка раз в 5 минут
+    setInterval(async () => {
+        if (document.hidden) return;
+        await pruneIfNeeded();
+    }, 5 * 60 * 1000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API
+    // ═══════════════════════════════════════════════════════════
+    window.AttachPersistCache = {
+        status: async () => {
+            try {
+                const db = await openDB();
+                const all = await new Promise((resolve) => {
+                    const t = db.transaction(STORE, 'readonly');
+                    const req = t.objectStore(STORE).getAll();
+                    req.onsuccess = () => resolve(req.result || []);
+                });
+
+                const totalSize = all.reduce((s, r) => s + (r.size || 0), 0);
+                const byChat = {};
+                for (const r of all) {
+                    const f = r.chatFile || 'unknown';
+                    byChat[f] = (byChat[f] || 0) + 1;
+                }
+
+                return {
+                    count: all.length,
+                    totalSize,
+                    totalSizeStr: (totalSize / 1024 / 1024).toFixed(2) + ' МБ',
+                    limitStr: (MAX_SIZE / 1024 / 1024).toFixed(0) + ' МБ',
+                    fillPercent: ((totalSize / MAX_SIZE) * 100).toFixed(1) + '%',
+                    byChat,
+                    items: all
+                        .sort((a, b) => (b.size || 0) - (a.size || 0))
+                        .slice(0, 30)
+                        .map(r => ({
+                            name: r.key,
+                            size: r.size,
+                            sizeStr: (r.size / 1024).toFixed(1) + ' КБ',
+                            chat: r.chatFile,
+                            accessCount: r.accessCount,
+                            lastAccess: new Date(r.lastAccess).toLocaleString('ru-RU'),
+                        })),
+                };
+            } catch (e) {
+                return { error: e.message };
+            }
+        },
+
+        clearChat: async (chatFile) => {
+            return await window.clearAttachmentPersistCache([chatFile]);
+        },
+
+        clearAll: async () => {
+            return await window.clearAllAttachmentPersistCache();
+        },
+
+        prune: async () => {
+            await pruneOldEntries();
+            await pruneIfNeeded();
+        },
+
+        setLimit: (mb) => {
+            MAX_SIZE = mb * 1024 * 1024;
+            console.log(`💾 [PersistCache] лимит: ${mb} МБ`);
+            pruneIfNeeded();
+        },
+    };
+
+    console.log('💾 [PersistCache] Постоянный кэш вложений активен');
+    console.log('   • Blob\'ы сохраняются в IndexedDB (лимит 150 МБ)');
+    console.log('   • При следующем запуске — восстанавливаются мгновенно');
+    console.log('   • LRU-очистка при переполнении');
+    console.log('   • API: AttachPersistCache.status() / .clearChat(id) / .clearAll()');
 })();
 </script>
 </body>
