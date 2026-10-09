@@ -3432,12 +3432,15 @@ body.player-active .messages-container { padding-bottom: 68px; }
     <div class="ucm-item" data-action="export">
         <span class="ucm-icon">💾</span>
         <span class="ucm-label">Экспорт профиля</span>
-    </div>
-    <div class="ucm-item" data-action="import">
+    </div>    <div class="ucm-item" data-action="import">
         <span class="ucm-icon">📥</span>
         <span class="ucm-label">Импорт профиля</span>
     </div>
     <div class="ucm-divider"></div>
+    <div class="ucm-item" data-action="clear-cache">
+        <span class="ucm-icon">🧹</span>
+        <span class="ucm-label">Очистить кеш чатов</span>
+    </div>
 </div>
 
 
@@ -3724,10 +3727,45 @@ body.player-active .messages-container { padding-bottom: 68px; }
             <input type="checkbox" id="importReplaceMode"
                    style="width:18px;height:18px;accent-color:#6c5ce7;cursor:pointer;margin:0;">
             <span>Заменить текущий список (иначе — объединить)</span>
-        </label>
-        <div class="modal-actions">
+        </label>        <div class="modal-actions">
             <button class="btn btn-secondary" id="cancelImportBtn">Отмена</button>
             <button class="btn" id="confirmImportBtn" disabled>📥 Импортировать</button>
+        </div>
+    </div>
+</div>
+
+<!-- ═══════════ МОДАЛКА ОЧИСТКИ КЕША ═══════════ -->
+<div class="image-modal" id="clearCacheModal">
+    <div class="form-modal-content" style="max-width:460px;">
+        <h2>🧹 Очистка кеша</h2>
+        <div class="file-preview" style="color:#aaa;margin-bottom:14px;line-height:1.6;">
+            Выберите чаты, кеш которых нужно очистить. Вложения загрузятся заново при следующем открытии.
+        </div>
+        <div style="display:flex;gap:8px;margin-bottom:12px;">
+            <button class="btn btn-secondary" id="cacheSelectAllBtn" style="flex:1;font-size:13px;padding:10px;">
+                ✅ Выбрать все
+            </button>
+            <button class="btn btn-secondary" id="cacheSelectNoneBtn" style="flex:1;font-size:13px;padding:10px;">
+                ⬜ Снять все
+            </button>
+        </div>
+        <div id="cacheChatsList" style="
+            max-height: 320px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            margin-bottom: 16px;
+            padding-right: 4px;
+        "></div>
+        <div style="font-size:12px;color:#888;margin-bottom:14px;text-align:center;" id="cacheSummary">
+            Выбрано: 0
+        </div>
+        <div class="modal-actions">
+            <button class="btn btn-secondary" id="cancelClearCacheBtn">Отмена</button>
+            <button class="btn" id="confirmClearCacheBtn" style="background:linear-gradient(135deg,#ff6b6b,#ee5253);">
+                🧹 Очистить
+            </button>
         </div>
     </div>
 </div>
@@ -11483,7 +11521,6 @@ function backToChats() {
         try { audioPlayers[id].audio.pause(); } catch (e) {}
         delete audioPlayers[id];
     });
-    clearAttachmentCache();
     resetHistoryState();
     state.messages = []; state.sha = null; state.lastMessageCount = 0;
     state._lastSentMessageId = null;
@@ -12045,15 +12082,12 @@ async function restoreSession() {
         const trigger = (id) => {
             const btn = document.getElementById(id);
             if (btn) btn.click();
-        };
-
-
-        switch (action) {
+        };        switch (action) {
     case 'create-chat': trigger('createChatBtn'); break;
     case 'join-chat':   trigger('joinChatBtn');   break;
     case 'export':      trigger('exportProfileBtn'); break;
     case 'import':      trigger('importProfileBtn'); break;
-    
+    case 'clear-cache': openClearCacheModal();     break;
 }
     });
 
@@ -27452,14 +27486,632 @@ markUnseen: (eventOrKey) => {
             lastIds: Object.fromEntries(_knownLastIds),
         }),
         forceReset: hardReset,
-    };
-
-    console.log('🔴 [BackBadge v2] Бейдж непрочитанных на «Назад» активен');
+    };    console.log('🔴 [BackBadge v2] Бейдж непрочитанных на «Назад» активен');
     console.log(`   • Опрос чужих чатов раз в ${POLL_INTERVAL_MS / 1000} сек`);
     console.log('   • Первичный замер без инкремента');
     console.log('   • Реагирует на возврат приложения из фона');
     console.log('   • API: BackButtonBadge.status() / .check() / .reset()');
 })();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🧹 РУЧНАЯ ОЧИСТКА КЕША ЧАТОВ С ВЫБОРОМ
+// ═══════════════════════════════════════════════════════════════
+
+const _cacheCounts = new Map();
+const _selectedCacheFiles = new Set();
+let _cacheModalBound = false;
+
+function openClearCacheModal() {
+    if (state.chats.length === 0) {
+        showToast('📭 Нет чатов для очистки', 1800);
+        return;
+    }
+    _selectedCacheFiles.clear();
+    renderCacheChatsList();
+    updateCacheSummary();
+    $('clearCacheModal').classList.add('active');
+
+    if (!_cacheModalBound) {
+        bindCacheModalEvents();
+        _cacheModalBound = true;
+    }
+    setTimeout(enrichCacheCounts, 100);
+}
+
+async function enrichCacheCounts() {
+    if (typeof OfflineCache === 'undefined' || !OfflineCache.listCached) return;
+    try {
+        const list = await OfflineCache.listCached();
+        _cacheCounts.clear();
+        for (const item of list) {
+            _cacheCounts.set(item.file, item.messageCount || 0);
+        }
+        if ($('clearCacheModal').classList.contains('active')) {
+            renderCacheChatsList();
+        }
+    } catch (e) {
+        console.warn('enrichCacheCounts failed:', e);
+    }
+}
+
+function renderCacheChatsList() {
+    const list = $('cacheChatsList');
+    if (!list) return;
+
+    if (!document.getElementById('cacheListStyles')) {
+        const style = document.createElement('style');
+        style.id = 'cacheListStyles';
+        style.textContent = `
+            .cache-chat-item {
+                display: flex; align-items: center; gap: 10px;
+                padding: 10px 12px;
+                background: rgba(255,255,255,0.04);
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 12px;
+                cursor: pointer;
+                transition: all 0.15s;
+                user-select: none;
+                -webkit-tap-highlight-color: transparent;
+            }
+            .cache-chat-item:hover { background: rgba(255,255,255,0.08); }
+            .cache-chat-item.selected {
+                background: rgba(108,92,231,0.15);
+                border-color: rgba(108,92,231,0.5);
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    const sorted = state.chats.slice().sort((a, b) => {
+        const na = (a.name || a.file).toLowerCase();
+        const nb = (b.name || b.file).toLowerCase();
+        return na.localeCompare(nb);
+    });
+
+    list.innerHTML = sorted.map(chat => {
+        const isCurrent = chat.file === state.chatFile;
+        const cachedCount = _cacheCounts.get(chat.file) || 0;
+        const letter = (chat.name || chat.file).charAt(0).toUpperCase();
+        const avatarData = typeof getChatAvatar === 'function' ? getChatAvatar(chat.file) : null;
+        const avatarHtml = avatarData
+            ? `<img src="${avatarData}" style="width:100%;height:100%;object-fit:cover;">`
+            : letter;
+        const isChecked = _selectedCacheFiles.has(chat.file);
+
+        return `
+            <label class="cache-chat-item ${isChecked ? 'selected' : ''}" data-file="${chat.file}">
+                <input type="checkbox" class="cache-chat-cb"
+                       data-file="${chat.file}"
+                       ${isChecked ? 'checked' : ''}
+                       style="width:18px;height:18px;accent-color:#6c5ce7;cursor:pointer;flex-shrink:0;">
+                <div style="
+                    width:36px;height:36px;border-radius:50%;
+                    background:linear-gradient(135deg,#6c5ce7,#00b894);
+                    display:flex;align-items:center;justify-content:center;
+                    font-weight:700;color:#fff;flex-shrink:0;font-size:14px;
+                    overflow:hidden;
+                ">${avatarHtml}</div>
+                <div style="flex:1;min-width:0;">
+                    <div style="font-size:14px;font-weight:600;color:#fff;
+                                white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+                        ${escapeHtml(chat.name || chat.file)}
+                        ${isCurrent ? '<span style="color:#feca57;font-size:11px;"> · текущий</span>' : ''}
+                    </div>
+                    <div style="font-size:11px;color:#888;margin-top:2px;
+                                white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+                        ${escapeHtml(chat.file)}
+                        ${cachedCount > 0
+                            ? ` · <span style="color:#00b894;">${cachedCount} сообщ. в кеше</span>`
+                            : ' · <span style="color:#666;">кеш пуст</span>'}
+                    </div>
+                </div>
+            </label>
+        `;
+    }).join('');
+
+    list.querySelectorAll('.cache-chat-item').forEach(item => {
+        const cb = item.querySelector('.cache-chat-cb');
+        const file = item.dataset.file;
+
+        item.addEventListener('click', (e) => {
+            if (e.target.tagName === 'INPUT') return;
+            cb.checked = !cb.checked;
+            cb.dispatchEvent(new Event('change'));
+        });
+
+        cb.addEventListener('change', () => {
+            if (cb.checked) {
+                _selectedCacheFiles.add(file);
+                item.classList.add('selected');
+            } else {
+                _selectedCacheFiles.delete(file);
+                item.classList.remove('selected');
+            }
+            updateCacheSummary();
+            soundManager.play('click');
+        });
+    });
+}
+
+function updateCacheSummary() {
+    const summary = $('cacheSummary');
+    if (!summary) return;
+    const n = _selectedCacheFiles.size;
+    if (n === 0) {
+        summary.textContent = 'Выбрано: 0';
+        summary.style.color = '#888';
+    } else {
+        summary.textContent = `Выбрано: ${n} ${pluralizeCache(n, 'чат', 'чата', 'чатов')}`;
+        summary.style.color = '#a78bfa';
+    }
+}
+
+function pluralizeCache(n, one, two, five) {
+    const mod10 = n % 10, mod100 = n % 100;
+    if (mod10 === 1 && mod100 !== 11) return one;
+    if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) return two;
+    return five;
+}
+
+function bindCacheModalEvents() {
+    $('cancelClearCacheBtn').addEventListener('click', () => {
+        $('clearCacheModal').classList.remove('active');
+        _selectedCacheFiles.clear();
+    });
+
+    $('cacheSelectAllBtn').addEventListener('click', () => {
+        _selectedCacheFiles.clear();
+        state.chats.forEach(c => _selectedCacheFiles.add(c.file));
+        renderCacheChatsList();
+        updateCacheSummary();
+        soundManager.play('click');
+    });
+
+    $('cacheSelectNoneBtn').addEventListener('click', () => {
+        _selectedCacheFiles.clear();
+        renderCacheChatsList();
+        updateCacheSummary();
+        soundManager.play('click');
+    });
+
+    $('confirmClearCacheBtn').addEventListener('click', doClearSelectedCache);
+
+    $('clearCacheModal').addEventListener('click', (e) => {
+        if (e.target === $('clearCacheModal')) {
+            $('clearCacheModal').classList.remove('active');
+            _selectedCacheFiles.clear();
+        }
+    });
+}
+
+async function doClearSelectedCache() {
+    if (_selectedCacheFiles.size === 0) {
+        showToast('❌ Ничего не выбрано', 1500);
+        return;
+    }
+
+    const count = _selectedCacheFiles.size;
+    const ok = confirm(
+        `Очистить кеш для ${count} ${pluralizeCache(count, 'чата', 'чатов', 'чатов')}?\n\n` +
+        `Вложения и история загрузятся заново при следующем открытии.`
+    );
+    if (!ok) return;
+
+    const btn = $('confirmClearCacheBtn');
+    btn.disabled = true;
+    btn.textContent = '⏳ Очистка…';
+
+    const files = Array.from(_selectedCacheFiles);
+    let clearedBlobs = 0;
+    let clearedChats = 0;
+
+    const protectedUrls = new Set();
+    if (typeof GlobalPlayer !== 'undefined' && GlobalPlayer.queue) {
+        for (const track of GlobalPlayer.queue) {
+            if (track.src) protectedUrls.add(track.src);
+            if (track.coverUrl) protectedUrls.add(track.coverUrl);
+        }
+    }
+    if (typeof GlobalPlayer !== 'undefined' && GlobalPlayer.audioEl?.src) {
+        protectedUrls.add(GlobalPlayer.audioEl.src);
+    }
+
+    const attachNamesToClear = new Set();
+    if (typeof OfflineCache !== 'undefined' && OfflineCache.getChat) {
+        for (const file of files) {
+            try {
+                const cached = await OfflineCache.getChat(file);
+                if (cached && Array.isArray(cached.messages)) {
+                    for (const msg of cached.messages) {
+                        if (msg.image) attachNamesToClear.add(msg.image);
+                        if (msg.audio) attachNamesToClear.add(msg.audio);
+                        if (msg.file) attachNamesToClear.add(msg.file);
+                        if (msg.video) attachNamesToClear.add(msg.video);
+                        if (msg.videoNote) attachNamesToClear.add(msg.videoNote);
+                        if (msg.audioCover) attachNamesToClear.add(msg.audioCover);
+                    }
+                }
+            } catch (e) {
+                console.warn('getChat failed for', file, e);
+            }
+        }
+    }
+
+    if (typeof _attachmentCache !== 'undefined') {
+        for (const name of attachNamesToClear) {
+            const url = _attachmentCache.get(name);
+            if (!url) continue;
+            if (protectedUrls.has(url)) continue;
+            try { URL.revokeObjectURL(url); } catch (e) {}
+            _attachmentCache.delete(name);
+            clearedBlobs++;
+        }
+    }
+
+    if (typeof OfflineCache !== 'undefined' && OfflineCache.removeChat) {
+        for (const file of files) {
+            try {
+                await OfflineCache.removeChat(file);
+                _cacheCounts.delete(file);
+                clearedChats++;
+            } catch (e) {
+                console.warn('removeChat failed:', file, e);
+            }
+        }
+    }
+
+    btn.disabled = false;
+    btn.textContent = '🧹 Очистить';
+    $('clearCacheModal').classList.remove('active');
+    _selectedCacheFiles.clear();
+
+    showToast(
+        `🧹 Очищено: ${clearedChats} ${pluralizeCache(clearedChats, 'чат', 'чата', 'чатов')}` +
+        (clearedBlobs > 0 ? ` · ${clearedBlobs} blob` : ''),
+        2500
+    );
+    soundManager.play('delete');
+}
+
+console.log('🧹 Модалка очистки кеша активна');
 </script>
+<script>
+(function installAttachmentCachePersistPatch() {
+    'use strict';
+
+    // ═══════════════════════════════════════════════════════════
+    //  КОНФИГ
+    // ═══════════════════════════════════════════════════════════
+    const CFG = {
+        maxCacheSize: 100 * 1024 * 1024,   // 100 МБ — лимит кэша
+        targetRatio: 0.7,                   // чистим до 70% при переполнении
+        logEnabled: true,
+    };
+
+    const log = (...a) => CFG.logEnabled && console.log('📦 [AttachCache]', ...a);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПРОВЕРКА: наши зависимости на месте?
+    // ═══════════════════════════════════════════════════════════
+    if (typeof _attachmentCache === 'undefined') {
+        console.error('📦 [AttachCache] _attachmentCache не найден — патч не установлен');
+        return;
+    }
+    if (typeof _pendingAttachmentLoads === 'undefined') {
+        console.error('📦 [AttachCache] _pendingAttachmentLoads не найден');
+        return;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ДОБАВЛЯЕМ ТРЕКЕРЫ (если их ещё нет)
+    // ═══════════════════════════════════════════════════════════
+    if (typeof window._attachmentSizes === 'undefined') {
+        window._attachmentSizes = new Map();       // name → размер (байты)
+    }
+    if (typeof window._attachmentLastAccess === 'undefined') {
+        window._attachmentLastAccess = new Map();  // name → timestamp
+    }
+    if (typeof window._attachmentAccessCount === 'undefined') {
+        window._attachmentAccessCount = new Map(); // name → сколько раз читали
+    }
+
+    const sizes = window._attachmentSizes;
+    const lastAccess = window._attachmentLastAccess;
+    const accessCount = window._attachmentAccessCount;
+
+    // ═══════════════════════════════════════════════════════════
+    //  СБОР ЗАЩИЩЁННЫХ URL (плеер + DOM)
+    // ═══════════════════════════════════════════════════════════
+    function collectProtectedUrls() {
+        const protectedUrls = new Set();
+
+        // Глобальный плеер — защищаем ВСЁ, что сейчас в очереди
+        try {
+            if (typeof GlobalPlayer !== 'undefined') {
+                const q = GlobalPlayer.queue;
+                if (Array.isArray(q)) {
+                    for (const track of q) {
+                        if (track && track.src) protectedUrls.add(track.src);
+                        if (track && track.coverUrl) protectedUrls.add(track.coverUrl);
+                    }
+                }
+                if (GlobalPlayer.audioEl && GlobalPlayer.audioEl.src) {
+                    protectedUrls.add(GlobalPlayer.audioEl.src);
+                }
+            }
+        } catch (e) {}
+
+        // Всё, что видно в DOM сейчас — защищаем
+        try {
+            if (typeof messagesInner !== 'undefined' && messagesInner) {
+                messagesInner.querySelectorAll('img[src^="blob:"], audio[src^="blob:"], video[src^="blob:"]')
+                    .forEach(el => {
+                        if (el.src) protectedUrls.add(el.src);
+                    });
+            }
+            // Также глобальный плеер и мини-плеер
+            document.querySelectorAll('#globalPlayerBar img[src^="blob:"], .audio-cover img[src^="blob:"]')
+                .forEach(el => {
+                    if (el.src) protectedUrls.add(el.src);
+                });
+        } catch (e) {}
+
+        return protectedUrls;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОПРЕДЕЛЯЕМ РАЗМЕР BLOB ПО URL
+    // ═══════════════════════════════════════════════════════════
+    async function getBlobSize(url) {
+        try {
+            const res = await fetch(url);
+            const blob = await res.blob();
+            return blob.size;
+        } catch (e) {
+            return 0;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  LRU-ОЧИСТКА (заменяет логику clearAttachmentCache)
+    // ═══════════════════════════════════════════════════════════
+    function smartClear() {
+        const protectedUrls = collectProtectedUrls();
+
+        let totalSize = 0;
+        const entries = [];
+
+        _attachmentCache.forEach((url, name) => {
+            const size = sizes.get(name) || 0;
+            const la = lastAccess.get(name) || 0;
+            const ac = accessCount.get(name) || 0;
+            totalSize += size;
+            entries.push({ name, url, size, la, ac, protected: protectedUrls.has(url) });
+        });
+
+        // ✅ Кэш в пределах лимита — ничего не делаем
+        if (totalSize <= CFG.maxCacheSize) {
+            log(`размер ${(totalSize / 1024 / 1024).toFixed(1)} МБ — в пределах лимита (${(CFG.maxCacheSize / 1024 / 1024).toFixed(0)} МБ), сохраняем всё`);
+            _pendingAttachmentLoads.clear();
+            return;
+        }
+
+        // ⚠️ Переполнен — чистим LRU
+        log(`переполнен: ${(totalSize / 1024 / 1024).toFixed(1)} МБ > ${(CFG.maxCacheSize / 1024 / 1024).toFixed(0)} МБ — очищаем`);
+
+        // Сортируем: старые по доступу вперёд (LRU)
+        // Вторичный критерий — меньше использований
+        entries.sort((a, b) => {
+            if (a.protected !== b.protected) return a.protected ? 1 : -1;
+            if (a.la !== b.la) return a.la - b.la;
+            return a.ac - b.ac;
+        });
+
+        const targetSize = CFG.maxCacheSize * CFG.targetRatio;
+        let freedSize = 0;
+        let removedCount = 0;
+
+        for (const entry of entries) {
+            if (totalSize - freedSize <= targetSize) break;
+            if (entry.protected) continue;
+
+            try {
+                URL.revokeObjectURL(entry.url);
+            } catch (e) {}
+
+            _attachmentCache.delete(entry.name);
+            sizes.delete(entry.name);
+            lastAccess.delete(entry.name);
+            accessCount.delete(entry.name);
+
+            freedSize += entry.size;
+            removedCount++;
+        }
+
+        log(`освобождено ${(freedSize / 1024 / 1024).toFixed(1)} МБ, удалено ${removedCount} вложений`);
+        _pendingAttachmentLoads.clear();
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПРОВЕРКА ЛИМИТА ПОСЛЕ ДОБАВЛЕНИЯ
+    // ═══════════════════════════════════════════════════════════
+    function checkLimitAndClean() {
+        let totalSize = 0;
+        _attachmentCache.forEach((_, name) => {
+            totalSize += sizes.get(name) || 0;
+        });
+        if (totalSize > CFG.maxCacheSize) {
+            // Асинхронно, чтобы не блокировать загрузку
+            setTimeout(smartClear, 0);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПОДМЕНЯЕМ clearAttachmentCache
+    //  (эту функцию вызывают enterChat и backToChats)
+    // ═══════════════════════════════════════════════════════════
+    // ⚠️ Важно: clearAttachmentCache объявлена как function declaration
+    // в основном скрипте. Через window её не перезаписать напрямую,
+    // но мы можем ПЕРЕОПРЕДЕЛИТЬ её глобально — браузер всё равно
+    // вызовет по имени, а имя резолвится в window.
+    try {
+        window.clearAttachmentCache = smartClear;
+        log('подменена функция clearAttachmentCache');
+    } catch (e) {
+        console.warn('📦 [AttachCache] не удалось подменить clearAttachmentCache:', e);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПОДМЕНЯЕМ loadAttachment — добавляем трекинг
+    // ═══════════════════════════════════════════════════════════
+    if (typeof window.loadAttachment === 'function') {
+        const _origLoadAttachment = window.loadAttachment;
+
+        window.loadAttachment = async function(chatFile, attachName) {
+            // Отмечаем доступ
+            lastAccess.set(attachName, Date.now());
+            accessCount.set(attachName, (accessCount.get(attachName) || 0) + 1);
+
+            const result = await _origLoadAttachment.call(this, chatFile, attachName);
+
+            // После загрузки — если размер ещё не знаем, определим
+            if (result && !sizes.has(attachName)) {
+                // Асинхронно, не блокируем возврат
+                getBlobSize(result).then(size => {
+                    if (size > 0) {
+                        sizes.set(attachName, size);
+                        checkLimitAndClean();
+                    }
+                }).catch(() => {});
+            }
+
+            return result;
+        };
+
+        log('обёрнута функция loadAttachment (трекинг размера и доступа)');
+    } else {
+        console.warn('📦 [AttachCache] loadAttachment не найдена');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПОДМЕНЯЕМ loadAttachmentsIn — обновляем время доступа
+    //  для всех загруженных вложений после рендера
+    // ═══════════════════════════════════════════════════════════
+    if (typeof window.loadAttachmentsIn === 'function') {
+        const _origLoadAttachmentsIn = window.loadAttachmentsIn;
+
+        window.loadAttachmentsIn = async function(root) {
+            const result = await _origLoadAttachmentsIn.call(this, root);
+
+            // Помечаем все вложения в DOM как «только что использованные»
+            if (root && root.querySelectorAll) {
+                const now = Date.now();
+                root.querySelectorAll('[data-attach][data-loaded]').forEach(el => {
+                    const name = el.dataset.attach;
+                    if (name && _attachmentCache.has(name)) {
+                        lastAccess.set(name, now);
+                        accessCount.set(name, (accessCount.get(name) || 0) + 1);
+                    }
+                });
+            }
+            return result;
+        };
+
+        log('обёрнута функция loadAttachmentsIn (обновление доступа)');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРИОДИЧЕСКАЯ ПРОВЕРКА ЛИМИТА
+    //  (раз в 2 минуты, чтобы точно не разрослось)
+    // ═══════════════════════════════════════════════════════════
+    setInterval(() => {
+        let totalSize = 0;
+        _attachmentCache.forEach((_, name) => {
+            totalSize += sizes.get(name) || 0;
+        });
+        if (totalSize > CFG.maxCacheSize) {
+            log(`периодическая проверка: ${(totalSize / 1024 / 1024).toFixed(1)} МБ — чистим`);
+            smartClear();
+        }
+    }, 120000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API ДЛЯ ОТЛАДКИ
+    // ═══════════════════════════════════════════════════════════
+    window.AttachmentCache = {
+        status: () => {
+            let totalSize = 0;
+            const items = [];
+            _attachmentCache.forEach((url, name) => {
+                const size = sizes.get(name) || 0;
+                totalSize += size;
+                items.push({
+                    name,
+                    size,
+                    sizeStr: (size / 1024).toFixed(1) + ' КБ',
+                    lastAccess: lastAccess.get(name) || 0,
+                    accessCount: accessCount.get(name) || 0,
+                });
+            });
+
+            items.sort((a, b) => b.size - a.size);
+
+            return {
+                count: _attachmentCache.size,
+                totalSize,
+                totalSizeStr: (totalSize / 1024 / 1024).toFixed(2) + ' МБ',
+                limitStr: (CFG.maxCacheSize / 1024 / 1024).toFixed(0) + ' МБ',
+                fillPercent: ((totalSize / CFG.maxCacheSize) * 100).toFixed(1) + '%',
+                items: items.slice(0, 30), // топ-30 самых тяжёлых
+            };
+        },
+
+        clear: () => {
+            log('ручная очистка всего кэша');
+            _attachmentCache.forEach(url => {
+                try { URL.revokeObjectURL(url); } catch (e) {}
+            });
+            _attachmentCache.clear();
+            sizes.clear();
+            lastAccess.clear();
+            accessCount.clear();
+            _pendingAttachmentLoads.clear();
+        },
+
+        clearLRU: () => {
+            log('ручная LRU-очистка');
+            smartClear();
+        },
+
+        setLimit: (mb) => {
+            CFG.maxCacheSize = mb * 1024 * 1024;
+            log(`лимит изменён на ${mb} МБ`);
+            checkLimitAndClean();
+        },
+
+        // Кто сейчас защищён от удаления?
+        protected: () => {
+            return Array.from(collectProtectedUrls());
+        },
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ГОТОВО
+    // ═══════════════════════════════════════════════════════════
+    log('✅ Патч установлен');
+    log(`   Лимит кэша: ${(CFG.maxCacheSize / 1024 / 1024).toFixed(0)} МБ`);
+    log(`   Всё, что ниже лимита — сохраняется между чатами`);
+    log(`   При переполнении удаляются самые старые (LRU)`);
+    log('');
+    log('   API в консоли:');
+    log('     AttachmentCache.status()      — показать содержимое');
+    log('     AttachmentCache.clearLRU()    — принудительная LRU-очистка');
+    log('     AttachmentCache.clear()       — полностью очистить');
+    log('     AttachmentCache.setLimit(200) — изменить лимит на 200 МБ');
+    log('     AttachmentCache.protected()   — что сейчас защищено от удаления');
+})();
+</script>
+
 </body>
 </html>
