@@ -15467,20 +15467,50 @@ function hide() {
 
 
     async function playTrack(index) {
-    if (index < 0 || index >= queue.length) return false;
-    buildUI();
-    const track = queue[index];
-    if (!track) return false;              // 🆕 защита от undefined
-    if (!track.src) {                      // 🆕 защита от битого blob:URL
-        console.warn('Track has no src:', track);
+if (index < 0 || index >= queue.length) return false;
+buildUI();
+const track = queue[index];
+if (!track) return false;
+
+// 🆕 Если src ещё не загружен — грузим его прямо здесь
+if (!track.src) {
+    try {
+        const bar = document.getElementById('globalPlayerBar');
+        if (bar) bar.classList.add('loading');
+        const loadTxt = document.getElementById('gpLoadingText');
+        if (loadTxt) loadTxt.textContent = 'Загрузка трека…';
+
+        track.src = await loadAttachment(
+            track._chatFile || state.chatFile,
+            track._msg.audio
+        );
+
+        // Обложку догрузим в фоне (не блокируя)
+        if (track._coverName && !track.coverUrl) {
+            loadAttachment(track._chatFile || state.chatFile, track._coverName)
+                .then(url => { track.coverUrl = url; })
+                .catch(() => {});
+        }
+    } catch (e) {
+        console.warn('Track load failed:', track.id, e);
+        // Пропускаем битый трек — идём к следующему
+        const nextIdx = index + (direction || 1);
+        if (nextIdx >= 0 && nextIdx < queue.length) {
+            return playTrack(nextIdx);
+        }
         return false;
     }
-    currentIndex = index;
-    currentMsgId = track.id;
 
-    audio.src = track.src;
-    renderMeta();
-    show();
+    const bar = document.getElementById('globalPlayerBar');
+    if (bar) bar.classList.remove('loading');
+}
+
+currentIndex = index;
+currentMsgId = track.id;
+
+audio.src = track.src;
+renderMeta();
+show();
 
     // 🆕 Media Session API — управление с локскрина телефона
 if ('mediaSession' in navigator) {
@@ -15638,58 +15668,61 @@ function buildAudioQueueFromHistory() {
 }
 
 // ═══ Запуск плейлиста из текущего чата, начиная с msgId ═══
+// 🆕 v2: сначала грузим ТОЛЬКО выбранный трек → сразу играем.
+//         Остальные — в фоне.
 
 async function playAudioFromMessage(msgId) {
     const queue = buildAudioQueueFromHistory();
     if (queue.length === 0) return;
 
-
     const startIndex = queue.findIndex(x => String(x.id) === String(msgId));
     if (startIndex === -1) return;
 
-
-    // 🆕 Фиксируем чат-источник — даже если пользователь выйдет из чата,
-    //     обложки всё равно загрузятся из правильного места
     const sourceChatFile = queue[0]._chatFile || state.chatFile;
 
-
-    const load = async (idx) => {
-        if (idx < 0 || idx >= queue.length) return;
-        const item = queue[idx];
-
-
-        // Аудио
+    // Загрузка одного трека (audio + обложка в фоне)
+    const loadOne = async (item) => {
+        if (!item) return false;
         if (!item.src) {
             try {
                 item.src = await loadAttachment(sourceChatFile, item._msg.audio);
             } catch (e) {
                 console.warn('failed to load audio', item.id, e);
                 item.src = null;
+                return false;
             }
         }
-
-
-        // 🆕 Обложка — через sourceChatFile, а не state.chatFile
+        // Обложку грузим НЕ блокируя
         if (item._coverName && !item.coverUrl) {
-            try {
-                item.coverUrl = await loadAttachment(sourceChatFile, item._coverName);
-            } catch (e) {
-                console.warn('failed to load cover', item.id, e);
-            }
+            loadAttachment(sourceChatFile, item._coverName)
+                .then(url => { item.coverUrl = url; })
+                .catch(() => {});
         }
+        return !!item.src;
     };
 
-
-    await Promise.all(queue.map((_, i) => load(i)));
-
-
-    const playable = queue.filter(x => x.src);
-    if (playable.length === 0) {
+    // 1) Сначала — только стартовый трек
+    const startItem = queue[startIndex];
+    const ok = await loadOne(startItem);
+    if (!ok) {
         showToast('❌ Не удалось загрузить аудио', 2000);
         return;
     }
-    const realStart = playable.findIndex(x => String(x.id) === String(msgId));
-    GlobalPlayer.playQueue(playable, realStart >= 0 ? realStart : 0, sourceChatFile);
+
+    // 2) Запускаем плеер на всю очередь (остальные с src=null)
+    GlobalPlayer.playQueue(queue, startIndex, sourceChatFile);
+
+    // 3) Фоновая догрузка остальных (по 2 параллельно)
+    (async () => {
+        const PARALLEL = 2;
+        const others = queue
+            .map((item, idx) => ({ item, idx }))
+            .filter(({ idx }) => idx !== startIndex);
+        for (let i = 0; i < others.length; i += PARALLEL) {
+            const batch = others.slice(i, i + PARALLEL);
+            await Promise.all(batch.map(({ item }) => loadOne(item)));
+        }
+    })();
 }
 // ═══ Перехват toggleAudioPlayback — теперь через GlobalPlayer ═══
 
