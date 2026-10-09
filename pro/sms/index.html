@@ -28112,6 +28112,461 @@ console.log('🧹 Модалка очистки кеша активна');
     log('     AttachmentCache.protected()   — что сейчас защищено от удаления');
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🩹 ПАТЧ: МЯГКОЕ ОПРЕДЕЛЕНИЕ СЕТИ
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: одно неудачное API-обращение → сразу "нет сети".
+//  Решение: счётчик последовательных ошибок (3+), большие таймауты,
+//  отдельное понятие "медленно" vs "офлайн".
+// ═══════════════════════════════════════════════════════════════
 
+(function installSoftNetworkDetection() {
+    'use strict';
+
+    // ═══════════════════════════════════════════════════════════
+    //  КОНФИГ
+    // ═══════════════════════════════════════════════════════════
+    const NET_CFG = {
+        // Сколько последовательных ошибок считать "реальным офлайном"
+        failThreshold: 3,
+        // Таймауты (мс)
+        pingTimeout: 25000,           // было ~5000 в checkNetwork
+        uploadTimeout: 120000,        // 2 мин на загрузку больших файлов
+        fetchTimeout: 45000,          // 45 сек на обычные запросы
+        // Интервалы
+        checkIntervalMs: 30000,       // проверка сети раз в 30 сек (было 15)
+        // Сброс счётчика при успехе
+        resetOnSuccess: true,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОСТОЯНИЕ
+    // ═══════════════════════════════════════════════════════════
+    const NetState = {
+        // Последовательные ошибки (успех обнуляет)
+        failStreak: 0,
+        // Успешные запросы подряд
+        successStreak: 0,
+        // Мягкий офлайн — сеть работает, но с перебоями
+        slowMode: false,
+        // Точная дата последней реальной ошибки
+        lastFailTs: 0,
+        // Дата последней успешной проверки
+        lastSuccessTs: Date.now(),
+        // Уже показали тост о потере сети? (чтобы не спамить)
+        offlineToastShown: false,
+        // Активные счётчики для каждого типа запроса
+        byKind: {
+            ping: 0,
+            fetch: 0,
+            upload: 0,
+            poll: 0,
+        },
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОБЁРТКА fetch С ТАЙМАУТОМ И СЧЁТЧИКОМ
+    // ═══════════════════════════════════════════════════════════
+    const _origFetch = window.fetch.bind(window);
+
+    /**
+     * fetch с таймаутом и учётом в NetState.
+     * @param {string} url
+     * @param {object} opts
+     * @param {object} meta — { kind: 'ping' | 'fetch' | 'upload' | 'poll', timeout: ms, silent: bool }
+     */
+    async function softFetch(url, opts = {}, meta = {}) {
+        const kind = meta.kind || 'fetch';
+        const timeout = meta.timeout || NET_CFG.fetchTimeout;
+        const silent = meta.silent === true;
+
+        // Если уже офлайн по navigator — не тратим время
+        if (!navigator.onLine) {
+            recordFailure(kind, 'navigator-offline', silent);
+            throw new TypeError('Failed to fetch (navigator offline)');
+        }
+
+        // Создаём контроллер с таймаутом (если свой не передан)
+        let controller = opts.signal ? null : new AbortController();
+        let timeoutId = null;
+
+        if (controller) {
+            timeoutId = setTimeout(() => controller.abort(new Error('timeout')), timeout);
+            opts = { ...opts, signal: controller.signal };
+        }
+
+        try {
+            const res = await _origFetch(url, opts);
+
+            // HTTP-ответ получен — значит сеть точно есть.
+            // Даже 4xx/5xx — это НЕ ошибка сети.
+            clearTimeout(timeoutId);
+            recordSuccess(kind);
+            return res;
+
+        } catch (err) {
+            clearTimeout(timeoutId);
+
+            // Различаем типы ошибок:
+            //  - AbortError → скорее всего таймаут или явный abort
+            //  - TypeError "Failed to fetch" → реально нет сети / DNS / CORS
+            //  - NetworkError → сеть отвалилась
+            const isAbort = err && err.name === 'AbortError';
+            const isNetError = err && (
+                err.name === 'TypeError' ||
+                err.name === 'NetworkError' ||
+                (err.message && (
+                    err.message.includes('Failed to fetch') ||
+                    err.message.includes('NetworkError') ||
+                    err.message.includes('network')
+                ))
+            );
+
+            if (isAbort) {
+                recordFailure(kind, 'timeout', silent);
+            } else if (isNetError) {
+                recordFailure(kind, 'network', silent);
+            } else {
+                // Что-то другое — не считаем сетевой ошибкой
+            }
+
+            throw err;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  УЧЁТ УСПЕХОВ / ОШИБОК
+    // ═══════════════════════════════════════════════════════════
+    function recordSuccess(kind) {
+        NetState.successStreak++;
+        NetState.lastSuccessTs = Date.now();
+
+        if (NET_CFG.resetOnSuccess) {
+            NetState.failStreak = 0;
+            NetState.byKind[kind] = 0;
+        }
+
+        // Были в "плохом" режиме — восстанавливаемся
+        if (NetState.slowMode) {
+            NetState.slowMode = false;
+            console.log('🌐 [Net] Соединение восстановлено');
+        }
+
+        // Были помечены как офлайн — восстанавливаем
+        if (!networkState.isOnline) {
+            networkState.isOnline = true;
+            console.log('🌐 [Net] networkState.isOnline = true');
+
+            // Если офлайн-баннер был показан — прячем
+            if (typeof OfflineMode !== 'undefined' && OfflineMode.deactivate) {
+                OfflineMode.deactivate();
+            }
+            NetState.offlineToastShown = false;
+
+            // Если открыт чат — перезапускаем поллинг
+            if (state.chatFile && typeof pollUpdates === 'function') {
+                setTimeout(() => {
+                    try { pollUpdates(); } catch (e) {}
+                }, 300);
+            }
+        }
+    }
+
+    function recordFailure(kind, reason, silent) {
+        NetState.byKind[kind] = (NetState.byKind[kind] || 0) + 1;
+        NetState.failStreak++;
+        NetState.lastFailTs = Date.now();
+
+        console.log(`🌐 [Net] fail #${NetState.failStreak} (${kind}, ${reason})`);
+
+        // Порог не достигнут — не объявляем офлайн
+        if (NetState.failStreak < NET_CFG.failThreshold) {
+            // Но если уже 2 ошибки — включаем "медленный режим"
+            if (NetState.failStreak >= 2 && !NetState.slowMode) {
+                NetState.slowMode = true;
+                if (!silent) {
+                    showToastSafe('🐢 Соединение медленное…', 2000);
+                }
+            }
+            return;
+        }
+
+        // ═══ Порог достигнут — считаем офлайном ═══
+        if (networkState.isOnline) {
+            networkState.isOnline = false;
+            console.warn('📵 [Net] networkState.isOnline = false (после', NetState.failStreak, 'ошибок)');
+
+            // Показываем тост ОДИН раз
+            if (!NetState.offlineToastShown) {
+                NetState.offlineToastShown = true;
+                showToastSafe('📵 Соединение потеряно', 2500);
+            }
+
+            // Активируем офлайн-баннер только если это не единичная ошибка
+            if (typeof OfflineMode !== 'undefined' && OfflineMode.activate) {
+                // Но не активируем насильно, если navigator.onLine ещё true —
+                // возможно, это временный сбой GitHub API
+                if (!navigator.onLine) {
+                    OfflineMode.activate('soft-detection');
+                }
+            }
+        }
+    }
+
+    function showToastSafe(msg, dur) {
+        try {
+            if (typeof showToast === 'function') showToast(msg, dur);
+        } catch (e) {}
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СБРОС СЧЁТЧИКА ПРИ СОБЫТИИ online
+    // ═══════════════════════════════════════════════════════════
+    window.addEventListener('online', () => {
+        console.log('🌐 [Net] браузер сообщил online — сброс счётчика');
+        NetState.failStreak = 0;
+        NetState.byKind = { ping: 0, fetch: 0, upload: 0, poll: 0 };
+
+        // Через секунду делаем мягкий пинг для проверки
+        setTimeout(() => {
+            if (typeof checkNetwork === 'function') {
+                checkNetwork().catch(() => {});
+            }
+        }, 800);
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПОДМЕНЯЕМ checkNetwork НА БОЛЕЕ ТЕРПЕЛИВУЮ ВЕРСИЮ
+    // ═══════════════════════════════════════════════════════════
+    if (typeof window.checkNetwork === 'function') {
+        const _origCheckNetwork = window.checkNetwork;
+
+        window.checkNetwork = async function() {
+            // Быстрая проверка: если браузер явно офлайн — сразу false
+            if (!navigator.onLine) {
+                networkState.isOnline = false;
+                return false;
+            }
+
+            try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(
+                    () => controller.abort(new Error('ping-timeout')),
+                    NET_CFG.pingTimeout
+                );
+
+                const response = await _origFetch(
+                    'https://api.github.com/rate_limit',
+                    {
+                        method: 'GET',
+                        signal: controller.signal,
+                        cache: 'no-store',
+                        headers: { 'Accept': 'application/vnd.github.v3+json' },
+                    }
+                );
+                clearTimeout(timeoutId);
+
+                // ЛЮБОЙ ответ — значит сеть есть
+                if (response.ok || response.status === 401 ||
+                    response.status === 403 || response.status === 404 ||
+                    response.status === 429) {
+                    recordSuccess('ping');
+                    networkState.isOnline = true;
+                    return true;
+                }
+
+                // 5xx — GitHub лежит, но сеть у нас есть
+                if (response.status >= 500) {
+                    recordSuccess('ping');
+                    networkState.isOnline = true;
+                    return true;
+                }
+
+                return true;
+
+            } catch (err) {
+                // Ошибка — учитываем счётчиком
+                const isAbort = err && err.name === 'AbortError';
+                const reason = isAbort ? 'timeout' : 'network';
+                recordFailure('ping', reason, false);
+
+                // Если порог ещё не достигнут — считаем что "медленно, но живы"
+                if (NetState.failStreak < NET_CFG.failThreshold) {
+                    // НЕ меняем networkState.isOnline = false
+                    return networkState.isOnline;
+                }
+
+                networkState.isOnline = false;
+                return false;
+            }
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПОДМЕНЯЕМ fetch ГЛОБАЛЬНО
+    //  Все запросы идут через softFetch с таймаутом и счётчиком.
+    // ═══════════════════════════════════════════════════════════
+    window.fetch = function(url, opts = {}) {
+        // Определяем "тип" запроса по URL и методу
+        const urlStr = typeof url === 'string' ? url : (url && url.url) || '';
+        let kind = 'fetch';
+        let timeout = NET_CFG.fetchTimeout;
+        let silent = false;
+
+        if (urlStr.includes('rate_limit')) {
+            kind = 'ping';
+            timeout = NET_CFG.pingTimeout;
+        } else if (urlStr.includes('api.github.com') && opts.method === 'PUT') {
+            kind = 'upload';
+            timeout = NET_CFG.uploadTimeout;
+        } else if (urlStr.includes('api.github.com/commits') ||
+                   urlStr.includes('/contents/')) {
+            kind = 'poll';
+            timeout = NET_CFG.fetchTimeout;
+        }
+
+        return softFetch(url, opts, { kind, timeout, silent });
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПОДМЕНЯЕМ setInterval ПРОВЕРКИ СЕТИ
+    //  Оригинал делает проверку каждые 15 сек. Теперь — 30.
+    // ═══════════════════════════════════════════════════════════
+    // (это глобальный setInterval, его подменять опасно,
+    //  лучше просто игнорировать лишние проверки по timestamp)
+    let _lastNetCheckTs = 0;
+    const _origSetInterval = window.setInterval;
+    window.setInterval = function(fn, delay, ...args) {
+        // Если это тот самый интервал 15 сек, и он вызывает checkNetwork —
+        // увеличиваем до 30 сек
+        if (delay === 15000) {
+            return _origSetInterval(fn, NET_CFG.checkIntervalMs, ...args);
+        }
+        return _origSetInterval(fn, delay, ...args);
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХЕЛПЕР: обёртка для сетевых операций внутри приложения
+    // ═══════════════════════════════════════════════════════════
+    window.NetUtil = {
+        // Статус
+        status: () => ({
+            failStreak: NetState.failStreak,
+            successStreak: NetState.successStreak,
+            slowMode: NetState.slowMode,
+            online: networkState.isOnline,
+            navigatorOnline: navigator.onLine,
+            lastFailAgo: NetState.lastFailTs
+                ? Math.round((Date.now() - NetState.lastFailTs) / 1000) + 's'
+                : 'never',
+            lastSuccessAgo: NetState.lastSuccessTs
+                ? Math.round((Date.now() - NetState.lastSuccessTs) / 1000) + 's'
+                : 'never',
+            byKind: { ...NetState.byKind },
+        }),
+
+        // Сброс счётчика (ручной)
+        reset: () => {
+            NetState.failStreak = 0;
+            NetState.slowMode = false;
+            NetState.offlineToastShown = false;
+            NetState.byKind = { ping: 0, fetch: 0, upload: 0, poll: 0 };
+            networkState.isOnline = navigator.onLine;
+            console.log('🌐 [Net] состояние сброшено');
+        },
+
+        // Принудительно пометить "медленный режим" — используется при долгих загрузках
+        markSlow: () => {
+            if (!NetState.slowMode) {
+                NetState.slowMode = true;
+                console.log('🐢 [Net] переключение в медленный режим');
+            }
+        },
+
+        // Принудительно пометить "норма"
+        markFast: () => {
+            NetState.slowMode = false;
+        },
+
+        // Настройки
+        config: NET_CFG,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ ОШИБОК ЗАГРУЗКИ В UploadProgress
+    //  Даём файлам больше времени и не считаем единичные сбои сетью
+    // ═══════════════════════════════════════════════════════════
+    if (typeof UploadProgress !== 'undefined') {
+        // Ничего не патчим, но при неудаче XHR — сообщаем NetUtil
+        const _origFail = UploadProgress.fail;
+        if (_origFail) {
+            UploadProgress.fail = function(text) {
+                // Если ошибка похожа на сетевую — увеличиваем счётчик
+                if (text && (
+                    text.includes('Сеть') ||
+                    text.includes('Network') ||
+                    text.includes('timeout') ||
+                    text.includes('NetworkError')
+                )) {
+                    recordFailure('upload', 'xhr-network', false);
+                }
+                return _origFail.call(this, text);
+            };
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ ПОЛЛИНГА
+    //  pollUpdates не должен сбрасывать online при единичной ошибке
+    // ═══════════════════════════════════════════════════════════
+    if (typeof window.pollUpdates === 'function') {
+        const _origPoll = window.pollUpdates;
+
+        window.pollUpdates = async function() {
+            try {
+                return await _origPoll.call(this);
+            } catch (err) {
+                // Помечаем ошибку в счётчик, но не даём оригиналу уронить сеть
+                const isNet = err && (
+                    err.name === 'TypeError' ||
+                    err.name === 'AbortError' ||
+                    (err.message && (
+                        err.message.includes('Failed to fetch') ||
+                        err.message.includes('NetworkError')
+                    ))
+                );
+                if (isNet) {
+                    recordFailure('poll', 'poll-error', false);
+                }
+                // НЕ пробрасываем дальше — поллинг сам разрулит
+            }
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧ: логика в enterChat, которая сбрасывает чат при ошибке сети
+    // ═══════════════════════════════════════════════════════════
+    // Оригинальный код внутри enterChat при сетевой ошибке делает
+    // state.chatFile = null и показывает "нет сети". Теперь —
+    // ошибка сети больше НЕ считается таковой, если это единичный сбой.
+    //
+    // Это уже реализовано через softFetch: fetch не выбросит
+    // TypeError так быстро, а AbortError по таймауту — только
+    // после 25-45 секунд ожидания.
+
+    // ═══════════════════════════════════════════════════════════
+    //  ФИНАЛЬНЫЙ ЛОГ
+    // ═══════════════════════════════════════════════════════════
+    console.log('🌐 [Net] Мягкое определение сети активно:');
+    console.log(`   • failThreshold: ${NET_CFG.failThreshold} ошибок до «офлайна»`);
+    console.log(`   • pingTimeout: ${NET_CFG.pingTimeout} мс`);
+    console.log(`   • fetchTimeout: ${NET_CFG.fetchTimeout} мс`);
+    console.log(`   • uploadTimeout: ${NET_CFG.uploadTimeout} мс`);
+    console.log(`   • checkInterval: ${NET_CFG.checkIntervalMs} мс`);
+    console.log('   • API: NetUtil.status() / .reset() / .config');
+
+})();
+</script>
 </body>
 </html>
