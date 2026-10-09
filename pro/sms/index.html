@@ -27553,115 +27553,122 @@ markUnseen: (eventOrKey) => {
 </script>
 <script>
 // ═══════════════════════════════════════════════════════════════
-//  🏠 CHAT HOUSE v1 — ЛОКАЛЬНЫЕ ДОМА ДЛЯ КАЖДОГО ЧАТА
-//  ─────────────────────────────────────────────────────────────
-//  Архитектура:
-//   • Каждый чат живёт в IndexedDB: сообщения + вложения (blob'ы)
-//   • При входе — мгновенный рендер из дома, даже офлайн
-//   • Параллельно — синк с GitHub: докачиваем новое
-//   • Отправка — сразу в дом, потом на GitHub
-//   • Очистка — через ⋯ меню на экране чатов
-//
-//  Хранилища:
-//   • chats    — метаданные чата (salt, file, lastSync, messageCount)
-//   • messages — сообщения (по file + id)
-//   • blobs    — вложения (по file + attachName → Blob)
+//  🏠 CHAT HOUSE v2 — с глушением старого OfflineMode
 // ═══════════════════════════════════════════════════════════════
 
+// ─── СНАЧАЛА: глушим старый OfflineMode ───
+// Он больше не нужен — дом его полностью заменяет.
+(function killOldOfflineMode() {
+    if (typeof OfflineMode === 'undefined') {
+        // Ещё не объявлен — попробуем позже
+        setTimeout(killOldOfflineMode, 500);
+        return;
+    }
+
+    // Заменяем все методы на пустышки
+    OfflineMode.activate = function() {};
+    OfflineMode.deactivate = function() {};
+    OfflineMode.isOffline = function() { return false; };
+    OfflineMode.forceOffline = function() {};
+    OfflineMode.forceOnline = function() {};
+    OfflineMode.getBanner = function() { return null; };
+
+    // Убираем полоску, если она уже показана
+    const banner = document.getElementById('offlineBanner');
+    if (banner) banner.remove();
+    document.body.classList.remove('offline-mode');
+
+    // Глушим автослушатели online/offline в OfflineMode
+    // (они уже навешаны — просто игнорируем их вызовы)
+    console.log('🏠 [House] Старый OfflineMode заглушен');
+})();
+
+// ─── Глушим window.addEventListener('offline') от старого кода ───
+// Перехватываем addEventListener чтобы поймать все будущие подписки
+(function patchAddEventListener() {
+    const _origAddEventListener = window.addEventListener;
+    window.addEventListener = function(type, listener, options) {
+        // Глушим offline/online-слушатели, которые показывают баннер
+        if (type === 'offline' || type === 'online') {
+            try {
+                const src = listener.toString();
+                // Если слушатель явно вызывает OfflineMode.activate — глушим
+                if (src.includes('activate') && src.includes('OfflineMode')) {
+                    console.log('🏠 [House] Заглушен offline/online слушатель');
+                    return;
+                }
+            } catch (e) {}
+        }
+        return _origAddEventListener.call(this, type, listener, options);
+    };
+})();
+
+// ─── Также блокируем сам window 'offline' event ───
+window.addEventListener('offline', (e) => {
+    // Ничего не делаем — старые обработчики уже заглушены,
+    // а новые не должны показывать баннер
+}, true);
+
+// ═══════════════════════════════════════════════════════════════
+//  CHAT HOUSE — теперь без внешних помех
+// ═══════════════════════════════════════════════════════════════
 const ChatHouse = (() => {
     'use strict';
 
     const DB_NAME = 'smschat_houses_v1';
     const DB_VERSION = 1;
-    const STORE_CHATS = 'chats';       // { file, salt, lastSyncAt, messageCount, createdAt, name }
-    const STORE_MESSAGES = 'messages'; // { file, id, msg, encrypted, savedAt }
-    const STORE_BLOBS = 'blobs';       // { file, attachName, blob, mime, size, savedAt }
+    const STORE_CHATS = 'chats';
+    const STORE_MESSAGES = 'messages';
+    const STORE_BLOBS = 'blobs';
 
     let _dbPromise = null;
 
-    // ═══════════════════════════════════════════════════════════
-    //  ОТКРЫТИЕ БД
-    // ═══════════════════════════════════════════════════════════
     function openDB() {
         if (_dbPromise) return _dbPromise;
-
         _dbPromise = new Promise((resolve, reject) => {
             if (!('indexedDB' in window)) {
                 reject(new Error('IndexedDB не поддерживается'));
                 return;
             }
             const req = indexedDB.open(DB_NAME, DB_VERSION);
-
             req.onupgradeneeded = (e) => {
                 const db = e.target.result;
-
                 if (!db.objectStoreNames.contains(STORE_CHATS)) {
                     db.createObjectStore(STORE_CHATS, { keyPath: 'file' });
                 }
                 if (!db.objectStoreNames.contains(STORE_MESSAGES)) {
                     const s = db.createObjectStore(STORE_MESSAGES, { keyPath: ['file', 'id'] });
                     s.createIndex('byFile', 'file', { unique: false });
-                    s.createIndex('byFileId', ['file', 'id'], { unique: true });
                 }
                 if (!db.objectStoreNames.contains(STORE_BLOBS)) {
                     const s = db.createObjectStore(STORE_BLOBS, { keyPath: ['file', 'attachName'] });
                     s.createIndex('byFile', 'file', { unique: false });
                 }
             };
-
             req.onsuccess = () => resolve(req.result);
             req.onerror = () => reject(req.error);
             req.onblocked = () => reject(new Error('IndexedDB заблокирован'));
         });
-
         return _dbPromise;
     }
 
-    // ─── Обёртка транзакций ───
     async function withStore(storeName, mode, fn) {
         const db = await openDB();
         return new Promise((resolve, reject) => {
             const t = db.transaction(storeName, mode);
             const store = t.objectStore(storeName);
             let result;
-            try {
-                result = fn(store);
-            } catch (e) {
-                reject(e);
-                return;
-            }
+            try { result = fn(store); } catch (e) { reject(e); return; }
             t.oncomplete = () => resolve(result);
             t.onerror = () => reject(t.error);
-            t.onabort = () => reject(t.error || new Error('Транзакция отменена'));
+            t.onabort = () => reject(t.error || new Error('Отменено'));
         });
     }
 
-    async function withStores(stores, mode, fn) {
-        const db = await openDB();
-        return new Promise((resolve, reject) => {
-            const t = db.transaction(stores, mode);
-            const map = {};
-            stores.forEach(s => map[s] = t.objectStore(s));
-            let result;
-            try {
-                result = fn(map);
-            } catch (e) {
-                reject(e);
-                return;
-            }
-            t.oncomplete = () => resolve(result);
-            t.onerror = () => reject(t.error);
-            t.onabort = () => reject(t.error || new Error('Транзакция отменена'));
-        });
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ЧАТЫ
-    // ═══════════════════════════════════════════════════════════
+    // ═══ ЧАТЫ ═══
     async function ensureChat(file, meta = {}) {
         const existing = await getChatMeta(file);
         if (existing) {
-            // Обновим метаданные, если пришли новые
             const merged = { ...existing, ...meta, file };
             await withStore(STORE_CHATS, 'readwrite', s => s.put(merged));
             return merged;
@@ -27681,16 +27688,14 @@ const ChatHouse = (() => {
 
     async function getChatMeta(file) {
         try {
-            return await new Promise(async (resolve, reject) => {
-                const db = await openDB();
+            const db = await openDB();
+            return new Promise((resolve, reject) => {
                 const t = db.transaction(STORE_CHATS, 'readonly');
                 const req = t.objectStore(STORE_CHATS).get(file);
                 req.onsuccess = () => resolve(req.result || null);
                 req.onerror = () => reject(req.error);
             });
-        } catch (e) {
-            return null;
-        }
+        } catch (e) { return null; }
     }
 
     async function updateChatMeta(file, patch) {
@@ -27702,28 +27707,25 @@ const ChatHouse = (() => {
 
     async function listHouses() {
         try {
-            return await new Promise(async (resolve, reject) => {
-                const db = await openDB();
+            const db = await openDB();
+            return new Promise((resolve, reject) => {
                 const t = db.transaction(STORE_CHATS, 'readonly');
                 const req = t.objectStore(STORE_CHATS).getAll();
                 req.onsuccess = () => resolve(req.result || []);
                 req.onerror = () => reject(req.error);
             });
-        } catch (e) {
-            return [];
-        }
+        } catch (e) { return []; }
     }
 
     async function deleteHouse(file) {
-        // Удаляем и метаданные чата, и все его сообщения, и все blob'ы
         const db = await openDB();
         return new Promise((resolve, reject) => {
             const t = db.transaction([STORE_CHATS, STORE_MESSAGES, STORE_BLOBS], 'readwrite');
             t.objectStore(STORE_CHATS).delete(file);
 
             const msgIdx = t.objectStore(STORE_MESSAGES).index('byFile');
-            const msgCursorReq = msgIdx.openKeyCursor(file);
-            msgCursorReq.onsuccess = (e) => {
+            const msgReq = msgIdx.openKeyCursor(file);
+            msgReq.onsuccess = (e) => {
                 const c = e.target.result;
                 if (c) {
                     t.objectStore(STORE_MESSAGES).delete(c.primaryKey);
@@ -27732,8 +27734,8 @@ const ChatHouse = (() => {
             };
 
             const blobIdx = t.objectStore(STORE_BLOBS).index('byFile');
-            const blobCursorReq = blobIdx.openKeyCursor(file);
-            blobCursorReq.onsuccess = (e) => {
+            const blobReq = blobIdx.openKeyCursor(file);
+            blobReq.onsuccess = (e) => {
                 const c = e.target.result;
                 if (c) {
                     t.objectStore(STORE_BLOBS).delete(c.primaryKey);
@@ -27743,18 +27745,10 @@ const ChatHouse = (() => {
 
             t.oncomplete = () => resolve(true);
             t.onerror = () => reject(t.error);
-            t.onabort = () => reject(t.error);
         });
     }
 
-    // ═══════════════════════════════════════════════════════════
-    //  СООБЩЕНИЯ
-    // ═══════════════════════════════════════════════════════════
-
-    /**
-     * Сохранить массив расшифрованных сообщений (полная замена).
-     * Используется при первичном синке.
-     */
+    // ═══ СООБЩЕНИЯ ═══
     async function saveMessagesFull(file, messages) {
         if (!Array.isArray(messages)) return;
         const db = await openDB();
@@ -27762,7 +27756,6 @@ const ChatHouse = (() => {
             const t = db.transaction(STORE_MESSAGES, 'readwrite');
             const store = t.objectStore(STORE_MESSAGES);
 
-            // Удаляем все старые сообщения этого чата
             const idx = store.index('byFile');
             const cursorReq = idx.openKeyCursor(file);
             cursorReq.onsuccess = (e) => {
@@ -27773,26 +27766,16 @@ const ChatHouse = (() => {
                 }
             };
 
-            // Добавляем новые
             const now = Date.now();
             for (const msg of messages) {
-                store.put({
-                    file,
-                    id: msg.id,
-                    msg,              // расшифрованный объект
-                    savedAt: now,
-                });
+                store.put({ file, id: msg.id, msg, savedAt: now });
             }
 
             t.oncomplete = () => resolve(true);
             t.onerror = () => reject(t.error);
-            t.onabort = () => reject(t.error);
         });
     }
 
-    /**
-     * Добавить/обновить пачку сообщений (инкрементально).
-     */
     async function upsertMessages(file, messages) {
         if (!Array.isArray(messages) || messages.length === 0) return;
         const db = await openDB();
@@ -27801,33 +27784,20 @@ const ChatHouse = (() => {
             const store = t.objectStore(STORE_MESSAGES);
             const now = Date.now();
             for (const msg of messages) {
-                store.put({
-                    file,
-                    id: msg.id,
-                    msg,
-                    savedAt: now,
-                });
+                store.put({ file, id: msg.id, msg, savedAt: now });
             }
             t.oncomplete = () => resolve(true);
             t.onerror = () => reject(t.error);
         });
     }
 
-    /**
-     * Удалить одно сообщение.
-     */
     async function deleteMessage(file, id) {
         try {
             await withStore(STORE_MESSAGES, 'readwrite', s => s.delete([file, id]));
             return true;
-        } catch (e) {
-            return false;
-        }
+        } catch (e) { return false; }
     }
 
-    /**
-     * Прочитать все сообщения чата (отсортированные по id).
-     */
     async function getMessages(file) {
         try {
             const db = await openDB();
@@ -27836,89 +27806,41 @@ const ChatHouse = (() => {
                 const idx = t.objectStore(STORE_MESSAGES).index('byFile');
                 const req = idx.getAll(file);
                 req.onsuccess = () => {
-                    const arr = (req.result || [])
-                        .map(r => r.msg)
-                        .sort((a, b) => a.id - b.id);
+                    const arr = (req.result || []).map(r => r.msg).sort((a, b) => a.id - b.id);
                     resolve(arr);
                 };
                 req.onerror = () => reject(req.error);
             });
-        } catch (e) {
-            return [];
-        }
+        } catch (e) { return []; }
     }
 
-    /**
-     * Получить только последние N сообщений (для быстрого рендера).
-     */
-    async function getRecentMessages(file, limit = 100) {
-        const all = await getMessages(file);
-        return all.slice(-limit);
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  BLOB'Ы (вложения)
-    // ═══════════════════════════════════════════════════════════
-
+    // ═══ BLOB'Ы ═══
     async function saveBlob(file, attachName, blob, mime) {
         if (!blob || !(blob instanceof Blob)) return false;
         try {
             await withStore(STORE_BLOBS, 'readwrite', s => s.put({
-                file,
-                attachName,
-                blob,
+                file, attachName, blob,
                 mime: mime || blob.type || 'application/octet-stream',
                 size: blob.size,
                 savedAt: Date.now(),
             }));
             return true;
         } catch (e) {
-            console.warn('saveBlob failed:', attachName, e);
+            console.warn('🏠 saveBlob failed:', attachName, e);
             return false;
-        }
-    }
-
-    async function saveBlobsBatch(file, items) {
-        if (!items || items.length === 0) return 0;
-        try {
-            const db = await openDB();
-            return await new Promise((resolve, reject) => {
-                const t = db.transaction(STORE_BLOBS, 'readwrite');
-                const store = t.objectStore(STORE_BLOBS);
-                const now = Date.now();
-                let saved = 0;
-                for (const it of items) {
-                    if (!it.blob || !(it.blob instanceof Blob)) continue;
-                    store.put({
-                        file,
-                        attachName: it.attachName,
-                        blob: it.blob,
-                        mime: it.mime || it.blob.type || 'application/octet-stream',
-                        size: it.blob.size,
-                        savedAt: now,
-                    });
-                    saved++;
-                }
-                t.oncomplete = () => resolve(saved);
-                t.onerror = () => reject(t.error);
-            });
-        } catch (e) {
-            return 0;
         }
     }
 
     async function getBlob(file, attachName) {
         try {
-            return await new Promise(async (resolve, reject) => {
-                const db = await openDB();
+            const db = await openDB();
+            return new Promise((resolve, reject) => {
                 const t = db.transaction(STORE_BLOBS, 'readonly');
                 const req = t.objectStore(STORE_BLOBS).get([file, attachName]);
                 req.onsuccess = () => resolve(req.result || null);
                 req.onerror = () => reject(req.error);
             });
-        } catch (e) {
-            return null;
-        }
+        } catch (e) { return null; }
     }
 
     async function hasBlob(file, attachName) {
@@ -27930,9 +27852,7 @@ const ChatHouse = (() => {
         try {
             await withStore(STORE_BLOBS, 'readwrite', s => s.delete([file, attachName]));
             return true;
-        } catch (e) {
-            return false;
-        }
+        } catch (e) { return false; }
     }
 
     async function listBlobs(file) {
@@ -27945,31 +27865,22 @@ const ChatHouse = (() => {
                 req.onsuccess = () => resolve(
                     (req.result || []).map(r => ({
                         attachName: r.attachName,
-                        size: r.size,
-                        mime: r.mime,
-                        savedAt: r.savedAt,
+                        size: r.size, mime: r.mime, savedAt: r.savedAt,
                     }))
                 );
                 req.onerror = () => reject(req.error);
             });
-        } catch (e) {
-            return [];
-        }
+        } catch (e) { return []; }
     }
 
-    // ═══════════════════════════════════════════════════════════
-    //  СТАТИСТИКА / УПРАВЛЕНИЕ
-    // ═══════════════════════════════════════════════════════════
-
+    // ═══ УТИЛИТЫ ═══
     async function getHouseStats(file) {
         const meta = await getChatMeta(file);
         const msgs = await getMessages(file);
         const blobs = await listBlobs(file);
         const totalBlobSize = blobs.reduce((s, b) => s + (b.size || 0), 0);
-
         return {
-            file,
-            meta,
+            file, meta,
             messageCount: msgs.length,
             blobCount: blobs.length,
             blobSize: totalBlobSize,
@@ -27986,12 +27897,10 @@ const ChatHouse = (() => {
             const blobs = await listBlobs(h.file);
             const size = blobs.reduce((s, b) => s + (b.size || 0), 0);
             out.push({
-                file: h.file,
-                name: h.name,
+                file: h.file, name: h.name,
                 messageCount: msgs.length,
                 blobCount: blobs.length,
-                size,
-                sizeHuman: formatFileSize(size),
+                size, sizeHuman: formatFileSize(size),
                 lastSyncAt: h.lastSyncAt,
             });
         }
@@ -28027,45 +27936,35 @@ const ChatHouse = (() => {
     }
 
     return {
-        // Чаты
         ensureChat, getChatMeta, updateChatMeta, listHouses, deleteHouse,
-        // Сообщения
-        saveMessagesFull, upsertMessages, deleteMessage, getMessages, getRecentMessages,
-        // Blob'ы
-        saveBlob, saveBlobsBatch, getBlob, hasBlob, deleteBlob, listBlobs,
-        // Утилиты
+        saveMessagesFull, upsertMessages, deleteMessage, getMessages,
+        saveBlob, getBlob, hasBlob, deleteBlob, listBlobs,
         getHouseStats, listAllHousesStats, estimateUsage, clearAllHouses,
     };
 })();
+
+window.ChatHouse = ChatHouse;
+console.log('🏠 [House] Ядро готово, OfflineMode заглушен');
 </script>
 <script>
 // ═══════════════════════════════════════════════════════════════
-//  🏠 CHAT HOUSE — ИНТЕГРАЦИЯ В ЖИЗНЕННЫЙ ЦИКЛ ЧАТА
-//  ─────────────────────────────────────────────────────────────
-//  Перехватывает:
-//   1. enterChat      → мгновенный рендер из дома + фоновый синк
-//   2. sendMessage    → сразу в дом, потом на GitHub
-//   3. deleteMessage  → удалить из дома тоже
-//   4. renderMessages → синхронизация дома с UI
-//   5. loadAttachment → сначала дом, потом сеть
+//  🏠 CHAT HOUSE — ИНТЕГРАЦИЯ v2 (правильное сохранение blob'ов)
 // ═══════════════════════════════════════════════════════════════
 
 (function installChatHouseIntegration() {
     'use strict';
 
     if (typeof ChatHouse === 'undefined') {
-        console.warn('🏠 ChatHouse не найден — пропускаем интеграцию');
+        console.warn('🏠 ChatHouse не найден');
         return;
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  1. ПЕРЕХВАТ loadAttachment — сначала дом, потом сеть
-    //     Это ключевой момент: офлайн-рендер вложений
+    //  1. loadAttachment: сначала дом, потом сеть
     // ═══════════════════════════════════════════════════════════
     const _origLoadAttachment = loadAttachment;
 
     loadAttachment = async function(chatFile, attachName) {
-        // Проверяем in-memory кэш
         if (_attachmentCache.has(attachName)) {
             return _attachmentCache.get(attachName);
         }
@@ -28074,38 +27973,25 @@ const ChatHouse = (() => {
         }
 
         const promise = (async () => {
-            // ═══ 1. Пробуем дом ═══
+            // ═══ 1. Дом ═══
             try {
                 const rec = await ChatHouse.getBlob(chatFile, attachName);
                 if (rec && rec.blob) {
                     const url = URL.createObjectURL(rec.blob);
                     _attachmentCache.set(attachName, url);
-                    console.log(`🏠 [House] attachment из дома: ${attachName}`);
+                    console.log(`🏠 [House] attachment из дома: ${attachName} (${rec.size} б)`);
                     return url;
                 }
-            } catch (e) {
-                // тихо
-            }
+            } catch (e) {}
 
-            // ═══ 2. Нет в доме — идём в сеть (оригинальная логика) ═══
-            try {
-                const url = await _origLoadAttachment.call(this, chatFile, attachName);
+            // ═══ 2. Сеть (оригинальный код) ═══
+            const url = await _origLoadAttachment.call(this, chatFile, attachName);
 
-                // 🆕 Сохраняем в дом на будущее
-                try {
-                    const res = await fetch(url);
-                    const blob = await res.blob();
-                    if (blob && blob.size > 0) {
-                        ChatHouse.saveBlob(chatFile, attachName, blob, blob.type).catch(() => {});
-                    }
-                } catch (e) {
-                    // не страшно, если не сохранилось
-                }
+            // ⚠️ ВАЖНО: НЕ сохраняем тут в дом — это уже blob:URL,
+            //    его нельзя нормально скачать повторно.
+            //    Сохранение происходит в uploadAttachmentAuto (см. ниже).
 
-                return url;
-            } catch (e) {
-                throw e;
-            }
+            return url;
         })();
 
         _pendingAttachmentLoads.set(attachName, promise);
@@ -28120,142 +28006,157 @@ const ChatHouse = (() => {
     console.log('🏠 [House] loadAttachment → сначала дом');
 
     // ═══════════════════════════════════════════════════════════
-    //  2. ПЕРЕХВАТ enterChat — мгновенный рендер + фоновый синк
+    //  2. uploadAttachmentAuto: сохраняем ОРИГИНАЛ в дом
+    //     Это ЕДИНСТВЕННОЕ правильное место — тут есть plainBuffer
+    // ═══════════════════════════════════════════════════════════
+    if (typeof uploadAttachmentAuto === 'function') {
+        const _origUploadAuto = uploadAttachmentAuto;
+        uploadAttachmentAuto = async function(chatFile, attachName, plainBuffer, mime, displayName) {
+            // 🆕 Сохраняем ОРИГИНАЛ в дом ДО отправки
+            try {
+                const blob = new Blob([plainBuffer], { type: mime || 'application/octet-stream' });
+                await ChatHouse.saveBlob(chatFile, attachName, blob, mime);
+                console.log(`🏠 [House] blob сохранён: ${attachName} (${formatFileSize(blob.size)})`);
+            } catch (e) {
+                console.warn('🏠 [House] saveBlob failed:', e);
+            }
+
+            // Отправляем в сеть (оригинальный код)
+            return await _origUploadAuto.call(this, chatFile, attachName, plainBuffer, mime, displayName);
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. enterChat: если дом заполнен — мгновенный рендер
+    //     ИНАЧЕ — оригинал + наполнение дома
     // ═══════════════════════════════════════════════════════════
     const _origEnterChat = enterChat;
 
     enterChat = async function(file, name, password) {
-        // ═══ Фаза A: мгновенный рендер из дома ═══
+        // ═══ Проверяем дом ═══
         const houseMeta = await ChatHouse.getChatMeta(file);
+        let cachedMessages = [];
 
-        // Если в доме есть сообщения и соль — рендерим сразу
         if (houseMeta && houseMeta.salt) {
             try {
-                const cachedMessages = await ChatHouse.getMessages(file);
-
-                if (cachedMessages.length > 0) {
-                    console.log(`🏠 [House] Мгновенный рендер из дома: ${cachedMessages.length} сообщ.`);
-
-                    // Показываем экран чата БЕЗ ожидания сети
-                    showChatTransition(name);
-                    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
-
-                    // Останавливаем старый polling
-                    if (typeof stopPolling === 'function') stopPolling();
-
-                    // Чистим кэш вложений (blob:URL предыдущего чата)
-                    clearAttachmentCache();
-                    resetHistoryState();
-
-                    // Устанавливаем состояние
-                    state.messages = cachedMessages.slice();
-                    state.chatFile = file;
-                    state.chatName = name;
-                    state.chatPassword = password;
-                    state.salt = houseMeta.salt;
-                    state.sha = null;
-                    state.lastMessageCount = cachedMessages.length;
-                    state._lastCommitSha = null;
-                    state._lastMetaVersion = houseMeta.lastMessageId || null;
-                    state._metaEtag = null;
-                    state._lastSentMessageId = null;
-                    state._chatEntered = false;
-                    state._lastActivityAt = Date.now();
-
-                    // 🆕 Ключ шифрования нужен для будущей отправки
-                    try {
-                        CRYPTO._key = await deriveKey(password, houseMeta.salt);
-                    } catch (e) {
-                        console.warn('🏠 [House] Не удалось получить ключ из дома:', e);
-                        CRYPTO._key = null;
-                    }
-
-                    // Заголовок
-                    chatTitle.textContent = name;
-                    userAvatar.textContent = getInitials(state.username);
-
-                    // Рендер
-                    messagesInner.dataset.lastDate = '';
-                    showChatScreen();
-                    showInputBar();
-
-                    historyState.allMessages = cachedMessages.slice();
-                    renderHistory();
-
-                    // ⚠️ Если не смогли получить ключ — работаем в read-only
-                    if (!CRYPTO._key) {
-                        messageInput.disabled = true;
-                        sendBtn.disabled = true;
-                        micBtn.disabled = true;
-                        showToast('🏠 Загружено из дома — синхронизируем…', 1500);
-                    } else {
-                        showToast('🏠 Мгновенно из дома', 1200);
-                    }
-
-                    state._chatEntered = true;
-
-                    // ═══ Фаза B: фоновый синк с GitHub ═══
-                    // Запускаем ПОСЛЕ рендера, не блокируя UI
-                    syncHouseWithGitHub(file, name, password).catch(e => {
-                        console.warn('🏠 [House] Sync failed:', e);
-                    });
-
-                    // Polling запускаем сразу — он тоже подтянет новое
-                    if (CRYPTO._key) {
-                        startPolling();
-                    }
-
-                    // Пометка прочитанным — с задержкой
-                    setTimeout(() => {
-                        if (state.chatFile === file) {
-                            markChatAsRead();
-                        }
-                    }, 1500);
-
-                    return;
-                }
+                cachedMessages = await ChatHouse.getMessages(file);
             } catch (e) {
-                console.warn('🏠 [House] Быстрый рендер не удался, fallback на оригинал:', e);
+                cachedMessages = [];
             }
         }
 
-        // ═══ Fallback: оригинальный enterChat (сеть) ═══
+        const houseReady = cachedMessages.length > 0 && houseMeta && houseMeta.salt;
+
+        // ═══════════════════════════════════════════════════════
+        //  ПУТЬ A: дом готов → мгновенный рендер + фоновый sync
+        // ═══════════════════════════════════════════════════════
+        if (houseReady) {
+            console.log(`🏠 [House] Мгновенный рендер: ${cachedMessages.length} сообщ.`);
+
+            showChatTransition(name);
+            await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+            if (typeof stopPolling === 'function') stopPolling();
+            clearAttachmentCache();
+            resetHistoryState();
+
+            // Восстанавливаем состояние
+            state.messages = cachedMessages.slice();
+            state.chatFile = file;
+            state.chatName = name;
+            state.chatPassword = password;
+            state.salt = houseMeta.salt;
+            state.sha = null;
+            state.lastMessageCount = cachedMessages.length;
+            state._lastCommitSha = null;
+            state._lastMetaVersion = houseMeta.lastMessageId || null;
+            state._metaEtag = null;
+            state._lastSentMessageId = null;
+            state._chatEntered = false;
+            state._lastActivityAt = Date.now();
+
+            // Деривим ключ
+            try {
+                CRYPTO._key = await deriveKey(password, houseMeta.salt);
+            } catch (e) {
+                console.warn('🏠 [House] deriveKey failed:', e);
+                CRYPTO._key = null;
+            }
+
+            chatTitle.textContent = name;
+            userAvatar.textContent = getInitials(state.username);
+
+            messagesInner.dataset.lastDate = '';
+            showChatScreen();
+            showInputBar();
+
+            historyState.allMessages = cachedMessages.slice();
+            renderHistory();
+
+            if (!CRYPTO._key) {
+                messageInput.disabled = true;
+                sendBtn.disabled = true;
+                micBtn.disabled = true;
+                showToast('🏠 Из дома — синхронизируем…', 1500);
+            } else {
+                showToast('🏠 Мгновенно из дома', 1200);
+            }
+
+            state._chatEntered = true;
+
+            // 🆕 Фоновый синк — не блокирует UI
+            syncHouseWithGitHub(file, name, password).catch(e => {
+                console.warn('🏠 [House] background sync failed:', e);
+            });
+
+            if (CRYPTO._key) {
+                startPolling();
+            }
+
+            setTimeout(() => {
+                if (state.chatFile === file) markChatAsRead();
+            }, 1500);
+
+            return;
+        }
+
+        // ═══════════════════════════════════════════════════════
+        //  ПУТЬ B: дом пуст → оригинальный enterChat + наполнение
+        // ═══════════════════════════════════════════════════════
+        console.log('🏠 [House] Дом пуст — обычная загрузка');
+
         const result = await _origEnterChat.call(this, file, name, password);
 
-        // После успешного входа — синхронизируем дом
-        if (state.chatFile === file && historyState.allMessages.length > 0) {
-            // Сохраняем полный набор сообщений
-            ChatHouse.saveMessagesFull(file, historyState.allMessages)
-                .then(() => {
-                    ChatHouse.updateChatMeta(file, {
-                        salt: state.salt,
-                        lastSyncAt: Date.now(),
-                        lastMessageId: historyState.allMessages[historyState.allMessages.length - 1].id,
-                        messageCount: historyState.allMessages.length,
-                        name,
-                    });
-                })
-                .catch(e => console.warn('🏠 [House] save after enterChat:', e));
+        // После успешной загрузки — сохраняем в дом
+        if (state.chatFile === file && historyState.allMessages.length >= 0) {
+            await ChatHouse.ensureChat(file, {
+                salt: state.salt,
+                name,
+                lastSyncAt: Date.now(),
+                lastMessageId: historyState.allMessages.length > 0
+                    ? historyState.allMessages[historyState.allMessages.length - 1].id
+                    : null,
+                messageCount: historyState.allMessages.length,
+            });
+
+            await ChatHouse.saveMessagesFull(file, historyState.allMessages);
+            console.log(`🏠 [House] Дом создан: ${historyState.allMessages.length} сообщ.`);
         }
 
         return result;
     };
 
-    console.log('🏠 [House] enterChat → мгновенный рендер из дома');
+    console.log('🏠 [House] enterChat → мгновенный рендер / создание дома');
 
     // ═══════════════════════════════════════════════════════════
-    //  3. СИНХРОНИЗАЦИЯ ДОМА С GITHUB
-    //     Умная: сначала meta.json — узнать, есть ли новое
-    //     Если новое — догружаем только дельту
+    //  4. syncHouseWithGitHub — умная синхронизация
     // ═══════════════════════════════════════════════════════════
     async function syncHouseWithGitHub(file, name, password) {
         if (!state.token || !state.isAuthorized) return;
-
-        // Если мы уже ушли из этого чата — не синкаем
         if (state.chatFile !== file) return;
 
         try {
-            // ═══ Шаг 1: лёгкая проверка через meta.json ═══
+            // Шаг 1: meta.json
             let meta = null;
             try {
                 const metaUrl = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${getMetaPath(file)}`;
@@ -28270,24 +28171,30 @@ const ChatHouse = (() => {
                     const data = await res.json();
                     meta = JSON.parse(base64ToUtf8((data.content || '').replace(/\n/g, '')));
                 }
-            } catch (e) {
-                console.warn('🏠 [House] meta fetch failed:', e);
-            }
+            } catch (e) {}
 
             const houseMeta = await ChatHouse.getChatMeta(file);
             const cachedLastId = houseMeta?.lastMessageId || 0;
             const serverLastId = meta?.version || 0;
 
-            // Если серверная версия не новее — обновим lastSyncAt и выйдем
             if (serverLastId <= cachedLastId) {
-                console.log(`🏠 [House] Sync: у дома всё актуально (${cachedLastId} >= ${serverLastId})`);
+                console.log(`🏠 [House] Sync: актуально (${cachedLastId} >= ${serverLastId})`);
                 await ChatHouse.updateChatMeta(file, { lastSyncAt: Date.now() });
+
+                // 🆕 Разблокируем отправку, если была заблокирована
+                if (messageInput.disabled && CRYPTO._key) {
+                    messageInput.disabled = false;
+                    messageInput.placeholder = 'Сообщение...';
+                    sendBtn.disabled = !state.isAuthorized;
+                    micBtn.disabled = !state.isAuthorized;
+                    startPolling();
+                }
                 return;
             }
 
-            console.log(`🏠 [House] Sync: сервер новее (${serverLastId} > ${cachedLastId}). Грузим дельту…`);
+            console.log(`🏠 [House] Sync: сервер новее (${serverLastId} > ${cachedLastId})`);
 
-            // ═══ Шаг 2: полная загрузка с сервера ═══
+            // Шаг 2: полная загрузка
             const path = getChatPath(file);
             const result = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
             if (!result.exists) return;
@@ -28295,12 +28202,9 @@ const ChatHouse = (() => {
             const content = result.content;
             if (!content || content.v !== CRYPTO.VERSION || !content.salt) return;
 
-            // Деривим ключ
             const key = await deriveKey(password, content.salt);
-
-            // Расшифровываем все сообщения с сервера
-            const serverMessages = [];
             const encMessages = Array.isArray(content.messages) ? content.messages : [];
+            const serverMessages = [];
 
             for (const enc of encMessages) {
                 try {
@@ -28311,12 +28215,7 @@ const ChatHouse = (() => {
                     );
                     const payload = JSON.parse(new TextDecoder().decode(plaintext));
 
-                    const msg = {
-                        id: enc.id,
-                        time: enc.time,
-                        username: payload.username,
-                        text: payload.text || '',
-                    };
+                    const msg = { id: enc.id, time: enc.time, username: payload.username, text: payload.text || '' };
                     if (payload.reactions) msg.reactions = payload.reactions;
                     if (Array.isArray(payload.comments) && payload.comments.length > 0) msg.comments = payload.comments;
                     if (payload.image) msg.image = payload.image;
@@ -28353,45 +28252,30 @@ const ChatHouse = (() => {
                     if (payload.replyTo) msg.replyTo = payload.replyTo;
 
                     serverMessages.push(msg);
-                } catch (e) {
-                    console.warn('🏠 [House] Decrypt fail:', enc.id, e.message);
-                }
+                } catch (e) {}
             }
 
-            // Если мы уже ушли из этого чата — не обновляем
             if (state.chatFile !== file) return;
 
-            // ═══ Шаг 3: сравнение и умное обновление UI ═══
+            // Шаг 3: сравнение
             const cachedMessages = historyState.allMessages;
-            const newCount = serverMessages.length;
-            const oldCount = cachedMessages.length;
-
-            // Удалённые с сервера → удаляем и у нас
             const serverIds = new Set(serverMessages.map(m => m.id));
             const removedIds = cachedMessages.filter(m => !serverIds.has(m.id)).map(m => m.id);
-
-            if (removedIds.length > 0) {
-                console.log(`🏠 [House] Удалено с сервера: ${removedIds.length}`);
-                // Удаляем из дома
-                for (const id of removedIds) {
-                    await ChatHouse.deleteMessage(file, id);
-                }
-            }
-
-            // Новые (по id) → добавляем в дом и на экран
             const cachedIds = new Set(cachedMessages.map(m => m.id));
             const newMessages = serverMessages.filter(m => !cachedIds.has(m.id));
 
+            // Удаляем из дома
+            for (const id of removedIds) {
+                await ChatHouse.deleteMessage(file, id);
+            }
+
+            // Добавляем новые
             if (newMessages.length > 0) {
-                console.log(`🏠 [House] Новых сообщений: ${newMessages.length}`);
-                // Сохраняем в дом
                 await ChatHouse.upsertMessages(file, newMessages);
 
-                // Обновляем UI
                 const wasAtBottom = isNearBottom();
                 appendMessages(newMessages);
 
-                // Если пользователь был внизу — скроллим
                 if (wasAtBottom) {
                     setTimeout(() => scrollToBottom(true), 100);
                 } else {
@@ -28401,9 +28285,8 @@ const ChatHouse = (() => {
                 }
             }
 
-            // Если сообщения удалились — надо перерисовать
+            // Перерисовываем при удалении
             if (removedIds.length > 0) {
-                // Пересобираем historyState
                 historyState.allMessages = serverMessages.slice();
                 state.messages = serverMessages.slice();
                 renderHistory();
@@ -28412,87 +28295,69 @@ const ChatHouse = (() => {
             // Обновляем state
             state.sha = result.sha;
             state._lastCommitSha = result.commitSha;
-            state.lastMessageCount = newCount;
+            state.lastMessageCount = serverMessages.length;
             state.salt = content.salt;
-            if (CRYPTO._key !== key) CRYPTO._key = key;
+            CRYPTO._key = key;
 
-            // Включаем отправку, если была заблокирована
-            if (messageInput.disabled && CRYPTO._key) {
+            // Разблокируем отправку
+            if (messageInput.disabled) {
                 messageInput.disabled = false;
                 messageInput.placeholder = 'Сообщение...';
                 sendBtn.disabled = !state.isAuthorized;
                 micBtn.disabled = !state.isAuthorized;
-                if (typeof startPolling === 'function') startPolling();
+                startPolling();
             }
 
-            // Обновляем метаданные дома
             await ChatHouse.updateChatMeta(file, {
                 salt: content.salt,
                 lastSyncAt: Date.now(),
-                lastMessageId: newCount > 0 ? serverMessages[newCount - 1].id : null,
-                messageCount: newCount,
+                lastMessageId: serverMessages.length > 0 ? serverMessages[serverMessages.length - 1].id : null,
+                messageCount: serverMessages.length,
                 name,
             });
 
-            console.log(`🏠 [House] Sync завершён: ${newCount} сообщ.`);
+            console.log(`🏠 [House] Sync готов: ${serverMessages.length} сообщ.`);
 
         } catch (e) {
-            console.warn('🏠 [House] syncHouseWithGitHub failed:', e);
+            console.warn('🏠 [House] sync failed:', e);
         }
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  4. ПЕРЕХВАТ sendMessage — сохраняем в дом СРАЗУ
-    //     (ещё до ухода на GitHub)
+    //  5. Сохранение в дом после мутаций
     // ═══════════════════════════════════════════════════════════
+
+    // Отправка
     const _origSendMessage = sendMessage;
-
     sendMessage = async function(...args) {
-        // Определяем: это попытка отправить сообщение?
         const result = await _origSendMessage.apply(this, args);
-
-        // После отправки (или начала отправки) — синкаем дом
-        // (оригинал уже добавил plainMsg в historyState.allMessages)
         if (state.chatFile && historyState.allMessages.length > 0) {
-            const lastMsgs = historyState.allMessages.slice(-5);
-            ChatHouse.upsertMessages(state.chatFile, lastMsgs).catch(() => {});
+            ChatHouse.upsertMessages(state.chatFile, historyState.allMessages.slice(-5)).catch(() => {});
             ChatHouse.updateChatMeta(state.chatFile, {
                 lastSyncAt: Date.now(),
                 lastMessageId: historyState.allMessages[historyState.allMessages.length - 1].id,
                 messageCount: historyState.allMessages.length,
             }).catch(() => {});
         }
-
         return result;
     };
 
-    console.log('🏠 [House] sendMessage → дом синхронизируется');
-
-    // ═══════════════════════════════════════════════════════════
-    //  5. ПЕРЕХВАТ deleteMessage — удаляем из дома
-    // ═══════════════════════════════════════════════════════════
+    // Удаление
     const _origDeleteMessage = deleteMessage;
-
     deleteMessage = async function(messageId) {
+        // Запоминаем сообщение ДО удаления
+        const msgBefore = historyState.allMessages.find(m => m.id === messageId);
         const result = await _origDeleteMessage.call(this, messageId);
-
-        // Удаляем из дома
         if (state.chatFile) {
             await ChatHouse.deleteMessage(state.chatFile, messageId);
-
-            // Также удаляем blob'ы этого сообщения
-            const msg = historyState.allMessages.find(m => m.id === messageId);
-            if (!msg) {
-                // Сообщение уже удалено из памяти — попробуем найти в доме
-                // (на случай гонки)
-                const allMsgs = await ChatHouse.getMessages(state.chatFile);
-                const found = allMsgs.find(m => m.id === messageId);
-                if (found) await deleteAttachmentsFromHouse(state.chatFile, found);
-            } else {
-                await deleteAttachmentsFromHouse(state.chatFile, msg);
+            // Удаляем blob'ы
+            if (msgBefore) {
+                const names = [msgBefore.image, msgBefore.audio, msgBefore.audioCover,
+                    msgBefore.file, msgBefore.video, msgBefore.videoNote].filter(Boolean);
+                for (const n of names) {
+                    if (isAttachmentRef(n)) await ChatHouse.deleteBlob(state.chatFile, n);
+                }
             }
-
-            // Обновляем метаданные
             await ChatHouse.updateChatMeta(state.chatFile, {
                 lastSyncAt: Date.now(),
                 lastMessageId: historyState.allMessages.length > 0
@@ -28501,103 +28366,18 @@ const ChatHouse = (() => {
                 messageCount: historyState.allMessages.length,
             });
         }
-
         return result;
     };
 
-    async function deleteAttachmentsFromHouse(file, msg) {
-        const toDelete = [];
-        if (msg.image) toDelete.push(msg.image);
-        if (msg.audio) toDelete.push(msg.audio);
-        if (msg.audioCover) toDelete.push(msg.audioCover);
-        if (msg.file) toDelete.push(msg.file);
-        if (msg.video) toDelete.push(msg.video);
-        if (msg.videoNote) toDelete.push(msg.videoNote);
-
-        for (const name of toDelete) {
-            if (isAttachmentRef(name)) {
-                await ChatHouse.deleteBlob(file, name);
-            }
-        }
-    }
-
-    console.log('🏠 [House] deleteMessage → дом очищается');
-
-    // ═══════════════════════════════════════════════════════════
-    //  6. ПЕРЕХВАТ РЕАКЦИЙ И КОММЕНТАРИЕВ
-    // ═══════════════════════════════════════════════════════════
-    if (typeof toggleReaction === 'function') {
-        const _origToggleReaction = toggleReaction;
-        toggleReaction = async function(msgId, emoji) {
-            const result = await _origToggleReaction.call(this, msgId, emoji);
-
-            // Обновляем в доме
-            const msg = historyState.allMessages.find(m => m.id === msgId);
-            if (msg && state.chatFile) {
-                ChatHouse.upsertMessages(state.chatFile, [msg]).catch(() => {});
-            }
-            return result;
-        };
-    }
-
-    if (typeof submitComment === 'function') {
-        const _origSubmitComment = submitComment;
-        submitComment = async function(msgId, text) {
-            const result = await _origSubmitComment.call(this, msgId, text);
-
-            const msg = historyState.allMessages.find(m => m.id === msgId);
-            if (msg && state.chatFile) {
-                ChatHouse.upsertMessages(state.chatFile, [msg]).catch(() => {});
-            }
-            return result;
-        };
-    }
-
-    if (typeof deleteComment === 'function') {
-        const _origDeleteComment = deleteComment;
-        deleteComment = async function(msgId, commentId) {
-            const result = await _origDeleteComment.call(this, msgId, commentId);
-
-            const msg = historyState.allMessages.find(m => m.id === msgId);
-            if (msg && state.chatFile) {
-                ChatHouse.upsertMessages(state.chatFile, [msg]).catch(() => {});
-            }
-            return result;
-        };
-    }
-
-    if (typeof confirmEditMessage === 'function') {
-        const _origEditMessage = confirmEditMessage;
-        confirmEditMessage = async function() {
-            const result = await _origEditMessage.call(this);
-
-            // После редактирования — пересохраняем последние 5
-            if (state.chatFile) {
-                ChatHouse.upsertMessages(state.chatFile, historyState.allMessages.slice(-5)).catch(() => {});
-            }
-            return result;
-        };
-    }
-
-    console.log('🏠 [House] реакции / комментарии / правки → дом синхронизируется');
-
-    // ═══════════════════════════════════════════════════════════
-    //  7. ПЕРЕХВАТ performBatchDelete
-    // ═══════════════════════════════════════════════════════════
+    // Пакетное удаление
     if (typeof performBatchDelete === 'function') {
-        const _origBatchDelete = performBatchDelete;
+        const _origBatch = performBatchDelete;
         performBatchDelete = async function(messageIds) {
-            const result = await _origBatchDelete.call(this, messageIds);
-
+            const result = await _origBatch.call(this, messageIds);
             if (state.chatFile && Array.isArray(messageIds)) {
-                for (const id of messageIds) {
-                    await ChatHouse.deleteMessage(state.chatFile, id);
-                }
+                for (const id of messageIds) await ChatHouse.deleteMessage(state.chatFile, id);
                 await ChatHouse.updateChatMeta(state.chatFile, {
                     lastSyncAt: Date.now(),
-                    lastMessageId: historyState.allMessages.length > 0
-                        ? historyState.allMessages[historyState.allMessages.length - 1].id
-                        : null,
                     messageCount: historyState.allMessages.length,
                 });
             }
@@ -28605,79 +28385,59 @@ const ChatHouse = (() => {
         };
     }
 
-    // ═══════════════════════════════════════════════════════════
-    //  8. ПЕРЕХВАТ РЕСУРСОВ ПРИ ЗАГРУЗКЕ БОЛЬШИХ ФАЙЛОВ
-    //     После успешной отправки — сохраняем blob в дом
-    // ═══════════════════════════════════════════════════════════
-    if (typeof uploadAttachmentAuto === 'function') {
-        const _origUploadAuto = uploadAttachmentAuto;
-        uploadAttachmentAuto = async function(chatFile, attachName, plainBuffer, mime, displayName) {
-            const result = await _origUploadAuto.call(this, chatFile, attachName, plainBuffer, mime, displayName);
+    // Реакции/комменты/правки
+    ['toggleReaction', 'submitComment', 'deleteComment'].forEach(fnName => {
+        if (typeof window[fnName] === 'function') {
+            const orig = window[fnName];
+            window[fnName] = async function(...args) {
+                const r = await orig.apply(this, args);
+                if (state.chatFile) {
+                    const msgs = historyState.allMessages.slice(-5);
+                    ChatHouse.upsertMessages(state.chatFile, msgs).catch(() => {});
+                }
+                return r;
+            };
+        }
+    });
 
-            // 🆕 Сохраняем ОРИГИНАЛ (не шифрованный) в дом как Blob
-            try {
-                const blob = new Blob([plainBuffer], { type: mime || 'application/octet-stream' });
-                await ChatHouse.saveBlob(chatFile, attachName, blob, mime);
-                console.log(`🏠 [House] Сохранён blob: ${attachName} (${formatFileSize(blob.size)})`);
-            } catch (e) {
-                console.warn('🏠 [House] saveBlob failed:', e);
-            }
-
-            return result;
-        };
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  9. ИНТЕГРАЦИЯ С OFFILINE CACHE (старый механизм)
-    //     Теперь OfflineCache не нужен — дом его заменяет.
-    //     Но чтобы не ломать существующий код, оставим оба.
-    //     Дом более приоритетен.
-    // ═══════════════════════════════════════════════════════════
+    const _origEdit = confirmEditMessage;
+    confirmEditMessage = async function() {
+        const r = await _origEdit.call(this);
+        if (state.chatFile) {
+            ChatHouse.upsertMessages(state.chatFile, historyState.allMessages.slice(-5)).catch(() => {});
+        }
+        return r;
+    };
 
     // ═══════════════════════════════════════════════════════════
-    //  10. УБОРКА ПРИ ВЫХОДЕ ИЗ ЧАТА
-    //      Не удаляем дом! Он должен оставаться.
-    //      Только сбрасываем in-memory кэш.
+    //  6. backToChats — финальный save перед выходом
     // ═══════════════════════════════════════════════════════════
     const _origBackToChats = backToChats;
     backToChats = function() {
-        // Перед уходом — убеждаемся, что всё сохранено
-        if (state.chatFile && historyState.allMessages.length > 0) {
+        if (state.chatFile && historyState.allMessages.length >= 0) {
             const file = state.chatFile;
-            const messages = historyState.allMessages.slice();
+            const msgs = historyState.allMessages.slice();
             const salt = state.salt;
             const name = state.chatName;
-            const lastMsgId = messages[messages.length - 1].id;
+            const lastMsgId = msgs.length > 0 ? msgs[msgs.length - 1].id : null;
 
-            // Fire-and-forget: не блокируем выход
-            ChatHouse.saveMessagesFull(file, messages)
+            // Fire and forget
+            ChatHouse.saveMessagesFull(file, msgs)
                 .then(() => ChatHouse.updateChatMeta(file, {
                     salt, name, lastMessageId: lastMsgId,
-                    messageCount: messages.length, lastSyncAt: Date.now(),
+                    messageCount: msgs.length, lastSyncAt: Date.now(),
                 }))
-                .catch(e => console.warn('🏠 [House] exit save failed:', e));
+                .catch(() => {});
         }
         return _origBackToChats.apply(this, arguments);
     };
 
-    // ─── При logout — НЕ удаляем дома (это кэш пользователя) ───
-    // Пользователь сам решит очистить через меню
-
-    console.log('🏠 [House] Интеграция завершена');
-    console.log('   • Вложения: сначала дом, потом сеть');
-    console.log('   • enterChat: мгновенный рендер + фоновый sync');
-    console.log('   • sendMessage/delete/reactions/comments: автосохранение');
-    console.log('   • backToChats: финальный save перед выходом');
+    console.log('🏠 [House] Интеграция v2 готова');
 })();
 </script>
 <script>
 // ═══════════════════════════════════════════════════════════════
-//  🏠 CHAT HOUSE — UI УПРАВЛЕНИЯ (очистка, размер, статистика)
-//  Добавляет в ⋯ меню на экране чатов:
-//   • «Очистить кэш этого чата»
-//   • «Кэш: 12.5 МБ · 156 файлов»
-//  И общий пункт:
-//   • «Управление кэшем» → отдельный оверлей
+//  🏠 CHAT HOUSE — UI v2 (прямой патч меню)
 // ═══════════════════════════════════════════════════════════════
 
 (function installChatHouseUI() {
@@ -28685,14 +28445,11 @@ const ChatHouse = (() => {
 
     if (typeof ChatHouse === 'undefined') return;
 
-    // ═══════════════════════════════════════════════════════════
-    //  СТИЛИ
-    // ═══════════════════════════════════════════════════════════
+    // ═══ Стили (те же, что в v1) ═══
     if (!document.getElementById('chatHouseUIStyles')) {
         const style = document.createElement('style');
         style.id = 'chatHouseUIStyles';
         style.textContent = `
-            /* ═══ Пункт в ⋯ меню ═══ */
             #unifiedChatMenu .ucm-item.house-info {
                 background: rgba(108,92,231,0.05);
                 border: 1px dashed rgba(108,92,231,0.25);
@@ -28700,36 +28457,21 @@ const ChatHouse = (() => {
                 pointer-events: none;
                 opacity: 0.9;
             }
-            #unifiedChatMenu .ucm-item.house-info .ucm-label {
-                font-size: 12px;
-                color: #888;
-            }
-            #unifiedChatMenu .ucm-item.house-info .ucm-icon {
-                font-size: 14px;
-            }
+            #unifiedChatMenu .ucm-item.house-info .ucm-label { font-size: 12px; color: #888; }
+            #unifiedChatMenu .ucm-item.house-info .ucm-icon { font-size: 14px; }
             #unifiedChatMenu .ucm-item.house-info code {
                 background: rgba(255,255,255,0.06);
-                padding: 1px 5px;
-                border-radius: 4px;
-                font-size: 11px;
-                color: #a78bfa;
+                padding: 1px 5px; border-radius: 4px;
+                font-size: 11px; color: #a78bfa;
             }
-            #unifiedChatMenu .ucm-item.house-clear {
-                color: #feca57;
-            }
-            #unifiedChatMenu .ucm-item.house-clear:hover {
-                background: rgba(254,202,87,0.15);
-            }
-            #unifiedChatMenu .ucm-item.house-clear:active {
-                background: rgba(254,202,87,0.25);
-            }
+            #unifiedChatMenu .ucm-item.house-clear { color: #feca57; }
+            #unifiedChatMenu .ucm-item.house-clear:hover { background: rgba(254,202,87,0.15); }
+            #unifiedChatMenu .ucm-item.house-clear:active { background: rgba(254,202,87,0.25); }
 
-            /* ═══ Оверлей управления домами ═══ */
             #houseManagerOverlay {
                 position: fixed; inset: 0;
                 background: linear-gradient(135deg, #0a0a0f, #1a1a2e);
-                z-index: 4950;
-                display: none;
+                z-index: 4950; display: none;
                 flex-direction: column;
                 animation: hmFadeIn 0.25s ease;
             }
@@ -28745,9 +28487,7 @@ const ChatHouse = (() => {
                 border-bottom: 1px solid rgba(255,255,255,0.06);
                 flex-shrink: 0;
             }
-            #houseManagerOverlay .hm-title {
-                flex: 1; min-width: 0;
-            }
+            #houseManagerOverlay .hm-title { flex: 1; min-width: 0; }
             #houseManagerOverlay .hm-title h2 {
                 font-size: 17px; font-weight: 700; color: #fff;
                 display: flex; align-items: center; gap: 8px;
@@ -28762,8 +28502,7 @@ const ChatHouse = (() => {
                 border: none; color: #888; font-size: 16px;
                 cursor: pointer;
                 display: flex; align-items: center; justify-content: center;
-                flex-shrink: 0;
-                transition: all 0.15s;
+                flex-shrink: 0; transition: all 0.15s;
             }
             #houseManagerOverlay .hm-btn:hover {
                 background: rgba(255,255,255,0.12); color: #fff;
@@ -28773,32 +28512,24 @@ const ChatHouse = (() => {
                 background: rgba(255,107,107,0.2); color: #ff6b6b;
             }
 
-            /* ═══ Блок статистики сверху ═══ */
             .hm-stats {
-                margin: 12px 12px 0;
-                padding: 16px;
+                margin: 12px 12px 0; padding: 16px;
                 background: linear-gradient(135deg, rgba(108,92,231,0.12), rgba(0,184,148,0.06));
                 border: 1px solid rgba(108,92,231,0.25);
-                border-radius: 16px;
-                flex-shrink: 0;
+                border-radius: 16px; flex-shrink: 0;
             }
             .hm-stats .hm-total {
-                font-size: 26px; font-weight: 700; color: #fff;
-                margin-bottom: 4px;
+                font-size: 26px; font-weight: 700; margin-bottom: 4px;
                 background: linear-gradient(135deg, #6c5ce7, #00b894);
                 -webkit-background-clip: text;
                 -webkit-text-fill-color: transparent;
             }
-            .hm-stats .hm-total-label {
-                font-size: 12px; color: #888;
-            }
+            .hm-stats .hm-total-label { font-size: 12px; color: #888; }
             .hm-stats .hm-bar {
                 width: 100%; height: 6px;
                 background: rgba(255,255,255,0.08);
-                border-radius: 3px;
-                overflow: hidden;
-                margin-top: 12px;
-                margin-bottom: 8px;
+                border-radius: 3px; overflow: hidden;
+                margin-top: 12px; margin-bottom: 8px;
             }
             .hm-stats .hm-bar-fill {
                 height: 100%;
@@ -28808,20 +28539,16 @@ const ChatHouse = (() => {
             }
             .hm-stats .hm-quota {
                 font-size: 11px; color: #666;
-                display: flex;
-                justify-content: space-between;
+                display: flex; justify-content: space-between;
                 font-variant-numeric: tabular-nums;
             }
 
-            /* ═══ Список домов ═══ */
             .hm-body {
                 flex: 1; overflow-y: auto;
                 padding: 12px 12px 40px;
                 -webkit-overflow-scrolling: touch;
             }
-            .hm-list {
-                display: flex; flex-direction: column; gap: 8px;
-            }
+            .hm-list { display: flex; flex-direction: column; gap: 8px; }
             .hm-house {
                 display: flex; align-items: center; gap: 12px;
                 padding: 12px 14px;
@@ -28839,17 +28566,13 @@ const ChatHouse = (() => {
                 background: linear-gradient(135deg, #6c5ce7, #00b894);
                 display: flex; align-items: center; justify-content: center;
                 font-weight: 700; color: #fff; font-size: 16px;
-                flex-shrink: 0;
-                overflow: hidden;
-                position: relative;
+                flex-shrink: 0; overflow: hidden; position: relative;
             }
             .hm-house .hm-avatar img {
                 width: 100%; height: 100%;
                 object-fit: cover; border-radius: 50%;
             }
-            .hm-house .hm-info {
-                flex: 1; min-width: 0;
-            }
+            .hm-house .hm-info { flex: 1; min-width: 0; }
             .hm-house .hm-name {
                 font-size: 14px; font-weight: 600; color: #fff;
                 white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
@@ -28857,30 +28580,22 @@ const ChatHouse = (() => {
             }
             .hm-house .hm-meta {
                 font-size: 11px; color: #888;
-                display: flex; gap: 8px;
-                flex-wrap: wrap;
+                display: flex; gap: 8px; flex-wrap: wrap;
             }
-            .hm-house .hm-meta .hm-dot {
-                color: #444;
-            }
+            .hm-house .hm-meta .hm-dot { color: #444; }
             .hm-house .hm-size {
-                font-size: 12px;
-                font-weight: 600;
-                color: #a78bfa;
+                font-size: 12px; font-weight: 600; color: #a78bfa;
                 font-variant-numeric: tabular-nums;
-                flex-shrink: 0;
-                margin-right: 4px;
+                flex-shrink: 0; margin-right: 4px;
             }
             .hm-house .hm-delete {
                 width: 32px; height: 32px; border-radius: 50%;
                 background: rgba(255,107,107,0.1);
                 border: 1px solid rgba(255,107,107,0.25);
-                color: #ff6b6b;
-                font-size: 14px;
+                color: #ff6b6b; font-size: 14px;
                 cursor: pointer;
                 display: flex; align-items: center; justify-content: center;
-                flex-shrink: 0;
-                transition: all 0.15s;
+                flex-shrink: 0; transition: all 0.15s;
             }
             .hm-house .hm-delete:hover {
                 background: rgba(255,107,107,0.25);
@@ -28888,43 +28603,25 @@ const ChatHouse = (() => {
             }
             .hm-house .hm-delete:active { transform: scale(0.9); }
 
-            .hm-empty {
-                text-align: center;
-                padding: 60px 20px;
-                color: #666;
-            }
+            .hm-empty { text-align: center; padding: 60px 20px; color: #666; }
             .hm-empty .hm-empty-icon {
-                font-size: 56px; margin-bottom: 12px;
-                opacity: 0.6;
+                font-size: 56px; margin-bottom: 12px; opacity: 0.6;
             }
             .hm-empty .hm-empty-title {
                 font-size: 15px; color: #aaa;
                 margin-bottom: 6px; font-weight: 600;
             }
             .hm-empty .hm-empty-sub {
-                font-size: 12px; color: #666;
-                line-height: 1.5;
+                font-size: 12px; color: #666; line-height: 1.5;
             }
 
-            /* Анимация удаления */
-            .hm-house.removing {
-                opacity: 0;
-                transform: translateX(-20px);
-                transition: opacity 0.2s, transform 0.2s;
-            }
-
-            /* ═══ Аварийная плашка во время очистки ═══ */
             #houseClearingToast {
-                position: fixed;
-                top: 50%; left: 50%;
+                position: fixed; top: 50%; left: 50%;
                 transform: translate(-50%, -50%) scale(0.9);
                 background: rgba(26,26,46,0.98);
                 border: 1px solid rgba(108,92,231,0.5);
-                border-radius: 18px;
-                padding: 20px 26px;
-                display: none;
-                align-items: center;
-                gap: 14px;
+                border-radius: 18px; padding: 20px 26px;
+                display: none; align-items: center; gap: 14px;
                 z-index: 5500;
                 box-shadow: 0 20px 60px rgba(0,0,0,0.7);
                 opacity: 0;
@@ -28932,8 +28629,7 @@ const ChatHouse = (() => {
                 pointer-events: none;
             }
             #houseClearingToast.show {
-                display: flex;
-                opacity: 1;
+                display: flex; opacity: 1;
                 transform: translate(-50%, -50%) scale(1);
             }
             #houseClearingToast .hct-spinner {
@@ -28957,74 +28653,60 @@ const ChatHouse = (() => {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ПЕРЕХВАТ openUnifiedMenu — добавляем пункты дома
+    //  🔑 ГЛАВНОЕ ОТЛИЧИЕ: патчим сам процесс открытия меню
+    //  Через capture-обработчик на document — ловим клик по .chat-more-btn
     // ═══════════════════════════════════════════════════════════
-    const _origOpenUnifiedMenu = window._unifiedChatSystem?.openMenu;
+    document.addEventListener('click', (e) => {
+        const moreBtn = e.target.closest && e.target.closest('.chat-more-btn');
+        if (!moreBtn) return;
 
-    if (window._unifiedChatSystem) {
-        const _origOpen = window._unifiedChatSystem.openMenu;
+        // Даём оригинальному обработчику создать меню
+        // (он вешается через capture: true в _unifiedChatSystem,
+        //  поэтому наш обычный слушатель сработает ПОСЛЕ)
+        setTimeout(async () => {
+            const menu = document.getElementById('unifiedChatMenu');
+            if (!menu) return;
 
-        window._unifiedChatSystem.openMenu = function(chatFile, buttonEl) {
-            // Вызываем оригинал — он создаст меню
-            const result = _origOpen.call(this, chatFile, buttonEl);
+            const chatItem = moreBtn.closest('.chat-list-item');
+            if (!chatItem) return;
+            const file = chatItem.dataset.file;
+            if (!file) return;
 
-            // Теперь патчим содержимое меню
-            setTimeout(() => {
-                const menu = document.getElementById('unifiedChatMenu');
-                if (!menu) return;
-                injectHouseItems(menu, chatFile);
-            }, 30);
+            await injectHouseItems(menu, file);
+        }, 50);
+    }, true);  // ⬅️ capture — срабатывает до обычных слушателей
 
-            return result;
-        };
-
-        console.log('🏠 [HouseUI] openUnifiedMenu пропатчен');
-    }
-
-    // ─── Дополнительная страховка через MutationObserver ───
-    // (на случай, если openMenu переопределят позже)
-    const menuObserver = new MutationObserver((mutations) => {
-        for (const mut of mutations) {
+    // ─── Дополнительно: MutationObserver как страховка ───
+    const menuObs = new MutationObserver((muts) => {
+        for (const mut of muts) {
             for (const node of mut.addedNodes) {
                 if (node.nodeType !== 1) continue;
                 if (node.id === 'unifiedChatMenu') {
-                    // Извлекаем file из data атрибутов или header
-                    const file = extractFileFromMenu(node);
-                    if (file) {
-                        setTimeout(() => injectHouseItems(node, file), 20);
+                    const idEl = node.querySelector('.ucm-id');
+                    if (idEl) {
+                        const file = idEl.textContent.trim();
+                        if (file) {
+                            setTimeout(() => injectHouseItems(node, file), 30);
+                        }
                     }
                 }
             }
         }
     });
-    menuObserver.observe(document.body, { childList: true, subtree: true });
-
-    function extractFileFromMenu(menu) {
-        // Внутри header есть .ucm-id с file
-        const idEl = menu.querySelector('.ucm-id');
-        if (idEl) return idEl.textContent.trim();
-
-        // Fallback: ищем в data-атрибутах
-        const anyItem = menu.querySelector('[data-action]');
-        // Не поможет — вернём null
-        return null;
-    }
+    menuObs.observe(document.body, { childList: true, subtree: true });
 
     // ═══════════════════════════════════════════════════════════
-    //  ИНЪЕКЦИЯ ПУНКТОВ ДОМА В МЕНЮ
+    //  ИНЪЕКЦИЯ ПУНКТОВ
     // ═══════════════════════════════════════════════════════════
     async function injectHouseItems(menu, chatFile) {
         if (!menu || !chatFile) return;
+        if (menu.querySelector('.ucm-item.house-info')) return;  // уже вставили
 
-        // Уже вставили?
-        if (menu.querySelector('.ucm-item.house-info')) return;
-
-        // Получаем статистику дома
         let stats;
         try {
             stats = await ChatHouse.getHouseStats(chatFile);
         } catch (e) {
-            console.warn('🏠 [HouseUI] getHouseStats failed:', e);
+            console.warn('🏠 [HouseUI] stats failed:', e);
             return;
         }
 
@@ -29032,12 +28714,15 @@ const ChatHouse = (() => {
         const blobCount = stats.blobCount || 0;
         const totalSize = stats.blobSizeHuman || '0 Б';
 
-        // Находим разделитель перед «Убрать из списка» (последний ucm-divider)
+        // Находим последний разделитель (перед «Убрать из списка»)
         const dividers = menu.querySelectorAll('.ucm-divider');
         const lastDivider = dividers[dividers.length - 1];
-        if (!lastDivider) return;
+        if (!lastDivider) {
+            console.warn('🏠 [HouseUI] Разделитель не найден');
+            return;
+        }
 
-        // Блок с информацией о доме
+        // Информация о доме
         const infoBlock = document.createElement('div');
         infoBlock.className = 'ucm-item house-info';
         infoBlock.innerHTML = `
@@ -29063,72 +28748,58 @@ const ChatHouse = (() => {
             </span>
         `;
 
-        // Вставляем ПЕРЕД последним разделителем
         lastDivider.parentNode.insertBefore(clearBtn, lastDivider);
         lastDivider.parentNode.insertBefore(infoBlock, clearBtn);
 
-        // Обработчик
         clearBtn.addEventListener('click', async (e) => {
             e.stopPropagation();
-
-            // Закрываем меню
-            if (window._unifiedChatSystem && window._unifiedChatSystem.closeMenu) {
+            if (window._unifiedChatSystem?.closeMenu) {
                 window._unifiedChatSystem.closeMenu();
             }
-
             await clearHouseOfChat(chatFile, stats);
         });
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ОЧИСТКА ДОМА ОДНОГО ЧАТА
+    //  ОЧИСТКА
     // ═══════════════════════════════════════════════════════════
     async function clearHouseOfChat(chatFile, stats = null) {
         if (!stats) {
-            try {
-                stats = await ChatHouse.getHouseStats(chatFile);
-            } catch (e) { /* ignore */ }
+            try { stats = await ChatHouse.getHouseStats(chatFile); } catch (e) {}
         }
 
         const chat = state.chats.find(c => c.file === chatFile);
         const chatName = chat ? (chat.name || chat.file) : chatFile;
-        const sizeText = stats ? stats.blobSizeHuman : 'неизвестно';
+        const sizeText = stats ? stats.blobSizeHuman : '?';
         const msgCount = stats ? stats.messageCount : '?';
         const blobCount = stats ? stats.blobCount : '?';
 
-        // Показываем подтверждение
         const ok = await showConfirmModal(
             '🧹 Очистить дом чата?',
             `Чат: «${chatName}»\n\n` +
             `Будет удалено локально:\n` +
             `• ${msgCount} сообщений\n` +
             `• ${blobCount} файлов (${sizeText})\n\n` +
-            `На GitHub ничего не тронется — при следующем входе чат загрузится заново.`,
-            'Очистить',
-            'Отмена'
+            `На GitHub ничего не тронется.`,
+            'Очистить', 'Отмена'
         );
-
         if (!ok) return;
 
-        // Показываем прогресс
         showClearingToast(`Очищаем «${chatName}»…`);
-
         try {
             await ChatHouse.deleteHouse(chatFile);
-            console.log(`🏠 [HouseUI] Дом чата очищен: ${chatFile}`);
             showToast(`🧹 Дом «${chatName}» очищен`, 2000);
             soundManager.play('delete');
         } catch (e) {
-            console.error('🏠 [HouseUI] clear failed:', e);
-            showToast('❌ Ошибка очистки: ' + e.message, 3000);
-            soundManager.play('error');
+            console.error(e);
+            showToast('❌ Ошибка: ' + e.message, 3000);
         } finally {
             hideClearingToast();
         }
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  МЕНЕДЖЕР ВСЕХ ДОМОВ (кнопка из чатов)
+    //  МЕНЕДЖЕР
     // ═══════════════════════════════════════════════════════════
     function ensureManagerOverlay() {
         let ov = document.getElementById('houseManagerOverlay');
@@ -29142,16 +28813,11 @@ const ChatHouse = (() => {
                     <h2>🏠 Дома чатов</h2>
                     <div class="hm-sub" id="hmSubtitle">Загрузка…</div>
                 </div>
-                <button class="hm-btn hm-btn-danger" id="hmClearAllBtn" title="Очистить все дома">🗑</button>
+                <button class="hm-btn hm-btn-danger" id="hmClearAllBtn" title="Очистить все">🗑</button>
                 <button class="hm-btn" id="hmRefreshBtn" title="Обновить">⟳</button>
                 <button class="hm-btn" id="hmCloseBtn" title="Закрыть">✕</button>
             </div>
-            <div class="hm-body" id="hmBody">
-                <div class="hm-empty">
-                    <div class="hm-empty-icon">🏠</div>
-                    <div class="hm-empty-title">Загрузка…</div>
-                </div>
-            </div>
+            <div class="hm-body" id="hmBody"></div>
         `;
         document.body.appendChild(ov);
 
@@ -29160,20 +28826,15 @@ const ChatHouse = (() => {
             document.body.style.overflow = '';
         });
 
-        ov.querySelector('#hmRefreshBtn').addEventListener('click', () => {
-            renderManagerContent();
-        });
+        ov.querySelector('#hmRefreshBtn').addEventListener('click', renderManagerContent);
 
         ov.querySelector('#hmClearAllBtn').addEventListener('click', async () => {
             const ok = await showConfirmModal(
                 '🧹 Очистить ВСЕ дома?',
-                'Это удалит все локальные копии всех чатов.\n\n' +
-                'На GitHub ничего не тронется. При следующем входе каждый чат загрузится заново.',
-                'Очистить всё',
-                'Отмена'
+                'Удалятся все локальные копии всех чатов.\nНа GitHub ничего не тронется.',
+                'Очистить всё', 'Отмена'
             );
             if (!ok) return;
-
             showClearingToast('Очищаем все дома…');
             try {
                 await ChatHouse.clearAllHouses();
@@ -29195,37 +28856,27 @@ const ChatHouse = (() => {
         const subtitle = document.getElementById('hmSubtitle');
         if (!body) return;
 
-        body.innerHTML = `
-            <div class="hm-empty">
-                <div class="hm-empty-icon">⏳</div>
-                <div class="hm-empty-title">Считаем…</div>
-            </div>
-        `;
+        body.innerHTML = `<div class="hm-empty"><div class="hm-empty-icon">⏳</div><div class="hm-empty-title">Считаем…</div></div>`;
 
-        // Собираем данные
         const [houses, usage] = await Promise.all([
             ChatHouse.listAllHousesStats(),
             ChatHouse.estimateUsage(),
         ]);
 
-        // Сортируем по размеру (крупные сверху)
         houses.sort((a, b) => (b.size || 0) - (a.size || 0));
 
         const totalSize = houses.reduce((s, h) => s + (h.size || 0), 0);
         const totalMessages = houses.reduce((s, h) => s + (h.messageCount || 0), 0);
         const totalBlobs = houses.reduce((s, h) => s + (h.blobCount || 0), 0);
 
-        // Подпись
         if (subtitle) {
             subtitle.textContent = houses.length === 0
                 ? 'Пусто'
                 : `${houses.length} чатов · ${totalMessages} сообщ. · ${totalBlobs} файлов`;
         }
 
-        // Собираем HTML
         let html = '';
 
-        // Блок статистики
         if (usage) {
             html += `
                 <div class="hm-stats">
@@ -29242,15 +28893,13 @@ const ChatHouse = (() => {
             `;
         }
 
-        // Список домов
         if (houses.length === 0) {
             html += `
                 <div class="hm-empty">
                     <div class="hm-empty-icon">🏠</div>
                     <div class="hm-empty-title">Пока нет домов</div>
                     <div class="hm-empty-sub">
-                        Зайдите в любой чат — его дом создастся автоматически,<br>
-                        и в следующий раз он откроется мгновенно.
+                        Зайдите в любой чат — его дом создастся автоматически.
                     </div>
                 </div>
             `;
@@ -29259,21 +28908,11 @@ const ChatHouse = (() => {
             for (const h of houses) {
                 const chat = state.chats.find(c => c.file === h.file);
                 const name = chat ? (chat.name || chat.file) : (h.name || h.file);
-
-                // Аватарка
-                let avatarHtml;
-                const avatarData = typeof getChatAvatar === 'function'
-                    ? getChatAvatar(h.file) : null;
-                if (avatarData) {
-                    avatarHtml = `<img src="${avatarData}" alt="">`;
-                } else {
-                    avatarHtml = (name || '?').charAt(0).toUpperCase();
-                }
-
-                // Время последнего синка
-                const lastSync = h.lastSyncAt
-                    ? timeAgoShort(h.lastSyncAt)
-                    : 'никогда';
+                const avatarData = typeof getChatAvatar === 'function' ? getChatAvatar(h.file) : null;
+                const avatarHtml = avatarData
+                    ? `<img src="${avatarData}" alt="">`
+                    : (name || '?').charAt(0).toUpperCase();
+                const lastSync = h.lastSyncAt ? timeAgoShort(h.lastSyncAt) : 'никогда';
 
                 html += `
                     <div class="hm-house" data-file="${escapeHtml(h.file)}">
@@ -29282,9 +28921,7 @@ const ChatHouse = (() => {
                             <div class="hm-name">${escapeHtml(name)}</div>
                             <div class="hm-meta">
                                 <span>💬 ${h.messageCount}</span>
-                                ${h.blobCount > 0
-                                    ? `<span class="hm-dot">·</span><span>📎 ${h.blobCount}</span>`
-                                    : ''}
+                                ${h.blobCount > 0 ? `<span class="hm-dot">·</span><span>📎 ${h.blobCount}</span>` : ''}
                                 <span class="hm-dot">·</span>
                                 <span>🕒 ${lastSync}</span>
                             </div>
@@ -29299,41 +28936,32 @@ const ChatHouse = (() => {
 
         body.innerHTML = html;
 
-        // Обработчики удаления
         body.querySelectorAll('.hm-delete').forEach(btn => {
             btn.addEventListener('click', async (e) => {
                 e.stopPropagation();
                 const file = btn.dataset.file;
                 await clearHouseOfChat(file);
-
-                // Анимация удаления
                 const card = btn.closest('.hm-house');
                 if (card) {
-                    card.classList.add('removing');
-                    setTimeout(() => {
-                        card.remove();
-                        // Пересчитываем статистику
-                        renderManagerContent();
-                    }, 220);
+                    card.style.transition = 'opacity 0.2s, transform 0.2s';
+                    card.style.opacity = '0';
+                    card.style.transform = 'translateX(-20px)';
+                    setTimeout(() => renderManagerContent(), 220);
                 }
             });
         });
     }
 
-    // ─── Хелпер: «5 мин назад» ───
     function timeAgoShort(ts) {
         if (!ts) return 'никогда';
         const diff = Date.now() - ts;
-        if (diff < 60 * 1000) return 'только что';
-        if (diff < 60 * 60 * 1000) return `${Math.floor(diff / 60000)} мин`;
-        if (diff < 24 * 60 * 60 * 1000) return `${Math.floor(diff / 3600000)} ч`;
-        if (diff < 7 * 24 * 60 * 60 * 1000) return `${Math.floor(diff / 86400000)} дн`;
+        if (diff < 60000) return 'только что';
+        if (diff < 3600000) return `${Math.floor(diff / 60000)} мин`;
+        if (diff < 86400000) return `${Math.floor(diff / 3600000)} ч`;
+        if (diff < 604800000) return `${Math.floor(diff / 86400000)} дн`;
         return new Date(ts).toLocaleDateString('ru-RU', { day: 'numeric', month: 'short' });
     }
 
-    // ═══════════════════════════════════════════════════════════
-    //  ПРОГРЕСС-ТОСТ ОЧИСТКИ
-    // ═══════════════════════════════════════════════════════════
     function showClearingToast(text, sub) {
         let el = document.getElementById('houseClearingToast');
         if (!el) {
@@ -29359,17 +28987,13 @@ const ChatHouse = (() => {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  КНОПКА «ДОМА ЧАТОВ» В ⋯ МЕНЮ НА ЭКРАНЕ ЧАТОВ
-    //  Добавляем пункт в существующее #chatsActionsMenu
+    //  КНОПКА В МЕНЮ ЭКРАНА ЧАТОВ (⋯)
     // ═══════════════════════════════════════════════════════════
-    function injectHousesButton() {
+    function injectHousesMenuItem() {
         const menu = document.getElementById('chatsActionsMenu');
-        if (!menu) return;
+        if (!menu) return false;
+        if (menu.querySelector('[data-action="houses"]')) return true;
 
-        // Уже есть?
-        if (menu.querySelector('[data-action="houses"]')) return;
-
-        // Находим разделитель
         const dividers = menu.querySelectorAll('.ucm-divider');
         const lastDivider = dividers[dividers.length - 1];
 
@@ -29389,11 +29013,13 @@ const ChatHouse = (() => {
 
         item.addEventListener('click', (e) => {
             e.stopPropagation();
-            // Закрываем меню
             const m = document.getElementById('chatsActionsMenu');
             if (m) m.classList.remove('show');
             openManagerOverlay();
         });
+
+        console.log('🏠 [HouseUI] Пункт «Дома чатов» добавлен');
+        return true;
     }
 
     function openManagerOverlay() {
@@ -29404,14 +29030,17 @@ const ChatHouse = (() => {
         renderManagerContent();
     }
 
-    // Устанавливаем при появлении меню
-    const chatsMenuObserver = new MutationObserver(() => {
-        injectHousesButton();
+    // 🆕 Наблюдаем ТОЛЬКО за добавлением #chatsActionsMenu в DOM
+    const obs = new MutationObserver(() => {
+        injectHousesMenuItem();
     });
-    chatsMenuObserver.observe(document.body, { childList: true, subtree: true });
+    obs.observe(document.body, { childList: true, subtree: true });
 
-    setTimeout(injectHousesButton, 2000);
-    setInterval(injectHousesButton, 3000);
+    // Периодическая страховка
+    setInterval(injectHousesMenuItem, 1500);
+
+    // Первая попытка
+    setTimeout(injectHousesMenuItem, 2000);
 
     // ═══════════════════════════════════════════════════════════
     //  ПУБЛИЧНЫЙ API
@@ -29420,20 +29049,22 @@ const ChatHouse = (() => {
         openManager: openManagerOverlay,
         closeManager: () => {
             const ov = document.getElementById('houseManagerOverlay');
-            if (ov) {
-                ov.classList.remove('show');
-                document.body.style.overflow = '';
-            }
+            if (ov) { ov.classList.remove('show'); document.body.style.overflow = ''; }
         },
         clearChat: clearHouseOfChat,
         stats: () => ChatHouse.listAllHousesStats(),
         usage: () => ChatHouse.estimateUsage(),
+        // 🆕 Принудительно вставить пункт в открытое меню чата
+        injectIntoMenu: (chatFile) => {
+            const menu = document.getElementById('unifiedChatMenu');
+            if (menu) injectHouseItems(menu, chatFile);
+        },
     };
 
-    console.log('🏠 [HouseUI] UI управления домами активен');
-    console.log('   • ⋯ меню чата → «🏠 Дом чата» + «🧹 Очистить кэш»');
-    console.log('   • ⋯ экрана чатов → «🏠 Дома чатов (кэш)»');
-    console.log('   • API: ChatHouseUI.openManager() / .clearChat(file)');
+    console.log('🏠 [HouseUI v2] Готов');
+    console.log('   • Пункт «🏠 Дома чатов» → ⋯ экрана чатов');
+    console.log('   • Пункт «🏠 Дом чата» + «🧹 Очистить» → ⋯ карточки');
+    console.log('   • API: ChatHouseUI.openManager()');
 })();
 </script>
 </body>
