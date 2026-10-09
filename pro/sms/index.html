@@ -29767,5 +29767,1858 @@ console.log('🧹 Модалка очистки кеша активна');
 
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  📤 OUTBOX QUEUE — ОФЛАЙН-ОЧЕРЕДЬ ОТПРАВКИ СООБЩЕНИЙ
+//  ─────────────────────────────────────────────────────────────
+//  Идея: пока нет сети — сообщения попадают в очередь, рисуются
+//  в чате с иконкой ⏳. Когда сеть появится — уходят по очереди.
+//  Очередь сохраняется в localStorage и переживает перезагрузку.
+// ═══════════════════════════════════════════════════════════════
+
+(function installOutboxQueue() {
+    'use strict';
+
+    // ═══════════════════════════════════════════════════════════
+    //  КОНФИГ
+    // ═══════════════════════════════════════════════════════════
+    const CFG = {
+        storageKey: 'smschat_outbox_v1',
+        maxRetries: 5,               // попыток отправки
+        retryDelayMs: 3000,          // между попытками
+        processIntervalMs: 1500,     // как часто проверяем очередь при онлайн
+        stuckTimeoutMs: 60000,       // если висит >1 мин — статус "ошибка"
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОСТОЯНИЕ
+    // ═══════════════════════════════════════════════════════════
+    const OB = {
+        // Сама очередь: массив задач
+        // Задача = {
+        //   id: string,              — уникальный ID (для отмены)
+        //   chatFile: string,        — куда отправить
+        //   text, imageData, audioData, fileData, ... — payload
+        //   replyTo: object|null,
+        //   createdAt: number,
+        //   retries: number,
+        //   status: 'pending' | 'sending' | 'error',
+        //   errorMessage: string|null,
+        //   localMsgId: number,      — ID временного сообщения в UI
+        // }
+        queue: [],
+
+        // Флаг «идёт обработка» — чтобы не было параллельных циклов
+        processing: false,
+
+        // Таймеры
+        processTimer: null,
+        stuckTimer: null,
+
+        // Флаг «мы в офлайне по нашим ощущениям»
+        offline: !navigator.onLine,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЗАГРУЗКА / СОХРАНЕНИЕ
+    // ═══════════════════════════════════════════════════════════
+    function loadQueue() {
+        try {
+            const raw = localStorage.getItem(CFG.storageKey);
+            if (!raw) return [];
+            const data = JSON.parse(raw);
+            if (!Array.isArray(data)) return [];
+            // Фильтруем только валидные задачи
+            return data.filter(t => t && t.id && t.chatFile);
+        } catch (e) {
+            console.warn('📤 [Outbox] loadQueue error:', e);
+            return [];
+        }
+    }
+
+    function saveQueue() {
+        try {
+            localStorage.setItem(CFG.storageKey, JSON.stringify(OB.queue));
+        } catch (e) {
+            if (e.name === 'QuotaExceededError') {
+                console.warn('📤 [Outbox] quota exceeded, trying to save without blobs');
+                // Удаляем самые тяжёлые задачи (blob'ы)
+                const trimmed = OB.queue.map(t => {
+                    // Оставляем только текст и метаданные
+                    const copy = { ...t };
+                    delete copy.imageData;
+                    delete copy.audioData;
+                    delete copy.fileData;
+                    return copy;
+                });
+                try {
+                    localStorage.setItem(CFG.storageKey, JSON.stringify(trimmed));
+                } catch (e2) {}
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  УТИЛИТЫ
+    // ═══════════════════════════════════════════════════════════
+    function genId() {
+        return 'ob_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+    }
+
+    function blobToBase64(blob) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(reader.result);
+            reader.onerror = reject;
+            reader.readAsDataURL(blob);
+        });
+    }
+
+    function base64ToBlob(base64, mime) {
+        const parts = base64.includes(',') ? base64.split(',') : [null, base64];
+        const bstr = atob(parts[1]);
+        const bytes = new Uint8Array(bstr.length);
+        for (let i = 0; i < bstr.length; i++) bytes[i] = bstr.charCodeAt(i);
+        return new Blob([bytes], { type: mime || 'application/octet-stream' });
+    }
+
+    // Сериализация задачи для localStorage
+    // Blob'ы превращаем в base64 (это тяжело, но иначе не сохранить)
+    async function serializeTask(task) {
+        const out = {
+            id: task.id,
+            chatFile: task.chatFile,
+            text: task.text || '',
+            replyTo: task.replyTo || null,
+            createdAt: task.createdAt,
+            retries: task.retries || 0,
+            status: task.status || 'pending',
+            errorMessage: task.errorMessage || null,
+            localMsgId: task.localMsgId,
+            _hasImage: !!task.imageBlob,
+            _hasAudio: !!task.audioData,
+            _hasFile: !!task.fileAttachment,
+            _hasAudioFile: !!task.audioFile,
+        };
+
+        try {
+            if (task.imageBlob instanceof Blob) {
+                out.imageData = await blobToBase64(task.imageBlob);
+                out.imageMime = task.imageBlob.type;
+            }
+            if (task.audioData) {
+                out.audioData = task.audioData;   // уже base64
+            }
+            if (task.fileAttachment && task.fileAttachment.blob instanceof Blob) {
+                out.fileData = await blobToBase64(task.fileAttachment.blob);
+                out.fileName = task.fileAttachment.name;
+                out.fileMime = task.fileAttachment.mime;
+            }
+            if (task.audioFile && task.audioFile.blob instanceof Blob) {
+                out.audioFileData = await blobToBase64(task.audioFile.blob);
+                out.audioFileName = task.audioFile.name;
+                out.audioFileMime = task.audioFile.mime;
+                out.audioFileDuration = task.audioFile.duration;
+            }
+        } catch (e) {
+            console.warn('📤 [Outbox] serializeTask error:', e);
+        }
+
+        return out;
+    }
+
+    // Восстановление Blob'ов из сохранённой задачи
+    function deserializeTask(saved) {
+        const task = {
+            id: saved.id,
+            chatFile: saved.chatFile,
+            text: saved.text || '',
+            replyTo: saved.replyTo || null,
+            createdAt: saved.createdAt,
+            retries: saved.retries || 0,
+            status: saved.status || 'pending',
+            errorMessage: saved.errorMessage || null,
+            localMsgId: saved.localMsgId,
+        };
+
+        try {
+            if (saved.imageData) {
+                task.imageBlob = base64ToBlob(saved.imageData, saved.imageMime || 'image/jpeg');
+            }
+            if (saved.audioData) {
+                task.audioData = saved.audioData;
+            }
+            if (saved.fileData) {
+                task.fileAttachment = {
+                    blob: base64ToBlob(saved.fileData, saved.fileMime),
+                    name: saved.fileName || 'file.bin',
+                    mime: saved.fileMime || 'application/octet-stream',
+                };
+            }
+            if (saved.audioFileData) {
+                task.audioFile = {
+                    blob: base64ToBlob(saved.audioFileData, saved.audioFileMime),
+                    name: saved.audioFileName || 'audio.mp3',
+                    mime: saved.audioFileMime || 'audio/mpeg',
+                    duration: saved.audioFileDuration || 0,
+                };
+            }
+        } catch (e) {
+            console.warn('📤 [Outbox] deserializeTask error:', e);
+        }
+
+        return task;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  РЕНДЕР «pending» СООБЩЕНИЯ
+    // ═══════════════════════════════════════════════════════════
+    /**
+     * Создаёт визуальное «сообщение в очереди».
+     * Использует обычный buildMessageHTML, но с флагом _outbox.
+     */
+    function renderPendingMessage(task) {
+        // Формируем plainMsg-объект, как если бы это было настоящее сообщение
+        const plainMsg = {
+            id: task.localMsgId,
+            username: state.username,
+            text: task.text || '',
+            time: new Date(task.createdAt).toISOString(),
+            _outbox: true,
+            _outboxTaskId: task.id,
+            _outboxStatus: task.status || 'pending',
+            _outboxError: task.errorMessage || null,
+        };
+
+        // Вложения
+        if (task.imageBlob) {
+            plainMsg._outboxImageBlob = task.imageBlob;
+            // data URL для превью — можно показать сразу
+            plainMsg._outboxImageUrl = task._previewUrl || null;
+        }
+        if (task.audioData) {
+            plainMsg._outboxAudio = task.audioData;
+        }
+        if (task.fileAttachment) {
+            plainMsg.fileName = task.fileAttachment.name;
+            plainMsg.fileSize = task.fileAttachment.blob.size;
+            plainMsg.fileMime = task.fileAttachment.mime;
+        }
+        if (task.audioFile) {
+            plainMsg.audioName = task.audioFile.name;
+            plainMsg.audioDuration = task.audioFile.duration;
+        }
+        if (task.replyTo) {
+            plainMsg.replyTo = task.replyTo;
+        }
+
+        // Возвращаем HTML обычного сообщения
+        // (buildMessageHTML уже отработает и нарисует нам привычный вид)
+        const html = buildMessageHTML(plainMsg, { noFade: false });
+
+        // Но! Нам нужно добавить спиннер поверх. Сделаем это через postprocessing.
+        return html;
+    }
+
+    /**
+     * После вставки HTML в DOM — навешиваем спиннер и обработчики.
+     */
+    function decoratePendingMessage(wrapper, task) {
+        if (!wrapper) return;
+        wrapper.classList.add('outbox-message');
+        wrapper.dataset.outboxTaskId = task.id;
+
+        // ─── Спиннер поверх сообщения ───
+        const msgEl = wrapper.querySelector('.message');
+        if (!msgEl) return;
+
+        // Уже есть спиннер?
+        if (msgEl.querySelector('.outbox-indicator')) return;
+
+        const indicator = document.createElement('div');
+        indicator.className = 'outbox-indicator';
+
+        if (task.status === 'error') {
+            indicator.classList.add('error');
+            indicator.innerHTML = `
+                <span class="outbox-icon">⚠️</span>
+                <span class="outbox-text">Не отправлено</span>
+                <button class="outbox-retry" title="Повторить">↻</button>
+                <button class="outbox-cancel" title="Удалить">✕</button>
+            `;
+        } else if (task.status === 'sending') {
+            indicator.innerHTML = `
+                <span class="outbox-spinner"></span>
+                <span class="outbox-text">Отправка…</span>
+            `;
+        } else {
+            indicator.innerHTML = `
+                <span class="outbox-spinner"></span>
+                <span class="outbox-text">В очереди</span>
+                <button class="outbox-cancel" title="Отменить">✕</button>
+            `;
+        }
+
+        msgEl.appendChild(indicator);
+
+        // ─── Обработчики кнопок ───
+        const cancelBtn = indicator.querySelector('.outbox-cancel');
+        if (cancelBtn) {
+            cancelBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                cancelTask(task.id);
+            });
+        }
+        const retryBtn = indicator.querySelector('.outbox-retry');
+        if (retryBtn) {
+            retryBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                retryTask(task.id);
+            });
+        }
+
+        // ─── Клик по всему индикатору для error = повтор ───
+        if (task.status === 'error') {
+            indicator.addEventListener('click', (e) => {
+                if (e.target.closest('button')) return;
+                retryTask(task.id);
+            });
+            indicator.style.cursor = 'pointer';
+        }
+    }
+
+    /**
+     * Обновляет статус уже отрисованного сообщения.
+     */
+    function updateMessageStatus(task) {
+        const wrapper = messagesInner.querySelector(
+            `.message-wrapper[data-outbox-task-id="${task.id}"]`
+        );
+        if (!wrapper) return;
+
+        // Удаляем старый индикатор
+        const old = wrapper.querySelector('.outbox-indicator');
+        if (old) old.remove();
+
+        // Рисуем заново
+        decoratePendingMessage(wrapper, task);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ДОБАВЛЕНИЕ В ОЧЕРЕДЬ
+    // ═══════════════════════════════════════════════════════════
+    async function enqueue(task) {
+        // Генерируем локальный ID сообщения (отрицательный, чтобы не конфликтовать с серверными)
+        task.localMsgId = -Date.now() - Math.floor(Math.random() * 1000);
+        task.createdAt = task.createdAt || Date.now();
+        task.status = task.status || 'pending';
+        task.retries = task.retries || 0;
+
+        OB.queue.push(task);
+        await saveQueueAsync();
+
+        // Если мы в этом чате — сразу рисуем
+        if (state.chatFile === task.chatFile && state.currentScreen === 'chat') {
+            appendOutboxMessage(task);
+        }
+
+        // Обновляем счётчики
+        updateBadges();
+
+        // Пытаемся отправить (если онлайн)
+        if (!isOffline()) {
+            processQueue();
+        }
+
+        console.log(`📤 [Outbox] Задача добавлена: ${task.id}, всего в очереди: ${OB.queue.length}`);
+        return task;
+    }
+
+    function appendOutboxMessage(task) {
+        const html = renderPendingMessage(task);
+        // Вставляем как обычно
+        const temp = document.createElement('div');
+        temp.innerHTML = html;
+        const wrapper = temp.firstElementChild;
+        messagesInner.appendChild(wrapper);
+        decoratePendingMessage(wrapper, task);
+        scrollToBottom(true);
+    }
+
+    async function saveQueueAsync() {
+        // Асинхронная сериализация (blob → base64 тяжело)
+        const serialized = await Promise.all(OB.queue.map(serializeTask));
+        try {
+            localStorage.setItem(CFG.storageKey, JSON.stringify(serialized));
+        } catch (e) {
+            console.warn('📤 [Outbox] saveQueueAsync error:', e);
+        }
+    }
+
+    // Синхронное сохранение — для случая, когда blob'ы уже сериализованы
+    function saveQueueSync() {
+        try {
+            localStorage.setItem(CFG.storageKey, JSON.stringify(OB.queue));
+        } catch (e) {}
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПРОВЕРКА СЕТИ
+    // ═══════════════════════════════════════════════════════════
+    function isOffline() {
+        // Наш флаг офлайна (устанавливается событиями + soft-детектором)
+        if (OB.offline) return true;
+        // Проверка через глобальный networkState
+        if (typeof networkState !== 'undefined' && networkState && !networkState.isOnline) {
+            return true;
+        }
+        return false;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОБРАБОТКА ОЧЕРЕДИ
+    // ═══════════════════════════════════════════════════════════
+    async function processQueue() {
+        if (OB.processing) return;
+        if (OB.queue.length === 0) return;
+        if (isOffline()) {
+            console.log('📤 [Outbox] Офлайн — очередь ждёт');
+            return;
+        }
+        if (!state.isAuthorized) return;
+
+        OB.processing = true;
+
+        try {
+            while (OB.queue.length > 0) {
+                const task = OB.queue[0];
+
+                // Если задача в статусе error — не трогаем (ждёт ручного retry)
+                if (task.status === 'error') {
+                    console.log('📤 [Outbox] Первая задача в error — останавливаемся');
+                    break;
+                }
+
+                // Проверяем ещё раз офлайн
+                if (isOffline()) {
+                    console.log('📤 [Outbox] Офлайн во время обработки — стоп');
+                    break;
+                }
+
+                // Меняем статус
+                task.status = 'sending';
+                updateMessageStatus(task);
+
+                try {
+                    await sendTask(task);
+                    // Успех — удаляем из очереди
+                    OB.queue.shift();
+                    task.status = 'sent';
+                    removeLocalMessage(task);
+                    await saveQueueAsync();
+                    updateBadges();
+                    soundManager.play('send');
+                } catch (err) {
+                    console.error('📤 [Outbox] Ошибка отправки:', err);
+                    task.retries = (task.retries || 0) + 1;
+
+                    // Сетевая ошибка?
+                    const isNetError = (
+                        !navigator.onLine ||
+                        err.name === 'TypeError' ||
+                        err.name === 'AbortError' ||
+                        (err.message && (
+                            err.message.includes('Failed to fetch') ||
+                            err.message.includes('NetworkError') ||
+                            err.message.includes('timeout')
+                        ))
+                    );
+
+                    if (isNetError && task.retries < CFG.maxRetries) {
+                        // Ждём и пробуем снова
+                        task.status = 'pending';
+                        updateMessageStatus(task);
+                        console.log(`📤 [Outbox] Сетевая ошибка, повтор через ${CFG.retryDelayMs}мс (попытка ${task.retries}/${CFG.maxRetries})`);
+                        await new Promise(r => setTimeout(r, CFG.retryDelayMs));
+                        continue;
+                    }
+
+                    // Не сетевая или кончились попытки — статус error
+                    task.status = 'error';
+                    task.errorMessage = err.message || 'Ошибка';
+                    updateMessageStatus(task);
+                    await saveQueueAsync();
+                    updateBadges();
+                    showToastSafe(`⚠️ Не отправлено: ${task.errorMessage}`, 2500);
+                    break;
+                }
+            }
+        } finally {
+            OB.processing = false;
+        }
+    }
+
+    /**
+     * Отправляет одну задачу через оригинальный sendMessage.
+     */
+    async function sendTask(task) {
+        // Убеждаемся, что мы в правильном чате
+        // (sendMessage работает с текущим чатом)
+        const wasInChat = state.chatFile === task.chatFile;
+
+        if (!wasInChat) {
+            // Если не в этом чате — временно подменяем контекст
+            // ВАЖНО: sendMessage использует state.chatFile для пути
+            const savedChatFile = state.chatFile;
+            const savedChatPassword = state.chatPassword;
+            const savedSalt = state.salt;
+            const savedKey = CRYPTO._key;
+
+            const targetPassword = state.savedPasswords[task.chatFile];
+            if (!targetPassword) {
+                throw new Error('Нет пароля для чата');
+            }
+
+            // Временно подменяем
+            state.chatFile = task.chatFile;
+            state.chatPassword = targetPassword;
+            state.salt = null;
+            CRYPTO._key = null;
+
+            try {
+                await _sendTaskInternal(task);
+            } finally {
+                // Возвращаем
+                state.chatFile = savedChatFile;
+                state.chatPassword = savedChatPassword;
+                state.salt = savedSalt;
+                CRYPTO._key = savedKey;
+            }
+        } else {
+            await _sendTaskInternal(task);
+        }
+    }
+
+    /**
+     * Внутренняя отправка — вызывает оригинальный _origSendMessage.
+     */
+    async function _sendTaskInternal(task) {
+        // Восстанавливаем payload
+        const text = task.text || '';
+        const imageBlob = task.imageBlob || null;
+        const audioData = task.audioData || null;
+        const fileAttachment = task.fileAttachment || null;
+        const audioFile = task.audioFile || null;
+        const replyContext = task.replyTo || null;
+
+        // Вызываем оригинальную sendMessage (ту, что была до патча Outbox)
+        // ВАЖНО: наша функция-обёртка _origSendMessageForOutbox
+        if (typeof _origSendMessageForOutbox !== 'function') {
+            throw new Error('Оригинальный sendMessage не найден');
+        }
+
+        await _origSendMessageForOutbox.call(
+            window,
+            text,
+            imageBlob,
+            audioData,
+            fileAttachment,
+            audioFile,
+            replyContext,
+            null   // videoPayload
+        );
+    }
+
+    function removeLocalMessage(task) {
+        const wrapper = messagesInner.querySelector(
+            `.message-wrapper[data-outbox-task-id="${task.id}"]`
+        );
+        if (wrapper) {
+            wrapper.style.transition = 'opacity 0.25s, transform 0.25s';
+            wrapper.style.opacity = '0';
+            wrapper.style.transform = 'scale(0.95)';
+            setTimeout(() => wrapper.remove(), 250);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОТМЕНА / ПОВТОР
+    // ═══════════════════════════════════════════════════════════
+    function cancelTask(taskId) {
+        const idx = OB.queue.findIndex(t => t.id === taskId);
+        if (idx === -1) return;
+
+        const task = OB.queue[idx];
+        if (task.status === 'sending') {
+            showToastSafe('⏳ Уже отправляется, подождите…', 1800);
+            return;
+        }
+
+        OB.queue.splice(idx, 1);
+        removeLocalMessage(task);
+        saveQueueAsync();
+        updateBadges();
+        soundManager.play('delete');
+        showToastSafe('🗑️ Отправка отменена', 1500);
+    }
+
+    function retryTask(taskId) {
+        const task = OB.queue.find(t => t.id === taskId);
+        if (!task) return;
+
+        task.status = 'pending';
+        task.retries = 0;
+        task.errorMessage = null;
+        updateMessageStatus(task);
+        saveQueueAsync();
+
+        showToastSafe('🔄 Пробуем снова…', 1500);
+
+        if (!isOffline()) {
+            processQueue();
+        } else {
+            showToastSafe('📵 Нет сети — ждём', 1800);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  БЕЙДЖИ / СЧЁТЧИКИ
+    // ═══════════════════════════════════════════════════════════
+    function updateBadges() {
+        const total = OB.queue.length;
+        const errors = OB.queue.filter(t => t.status === 'error').length;
+
+        // Обновляем title кнопки «Назад»
+        try {
+            const backBtn = document.getElementById('backToChatsBtn');
+            if (backBtn) {
+                const existingBadge = backBtn.querySelector('.outbox-badge');
+                if (existingBadge) existingBadge.remove();
+
+                if (total > 0) {
+                    backBtn.style.position = 'relative';
+                    const badge = document.createElement('span');
+                    badge.className = 'outbox-badge';
+                    badge.textContent = total > 99 ? '99+' : String(total);
+                    if (errors > 0) badge.classList.add('has-errors');
+                    backBtn.appendChild(badge);
+                }
+            }
+        } catch (e) {}
+
+        // Счётчик в шапке чата
+        try {
+            const chatHeader = document.querySelector('#chatScreen .chat-header');
+            if (chatHeader) {
+                const existing = chatHeader.querySelector('.outbox-header-counter');
+                if (existing) existing.remove();
+
+                if (total > 0 && state.currentScreen === 'chat') {
+                    const counter = document.createElement('div');
+                    counter.className = 'outbox-header-counter';
+                    counter.innerHTML = `
+                        <span class="ohc-icon">${errors > 0 ? '⚠️' : '⏳'}</span>
+                        <span class="ohc-text">${total} в очереди</span>
+                    `;
+                    if (errors > 0) counter.classList.add('has-errors');
+                    chatHeader.appendChild(counter);
+                }
+            }
+        } catch (e) {}
+
+        // Стили для бейджей — добавим один раз
+        if (!document.getElementById('outboxStyles')) {
+            const style = document.createElement('style');
+            style.id = 'outboxStyles';
+            style.textContent = `
+                /* ─── Индикатор на сообщении ─── */
+                .message-wrapper.outbox-message .message {
+                    position: relative;
+                    padding-bottom: 32px;
+                }
+                .outbox-indicator {
+                    position: absolute;
+                    left: 10px;
+                    right: 10px;
+                    bottom: 6px;
+                    display: flex;
+                    align-items: center;
+                    gap: 8px;
+                    padding: 4px 10px;
+                    background: rgba(0,0,0,0.35);
+                    border-radius: 12px;
+                    font-size: 11px;
+                    color: rgba(255,255,255,0.85);
+                    backdrop-filter: blur(6px);
+                    -webkit-backdrop-filter: blur(6px);
+                    pointer-events: auto;
+                    user-select: none;
+                }
+                .outbox-indicator .outbox-spinner {
+                    width: 12px;
+                    height: 12px;
+                    border: 2px solid rgba(255,255,255,0.25);
+                    border-top-color: #fff;
+                    border-radius: 50%;
+                    animation: outboxSpin 0.8s linear infinite;
+                    flex-shrink: 0;
+                }
+                @keyframes outboxSpin {
+                    to { transform: rotate(360deg); }
+                }
+                .outbox-indicator .outbox-icon {
+                    font-size: 13px;
+                    flex-shrink: 0;
+                }
+                .outbox-indicator .outbox-text {
+                    flex: 1;
+                    min-width: 0;
+                    white-space: nowrap;
+                    overflow: hidden;
+                    text-overflow: ellipsis;
+                }
+                .outbox-indicator .outbox-cancel,
+                .outbox-indicator .outbox-retry {
+                    width: 22px;
+                    height: 22px;
+                    border-radius: 50%;
+                    border: none;
+                    background: rgba(255,255,255,0.15);
+                    color: #fff;
+                    font-size: 12px;
+                    cursor: pointer;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    flex-shrink: 0;
+                    padding: 0;
+                    line-height: 1;
+                    transition: all 0.15s;
+                }
+                .outbox-indicator .outbox-cancel:hover {
+                    background: rgba(255,107,107,0.5);
+                }
+                .outbox-indicator .outbox-retry:hover {
+                    background: rgba(0,184,148,0.5);
+                }
+                .outbox-indicator .outbox-cancel:active,
+                .outbox-indicator .outbox-retry:active {
+                    transform: scale(0.88);
+                }
+                .outbox-indicator.error {
+                    background: rgba(255,107,107,0.25);
+                    border: 1px solid rgba(255,107,107,0.5);
+                    color: #ff8a8a;
+                }
+                .outbox-indicator.error .outbox-text {
+                    color: #ff8a8a;
+                    font-weight: 600;
+                }
+                .message-wrapper.outbox-message .message {
+                    opacity: 0.92;
+                }
+                .message-wrapper.outbox-message .delete-btn {
+                    display: none !important;
+                }
+
+                /* ─── Бейдж на кнопке «Назад» ─── */
+                #backToChatsBtn .outbox-badge {
+                    position: absolute;
+                    top: -4px;
+                    right: -4px;
+                    min-width: 18px;
+                    height: 18px;
+                    padding: 0 5px;
+                    border-radius: 9px;
+                    background: linear-gradient(135deg, #ff9f43, #feca57);
+                    color: #1a1a2e;
+                    font-size: 10px;
+                    font-weight: 700;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    box-shadow: 0 2px 8px rgba(255,159,67,0.6);
+                    border: 2px solid #0a0a0f;
+                    line-height: 1;
+                    pointer-events: none;
+                    z-index: 5;
+                }
+                #backToChatsBtn .outbox-badge.has-errors {
+                    background: linear-gradient(135deg, #ff6b6b, #ee5253);
+                    color: #fff;
+                    box-shadow: 0 2px 8px rgba(238,82,83,0.6);
+                }
+
+                /* ─── Счётчик в шапке чата ─── */
+                .outbox-header-counter {
+                    display: flex;
+                    align-items: center;
+                    gap: 5px;
+                    padding: 4px 10px;
+                    background: linear-gradient(135deg, rgba(255,159,67,0.2), rgba(254,202,87,0.15));
+                    border: 1px solid rgba(255,159,67,0.4);
+                    border-radius: 12px;
+                    font-size: 11px;
+                    font-weight: 600;
+                    color: #feca57;
+                    margin-right: 8px;
+                    animation: outboxCounterPulse 2s ease-in-out infinite;
+                    flex-shrink: 0;
+                }
+                .outbox-header-counter.has-errors {
+                    background: linear-gradient(135deg, rgba(255,107,107,0.25), rgba(238,82,83,0.15));
+                    border-color: rgba(255,107,107,0.5);
+                    color: #ff8a8a;
+                }
+                @keyframes outboxCounterPulse {
+                    0%, 100% { opacity: 1; }
+                    50%      { opacity: 0.7; }
+                }
+
+                /* ─── Скрываем индикатор в режиме мультивыбора ─── */
+                body.selection-mode .outbox-indicator {
+                    display: none;
+                }
+            `;
+            document.head.appendChild(style);
+        }
+    }
+
+    function showToastSafe(msg, dur) {
+        try {
+            if (typeof showToast === 'function') showToast(msg, dur);
+        } catch (e) {}
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ГЛАВНЫЙ ПЕРЕХВАТ window.sendMessage
+    // ═══════════════════════════════════════════════════════════
+    let _origSendMessageForOutbox = null;
+
+    function installSendMessageInterceptor() {
+        // Находим «последнюю настоящую» sendMessage до наших патчей
+        // Мы вызываемся ПОСЛЕ всех остальных патчей, поэтому window.sendMessage
+        // сейчас — это уже обёртка над оригиналом. Возьмём её.
+        _origSendMessageForOutbox = window.sendMessage;
+
+        window.sendMessage = async function(text, imageBlob, audioData, fileAttachment, audioFile, replyContext, videoPayload) {
+            // ─── Проверяем: офлайн ли мы ───
+            const offline = isOffline() || !navigator.onLine;
+
+            // ─── Если офлайн и есть реальный контент — в очередь ───
+            const hasContent = !!(
+                (text && text.trim()) ||
+                imageBlob instanceof Blob ||
+                audioData ||
+                (fileAttachment && fileAttachment.blob) ||
+                (audioFile && audioFile.blob) ||
+                videoPayload
+            );
+
+            if (offline && hasContent && state.chatFile) {
+                // 🆕 Не отправляем сразу — кладём в очередь
+                const task = {
+                    id: genId(),
+                    chatFile: state.chatFile,
+                    text: text || '',
+                    imageBlob: imageBlob || null,
+                    audioData: audioData || null,
+                    fileAttachment: fileAttachment || null,
+                    audioFile: audioFile || null,
+                    replyTo: replyContext || null,
+                    videoPayload: videoPayload || null,
+                    createdAt: Date.now(),
+                    retries: 0,
+                    status: 'pending',
+                };
+
+                await enqueue(task);
+
+                // Очищаем UI (как будто отправили)
+                if (typeof cancelReply === 'function') cancelReply();
+                if (typeof cancelComment === 'function' && typeof _commentToMsgId !== 'undefined' && _commentToMsgId) {
+                    cancelComment();
+                }
+                messageInput.value = '';
+                messageInput.style.height = 'auto';
+                if (typeof _emojiPanelOpen !== 'undefined' && _emojiPanelOpen && typeof toggleEmojiPanel === 'function') {
+                    toggleEmojiPanel(false);
+                }
+                if (typeof _attachMenuOpen !== 'undefined' && _attachMenuOpen && typeof toggleAttachMenu === 'function') {
+                    toggleAttachMenu(false);
+                }
+
+                soundManager.play('click');
+                showToastSafe('📤 Сообщение в очереди — отправится при появлении сети', 2200);
+
+                return;
+            }
+
+            // ─── Онлайн — отправляем как обычно ───
+            return _origSendMessageForOutbox.call(
+                this, text, imageBlob, audioData, fileAttachment, audioFile, replyContext, videoPayload
+            );
+        };
+
+        console.log('📤 [Outbox] window.sendMessage перехвачен');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОБЫТИЯ ONLINE / OFFLINE
+    // ═══════════════════════════════════════════════════════════
+    window.addEventListener('online', () => {
+        console.log('📤 [Outbox] Событие online — запускаем обработку очереди');
+        OB.offline = false;
+        setTimeout(() => processQueue(), 800);
+    });
+
+    window.addEventListener('offline', () => {
+        console.log('📤 [Outbox] Событие offline');
+        OB.offline = true;
+    });
+
+    // Также следим за networkState
+    if (typeof networkState !== 'undefined') {
+        let lastOnlineState = networkState.isOnline;
+        setInterval(() => {
+            if (networkState.isOnline && !lastOnlineState) {
+                // Перешли из офлайна в онлайн
+                console.log('📤 [Outbox] networkState → online');
+                OB.offline = false;
+                processQueue();
+            } else if (!networkState.isOnline && lastOnlineState) {
+                OB.offline = true;
+            }
+            lastOnlineState = networkState.isOnline;
+        }, 3000);
+    }
+
+    // Периодическая попытка обработки (на случай, если событие online не пришло)
+    setInterval(() => {
+        if (OB.queue.length === 0) return;
+        if (document.hidden) return;
+        if (isOffline()) return;
+        if (OB.processing) return;
+        processQueue();
+    }, CFG.processIntervalMs);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ВОССТАНОВЛЕНИЕ ОЧЕРЕДИ ПОСЛЕ ПЕРЕЗАГРУЗКИ
+    // ═══════════════════════════════════════════════════════════
+    function restoreQueueOnStartup() {
+        const saved = loadQueue();
+        if (saved.length === 0) return;
+
+        console.log(`📤 [Outbox] Восстановление очереди: ${saved.length} задач`);
+        OB.queue = saved.map(deserializeTask);
+
+        // Обновляем бейджи
+        updateBadges();
+
+        // Если открыт чат с этими сообщениями — отрисуем
+        setTimeout(() => {
+            const tasksForCurrentChat = OB.queue.filter(t => t.chatFile === state.chatFile);
+            if (tasksForCurrentChat.length > 0 && state.currentScreen === 'chat') {
+                tasksForCurrentChat.forEach(task => {
+                    // Проверяем, не отрисовано ли уже
+                    const existing = messagesInner.querySelector(
+                        `.message-wrapper[data-outbox-task-id="${task.id}"]`
+                    );
+                    if (!existing) appendOutboxMessage(task);
+                });
+            }
+
+            // Пытаемся отправить, если онлайн
+            if (!isOffline()) {
+                setTimeout(() => processQueue(), 2000);
+            }
+        }, 3000);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ИНТЕГРАЦИЯ С ENTERCHAT — отрисовка очереди при входе в чат
+    // ═══════════════════════════════════════════════════════════
+    if (typeof enterChat === 'function') {
+        const _origEnterChat = enterChat;
+        enterChat = async function(file, name, password) {
+            const result = await _origEnterChat.call(this, file, name, password);
+
+            // После входа в чат — рисуем задачи из очереди для этого чата
+            if (state.chatFile === file) {
+                setTimeout(() => {
+                    const tasks = OB.queue.filter(t => t.chatFile === file);
+                    tasks.forEach(task => {
+                        const existing = messagesInner.querySelector(
+                            `.message-wrapper[data-outbox-task-id="${task.id}"]`
+                        );
+                        if (!existing) appendOutboxMessage(task);
+                    });
+                    updateBadges();
+                }, 800);
+            }
+
+            return result;
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ИНТЕГРАЦИЯ С APPEND MESSAGES — задачи из очереди
+    //  должны быть ВСЕГДА внизу, после обычных сообщений
+    // ═══════════════════════════════════════════════════════════
+    // (в будущем, если нужно — можно переделать на DOM-порядок)
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОЧИСТКА ПРИ LOGOUT
+    // ═══════════════════════════════════════════════════════════
+    if (typeof logout === 'function') {
+        const _origLogout = logout;
+        logout = function() {
+            // Очищаем очередь при выходе
+            if (OB.queue.length > 0) {
+                const confirmMsg = `В очереди ${OB.queue.length} неотправленных сообщений.\n\nУдалить их при выходе?`;
+                if (!confirm(confirmMsg)) {
+                    // Не выходим
+                    return;
+                }
+            }
+            OB.queue = [];
+            localStorage.removeItem(CFG.storageKey);
+            updateBadges();
+            return _origLogout.apply(this, arguments);
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API
+    // ═══════════════════════════════════════════════════════════
+    window.OutboxQueue = {
+        // Список задач
+        getQueue: () => OB.queue.map(t => ({
+            id: t.id,
+            chatFile: t.chatFile,
+            text: t.text,
+            status: t.status,
+            retries: t.retries,
+            createdAt: new Date(t.createdAt).toLocaleString('ru-RU'),
+            hasImage: !!t.imageBlob,
+            hasAudio: !!t.audioData,
+            hasFile: !!t.fileAttachment,
+            hasAudioFile: !!t.audioFile,
+            errorMessage: t.errorMessage,
+        })),
+
+        getCount: () => OB.queue.length,
+        getErrorCount: () => OB.queue.filter(t => t.status === 'error').length,
+        isProcessing: () => OB.processing,
+
+        // Управление
+        process: () => processQueue(),
+        cancel: (taskId) => cancelTask(taskId),
+        retry: (taskId) => retryTask(taskId),
+        cancelAll: () => {
+            OB.queue.forEach(t => removeLocalMessage(t));
+            OB.queue = [];
+            localStorage.removeItem(CFG.storageKey);
+            updateBadges();
+            showToastSafe('🗑️ Очередь очищена', 1500);
+        },
+
+        // Диагностика
+        status: () => ({
+            queueSize: OB.queue.length,
+            errorCount: OB.queue.filter(t => t.status === 'error').length,
+            processing: OB.processing,
+            offline: OB.offline,
+            navigatorOnline: navigator.onLine,
+            networkStateOnline: typeof networkState !== 'undefined' ? networkState.isOnline : 'unknown',
+            tasks: OB.queue.map(t => ({
+                id: t.id,
+                chat: t.chatFile,
+                status: t.status,
+                retries: t.retries,
+                text: (t.text || '').slice(0, 50),
+            })),
+        }),
+
+        // Тест: добавить фейковую задачу
+        testEnqueue: async () => {
+            await enqueue({
+                chatFile: state.chatFile,
+                text: '🧪 Тестовое сообщение из очереди',
+                createdAt: Date.now(),
+                retries: 0,
+                status: 'pending',
+            });
+        },
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЗАПУСК
+    // ═══════════════════════════════════════════════════════════
+    installSendMessageInterceptor();
+    OB.offline = !navigator.onLine;
+    restoreQueueOnStartup();
+    updateBadges();
+
+    console.log('📤 [Outbox] Офлайн-очередь отправки активна');
+    console.log('   • Офлайн: сообщение → в очередь, рисуется в чате со спиннером');
+    console.log('   • Онлайн: очередь уходит автоматически по одной');
+    console.log('   • Сохраняется в localStorage — переживёт перезагрузку');
+    console.log('   • API: OutboxQueue.status() / .getQueue() / .process() / .cancelAll()');
+    console.log('   • Тест: OutboxQueue.testEnqueue()');
+    console.log('   • Эмуляция офлайна: OfflineAPI.forceOffline()');
+
+})();
+</script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🟢 КОМПАКТНЫЙ ИНДИКАТОР СЕТИ (замена баннеров)
+//  ─────────────────────────────────────────────────────────────
+//  Убирает полосатые баннеры "офлайн — только чтение".
+//  Вместо них — маленькая лампочка в правом верхнем углу.
+//  По тапу — мини-попап с деталями.
+// ═══════════════════════════════════════════════════════════════
+
+(function installCompactNetworkIndicator() {
+    'use strict';
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОСТОЯНИЕ
+    // ═══════════════════════════════════════════════════════════
+    const NI = {
+        dotEl: null,           // сам кружок
+        popupEl: null,         // попап с деталями
+        popupOpen: false,
+        currentState: 'online', // 'online' | 'slow' | 'offline'
+        lastTapTs: 0,
+        hideTimeout: null,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  СТИЛИ
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('netIndicatorStyles')) {
+        const style = document.createElement('style');
+        style.id = 'netIndicatorStyles';
+        style.textContent = `
+            /* ═══ Кружок-лампочка ═══ */
+            #netIndicator {
+                position: fixed;
+                top: calc(8px + env(safe-area-inset-top, 0px));
+                right: 8px;
+                width: 14px;
+                height: 14px;
+                border-radius: 50%;
+                z-index: 8000;
+                cursor: pointer;
+                transition: transform 0.15s, box-shadow 0.3s, background 0.3s;
+                -webkit-tap-highlight-color: transparent;
+                user-select: none;
+                display: none;
+            }
+            #netIndicator.show {
+                display: block;
+            }
+            #netIndicator:active {
+                transform: scale(0.85);
+            }
+
+            /* 🟢 Онлайн */
+            #netIndicator.state-online {
+                background: radial-gradient(circle at 30% 30%, #4fd166, #2d9e4a);
+                box-shadow: 0 0 6px rgba(79, 209, 102, 0.8),
+                            0 0 0 2px rgba(79, 209, 102, 0.25);
+            }
+
+            /* 🟡 Медленно */
+            #netIndicator.state-slow {
+                background: radial-gradient(circle at 30% 30%, #feca57, #f39c12);
+                box-shadow: 0 0 8px rgba(254, 202, 87, 0.9),
+                            0 0 0 2px rgba(254, 202, 87, 0.3);
+                animation: netIndicatorPulse 1.4s ease-in-out infinite;
+            }
+
+            /* 🔴 Офлайн */
+            #netIndicator.state-offline {
+                background: radial-gradient(circle at 30% 30%, #ff6b6b, #c0392b);
+                box-shadow: 0 0 8px rgba(255, 107, 107, 0.9),
+                            0 0 0 2px rgba(255, 107, 107, 0.3);
+                animation: netIndicatorBlink 2s ease-in-out infinite;
+            }
+
+            @keyframes netIndicatorPulse {
+                0%, 100% { transform: scale(1); box-shadow: 0 0 8px rgba(254,202,87,0.9), 0 0 0 2px rgba(254,202,87,0.3); }
+                50%      { transform: scale(1.15); box-shadow: 0 0 14px rgba(254,202,87,1), 0 0 0 5px rgba(254,202,87,0); }
+            }
+            @keyframes netIndicatorBlink {
+                0%, 100% { opacity: 1; }
+                50%      { opacity: 0.45; }
+            }
+
+            /* ═══ Попап с деталями ═══ */
+            #netIndicatorPopup {
+                position: fixed;
+                top: calc(28px + env(safe-area-inset-top, 0px));
+                right: 8px;
+                min-width: 220px;
+                max-width: 280px;
+                background: rgba(26, 26, 46, 0.97);
+                backdrop-filter: blur(24px);
+                -webkit-backdrop-filter: blur(24px);
+                border: 1px solid rgba(255,255,255,0.12);
+                border-radius: 14px;
+                padding: 12px 14px;
+                z-index: 7999;
+                box-shadow: 0 12px 40px rgba(0,0,0,0.6);
+                font-family: inherit;
+                display: none;
+                animation: netPopupIn 0.18s cubic-bezier(0.22, 0.61, 0.36, 1);
+                transform-origin: top right;
+                pointer-events: auto;
+            }
+            #netIndicatorPopup.show {
+                display: block;
+            }
+            @keyframes netPopupIn {
+                from { opacity: 0; transform: scale(0.9) translateY(-4px); }
+                to   { opacity: 1; transform: scale(1) translateY(0); }
+            }
+
+            #netIndicatorPopup .ni-header {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                padding-bottom: 8px;
+                margin-bottom: 8px;
+                border-bottom: 1px solid rgba(255,255,255,0.08);
+            }
+            #netIndicatorPopup .ni-header-icon {
+                font-size: 18px;
+                flex-shrink: 0;
+            }
+            #netIndicatorPopup .ni-header-text {
+                flex: 1;
+                min-width: 0;
+            }
+            #netIndicatorPopup .ni-title {
+                font-size: 13px;
+                font-weight: 700;
+                color: #fff;
+                line-height: 1.2;
+            }
+            #netIndicatorPopup .ni-sub {
+                font-size: 11px;
+                color: #888;
+                margin-top: 2px;
+            }
+
+            #netIndicatorPopup .ni-row {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 8px;
+                padding: 5px 0;
+                font-size: 12px;
+                color: #ccc;
+            }
+            #netIndicatorPopup .ni-row .ni-label {
+                color: #888;
+                flex-shrink: 0;
+            }
+            #netIndicatorPopup .ni-row .ni-value {
+                color: #fff;
+                font-weight: 600;
+                text-align: right;
+                word-break: break-word;
+                min-width: 0;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                max-width: 150px;
+            }
+            #netIndicatorPopup .ni-value.good  { color: #00b894; }
+            #netIndicatorPopup .ni-value.warn  { color: #feca57; }
+            #netIndicatorPopup .ni-value.bad   { color: #ff6b6b; }
+
+            #netIndicatorPopup .ni-actions {
+                display: flex;
+                gap: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+                border-top: 1px solid rgba(255,255,255,0.08);
+            }
+            #netIndicatorPopup .ni-action {
+                flex: 1;
+                padding: 8px 10px;
+                border-radius: 10px;
+                border: 1px solid rgba(255,255,255,0.1);
+                background: rgba(255,255,255,0.06);
+                color: #ddd;
+                font-size: 11px;
+                font-weight: 600;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                gap: 4px;
+                transition: all 0.15s;
+                font-family: inherit;
+                -webkit-tap-highlight-color: transparent;
+            }
+            #netIndicatorPopup .ni-action:hover {
+                background: rgba(108,92,231,0.2);
+                border-color: rgba(108,92,231,0.4);
+                color: #fff;
+            }
+            #netIndicatorPopup .ni-action:active {
+                transform: scale(0.95);
+            }
+            #netIndicatorPopup .ni-action .ni-spin {
+                display: inline-block;
+                transition: transform 0.3s;
+            }
+            #netIndicatorPopup .ni-action.checking .ni-spin {
+                animation: niSpin 0.8s linear infinite;
+            }
+            @keyframes niSpin {
+                to { transform: rotate(360deg); }
+            }
+
+            /* 🆕 Небольшой отступ чтобы не мешать кнопке ✕ справа */
+            @media (max-width: 480px) {
+                #netIndicator {
+                    top: calc(6px + env(safe-area-inset-top, 0px));
+                    right: 6px;
+                    width: 12px;
+                    height: 12px;
+                }
+                #netIndicatorPopup {
+                    top: calc(22px + env(safe-area-inset-top, 0px));
+                    right: 6px;
+                    min-width: 200px;
+                    max-width: calc(100vw - 24px);
+                    padding: 10px 12px;
+                }
+                #netIndicatorPopup .ni-title { font-size: 12px; }
+                #netIndicatorPopup .ni-row { font-size: 11px; padding: 4px 0; }
+                #netIndicatorPopup .ni-action { font-size: 10px; padding: 7px 8px; }
+            }
+
+            /* ═══ 🆕 Убираем старые баннеры ═══ */
+            #offlineBanner {
+                display: none !important;
+            }
+            /* Откатываем отступы, которые ставил баннер */
+            body:not(.offline-mode) .auth-header,
+            body:not(.offline-mode) .chat-header {
+                padding-top: revert !important;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОЗДАНИЕ ЭЛЕМЕНТОВ
+    // ═══════════════════════════════════════════════════════════
+    function ensureElements() {
+        // Кружок
+        if (!NI.dotEl) {
+            const dot = document.createElement('div');
+            dot.id = 'netIndicator';
+            dot.className = 'state-online';
+            dot.title = 'Сеть: онлайн';
+            document.body.appendChild(dot);
+            NI.dotEl = dot;
+
+            // Обработчик клика
+            dot.addEventListener('click', (e) => {
+                e.stopPropagation();
+                togglePopup();
+            });
+        }
+
+        // Попап
+        if (!NI.popupEl) {
+            const popup = document.createElement('div');
+            popup.id = 'netIndicatorPopup';
+            popup.innerHTML = `
+                <div class="ni-header">
+                    <div class="ni-header-icon" id="niHeaderIcon">🟢</div>
+                    <div class="ni-header-text">
+                        <div class="ni-title" id="niTitle">Онлайн</div>
+                        <div class="ni-sub" id="niSub">Соединение в норме</div>
+                    </div>
+                </div>
+                <div class="ni-row">
+                    <span class="ni-label">Сеть</span>
+                    <span class="ni-value" id="niNetwork">—</span>
+                </div>
+                <div class="ni-row">
+                    <span class="ni-label">Браузер</span>
+                    <span class="ni-value" id="niBrowser">—</span>
+                </div>
+                <div class="ni-row" id="niQueueRow" style="display:none;">
+                    <span class="ni-label">Очередь</span>
+                    <span class="ni-value" id="niQueue">0</span>
+                </div>
+                <div class="ni-row" id="niFailRow" style="display:none;">
+                    <span class="ni-label">Ошибок подряд</span>
+                    <span class="ni-value warn" id="niFails">0</span>
+                </div>
+                <div class="ni-actions">
+                    <button class="ni-action" id="niCheckBtn">
+                        <span class="ni-spin">⟳</span> Проверить
+                    </button>
+                    <button class="ni-action" id="niCloseBtn">
+                        ✕ Закрыть
+                    </button>
+                </div>
+            `;
+            document.body.appendChild(popup);
+            NI.popupEl = popup;
+
+            // Обработчики
+            popup.addEventListener('click', (e) => e.stopPropagation());
+            popup.querySelector('#niCheckBtn').addEventListener('click', doCheckNow);
+            popup.querySelector('#niCloseBtn').addEventListener('click', closePopup);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОПРЕДЕЛЕНИЕ СОСТОЯНИЯ
+    // ═══════════════════════════════════════════════════════════
+    function detectState() {
+        // Офлайн: либо браузер говорит офлайн, либо наш networkState офлайн,
+        // либо Outbox офлайн
+        const browserOffline = !navigator.onLine;
+        const netStateOffline = typeof networkState !== 'undefined'
+            && networkState
+            && networkState.isOnline === false;
+
+        if (browserOffline || netStateOffline) {
+            return 'offline';
+        }
+
+        // Медленно: soft-детектор в slowMode, либо failStreak >= 2
+        if (typeof NetUtil !== 'undefined' && NetUtil.status) {
+            try {
+                const st = NetUtil.status();
+                if (st.slowMode || st.failStreak >= 2) {
+                    return 'slow';
+                }
+            } catch (e) {}
+        }
+
+        return 'online';
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОБНОВЛЕНИЕ КРУЖКА
+    // ═══════════════════════════════════════════════════════════
+    function updateDot() {
+    ensureElements();
+
+    const newState = detectState();
+    if (newState === NI.currentState) {
+        // Состояние не изменилось — но попап может быть открыт,
+        // обновим в нём данные
+        if (NI.popupOpen) updatePopupContent();
+        // 🆕 И на всякий случай перепроверим видимость
+        updateVisibility();
+        return;
+    }
+
+        NI.currentState = newState;
+
+        // Меняем класс
+        NI.dotEl.classList.remove('state-online', 'state-slow', 'state-offline');
+        NI.dotEl.classList.add('state-' + newState);
+
+        // Title
+        if (newState === 'online') {
+            NI.dotEl.title = 'Сеть: онлайн';
+        } else if (newState === 'slow') {
+            NI.dotEl.title = 'Сеть: медленно';
+        } else {
+            NI.dotEl.title = 'Сеть: офлайн (сообщения копятся в очереди)';
+        }
+
+        // Если попап открыт — обновляем
+        if (NI.popupOpen) updatePopupContent();
+
+        // Показываем кружок (только в авторизованном состоянии)
+        updateVisibility();
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ВИДИМОСТЬ (только когда авторизован)
+    // ═══════════════════════════════════════════════════════════
+    function updateVisibility() {
+    if (!NI.dotEl) return;
+    // 🆕 Показываем только когда есть проблема (не онлайн)
+    const isOnline = NI.currentState === 'online';
+    const shouldShow = state
+        && state.isAuthorized
+        && state.currentScreen !== 'auth'
+        && !isOnline;                       // ← главное изменение
+    NI.dotEl.classList.toggle('show', shouldShow);
+    if (!shouldShow && NI.popupOpen) closePopup();
+}
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПОПАП
+    // ═══════════════════════════════════════════════════════════
+    function togglePopup() {
+        // Защита от двойного тапа
+        const now = Date.now();
+        if (now - NI.lastTapTs < 250) return;
+        NI.lastTapTs = now;
+
+        if (NI.popupOpen) {
+            closePopup();
+        } else {
+            openPopup();
+        }
+    }
+
+    function openPopup() {
+        ensureElements();
+        NI.popupOpen = true;
+        NI.popupEl.classList.add('show');
+        updatePopupContent();
+
+        // Закрытие по клику вне
+        setTimeout(() => {
+            document.addEventListener('click', onOutsideClick, { capture: true });
+        }, 0);
+
+        if (navigator.vibrate) navigator.vibrate(8);
+    }
+
+    function closePopup() {
+        if (!NI.popupEl) return;
+        NI.popupOpen = false;
+        NI.popupEl.classList.remove('show');
+        document.removeEventListener('click', onOutsideClick, { capture: true });
+    }
+
+    function onOutsideClick(e) {
+        if (NI.popupEl && NI.popupEl.contains(e.target)) return;
+        if (NI.dotEl && NI.dotEl.contains(e.target)) return;
+        closePopup();
+    }
+
+    function updatePopupContent() {
+        if (!NI.popupEl) return;
+
+        const state = NI.currentState;
+        const icon = NI.popupEl.querySelector('#niHeaderIcon');
+        const title = NI.popupEl.querySelector('#niTitle');
+        const sub = NI.popupEl.querySelector('#niSub');
+        const network = NI.popupEl.querySelector('#niNetwork');
+        const browser = NI.popupEl.querySelector('#niBrowser');
+        const queueRow = NI.popupEl.querySelector('#niQueueRow');
+        const queueVal = NI.popupEl.querySelector('#niQueue');
+        const failRow = NI.popupEl.querySelector('#niFailRow');
+        const failsVal = NI.popupEl.querySelector('#niFails');
+
+        // ─── Заголовок ───
+        if (state === 'online') {
+            icon.textContent = '🟢';
+            title.textContent = 'Онлайн';
+            sub.textContent = 'Всё работает';
+        } else if (state === 'slow') {
+            icon.textContent = '🟡';
+            title.textContent = 'Медленно';
+            sub.textContent = 'Сеть нестабильна';
+        } else {
+            icon.textContent = '🔴';
+            title.textContent = 'Офлайн';
+            sub.textContent = 'Сообщения копятся в очереди';
+        }
+
+        // ─── Сеть ───
+        let netText = '—';
+        let netClass = '';
+        if (typeof networkState !== 'undefined' && networkState) {
+            if (networkState.isOnline) {
+                netText = 'активна';
+                netClass = 'good';
+            } else {
+                netText = 'нет связи';
+                netClass = 'bad';
+            }
+        }
+        network.textContent = netText;
+        network.className = 'ni-value ' + netClass;
+
+        // ─── Браузер ───
+        if (navigator.onLine) {
+            browser.textContent = 'online';
+            browser.className = 'ni-value good';
+        } else {
+            browser.textContent = 'offline';
+            browser.className = 'ni-value bad';
+        }
+
+        // ─── Очередь ───
+        if (typeof OutboxQueue !== 'undefined' && OutboxQueue.getCount) {
+            const count = OutboxQueue.getCount();
+            const errorCount = OutboxQueue.getErrorCount ? OutboxQueue.getErrorCount() : 0;
+            if (count > 0 || errorCount > 0) {
+                queueRow.style.display = 'flex';
+                const errorBadge = errorCount > 0
+                    ? ` <span style="color:#ff6b6b;">(${errorCount} ✕)</span>`
+                    : '';
+                queueVal.innerHTML = `${count}${errorBadge}`;
+                queueVal.className = 'ni-value ' + (errorCount > 0 ? 'bad' : 'warn');
+            } else {
+                queueRow.style.display = 'none';
+            }
+        } else {
+            queueRow.style.display = 'none';
+        }
+
+        // ─── Ошибки подряд ───
+        let failStreak = 0;
+        if (typeof NetUtil !== 'undefined' && NetUtil.status) {
+            try {
+                failStreak = NetUtil.status().failStreak || 0;
+            } catch (e) {}
+        }
+        if (failStreak > 0) {
+            failRow.style.display = 'flex';
+            failsVal.textContent = failStreak;
+        } else {
+            failRow.style.display = 'none';
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПРИНУДИТЕЛЬНАЯ ПРОВЕРКА
+    // ═══════════════════════════════════════════════════════════
+    async function doCheckNow() {
+        const btn = NI.popupEl.querySelector('#niCheckBtn');
+        btn.classList.add('checking');
+        btn.disabled = true;
+
+        try {
+            let ok = false;
+            if (typeof checkNetwork === 'function') {
+                ok = await checkNetwork();
+            } else {
+                // Fallback: пробуем fetch
+                try {
+                    const res = await fetch('https://api.github.com/rate_limit', {
+                        method: 'GET',
+                        cache: 'no-store',
+                    });
+                    ok = res.ok || res.status === 403 || res.status === 401;
+                } catch (e) {
+                    ok = false;
+                }
+            }
+
+            if (ok) {
+                if (typeof NetUtil !== 'undefined' && NetUtil.reset) {
+                    NetUtil.reset();
+                }
+                if (typeof networkState !== 'undefined') {
+                    networkState.isOnline = true;
+                }
+                showToastSafe('🟢 Соединение восстановлено', 1800);
+
+                // Если очередь есть — запускаем
+                if (typeof OutboxQueue !== 'undefined' && OutboxQueue.process) {
+                    setTimeout(() => OutboxQueue.process(), 300);
+                }
+            } else {
+                showToastSafe('🔴 Сети всё ещё нет', 1800);
+            }
+
+            // Обновляем состояние
+            updateDot();
+        } finally {
+            btn.classList.remove('checking');
+            btn.disabled = false;
+        }
+    }
+
+    function showToastSafe(msg, dur) {
+        try {
+            if (typeof showToast === 'function') showToast(msg, dur);
+        } catch (e) {}
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  🚫 ПОДАВЛЕНИЕ СТАРЫХ БАННЕРОВ
+    // ═══════════════════════════════════════════════════════════
+
+    // 1. Прячем #offlineBanner при появлении
+    const _bannerObserver = new MutationObserver(() => {
+        const banner = document.getElementById('offlineBanner');
+        if (banner && banner.style.display !== 'none') {
+            banner.style.display = 'none';
+            banner.style.transform = 'translateY(-100%)';
+        }
+    });
+    _bannerObserver.observe(document.body, { childList: true, subtree: true });
+
+    // 2. Патчим OfflineMode.activate / deactivate — не показывать баннер
+    if (typeof OfflineMode !== 'undefined') {
+        const _origActivate = OfflineMode.activate;
+        OfflineMode.activate = function() {
+            // Не показываем баннер — только обновляем кружок
+            console.log('🟢 [NetIndicator] OfflineMode.activate → тихий режим');
+            setTimeout(updateDot, 50);
+            // Не вызываем оригинал — он показывает баннер
+            // Но нам нужно пометить тело как offline-mode для стилей
+            document.body.classList.add('offline-mode');
+        };
+
+        const _origDeactivate = OfflineMode.deactivate;
+        OfflineMode.deactivate = function() {
+            console.log('🟢 [NetIndicator] OfflineMode.deactivate → тихий режим');
+            document.body.classList.remove('offline-mode');
+            setTimeout(updateDot, 50);
+        };
+    }
+
+    // 3. На всякий случай — прячем баннер при старте
+    setTimeout(() => {
+        const banner = document.getElementById('offlineBanner');
+        if (banner) {
+            banner.style.display = 'none';
+            banner.style.transform = 'translateY(-100%)';
+        }
+    }, 500);
+
+    // ═══════════════════════════════════════════════════════════
+    //  🚫 УБИРАЕМ БЛОКИРОВКУ textarea В ОФЛАЙНЕ
+    //  Раньше офлайн-режим делал messageInput.disabled = true.
+    //  Теперь это не нужно — сообщения уходят в очередь.
+    // ═══════════════════════════════════════════════════════════
+    function unblockInputInOffline() {
+        // Переопределяем функцию, если она есть
+        window.__unblockInputInOffline = true;
+
+        // Патчим событие offline — вместо блокировки просто обновляем кружок
+        window.addEventListener('offline', () => {
+            console.log('🟢 [NetIndicator] offline → разблокируем input');
+            setTimeout(() => {
+                if (typeof messageInput !== 'undefined' && messageInput) {
+                    messageInput.disabled = false;
+                    messageInput.placeholder = 'Сообщение… (уйдёт в очередь)';
+                }
+                if (typeof sendBtn !== 'undefined' && sendBtn) {
+                    sendBtn.disabled = !state.isAuthorized;
+                }
+                if (typeof micBtn !== 'undefined' && micBtn) {
+                    micBtn.disabled = !state.isAuthorized;
+                }
+                updateDot();
+            }, 100);
+        });
+
+        window.addEventListener('online', () => {
+            setTimeout(() => {
+                if (typeof messageInput !== 'undefined' && messageInput) {
+                    messageInput.disabled = false;
+                    messageInput.placeholder = 'Сообщение...';
+                }
+                updateDot();
+            }, 100);
+        });
+    }
+
+    // Перехватываем конкретные места в оригинале:
+    // 1) В OfflineMode — там где ставится disabled = true
+    // 2) В обработчике online — там где ставится disabled = false
+
+    // Простой хак: MutationObserver на атрибут disabled у textarea
+    const _inputObserver = new MutationObserver((mutations) => {
+        if (typeof messageInput === 'undefined' || !messageInput) return;
+        for (const mut of mutations) {
+            if (mut.type === 'attributes' && mut.attributeName === 'disabled') {
+                // Если кто-то (офлайн-логика) ставит disabled = true,
+                // а мы авторизованы — снимаем.
+                if (messageInput.disabled && state && state.isAuthorized && state.chatFile) {
+                    messageInput.disabled = false;
+                    // Меняем placeholder чтобы намекнуть про очередь
+                    if (!navigator.onLine || (typeof networkState !== 'undefined' && !networkState.isOnline)) {
+                        messageInput.placeholder = 'Сообщение… (уйдёт в очередь)';
+                    }
+                }
+            }
+        }
+    });
+
+    // Наблюдаем за messageInput, когда он появится
+    function startInputObserver() {
+        if (typeof messageInput !== 'undefined' && messageInput) {
+            _inputObserver.observe(messageInput, { attributes: true, attributeFilter: ['disabled'] });
+        } else {
+            setTimeout(startInputObserver, 500);
+        }
+    }
+    setTimeout(startInputObserver, 1000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРИОДИЧЕСКОЕ ОБНОВЛЕНИЕ
+    // ═══════════════════════════════════════════════════════════
+    setInterval(updateDot, 2000);
+
+    // События для мгновенного отклика
+    window.addEventListener('online', () => setTimeout(updateDot, 100));
+    window.addEventListener('offline', () => setTimeout(updateDot, 100));
+
+    // Обновляем при смене экранов
+    if (typeof showChatsScreen === 'function') {
+        const _orig = showChatsScreen;
+        showChatsScreen = function() {
+            const r = _orig.apply(this, arguments);
+            setTimeout(updateVisibility, 100);
+            return r;
+        };
+    }
+    if (typeof showChatScreen === 'function') {
+        const _orig = showChatScreen;
+        showChatScreen = function() {
+            const r = _orig.apply(this, arguments);
+            setTimeout(updateVisibility, 100);
+            return r;
+        };
+    }
+    if (typeof showAuthScreen === 'function') {
+        const _orig = showAuthScreen;
+        showAuthScreen = function() {
+            const r = _orig.apply(this, arguments);
+            setTimeout(updateVisibility, 100);
+            return r;
+        };
+    }
+
+    // Реакция на изменение очереди Outbox — обновляем попап
+    setInterval(() => {
+        if (NI.popupOpen) updatePopupContent();
+    }, 1000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЗАПУСК
+    // ═══════════════════════════════════════════════════════════
+    ensureElements();
+    unblockInputInOffline();
+    updateDot();
+
+    console.log('🟢 Компактный индикатор сети активен');
+    console.log('   • 🟢 зелёный = онлайн');
+    console.log('   • 🟡 жёлтый = медленно');
+    console.log('   • 🔴 красный = офлайн (сообщения в очередь)');
+    console.log('   • Клик по кружку = подробности + кнопка проверки');
+    console.log('   • Старые баннеры отключены');
+    console.log('   • Поле ввода НЕ блокируется в офлайне');
+
+})();
+</script>
 </body>
 </html>
