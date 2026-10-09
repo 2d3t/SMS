@@ -1,5 +1,5 @@
 // sw.js - Универсальный кеш + уведомления
-const CACHE_NAME = 'sms-pwa-v113-offlinesendgo';
+const CACHE_NAME = 'sms-pwa-v113-offlinesendgo-cash400gb';
 
 const FILES_TO_CACHE = [
     '/SMS/pro/sms/index.html',
