@@ -27550,7 +27550,8 @@ markUnseen: (eventOrKey) => {
     console.log('   • Реагирует на возврат приложения из фона');
     console.log('   • API: BackButtonBadge.status() / .check() / .reset()');
 })();
-</script><script>
+</script>
+<script>
 // ═══════════════════════════════════════════════════════════════
 //  🏠 CHAT HOUSE v1 — ЛОКАЛЬНЫЕ ДОМА ДЛЯ КАЖДОГО ЧАТА
 //  ─────────────────────────────────────────────────────────────
@@ -28035,6 +28036,1404 @@ const ChatHouse = (() => {
         // Утилиты
         getHouseStats, listAllHousesStats, estimateUsage, clearAllHouses,
     };
+})();
+</script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🏠 CHAT HOUSE — ИНТЕГРАЦИЯ В ЖИЗНЕННЫЙ ЦИКЛ ЧАТА
+//  ─────────────────────────────────────────────────────────────
+//  Перехватывает:
+//   1. enterChat      → мгновенный рендер из дома + фоновый синк
+//   2. sendMessage    → сразу в дом, потом на GitHub
+//   3. deleteMessage  → удалить из дома тоже
+//   4. renderMessages → синхронизация дома с UI
+//   5. loadAttachment → сначала дом, потом сеть
+// ═══════════════════════════════════════════════════════════════
+
+(function installChatHouseIntegration() {
+    'use strict';
+
+    if (typeof ChatHouse === 'undefined') {
+        console.warn('🏠 ChatHouse не найден — пропускаем интеграцию');
+        return;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  1. ПЕРЕХВАТ loadAttachment — сначала дом, потом сеть
+    //     Это ключевой момент: офлайн-рендер вложений
+    // ═══════════════════════════════════════════════════════════
+    const _origLoadAttachment = loadAttachment;
+
+    loadAttachment = async function(chatFile, attachName) {
+        // Проверяем in-memory кэш
+        if (_attachmentCache.has(attachName)) {
+            return _attachmentCache.get(attachName);
+        }
+        if (_pendingAttachmentLoads.has(attachName)) {
+            return _pendingAttachmentLoads.get(attachName);
+        }
+
+        const promise = (async () => {
+            // ═══ 1. Пробуем дом ═══
+            try {
+                const rec = await ChatHouse.getBlob(chatFile, attachName);
+                if (rec && rec.blob) {
+                    const url = URL.createObjectURL(rec.blob);
+                    _attachmentCache.set(attachName, url);
+                    console.log(`🏠 [House] attachment из дома: ${attachName}`);
+                    return url;
+                }
+            } catch (e) {
+                // тихо
+            }
+
+            // ═══ 2. Нет в доме — идём в сеть (оригинальная логика) ═══
+            try {
+                const url = await _origLoadAttachment.call(this, chatFile, attachName);
+
+                // 🆕 Сохраняем в дом на будущее
+                try {
+                    const res = await fetch(url);
+                    const blob = await res.blob();
+                    if (blob && blob.size > 0) {
+                        ChatHouse.saveBlob(chatFile, attachName, blob, blob.type).catch(() => {});
+                    }
+                } catch (e) {
+                    // не страшно, если не сохранилось
+                }
+
+                return url;
+            } catch (e) {
+                throw e;
+            }
+        })();
+
+        _pendingAttachmentLoads.set(attachName, promise);
+        try {
+            return await promise;
+        } catch (e) {
+            _pendingAttachmentLoads.delete(attachName);
+            throw e;
+        }
+    };
+
+    console.log('🏠 [House] loadAttachment → сначала дом');
+
+    // ═══════════════════════════════════════════════════════════
+    //  2. ПЕРЕХВАТ enterChat — мгновенный рендер + фоновый синк
+    // ═══════════════════════════════════════════════════════════
+    const _origEnterChat = enterChat;
+
+    enterChat = async function(file, name, password) {
+        // ═══ Фаза A: мгновенный рендер из дома ═══
+        const houseMeta = await ChatHouse.getChatMeta(file);
+
+        // Если в доме есть сообщения и соль — рендерим сразу
+        if (houseMeta && houseMeta.salt) {
+            try {
+                const cachedMessages = await ChatHouse.getMessages(file);
+
+                if (cachedMessages.length > 0) {
+                    console.log(`🏠 [House] Мгновенный рендер из дома: ${cachedMessages.length} сообщ.`);
+
+                    // Показываем экран чата БЕЗ ожидания сети
+                    showChatTransition(name);
+                    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+                    // Останавливаем старый polling
+                    if (typeof stopPolling === 'function') stopPolling();
+
+                    // Чистим кэш вложений (blob:URL предыдущего чата)
+                    clearAttachmentCache();
+                    resetHistoryState();
+
+                    // Устанавливаем состояние
+                    state.messages = cachedMessages.slice();
+                    state.chatFile = file;
+                    state.chatName = name;
+                    state.chatPassword = password;
+                    state.salt = houseMeta.salt;
+                    state.sha = null;
+                    state.lastMessageCount = cachedMessages.length;
+                    state._lastCommitSha = null;
+                    state._lastMetaVersion = houseMeta.lastMessageId || null;
+                    state._metaEtag = null;
+                    state._lastSentMessageId = null;
+                    state._chatEntered = false;
+                    state._lastActivityAt = Date.now();
+
+                    // 🆕 Ключ шифрования нужен для будущей отправки
+                    try {
+                        CRYPTO._key = await deriveKey(password, houseMeta.salt);
+                    } catch (e) {
+                        console.warn('🏠 [House] Не удалось получить ключ из дома:', e);
+                        CRYPTO._key = null;
+                    }
+
+                    // Заголовок
+                    chatTitle.textContent = name;
+                    userAvatar.textContent = getInitials(state.username);
+
+                    // Рендер
+                    messagesInner.dataset.lastDate = '';
+                    showChatScreen();
+                    showInputBar();
+
+                    historyState.allMessages = cachedMessages.slice();
+                    renderHistory();
+
+                    // ⚠️ Если не смогли получить ключ — работаем в read-only
+                    if (!CRYPTO._key) {
+                        messageInput.disabled = true;
+                        sendBtn.disabled = true;
+                        micBtn.disabled = true;
+                        showToast('🏠 Загружено из дома — синхронизируем…', 1500);
+                    } else {
+                        showToast('🏠 Мгновенно из дома', 1200);
+                    }
+
+                    state._chatEntered = true;
+
+                    // ═══ Фаза B: фоновый синк с GitHub ═══
+                    // Запускаем ПОСЛЕ рендера, не блокируя UI
+                    syncHouseWithGitHub(file, name, password).catch(e => {
+                        console.warn('🏠 [House] Sync failed:', e);
+                    });
+
+                    // Polling запускаем сразу — он тоже подтянет новое
+                    if (CRYPTO._key) {
+                        startPolling();
+                    }
+
+                    // Пометка прочитанным — с задержкой
+                    setTimeout(() => {
+                        if (state.chatFile === file) {
+                            markChatAsRead();
+                        }
+                    }, 1500);
+
+                    return;
+                }
+            } catch (e) {
+                console.warn('🏠 [House] Быстрый рендер не удался, fallback на оригинал:', e);
+            }
+        }
+
+        // ═══ Fallback: оригинальный enterChat (сеть) ═══
+        const result = await _origEnterChat.call(this, file, name, password);
+
+        // После успешного входа — синхронизируем дом
+        if (state.chatFile === file && historyState.allMessages.length > 0) {
+            // Сохраняем полный набор сообщений
+            ChatHouse.saveMessagesFull(file, historyState.allMessages)
+                .then(() => {
+                    ChatHouse.updateChatMeta(file, {
+                        salt: state.salt,
+                        lastSyncAt: Date.now(),
+                        lastMessageId: historyState.allMessages[historyState.allMessages.length - 1].id,
+                        messageCount: historyState.allMessages.length,
+                        name,
+                    });
+                })
+                .catch(e => console.warn('🏠 [House] save after enterChat:', e));
+        }
+
+        return result;
+    };
+
+    console.log('🏠 [House] enterChat → мгновенный рендер из дома');
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. СИНХРОНИЗАЦИЯ ДОМА С GITHUB
+    //     Умная: сначала meta.json — узнать, есть ли новое
+    //     Если новое — догружаем только дельту
+    // ═══════════════════════════════════════════════════════════
+    async function syncHouseWithGitHub(file, name, password) {
+        if (!state.token || !state.isAuthorized) return;
+
+        // Если мы уже ушли из этого чата — не синкаем
+        if (state.chatFile !== file) return;
+
+        try {
+            // ═══ Шаг 1: лёгкая проверка через meta.json ═══
+            let meta = null;
+            try {
+                const metaUrl = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${getMetaPath(file)}`;
+                const res = await fetch(metaUrl, {
+                    headers: {
+                        'Authorization': `token ${state.token}`,
+                        'Accept': 'application/vnd.github.v3+json',
+                    },
+                    cache: 'no-store',
+                });
+                if (res.ok) {
+                    const data = await res.json();
+                    meta = JSON.parse(base64ToUtf8((data.content || '').replace(/\n/g, '')));
+                }
+            } catch (e) {
+                console.warn('🏠 [House] meta fetch failed:', e);
+            }
+
+            const houseMeta = await ChatHouse.getChatMeta(file);
+            const cachedLastId = houseMeta?.lastMessageId || 0;
+            const serverLastId = meta?.version || 0;
+
+            // Если серверная версия не новее — обновим lastSyncAt и выйдем
+            if (serverLastId <= cachedLastId) {
+                console.log(`🏠 [House] Sync: у дома всё актуально (${cachedLastId} >= ${serverLastId})`);
+                await ChatHouse.updateChatMeta(file, { lastSyncAt: Date.now() });
+                return;
+            }
+
+            console.log(`🏠 [House] Sync: сервер новее (${serverLastId} > ${cachedLastId}). Грузим дельту…`);
+
+            // ═══ Шаг 2: полная загрузка с сервера ═══
+            const path = getChatPath(file);
+            const result = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
+            if (!result.exists) return;
+
+            const content = result.content;
+            if (!content || content.v !== CRYPTO.VERSION || !content.salt) return;
+
+            // Деривим ключ
+            const key = await deriveKey(password, content.salt);
+
+            // Расшифровываем все сообщения с сервера
+            const serverMessages = [];
+            const encMessages = Array.isArray(content.messages) ? content.messages : [];
+
+            for (const enc of encMessages) {
+                try {
+                    const iv = new Uint8Array(base64ToArrayBuffer(enc.iv));
+                    const ciphertext = base64ToArrayBuffer(enc.data);
+                    const plaintext = await crypto.subtle.decrypt(
+                        { name: 'AES-GCM', iv }, key, ciphertext
+                    );
+                    const payload = JSON.parse(new TextDecoder().decode(plaintext));
+
+                    const msg = {
+                        id: enc.id,
+                        time: enc.time,
+                        username: payload.username,
+                        text: payload.text || '',
+                    };
+                    if (payload.reactions) msg.reactions = payload.reactions;
+                    if (Array.isArray(payload.comments) && payload.comments.length > 0) msg.comments = payload.comments;
+                    if (payload.image) msg.image = payload.image;
+                    if (payload.audio) {
+                        msg.audio = payload.audio;
+                        msg.audioDuration = payload.audioDuration || 0;
+                        msg.audioMime = payload.audioMime || 'audio/webm';
+                        msg.audioName = payload.audioName || '';
+                        msg.audioCover = payload.audioCover || '';
+                    }
+                    if (payload.file) {
+                        msg.file = payload.file;
+                        msg.fileName = payload.fileName || 'file.bin';
+                        msg.fileMime = payload.fileMime || 'application/octet-stream';
+                        msg.fileSize = payload.fileSize || 0;
+                    }
+                    if (payload.video) {
+                        msg.video = payload.video;
+                        msg.videoDuration = payload.videoDuration || 0;
+                        msg.videoMime = payload.videoMime || 'video/mp4';
+                        msg.videoName = payload.videoName || '';
+                        msg.videoSize = payload.videoSize || 0;
+                    }
+                    if (payload.videoNote) {
+                        msg.videoNote = payload.videoNote;
+                        msg.videoDuration = payload.videoDuration || 0;
+                        msg.videoMime = payload.videoMime || 'video/webm';
+                    }
+                    if (payload.batchId) {
+                        msg.batchId = payload.batchId;
+                        msg.batchIndex = payload.batchIndex;
+                        msg.batchTotal = payload.batchTotal;
+                    }
+                    if (payload.replyTo) msg.replyTo = payload.replyTo;
+
+                    serverMessages.push(msg);
+                } catch (e) {
+                    console.warn('🏠 [House] Decrypt fail:', enc.id, e.message);
+                }
+            }
+
+            // Если мы уже ушли из этого чата — не обновляем
+            if (state.chatFile !== file) return;
+
+            // ═══ Шаг 3: сравнение и умное обновление UI ═══
+            const cachedMessages = historyState.allMessages;
+            const newCount = serverMessages.length;
+            const oldCount = cachedMessages.length;
+
+            // Удалённые с сервера → удаляем и у нас
+            const serverIds = new Set(serverMessages.map(m => m.id));
+            const removedIds = cachedMessages.filter(m => !serverIds.has(m.id)).map(m => m.id);
+
+            if (removedIds.length > 0) {
+                console.log(`🏠 [House] Удалено с сервера: ${removedIds.length}`);
+                // Удаляем из дома
+                for (const id of removedIds) {
+                    await ChatHouse.deleteMessage(file, id);
+                }
+            }
+
+            // Новые (по id) → добавляем в дом и на экран
+            const cachedIds = new Set(cachedMessages.map(m => m.id));
+            const newMessages = serverMessages.filter(m => !cachedIds.has(m.id));
+
+            if (newMessages.length > 0) {
+                console.log(`🏠 [House] Новых сообщений: ${newMessages.length}`);
+                // Сохраняем в дом
+                await ChatHouse.upsertMessages(file, newMessages);
+
+                // Обновляем UI
+                const wasAtBottom = isNearBottom();
+                appendMessages(newMessages);
+
+                // Если пользователь был внизу — скроллим
+                if (wasAtBottom) {
+                    setTimeout(() => scrollToBottom(true), 100);
+                } else {
+                    scrollState.unreadCount += newMessages.length;
+                    updateScrollBadge();
+                    updateScrollButton();
+                }
+            }
+
+            // Если сообщения удалились — надо перерисовать
+            if (removedIds.length > 0) {
+                // Пересобираем historyState
+                historyState.allMessages = serverMessages.slice();
+                state.messages = serverMessages.slice();
+                renderHistory();
+            }
+
+            // Обновляем state
+            state.sha = result.sha;
+            state._lastCommitSha = result.commitSha;
+            state.lastMessageCount = newCount;
+            state.salt = content.salt;
+            if (CRYPTO._key !== key) CRYPTO._key = key;
+
+            // Включаем отправку, если была заблокирована
+            if (messageInput.disabled && CRYPTO._key) {
+                messageInput.disabled = false;
+                messageInput.placeholder = 'Сообщение...';
+                sendBtn.disabled = !state.isAuthorized;
+                micBtn.disabled = !state.isAuthorized;
+                if (typeof startPolling === 'function') startPolling();
+            }
+
+            // Обновляем метаданные дома
+            await ChatHouse.updateChatMeta(file, {
+                salt: content.salt,
+                lastSyncAt: Date.now(),
+                lastMessageId: newCount > 0 ? serverMessages[newCount - 1].id : null,
+                messageCount: newCount,
+                name,
+            });
+
+            console.log(`🏠 [House] Sync завершён: ${newCount} сообщ.`);
+
+        } catch (e) {
+            console.warn('🏠 [House] syncHouseWithGitHub failed:', e);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  4. ПЕРЕХВАТ sendMessage — сохраняем в дом СРАЗУ
+    //     (ещё до ухода на GitHub)
+    // ═══════════════════════════════════════════════════════════
+    const _origSendMessage = sendMessage;
+
+    sendMessage = async function(...args) {
+        // Определяем: это попытка отправить сообщение?
+        const result = await _origSendMessage.apply(this, args);
+
+        // После отправки (или начала отправки) — синкаем дом
+        // (оригинал уже добавил plainMsg в historyState.allMessages)
+        if (state.chatFile && historyState.allMessages.length > 0) {
+            const lastMsgs = historyState.allMessages.slice(-5);
+            ChatHouse.upsertMessages(state.chatFile, lastMsgs).catch(() => {});
+            ChatHouse.updateChatMeta(state.chatFile, {
+                lastSyncAt: Date.now(),
+                lastMessageId: historyState.allMessages[historyState.allMessages.length - 1].id,
+                messageCount: historyState.allMessages.length,
+            }).catch(() => {});
+        }
+
+        return result;
+    };
+
+    console.log('🏠 [House] sendMessage → дом синхронизируется');
+
+    // ═══════════════════════════════════════════════════════════
+    //  5. ПЕРЕХВАТ deleteMessage — удаляем из дома
+    // ═══════════════════════════════════════════════════════════
+    const _origDeleteMessage = deleteMessage;
+
+    deleteMessage = async function(messageId) {
+        const result = await _origDeleteMessage.call(this, messageId);
+
+        // Удаляем из дома
+        if (state.chatFile) {
+            await ChatHouse.deleteMessage(state.chatFile, messageId);
+
+            // Также удаляем blob'ы этого сообщения
+            const msg = historyState.allMessages.find(m => m.id === messageId);
+            if (!msg) {
+                // Сообщение уже удалено из памяти — попробуем найти в доме
+                // (на случай гонки)
+                const allMsgs = await ChatHouse.getMessages(state.chatFile);
+                const found = allMsgs.find(m => m.id === messageId);
+                if (found) await deleteAttachmentsFromHouse(state.chatFile, found);
+            } else {
+                await deleteAttachmentsFromHouse(state.chatFile, msg);
+            }
+
+            // Обновляем метаданные
+            await ChatHouse.updateChatMeta(state.chatFile, {
+                lastSyncAt: Date.now(),
+                lastMessageId: historyState.allMessages.length > 0
+                    ? historyState.allMessages[historyState.allMessages.length - 1].id
+                    : null,
+                messageCount: historyState.allMessages.length,
+            });
+        }
+
+        return result;
+    };
+
+    async function deleteAttachmentsFromHouse(file, msg) {
+        const toDelete = [];
+        if (msg.image) toDelete.push(msg.image);
+        if (msg.audio) toDelete.push(msg.audio);
+        if (msg.audioCover) toDelete.push(msg.audioCover);
+        if (msg.file) toDelete.push(msg.file);
+        if (msg.video) toDelete.push(msg.video);
+        if (msg.videoNote) toDelete.push(msg.videoNote);
+
+        for (const name of toDelete) {
+            if (isAttachmentRef(name)) {
+                await ChatHouse.deleteBlob(file, name);
+            }
+        }
+    }
+
+    console.log('🏠 [House] deleteMessage → дом очищается');
+
+    // ═══════════════════════════════════════════════════════════
+    //  6. ПЕРЕХВАТ РЕАКЦИЙ И КОММЕНТАРИЕВ
+    // ═══════════════════════════════════════════════════════════
+    if (typeof toggleReaction === 'function') {
+        const _origToggleReaction = toggleReaction;
+        toggleReaction = async function(msgId, emoji) {
+            const result = await _origToggleReaction.call(this, msgId, emoji);
+
+            // Обновляем в доме
+            const msg = historyState.allMessages.find(m => m.id === msgId);
+            if (msg && state.chatFile) {
+                ChatHouse.upsertMessages(state.chatFile, [msg]).catch(() => {});
+            }
+            return result;
+        };
+    }
+
+    if (typeof submitComment === 'function') {
+        const _origSubmitComment = submitComment;
+        submitComment = async function(msgId, text) {
+            const result = await _origSubmitComment.call(this, msgId, text);
+
+            const msg = historyState.allMessages.find(m => m.id === msgId);
+            if (msg && state.chatFile) {
+                ChatHouse.upsertMessages(state.chatFile, [msg]).catch(() => {});
+            }
+            return result;
+        };
+    }
+
+    if (typeof deleteComment === 'function') {
+        const _origDeleteComment = deleteComment;
+        deleteComment = async function(msgId, commentId) {
+            const result = await _origDeleteComment.call(this, msgId, commentId);
+
+            const msg = historyState.allMessages.find(m => m.id === msgId);
+            if (msg && state.chatFile) {
+                ChatHouse.upsertMessages(state.chatFile, [msg]).catch(() => {});
+            }
+            return result;
+        };
+    }
+
+    if (typeof confirmEditMessage === 'function') {
+        const _origEditMessage = confirmEditMessage;
+        confirmEditMessage = async function() {
+            const result = await _origEditMessage.call(this);
+
+            // После редактирования — пересохраняем последние 5
+            if (state.chatFile) {
+                ChatHouse.upsertMessages(state.chatFile, historyState.allMessages.slice(-5)).catch(() => {});
+            }
+            return result;
+        };
+    }
+
+    console.log('🏠 [House] реакции / комментарии / правки → дом синхронизируется');
+
+    // ═══════════════════════════════════════════════════════════
+    //  7. ПЕРЕХВАТ performBatchDelete
+    // ═══════════════════════════════════════════════════════════
+    if (typeof performBatchDelete === 'function') {
+        const _origBatchDelete = performBatchDelete;
+        performBatchDelete = async function(messageIds) {
+            const result = await _origBatchDelete.call(this, messageIds);
+
+            if (state.chatFile && Array.isArray(messageIds)) {
+                for (const id of messageIds) {
+                    await ChatHouse.deleteMessage(state.chatFile, id);
+                }
+                await ChatHouse.updateChatMeta(state.chatFile, {
+                    lastSyncAt: Date.now(),
+                    lastMessageId: historyState.allMessages.length > 0
+                        ? historyState.allMessages[historyState.allMessages.length - 1].id
+                        : null,
+                    messageCount: historyState.allMessages.length,
+                });
+            }
+            return result;
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  8. ПЕРЕХВАТ РЕСУРСОВ ПРИ ЗАГРУЗКЕ БОЛЬШИХ ФАЙЛОВ
+    //     После успешной отправки — сохраняем blob в дом
+    // ═══════════════════════════════════════════════════════════
+    if (typeof uploadAttachmentAuto === 'function') {
+        const _origUploadAuto = uploadAttachmentAuto;
+        uploadAttachmentAuto = async function(chatFile, attachName, plainBuffer, mime, displayName) {
+            const result = await _origUploadAuto.call(this, chatFile, attachName, plainBuffer, mime, displayName);
+
+            // 🆕 Сохраняем ОРИГИНАЛ (не шифрованный) в дом как Blob
+            try {
+                const blob = new Blob([plainBuffer], { type: mime || 'application/octet-stream' });
+                await ChatHouse.saveBlob(chatFile, attachName, blob, mime);
+                console.log(`🏠 [House] Сохранён blob: ${attachName} (${formatFileSize(blob.size)})`);
+            } catch (e) {
+                console.warn('🏠 [House] saveBlob failed:', e);
+            }
+
+            return result;
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  9. ИНТЕГРАЦИЯ С OFFILINE CACHE (старый механизм)
+    //     Теперь OfflineCache не нужен — дом его заменяет.
+    //     Но чтобы не ломать существующий код, оставим оба.
+    //     Дом более приоритетен.
+    // ═══════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════
+    //  10. УБОРКА ПРИ ВЫХОДЕ ИЗ ЧАТА
+    //      Не удаляем дом! Он должен оставаться.
+    //      Только сбрасываем in-memory кэш.
+    // ═══════════════════════════════════════════════════════════
+    const _origBackToChats = backToChats;
+    backToChats = function() {
+        // Перед уходом — убеждаемся, что всё сохранено
+        if (state.chatFile && historyState.allMessages.length > 0) {
+            const file = state.chatFile;
+            const messages = historyState.allMessages.slice();
+            const salt = state.salt;
+            const name = state.chatName;
+            const lastMsgId = messages[messages.length - 1].id;
+
+            // Fire-and-forget: не блокируем выход
+            ChatHouse.saveMessagesFull(file, messages)
+                .then(() => ChatHouse.updateChatMeta(file, {
+                    salt, name, lastMessageId: lastMsgId,
+                    messageCount: messages.length, lastSyncAt: Date.now(),
+                }))
+                .catch(e => console.warn('🏠 [House] exit save failed:', e));
+        }
+        return _origBackToChats.apply(this, arguments);
+    };
+
+    // ─── При logout — НЕ удаляем дома (это кэш пользователя) ───
+    // Пользователь сам решит очистить через меню
+
+    console.log('🏠 [House] Интеграция завершена');
+    console.log('   • Вложения: сначала дом, потом сеть');
+    console.log('   • enterChat: мгновенный рендер + фоновый sync');
+    console.log('   • sendMessage/delete/reactions/comments: автосохранение');
+    console.log('   • backToChats: финальный save перед выходом');
+})();
+</script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🏠 CHAT HOUSE — UI УПРАВЛЕНИЯ (очистка, размер, статистика)
+//  Добавляет в ⋯ меню на экране чатов:
+//   • «Очистить кэш этого чата»
+//   • «Кэш: 12.5 МБ · 156 файлов»
+//  И общий пункт:
+//   • «Управление кэшем» → отдельный оверлей
+// ═══════════════════════════════════════════════════════════════
+
+(function installChatHouseUI() {
+    'use strict';
+
+    if (typeof ChatHouse === 'undefined') return;
+
+    // ═══════════════════════════════════════════════════════════
+    //  СТИЛИ
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('chatHouseUIStyles')) {
+        const style = document.createElement('style');
+        style.id = 'chatHouseUIStyles';
+        style.textContent = `
+            /* ═══ Пункт в ⋯ меню ═══ */
+            #unifiedChatMenu .ucm-item.house-info {
+                background: rgba(108,92,231,0.05);
+                border: 1px dashed rgba(108,92,231,0.25);
+                margin: 4px 0;
+                pointer-events: none;
+                opacity: 0.9;
+            }
+            #unifiedChatMenu .ucm-item.house-info .ucm-label {
+                font-size: 12px;
+                color: #888;
+            }
+            #unifiedChatMenu .ucm-item.house-info .ucm-icon {
+                font-size: 14px;
+            }
+            #unifiedChatMenu .ucm-item.house-info code {
+                background: rgba(255,255,255,0.06);
+                padding: 1px 5px;
+                border-radius: 4px;
+                font-size: 11px;
+                color: #a78bfa;
+            }
+            #unifiedChatMenu .ucm-item.house-clear {
+                color: #feca57;
+            }
+            #unifiedChatMenu .ucm-item.house-clear:hover {
+                background: rgba(254,202,87,0.15);
+            }
+            #unifiedChatMenu .ucm-item.house-clear:active {
+                background: rgba(254,202,87,0.25);
+            }
+
+            /* ═══ Оверлей управления домами ═══ */
+            #houseManagerOverlay {
+                position: fixed; inset: 0;
+                background: linear-gradient(135deg, #0a0a0f, #1a1a2e);
+                z-index: 4950;
+                display: none;
+                flex-direction: column;
+                animation: hmFadeIn 0.25s ease;
+            }
+            #houseManagerOverlay.show { display: flex; }
+            @keyframes hmFadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+            #houseManagerOverlay .hm-header {
+                display: flex; align-items: center; gap: 10px;
+                padding: 14px 16px;
+                padding-top: calc(14px + env(safe-area-inset-top, 0px));
+                background: rgba(255,255,255,0.04);
+                backdrop-filter: blur(20px);
+                border-bottom: 1px solid rgba(255,255,255,0.06);
+                flex-shrink: 0;
+            }
+            #houseManagerOverlay .hm-title {
+                flex: 1; min-width: 0;
+            }
+            #houseManagerOverlay .hm-title h2 {
+                font-size: 17px; font-weight: 700; color: #fff;
+                display: flex; align-items: center; gap: 8px;
+            }
+            #houseManagerOverlay .hm-title .hm-sub {
+                font-size: 11px; color: #888; margin-top: 2px;
+                font-variant-numeric: tabular-nums;
+            }
+            #houseManagerOverlay .hm-btn {
+                width: 38px; height: 38px; border-radius: 50%;
+                background: rgba(255,255,255,0.06);
+                border: none; color: #888; font-size: 16px;
+                cursor: pointer;
+                display: flex; align-items: center; justify-content: center;
+                flex-shrink: 0;
+                transition: all 0.15s;
+            }
+            #houseManagerOverlay .hm-btn:hover {
+                background: rgba(255,255,255,0.12); color: #fff;
+            }
+            #houseManagerOverlay .hm-btn:active { transform: scale(0.9); }
+            #houseManagerOverlay .hm-btn.hm-btn-danger:hover {
+                background: rgba(255,107,107,0.2); color: #ff6b6b;
+            }
+
+            /* ═══ Блок статистики сверху ═══ */
+            .hm-stats {
+                margin: 12px 12px 0;
+                padding: 16px;
+                background: linear-gradient(135deg, rgba(108,92,231,0.12), rgba(0,184,148,0.06));
+                border: 1px solid rgba(108,92,231,0.25);
+                border-radius: 16px;
+                flex-shrink: 0;
+            }
+            .hm-stats .hm-total {
+                font-size: 26px; font-weight: 700; color: #fff;
+                margin-bottom: 4px;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+            }
+            .hm-stats .hm-total-label {
+                font-size: 12px; color: #888;
+            }
+            .hm-stats .hm-bar {
+                width: 100%; height: 6px;
+                background: rgba(255,255,255,0.08);
+                border-radius: 3px;
+                overflow: hidden;
+                margin-top: 12px;
+                margin-bottom: 8px;
+            }
+            .hm-stats .hm-bar-fill {
+                height: 100%;
+                background: linear-gradient(90deg, #6c5ce7, #00b894);
+                border-radius: 3px;
+                transition: width 0.4s ease;
+            }
+            .hm-stats .hm-quota {
+                font-size: 11px; color: #666;
+                display: flex;
+                justify-content: space-between;
+                font-variant-numeric: tabular-nums;
+            }
+
+            /* ═══ Список домов ═══ */
+            .hm-body {
+                flex: 1; overflow-y: auto;
+                padding: 12px 12px 40px;
+                -webkit-overflow-scrolling: touch;
+            }
+            .hm-list {
+                display: flex; flex-direction: column; gap: 8px;
+            }
+            .hm-house {
+                display: flex; align-items: center; gap: 12px;
+                padding: 12px 14px;
+                background: rgba(255,255,255,0.04);
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 14px;
+                transition: background 0.15s, border-color 0.15s;
+            }
+            .hm-house:hover {
+                background: rgba(255,255,255,0.06);
+                border-color: rgba(108,92,231,0.3);
+            }
+            .hm-house .hm-avatar {
+                width: 42px; height: 42px; border-radius: 50%;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                display: flex; align-items: center; justify-content: center;
+                font-weight: 700; color: #fff; font-size: 16px;
+                flex-shrink: 0;
+                overflow: hidden;
+                position: relative;
+            }
+            .hm-house .hm-avatar img {
+                width: 100%; height: 100%;
+                object-fit: cover; border-radius: 50%;
+            }
+            .hm-house .hm-info {
+                flex: 1; min-width: 0;
+            }
+            .hm-house .hm-name {
+                font-size: 14px; font-weight: 600; color: #fff;
+                white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+                margin-bottom: 3px;
+            }
+            .hm-house .hm-meta {
+                font-size: 11px; color: #888;
+                display: flex; gap: 8px;
+                flex-wrap: wrap;
+            }
+            .hm-house .hm-meta .hm-dot {
+                color: #444;
+            }
+            .hm-house .hm-size {
+                font-size: 12px;
+                font-weight: 600;
+                color: #a78bfa;
+                font-variant-numeric: tabular-nums;
+                flex-shrink: 0;
+                margin-right: 4px;
+            }
+            .hm-house .hm-delete {
+                width: 32px; height: 32px; border-radius: 50%;
+                background: rgba(255,107,107,0.1);
+                border: 1px solid rgba(255,107,107,0.25);
+                color: #ff6b6b;
+                font-size: 14px;
+                cursor: pointer;
+                display: flex; align-items: center; justify-content: center;
+                flex-shrink: 0;
+                transition: all 0.15s;
+            }
+            .hm-house .hm-delete:hover {
+                background: rgba(255,107,107,0.25);
+                border-color: rgba(255,107,107,0.5);
+            }
+            .hm-house .hm-delete:active { transform: scale(0.9); }
+
+            .hm-empty {
+                text-align: center;
+                padding: 60px 20px;
+                color: #666;
+            }
+            .hm-empty .hm-empty-icon {
+                font-size: 56px; margin-bottom: 12px;
+                opacity: 0.6;
+            }
+            .hm-empty .hm-empty-title {
+                font-size: 15px; color: #aaa;
+                margin-bottom: 6px; font-weight: 600;
+            }
+            .hm-empty .hm-empty-sub {
+                font-size: 12px; color: #666;
+                line-height: 1.5;
+            }
+
+            /* Анимация удаления */
+            .hm-house.removing {
+                opacity: 0;
+                transform: translateX(-20px);
+                transition: opacity 0.2s, transform 0.2s;
+            }
+
+            /* ═══ Аварийная плашка во время очистки ═══ */
+            #houseClearingToast {
+                position: fixed;
+                top: 50%; left: 50%;
+                transform: translate(-50%, -50%) scale(0.9);
+                background: rgba(26,26,46,0.98);
+                border: 1px solid rgba(108,92,231,0.5);
+                border-radius: 18px;
+                padding: 20px 26px;
+                display: none;
+                align-items: center;
+                gap: 14px;
+                z-index: 5500;
+                box-shadow: 0 20px 60px rgba(0,0,0,0.7);
+                opacity: 0;
+                transition: opacity 0.2s, transform 0.2s;
+                pointer-events: none;
+            }
+            #houseClearingToast.show {
+                display: flex;
+                opacity: 1;
+                transform: translate(-50%, -50%) scale(1);
+            }
+            #houseClearingToast .hct-spinner {
+                width: 28px; height: 28px;
+                border: 3px solid rgba(108,92,231,0.25);
+                border-top-color: #6c5ce7;
+                border-right-color: #00b894;
+                border-radius: 50%;
+                animation: hctSpin 0.8s linear infinite;
+                flex-shrink: 0;
+            }
+            @keyframes hctSpin { to { transform: rotate(360deg); } }
+            #houseClearingToast .hct-text {
+                font-size: 14px; font-weight: 600; color: #fff;
+            }
+            #houseClearingToast .hct-sub {
+                font-size: 11px; color: #888; margin-top: 2px;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ openUnifiedMenu — добавляем пункты дома
+    // ═══════════════════════════════════════════════════════════
+    const _origOpenUnifiedMenu = window._unifiedChatSystem?.openMenu;
+
+    if (window._unifiedChatSystem) {
+        const _origOpen = window._unifiedChatSystem.openMenu;
+
+        window._unifiedChatSystem.openMenu = function(chatFile, buttonEl) {
+            // Вызываем оригинал — он создаст меню
+            const result = _origOpen.call(this, chatFile, buttonEl);
+
+            // Теперь патчим содержимое меню
+            setTimeout(() => {
+                const menu = document.getElementById('unifiedChatMenu');
+                if (!menu) return;
+                injectHouseItems(menu, chatFile);
+            }, 30);
+
+            return result;
+        };
+
+        console.log('🏠 [HouseUI] openUnifiedMenu пропатчен');
+    }
+
+    // ─── Дополнительная страховка через MutationObserver ───
+    // (на случай, если openMenu переопределят позже)
+    const menuObserver = new MutationObserver((mutations) => {
+        for (const mut of mutations) {
+            for (const node of mut.addedNodes) {
+                if (node.nodeType !== 1) continue;
+                if (node.id === 'unifiedChatMenu') {
+                    // Извлекаем file из data атрибутов или header
+                    const file = extractFileFromMenu(node);
+                    if (file) {
+                        setTimeout(() => injectHouseItems(node, file), 20);
+                    }
+                }
+            }
+        }
+    });
+    menuObserver.observe(document.body, { childList: true, subtree: true });
+
+    function extractFileFromMenu(menu) {
+        // Внутри header есть .ucm-id с file
+        const idEl = menu.querySelector('.ucm-id');
+        if (idEl) return idEl.textContent.trim();
+
+        // Fallback: ищем в data-атрибутах
+        const anyItem = menu.querySelector('[data-action]');
+        // Не поможет — вернём null
+        return null;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ИНЪЕКЦИЯ ПУНКТОВ ДОМА В МЕНЮ
+    // ═══════════════════════════════════════════════════════════
+    async function injectHouseItems(menu, chatFile) {
+        if (!menu || !chatFile) return;
+
+        // Уже вставили?
+        if (menu.querySelector('.ucm-item.house-info')) return;
+
+        // Получаем статистику дома
+        let stats;
+        try {
+            stats = await ChatHouse.getHouseStats(chatFile);
+        } catch (e) {
+            console.warn('🏠 [HouseUI] getHouseStats failed:', e);
+            return;
+        }
+
+        const msgCount = stats.messageCount || 0;
+        const blobCount = stats.blobCount || 0;
+        const totalSize = stats.blobSizeHuman || '0 Б';
+
+        // Находим разделитель перед «Убрать из списка» (последний ucm-divider)
+        const dividers = menu.querySelectorAll('.ucm-divider');
+        const lastDivider = dividers[dividers.length - 1];
+        if (!lastDivider) return;
+
+        // Блок с информацией о доме
+        const infoBlock = document.createElement('div');
+        infoBlock.className = 'ucm-item house-info';
+        infoBlock.innerHTML = `
+            <span class="ucm-icon">🏠</span>
+            <span class="ucm-label">
+                <div>Дом чата</div>
+                <div class="ucm-hint">
+                    <code>${msgCount}</code> сообщ.
+                    ${blobCount > 0 ? ` · <code>${blobCount}</code> файлов · <code>${totalSize}</code>` : ''}
+                </div>
+            </span>
+        `;
+
+        // Кнопка очистки
+        const clearBtn = document.createElement('div');
+        clearBtn.className = 'ucm-item house-clear';
+        clearBtn.dataset.action = 'house-clear';
+        clearBtn.innerHTML = `
+            <span class="ucm-icon">🧹</span>
+            <span class="ucm-label">
+                <div>Очистить кэш чата</div>
+                <div class="ucm-hint">Только локально · GitHub не тронем</div>
+            </span>
+        `;
+
+        // Вставляем ПЕРЕД последним разделителем
+        lastDivider.parentNode.insertBefore(clearBtn, lastDivider);
+        lastDivider.parentNode.insertBefore(infoBlock, clearBtn);
+
+        // Обработчик
+        clearBtn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+
+            // Закрываем меню
+            if (window._unifiedChatSystem && window._unifiedChatSystem.closeMenu) {
+                window._unifiedChatSystem.closeMenu();
+            }
+
+            await clearHouseOfChat(chatFile, stats);
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОЧИСТКА ДОМА ОДНОГО ЧАТА
+    // ═══════════════════════════════════════════════════════════
+    async function clearHouseOfChat(chatFile, stats = null) {
+        if (!stats) {
+            try {
+                stats = await ChatHouse.getHouseStats(chatFile);
+            } catch (e) { /* ignore */ }
+        }
+
+        const chat = state.chats.find(c => c.file === chatFile);
+        const chatName = chat ? (chat.name || chat.file) : chatFile;
+        const sizeText = stats ? stats.blobSizeHuman : 'неизвестно';
+        const msgCount = stats ? stats.messageCount : '?';
+        const blobCount = stats ? stats.blobCount : '?';
+
+        // Показываем подтверждение
+        const ok = await showConfirmModal(
+            '🧹 Очистить дом чата?',
+            `Чат: «${chatName}»\n\n` +
+            `Будет удалено локально:\n` +
+            `• ${msgCount} сообщений\n` +
+            `• ${blobCount} файлов (${sizeText})\n\n` +
+            `На GitHub ничего не тронется — при следующем входе чат загрузится заново.`,
+            'Очистить',
+            'Отмена'
+        );
+
+        if (!ok) return;
+
+        // Показываем прогресс
+        showClearingToast(`Очищаем «${chatName}»…`);
+
+        try {
+            await ChatHouse.deleteHouse(chatFile);
+            console.log(`🏠 [HouseUI] Дом чата очищен: ${chatFile}`);
+            showToast(`🧹 Дом «${chatName}» очищен`, 2000);
+            soundManager.play('delete');
+        } catch (e) {
+            console.error('🏠 [HouseUI] clear failed:', e);
+            showToast('❌ Ошибка очистки: ' + e.message, 3000);
+            soundManager.play('error');
+        } finally {
+            hideClearingToast();
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  МЕНЕДЖЕР ВСЕХ ДОМОВ (кнопка из чатов)
+    // ═══════════════════════════════════════════════════════════
+    function ensureManagerOverlay() {
+        let ov = document.getElementById('houseManagerOverlay');
+        if (ov) return ov;
+
+        ov = document.createElement('div');
+        ov.id = 'houseManagerOverlay';
+        ov.innerHTML = `
+            <div class="hm-header">
+                <div class="hm-title">
+                    <h2>🏠 Дома чатов</h2>
+                    <div class="hm-sub" id="hmSubtitle">Загрузка…</div>
+                </div>
+                <button class="hm-btn hm-btn-danger" id="hmClearAllBtn" title="Очистить все дома">🗑</button>
+                <button class="hm-btn" id="hmRefreshBtn" title="Обновить">⟳</button>
+                <button class="hm-btn" id="hmCloseBtn" title="Закрыть">✕</button>
+            </div>
+            <div class="hm-body" id="hmBody">
+                <div class="hm-empty">
+                    <div class="hm-empty-icon">🏠</div>
+                    <div class="hm-empty-title">Загрузка…</div>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(ov);
+
+        ov.querySelector('#hmCloseBtn').addEventListener('click', () => {
+            ov.classList.remove('show');
+            document.body.style.overflow = '';
+        });
+
+        ov.querySelector('#hmRefreshBtn').addEventListener('click', () => {
+            renderManagerContent();
+        });
+
+        ov.querySelector('#hmClearAllBtn').addEventListener('click', async () => {
+            const ok = await showConfirmModal(
+                '🧹 Очистить ВСЕ дома?',
+                'Это удалит все локальные копии всех чатов.\n\n' +
+                'На GitHub ничего не тронется. При следующем входе каждый чат загрузится заново.',
+                'Очистить всё',
+                'Отмена'
+            );
+            if (!ok) return;
+
+            showClearingToast('Очищаем все дома…');
+            try {
+                await ChatHouse.clearAllHouses();
+                showToast('🧹 Все дома очищены', 2000);
+                soundManager.play('delete');
+                renderManagerContent();
+            } catch (e) {
+                showToast('❌ Ошибка: ' + e.message, 3000);
+            } finally {
+                hideClearingToast();
+            }
+        });
+
+        return ov;
+    }
+
+    async function renderManagerContent() {
+        const body = document.getElementById('hmBody');
+        const subtitle = document.getElementById('hmSubtitle');
+        if (!body) return;
+
+        body.innerHTML = `
+            <div class="hm-empty">
+                <div class="hm-empty-icon">⏳</div>
+                <div class="hm-empty-title">Считаем…</div>
+            </div>
+        `;
+
+        // Собираем данные
+        const [houses, usage] = await Promise.all([
+            ChatHouse.listAllHousesStats(),
+            ChatHouse.estimateUsage(),
+        ]);
+
+        // Сортируем по размеру (крупные сверху)
+        houses.sort((a, b) => (b.size || 0) - (a.size || 0));
+
+        const totalSize = houses.reduce((s, h) => s + (h.size || 0), 0);
+        const totalMessages = houses.reduce((s, h) => s + (h.messageCount || 0), 0);
+        const totalBlobs = houses.reduce((s, h) => s + (h.blobCount || 0), 0);
+
+        // Подпись
+        if (subtitle) {
+            subtitle.textContent = houses.length === 0
+                ? 'Пусто'
+                : `${houses.length} чатов · ${totalMessages} сообщ. · ${totalBlobs} файлов`;
+        }
+
+        // Собираем HTML
+        let html = '';
+
+        // Блок статистики
+        if (usage) {
+            html += `
+                <div class="hm-stats">
+                    <div class="hm-total">${formatFileSize(totalSize)}</div>
+                    <div class="hm-total-label">Занято домами чатов</div>
+                    <div class="hm-bar">
+                        <div class="hm-bar-fill" style="width:${Math.min(100, usage.percent).toFixed(1)}%"></div>
+                    </div>
+                    <div class="hm-quota">
+                        <span>${usage.usageHuman} всего</span>
+                        <span>${usage.quotaHuman} доступно</span>
+                    </div>
+                </div>
+            `;
+        }
+
+        // Список домов
+        if (houses.length === 0) {
+            html += `
+                <div class="hm-empty">
+                    <div class="hm-empty-icon">🏠</div>
+                    <div class="hm-empty-title">Пока нет домов</div>
+                    <div class="hm-empty-sub">
+                        Зайдите в любой чат — его дом создастся автоматически,<br>
+                        и в следующий раз он откроется мгновенно.
+                    </div>
+                </div>
+            `;
+        } else {
+            html += `<div class="hm-list">`;
+            for (const h of houses) {
+                const chat = state.chats.find(c => c.file === h.file);
+                const name = chat ? (chat.name || chat.file) : (h.name || h.file);
+
+                // Аватарка
+                let avatarHtml;
+                const avatarData = typeof getChatAvatar === 'function'
+                    ? getChatAvatar(h.file) : null;
+                if (avatarData) {
+                    avatarHtml = `<img src="${avatarData}" alt="">`;
+                } else {
+                    avatarHtml = (name || '?').charAt(0).toUpperCase();
+                }
+
+                // Время последнего синка
+                const lastSync = h.lastSyncAt
+                    ? timeAgoShort(h.lastSyncAt)
+                    : 'никогда';
+
+                html += `
+                    <div class="hm-house" data-file="${escapeHtml(h.file)}">
+                        <div class="hm-avatar">${avatarHtml}</div>
+                        <div class="hm-info">
+                            <div class="hm-name">${escapeHtml(name)}</div>
+                            <div class="hm-meta">
+                                <span>💬 ${h.messageCount}</span>
+                                ${h.blobCount > 0
+                                    ? `<span class="hm-dot">·</span><span>📎 ${h.blobCount}</span>`
+                                    : ''}
+                                <span class="hm-dot">·</span>
+                                <span>🕒 ${lastSync}</span>
+                            </div>
+                        </div>
+                        ${h.size > 0 ? `<div class="hm-size">${h.sizeHuman}</div>` : ''}
+                        <button class="hm-delete" data-file="${escapeHtml(h.file)}" title="Удалить">✕</button>
+                    </div>
+                `;
+            }
+            html += `</div>`;
+        }
+
+        body.innerHTML = html;
+
+        // Обработчики удаления
+        body.querySelectorAll('.hm-delete').forEach(btn => {
+            btn.addEventListener('click', async (e) => {
+                e.stopPropagation();
+                const file = btn.dataset.file;
+                await clearHouseOfChat(file);
+
+                // Анимация удаления
+                const card = btn.closest('.hm-house');
+                if (card) {
+                    card.classList.add('removing');
+                    setTimeout(() => {
+                        card.remove();
+                        // Пересчитываем статистику
+                        renderManagerContent();
+                    }, 220);
+                }
+            });
+        });
+    }
+
+    // ─── Хелпер: «5 мин назад» ───
+    function timeAgoShort(ts) {
+        if (!ts) return 'никогда';
+        const diff = Date.now() - ts;
+        if (diff < 60 * 1000) return 'только что';
+        if (diff < 60 * 60 * 1000) return `${Math.floor(diff / 60000)} мин`;
+        if (diff < 24 * 60 * 60 * 1000) return `${Math.floor(diff / 3600000)} ч`;
+        if (diff < 7 * 24 * 60 * 60 * 1000) return `${Math.floor(diff / 86400000)} дн`;
+        return new Date(ts).toLocaleDateString('ru-RU', { day: 'numeric', month: 'short' });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПРОГРЕСС-ТОСТ ОЧИСТКИ
+    // ═══════════════════════════════════════════════════════════
+    function showClearingToast(text, sub) {
+        let el = document.getElementById('houseClearingToast');
+        if (!el) {
+            el = document.createElement('div');
+            el.id = 'houseClearingToast';
+            el.innerHTML = `
+                <div class="hct-spinner"></div>
+                <div>
+                    <div class="hct-text" id="hctText">Очищаем…</div>
+                    <div class="hct-sub" id="hctSub"></div>
+                </div>
+            `;
+            document.body.appendChild(el);
+        }
+        el.querySelector('#hctText').textContent = text || 'Очищаем…';
+        el.querySelector('#hctSub').textContent = sub || '';
+        el.classList.add('show');
+    }
+
+    function hideClearingToast() {
+        const el = document.getElementById('houseClearingToast');
+        if (el) el.classList.remove('show');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  КНОПКА «ДОМА ЧАТОВ» В ⋯ МЕНЮ НА ЭКРАНЕ ЧАТОВ
+    //  Добавляем пункт в существующее #chatsActionsMenu
+    // ═══════════════════════════════════════════════════════════
+    function injectHousesButton() {
+        const menu = document.getElementById('chatsActionsMenu');
+        if (!menu) return;
+
+        // Уже есть?
+        if (menu.querySelector('[data-action="houses"]')) return;
+
+        // Находим разделитель
+        const dividers = menu.querySelectorAll('.ucm-divider');
+        const lastDivider = dividers[dividers.length - 1];
+
+        const item = document.createElement('div');
+        item.className = 'ucm-item';
+        item.dataset.action = 'houses';
+        item.innerHTML = `
+            <span class="ucm-icon">🏠</span>
+            <span class="ucm-label">Дома чатов (кэш)</span>
+        `;
+
+        if (lastDivider) {
+            lastDivider.parentNode.insertBefore(item, lastDivider);
+        } else {
+            menu.appendChild(item);
+        }
+
+        item.addEventListener('click', (e) => {
+            e.stopPropagation();
+            // Закрываем меню
+            const m = document.getElementById('chatsActionsMenu');
+            if (m) m.classList.remove('show');
+            openManagerOverlay();
+        });
+    }
+
+    function openManagerOverlay() {
+        ensureManagerOverlay();
+        const ov = document.getElementById('houseManagerOverlay');
+        ov.classList.add('show');
+        document.body.style.overflow = 'hidden';
+        renderManagerContent();
+    }
+
+    // Устанавливаем при появлении меню
+    const chatsMenuObserver = new MutationObserver(() => {
+        injectHousesButton();
+    });
+    chatsMenuObserver.observe(document.body, { childList: true, subtree: true });
+
+    setTimeout(injectHousesButton, 2000);
+    setInterval(injectHousesButton, 3000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНЫЙ API
+    // ═══════════════════════════════════════════════════════════
+    window.ChatHouseUI = {
+        openManager: openManagerOverlay,
+        closeManager: () => {
+            const ov = document.getElementById('houseManagerOverlay');
+            if (ov) {
+                ov.classList.remove('show');
+                document.body.style.overflow = '';
+            }
+        },
+        clearChat: clearHouseOfChat,
+        stats: () => ChatHouse.listAllHousesStats(),
+        usage: () => ChatHouse.estimateUsage(),
+    };
+
+    console.log('🏠 [HouseUI] UI управления домами активен');
+    console.log('   • ⋯ меню чата → «🏠 Дом чата» + «🧹 Очистить кэш»');
+    console.log('   • ⋯ экрана чатов → «🏠 Дома чатов (кэш)»');
+    console.log('   • API: ChatHouseUI.openManager() / .clearChat(file)');
 })();
 </script>
 </body>
