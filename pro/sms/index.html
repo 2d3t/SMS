@@ -29065,5 +29065,707 @@ console.log('🧹 Модалка очистки кеша активна');
     console.log('   • API: AttachPersistCache.status() / .clearChat(id) / .clearAll()');
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🎨 ЦВЕТНЫЕ КРУЖКИ ДЛЯ СООБЩЕНИЙ (как в Telegram)
+//  ─────────────────────────────────────────────────────────────
+//  Если у пользователя НЕТ своей аватарки — рисуем букву
+//  на уникальном градиенте, зависящем от имени.
+//  Один и тот же ник = один и тот же цвет всегда.
+// ═══════════════════════════════════════════════════════════════
+
+(function installColorfulSenderAvatars() {
+    'use strict';
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАЛИТРА (взята из Telegram — тёплые и холодные тона)
+    //  Каждая запись — пара цветов для градиента 135deg
+    // ═══════════════════════════════════════════════════════════
+    const PALETTE = [
+        // ─── Telegram-подобные ───
+        ['#FF516A', '#FF8A9E'],   // красный
+        ['#FFA85C', '#FFC57D'],   // оранжевый
+        ['#FFD93B', '#FFE57A'],   // жёлтый
+        ['#9ED94C', '#B8E876'],   // лаймовый
+        ['#4FD166', '#7EE08E'],   // зелёный
+        ['#3FC9C1', '#68DBD4'],   // бирюзовый
+        ['#5CA8FF', '#7FBEFF'],   // голубой
+        ['#7B7FF6', '#9B9EFF'],   // синий
+        ['#B36BFF', '#CC8FFF'],   // фиолетовый
+        ['#F36BE1', '#F89CEB'],   // розовый
+
+        // ─── Дополнительные ───
+        ['#E0564B', '#F07E74'],   // тёмно-красный
+        ['#C77C3F', '#DFA065'],   // коричневый
+        ['#A8A83C', '#C4C46A'],   // оливковый
+        ['#3D9E6F', '#5FBF8D'],   // изумрудный
+        ['#2E8FB8', '#57AFD4'],   // морской
+        ['#4D5BC4', '#7381DB'],   // индиго
+        ['#8E4DD4', '#AB73E5'],   // пурпурный
+        ['#D64D8E', '#E677AC'],   // малиновый
+        ['#7C4DAB', '#9C72C4'],   // виноградный
+        ['#4A7C59', '#6DA07B'],   // тёмно-зелёный
+    ];
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХЕШ-ФУНКЦИЯ
+    //  Стабильная, быстрая, с хорошим распределением.
+    //  Одно и то же имя → всегда один и тот же индекс.
+    // ═══════════════════════════════════════════════════════════
+    function hashUsername(username) {
+        if (!username) return 0;
+        // FNV-1a 32-bit
+        let hash = 0x811c9dc5;
+        for (let i = 0; i < username.length; i++) {
+            hash ^= username.charCodeAt(i);
+            hash = (hash * 0x01000193) >>> 0;
+        }
+        return hash;
+    }
+
+    function getColorForUsername(username) {
+        if (!username) return PALETTE[0];
+        const idx = hashUsername(username) % PALETTE.length;
+        return PALETTE[idx];
+    }
+
+    function getGradient(username) {
+        const [c1, c2] = getColorForUsername(username);
+        return `linear-gradient(135deg, ${c1}, ${c2})`;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧ renderUserAvatarHtml
+    //  Это ЕДИНАЯ точка, через которую рисуются все кружки
+    //  (сообщения + комментарии). Идеальное место для патча.
+    // ═══════════════════════════════════════════════════════════
+    if (typeof renderUserAvatarHtml === 'function') {
+        const _origRender = renderUserAvatarHtml;
+
+        renderUserAvatarHtml = function(username, sizeClass = 'sender-avatar') {
+            const safeName = (typeof escapeHtml === 'function')
+                ? escapeHtml(username || '?')
+                : (username || '?');
+            const letter = (username || '?').charAt(0).toUpperCase();
+            const dataUrl = (typeof UserAvatars !== 'undefined')
+                ? UserAvatars.get(username)
+                : null;
+
+            const cls = `user-avatar ${sizeClass}` + (dataUrl ? ' has-custom' : '');
+            const inner = dataUrl
+                ? `<img src="${dataUrl}" alt="" draggable="false">`
+                : letter;
+
+            // 🎨 Главное изменение — устанавливаем inline-стиль
+            //    с уникальным градиентом для каждого ника.
+            //    Если есть кастомная аватарка — градиент не нужен
+            //    (картинка закроет его), но оставим на случай прозрачности.
+            const bgStyle = dataUrl
+                ? ''
+                : ` style="background:${getGradient(username || '?')};"`;
+
+            return `<span class="${cls}" data-user="${safeName}"${bgStyle}>${inner}</span>`;
+        };
+
+        console.log('🎨 [ColorfulAvatars] renderUserAvatarHtml пропатчен');
+    } else {
+        console.warn('🎨 [ColorfulAvatars] renderUserAvatarHtml не найден');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧ refreshAllUserAvatars
+    //  Когда пользователь удаляет аватарку — кружок должен
+    //  вернуться к цветному состоянию, а не к стандартному градиенту.
+    // ═══════════════════════════════════════════════════════════
+    if (typeof refreshAllUserAvatars === 'function') {
+        const _origRefresh = refreshAllUserAvatars;
+
+        refreshAllUserAvatars = function(username) {
+            if (!username) return;
+            const safeName = CSS.escape(username);
+            const dataUrl = (typeof UserAvatars !== 'undefined')
+                ? UserAvatars.get(username)
+                : null;
+            const letter = username.charAt(0).toUpperCase();
+
+            document.querySelectorAll(`.user-avatar[data-user="${safeName}"]`).forEach(el => {
+                if (dataUrl) {
+                    el.innerHTML = `<img src="${dataUrl}" alt="" draggable="false">`;
+                    el.classList.add('has-custom');
+                    // Убираем inline-градиент, т.к. есть картинка
+                    el.style.background = '';
+                } else {
+                    el.textContent = letter;
+                    el.classList.remove('has-custom');
+                    // 🎨 Возвращаем уникальный градиент
+                    el.style.background = getGradient(username);
+                }
+            });
+        };
+
+        console.log('🎨 [ColorfulAvatars] refreshAllUserAvatars пропатчен');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧ applyAvatarToElement (для аватарок ЧАТОВ — не пользователей)
+    //  Там тоже буква-фолбэк. Но у чатов уже есть свой градиент
+    //  в CSS, его и оставим — чтобы визуально отличать чат от юзера.
+    //  Хотя... почему бы и чатам не дать уникальные цвета?
+    //  Давай сделаем и для чатов — но по file (ID чата).
+    // ═══════════════════════════════════════════════════════════
+    if (typeof applyAvatarToElement === 'function') {
+        const _origApply = applyAvatarToElement;
+
+        applyAvatarToElement = function(el, chatFile) {
+            if (!el || !chatFile) return;
+
+            // Сохраняем служебные классы
+            const keepClasses = [];
+            if (el.classList.contains('has-unread')) keepClasses.push('has-unread');
+            if (el.classList.contains('uploading')) keepClasses.push('uploading');
+
+            const dataUrl = (typeof getChatAvatar === 'function')
+                ? getChatAvatar(chatFile)
+                : null;
+            const chat = (typeof state !== 'undefined' && state.chats)
+                ? state.chats.find(c => c.file === chatFile)
+                : null;
+            const letter = (chat?.name || chatFile).charAt(0).toUpperCase();
+
+            // Очищаем и пересобираем
+            el.innerHTML = '';
+            el.classList.remove('has-custom-avatar');
+            keepClasses.forEach(c => el.classList.add(c));
+
+            if (dataUrl) {
+                const img = document.createElement('img');
+                img.src = dataUrl;
+                img.alt = 'Аватар';
+                el.appendChild(img);
+                el.classList.add('has-custom-avatar');
+                el.style.background = '';
+            } else {
+                el.textContent = letter;
+                // 🎨 Цвет по ID чата (стабильный)
+                el.style.background = getGradient(chatFile);
+            }
+        };
+
+        console.log('🎨 [ColorfulAvatars] applyAvatarToElement пропатчен');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧ: перекрасить уже отрисованные сообщения
+    //  Если чат уже открыт к моменту применения патча — нужно
+    //  обновить все кружки прямо сейчас.
+    // ═══════════════════════════════════════════════════════════
+    function recolorAllExisting() {
+        if (typeof messagesInner === 'undefined' || !messagesInner) return;
+
+        messagesInner.querySelectorAll('.user-avatar[data-user]').forEach(el => {
+            const username = el.dataset.user;
+            if (!username) return;
+
+            const dataUrl = (typeof UserAvatars !== 'undefined')
+                ? UserAvatars.get(username)
+                : null;
+
+            if (!dataUrl) {
+                el.style.background = getGradient(username);
+            }
+        });
+
+        // И кружки в списке чатов
+        document.querySelectorAll('#chatsList .chat-avatar[data-avatar-file]').forEach(el => {
+            const file = el.dataset.avatarFile;
+            if (!file) return;
+            const dataUrl = (typeof getChatAvatar === 'function')
+                ? getChatAvatar(file)
+                : null;
+            if (!dataUrl) {
+                el.style.background = getGradient(file);
+            }
+        });
+    }
+
+    // Сразу — для уже открытых
+    setTimeout(recolorAllExisting, 100);
+    setTimeout(recolorAllExisting, 800);
+
+    // Также при смене экрана — перекрашиваем
+    if (typeof showChatScreen === 'function') {
+        const _origShowChatScreen = showChatScreen;
+        showChatScreen = function() {
+            const r = _origShowChatScreen.apply(this, arguments);
+            setTimeout(recolorAllExisting, 150);
+            return r;
+        };
+    }
+
+    if (typeof showChatsScreen === 'function') {
+        const _origShowChatsScreen = showChatsScreen;
+        showChatsScreen = function() {
+            const r = _origShowChatsScreen.apply(this, arguments);
+            setTimeout(recolorAllExisting, 150);
+            return r;
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ДОПОЛНИТЕЛЬНЫЙ CSS: убираем стандартный градиент-фолбэк
+    //  на тех кружках, у которых мы ставим inline-style.
+    //  Оставляем его только как fallback (не должен срабатывать).
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('colorfulAvatarStyles')) {
+        const style = document.createElement('style');
+        style.id = 'colorfulAvatarStyles';
+        style.textContent = `
+            /* Плавный переход цвета при смене имени/аватарки */
+            .user-avatar {
+                transition: transform 0.15s, box-shadow 0.15s,
+                            opacity 0.15s, background 0.2s;
+            }
+            /* Текст буквы — почти белый, но чуть мягкий */
+            .user-avatar:not(.has-custom) {
+                color: #fff;
+                text-shadow: 0 1px 2px rgba(0,0,0,0.15);
+                font-weight: 700;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  API ДЛЯ ОТЛАДКИ / КАСТОМИЗАЦИИ
+    // ═══════════════════════════════════════════════════════════
+    window.ColorfulAvatars = {
+        palette: PALETTE,
+        hash: hashUsername,
+        colorOf: (username) => getColorForUsername(username),
+        gradientOf: (username) => getGradient(username),
+
+        // Пример: как выглядит палитра для списка ников
+        preview: (usernames) => {
+            return usernames.map(u => ({
+                username: u,
+                gradient: getGradient(u),
+            }));
+        },
+
+        // Перекрасить всё заново
+        recolor: recolorAllExisting,
+    };
+
+    console.log('🎨 Уникальные цвета кружков активны');
+    console.log('   • Один ник = один цвет, всегда');
+    console.log('   • ' + PALETTE.length + ' цветов в палитре');
+    console.log('   • API: ColorfulAvatars.gradientOf("имя")');
+})();
+</script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  📊 РАЗМЕР КЭША КАЖДОГО ЧАТА В МОДАЛКЕ ОЧИСТКИ
+//  ─────────────────────────────────────────────────────────────
+//  Считает реальный размер вложений (blob'ы в памяти + IndexedDB),
+//  привязанных к каждому чату. Показывает в списке.
+// ═══════════════════════════════════════════════════════════════
+
+(function installCacheSizeDisplay() {
+    'use strict';
+
+    // ─── Состояние ───
+    const _cacheSizes = new Map();       // { file: bytes }
+    const _cacheDetails = new Map();     // { file: { msgs, blobs, totalBytes } }
+    let _computing = false;
+
+    // ═══════════════════════════════════════════════════════════
+    //  Форматирование размера
+    // ═══════════════════════════════════════════════════════════
+    function fmtBytes(bytes) {
+        if (!bytes || bytes < 1024) return (bytes || 0) + ' Б';
+        if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' КБ';
+        if (bytes < 1024 * 1024 * 1024) return (bytes / 1024 / 1024).toFixed(2) + ' МБ';
+        return (bytes / 1024 / 1024 / 1024).toFixed(2) + ' ГБ';
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Собрать имена вложений из сообщений чата
+    // ═══════════════════════════════════════════════════════════
+    function collectAttachNames(messages) {
+        const names = new Set();
+        if (!Array.isArray(messages)) return names;
+        for (const msg of messages) {
+            if (msg.image)   names.add(msg.image);
+            if (msg.audio)   names.add(msg.audio);
+            if (msg.file)    names.add(msg.file);
+            if (msg.video)   names.add(msg.video);
+            if (msg.videoNote) names.add(msg.videoNote);
+            if (msg.audioCover) names.add(msg.audioCover);
+        }
+        return names;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Размер blob по URL (кеш blob:)
+    // ═══════════════════════════════════════════════════════════
+    const _blobSizeCache = new Map();   // url → size
+    async function getBlobSizeByUrl(url) {
+        if (!url) return 0;
+        if (_blobSizeCache.has(url)) return _blobSizeCache.get(url);
+        try {
+            const res = await fetch(url);
+            const blob = await res.blob();
+            _blobSizeCache.set(url, blob.size);
+            return blob.size;
+        } catch (e) {
+            return 0;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Подсчёт размера для одного чата
+    // ═══════════════════════════════════════════════════════════
+    async function computeChatSize(chatFile) {
+        let msgsCount = 0;
+        let memBlobsBytes = 0;
+        let dbBlobsBytes = 0;
+        let memCount = 0;
+        let dbCount = 0;
+
+        // ─── 1. Сообщения и имена вложений из OfflineCache ───
+        let messages = [];
+        try {
+            if (typeof OfflineCache !== 'undefined' && OfflineCache.getChat) {
+                const cached = await OfflineCache.getChat(chatFile);
+                if (cached && Array.isArray(cached.messages)) {
+                    messages = cached.messages;
+                    msgsCount = cached.messages.length;
+                }
+            }
+        } catch (e) { /* ignore */ }
+
+        const attachNames = collectAttachNames(messages);
+
+        // ─── 2. Blob'ы в ПАМЯТИ (_attachmentCache) ───
+        if (typeof _attachmentCache !== 'undefined') {
+            for (const name of attachNames) {
+                const url = _attachmentCache.get(name);
+                if (!url) continue;
+                memCount++;
+                // Сначала пробуем взять из трекера размеров
+                let size = 0;
+                if (typeof window._attachmentSizes !== 'undefined') {
+                    size = window._attachmentSizes.get(name) || 0;
+                }
+                if (!size) {
+                    size = await getBlobSizeByUrl(url);
+                }
+                memBlobsBytes += size;
+            }
+        }
+
+        // ─── 3. Blob'ы в IndexedDB (PersistCache) ───
+        try {
+            if (typeof AttachPersistCache !== 'undefined' && AttachPersistCache.status) {
+                const status = await AttachPersistCache.status();
+                if (status && status.byChat && status.items) {
+                    // Проверяем по byChat
+                    dbCount = status.byChat[chatFile] || 0;
+                    // Если есть items — считаем точнее
+                    if (Array.isArray(status.items)) {
+                        // items — это топ-30, поэтому общая сумма по чату
+                        // может быть неполной. Всё равно используем — это
+                        // разумная оценка.
+                        for (const item of status.items) {
+                            if (item.chat === chatFile) {
+                                dbBlobsBytes += item.size || 0;
+                            }
+                        }
+                        // Если у нас есть количество и мы видим что сумма меньше — 
+                        // можно умножить на коэффициент, но это неточно.
+                        // Оставим как есть.
+                    }
+                }
+            }
+        } catch (e) { /* ignore */ }
+
+        const totalBytes = memBlobsBytes + dbBlobsBytes;
+
+        return {
+            file: chatFile,
+            msgs: msgsCount,
+            memBlobs: memCount,
+            dbBlobs: dbCount,
+            memBytes: memBlobsBytes,
+            dbBytes: dbBlobsBytes,
+            totalBytes,
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Точный подсчёт размера из IndexedDB (все записи по чату)
+    // ═══════════════════════════════════════════════════════════
+    async function computeDbSizeForChat(chatFile) {
+        // Прямой запрос к IndexedDB — чтобы не зависеть от top-30
+        if (!('indexedDB' in window)) return { count: 0, bytes: 0 };
+
+        try {
+            const db = await new Promise((resolve, reject) => {
+                const req = indexedDB.open('smschat_attachments', 1);
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => reject(req.error);
+                setTimeout(() => reject(new Error('timeout')), 5000);
+            });
+
+            return await new Promise((resolve) => {
+                const t = db.transaction('blobs', 'readonly');
+                const store = t.objectStore('blobs');
+                const req = store.openCursor();
+
+                let count = 0;
+                let bytes = 0;
+
+                req.onsuccess = (e) => {
+                    const cursor = e.target.result;
+                    if (cursor) {
+                        const rec = cursor.value;
+                        if (rec.chatFile === chatFile) {
+                            count++;
+                            bytes += rec.size || 0;
+                        }
+                        cursor.continue();
+                    } else {
+                        resolve({ count, bytes });
+                    }
+                };
+                req.onerror = () => resolve({ count: 0, bytes: 0 });
+            });
+        } catch (e) {
+            return { count: 0, bytes: 0 };
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Полный пересчёт размеров всех чатов
+    // ═══════════════════════════════════════════════════════════
+    async function recomputeAllSizes() {
+        if (_computing) return;
+        _computing = true;
+
+        try {
+            const chatFiles = (state.chats || []).map(c => c.file);
+            _cacheSizes.clear();
+            _cacheDetails.clear();
+
+            const tasks = chatFiles.map(async (file) => {
+                let msgsCount = 0;
+
+                // Из OfflineCache
+                try {
+                    if (typeof OfflineCache !== 'undefined' && OfflineCache.getChat) {
+                        const cached = await OfflineCache.getChat(file);
+                        if (cached && Array.isArray(cached.messages)) {
+                            msgsCount = cached.messages.length;
+                        }
+                    }
+                } catch (e) {}
+
+                // Из IndexedDB (точный подсчёт)
+                const dbData = await computeDbSizeForChat(file);
+
+                const totalBytes = dbData.bytes;
+                _cacheSizes.set(file, totalBytes);
+                _cacheDetails.set(file, {
+                    msgs: msgsCount,
+                    dbBlobs: dbData.count,
+                    bytes: totalBytes,
+                });
+            });
+
+            await Promise.all(tasks);
+
+            console.log('📊 [CacheSize] Размеры посчитаны:',
+                Array.from(_cacheSizes.entries()).map(([f, b]) => `${f}: ${fmtBytes(b)}`));
+        } catch (e) {
+            console.warn('📊 [CacheSize] recomputeAllSizes error:', e);
+        } finally {
+            _computing = false;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧ renderCacheChatsList
+    //  Добавляем отображение размера в каждой строке.
+    // ═══════════════════════════════════════════════════════════
+    if (typeof renderCacheChatsList === 'function') {
+        const _origRender = renderCacheChatsList;
+
+        renderCacheChatsList = function() {
+            const result = _origRender.apply(this, arguments);
+
+            // После того как оригинал нарисовал список —
+            // дописываем размер в каждую строку
+            const list = document.getElementById('cacheChatsList');
+            if (!list) return result;
+
+            list.querySelectorAll('.cache-chat-item').forEach(item => {
+                const file = item.dataset.file;
+                if (!file) return;
+
+                const size = _cacheSizes.get(file) || 0;
+                const details = _cacheDetails.get(file);
+
+                // Находим подпись (третья строка с ID)
+                const subtitle = item.querySelector('div[style*="font-size:11px"]');
+                if (!subtitle) return;
+
+                // Убираем старую инфу о размере, если есть
+                const oldSize = subtitle.querySelector('.cache-size-label');
+                if (oldSize) oldSize.remove();
+
+                // Формируем новую инфу
+                const sizeStr = size > 0 ? fmtBytes(size) : '—';
+                const sizeColor = size > 0 ? '#feca57' : '#666';
+                const msgsText = details && details.msgs > 0
+                    ? `${details.msgs} сообщ.`
+                    : 'кеш пуст';
+
+                const sizeHtml = `<span class="cache-size-label" style="color:${sizeColor};font-weight:600;"> · ${sizeStr}</span>`;
+                subtitle.insertAdjacentHTML('beforeend', sizeHtml);
+            });
+
+            return result;
+        };
+
+        console.log('📊 [CacheSize] renderCacheChatsList пропатчен');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧ openClearCacheModal
+    //  Перед открытием — пересчитываем размеры.
+    // ═══════════════════════════════════════════════════════════
+    if (typeof openClearCacheModal === 'function') {
+        const _origOpen = openClearCacheModal;
+
+        openClearCacheModal = async function() {
+            // Сначала пересчитываем размеры
+            // (асинхронно, но не блокируем открытие модалки)
+            recomputeAllSizes().then(() => {
+                // После подсчёта — перерисовываем список
+                if (document.getElementById('clearCacheModal')?.classList.contains('active')) {
+                    renderCacheChatsList();
+                    updateTotalSizeInModal();
+                }
+            });
+
+            const result = await _origOpen.apply(this, arguments);
+            return result;
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Общая сумма внизу модалки
+    // ═══════════════════════════════════════════════════════════
+    function updateTotalSizeInModal() {
+        const summary = document.getElementById('cacheSummary');
+        if (!summary) return;
+
+        let totalBytes = 0;
+        _cacheSizes.forEach(b => totalBytes += b);
+
+        // Ищем существующую строку с общей суммой
+        let totalEl = summary.querySelector('.cache-total-size');
+        if (!totalEl) {
+            totalEl = document.createElement('div');
+            totalEl.className = 'cache-total-size';
+            totalEl.style.cssText = 'margin-top:6px;font-size:12px;color:#feca57;font-weight:600;';
+            summary.appendChild(totalEl);
+        }
+
+        if (totalBytes > 0) {
+            totalEl.textContent = `💾 Всего: ${fmtBytes(totalBytes)}`;
+            totalEl.style.display = 'block';
+        } else {
+            totalEl.style.display = 'none';
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧ updateCacheSummary — добавляем инфу о размере
+    // ═══════════════════════════════════════════════════════════
+    if (typeof updateCacheSummary === 'function') {
+        const _origUpdate = updateCacheSummary;
+
+        updateCacheSummary = function() {
+            _origUpdate.apply(this, arguments);
+
+            // Дополнительно показываем размер выбранных чатов
+            const summary = document.getElementById('cacheSummary');
+            if (!summary) return;
+
+            let selectedBytes = 0;
+            if (typeof _selectedCacheFiles !== 'undefined') {
+                _selectedCacheFiles.forEach(file => {
+                    selectedBytes += _cacheSizes.get(file) || 0;
+                });
+            }
+
+            // Управляем блоком "выбранных"
+            let selEl = summary.querySelector('.cache-selected-size');
+            if (!selEl) {
+                selEl = document.createElement('div');
+                selEl.className = 'cache-selected-size';
+                selEl.style.cssText = 'margin-top:4px;font-size:12px;color:#a78bfa;';
+                summary.appendChild(selEl);
+            }
+
+            if (selectedBytes > 0 && _selectedCacheFiles?.size > 0) {
+                selEl.textContent = `📦 Будет очищено: ${fmtBytes(selectedBytes)}`;
+                selEl.style.display = 'block';
+            } else {
+                selEl.style.display = 'none';
+            }
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Публичное API
+    // ═══════════════════════════════════════════════════════════
+    window.CacheSizeInfo = {
+        recompute: recomputeAllSizes,
+        getSize: (file) => _cacheSizes.get(file) || 0,
+        getAll: () => Object.fromEntries(_cacheSizes),
+        getDetails: (file) => _cacheDetails.get(file) || null,
+        fmt: fmtBytes,
+
+        // Быстрый отчёт в консоли
+        report: async () => {
+            await recomputeAllSizes();
+            const lines = [];
+            let total = 0;
+            for (const [file, bytes] of _cacheSizes.entries()) {
+                const chat = state.chats.find(c => c.file === file);
+                const name = chat ? (chat.name || file) : file;
+                lines.push(`${name}: ${fmtBytes(bytes)}`);
+                total += bytes;
+            }
+            console.log('📊 Размер кэша по чатам:');
+            lines.forEach(l => console.log('  ', l));
+            console.log(`  ВСЕГО: ${fmtBytes(total)}`);
+            return { total, byChat: Object.fromEntries(_cacheSizes) };
+        },
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  Готово
+    // ═══════════════════════════════════════════════════════════
+    console.log('📊 Отображение размера кэша чатов активно');
+    console.log('   • При открытии модалки очистки — размеры считаются');
+    console.log('   • Показывается: количество сообщений + размер вложений');
+    console.log('   • Внизу — общая сумма по всем чатам');
+    console.log('   • API: CacheSizeInfo.report()');
+
+})();
+</script>
 </body>
 </html>
