@@ -32183,5 +32183,1220 @@ try {
     console.log('   • checkNetwork доверяет navigator.onLine');
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🩹 ПАТЧ v3: АВТОНОМНАЯ ОЧЕРЕДЬ ОТПРАВКИ
+//  ─────────────────────────────────────────────────────────────
+//  НЕ трогает глобальный state. Работает где угодно и всегда.
+// ═══════════════════════════════════════════════════════════════
+
+(function installAutonomousOutbox() {
+    'use strict';
+
+    // ═══════════════════════════════════════════════════════════
+    //  0. Отключаем старые патчи Outbox (v1 и v2)
+    // ═══════════════════════════════════════════════════════════
+    // Наш новый модуль — единственный источник правды.
+    // Старые process-функции больше не будут вызываться.
+    if (typeof OutboxQueue !== 'undefined') {
+        // Замораживаем старый API, чтобы не мешал
+        OutboxQueue.process = function() {
+            // ничего не делаем — новый модуль работает сам
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  КОНФИГ
+    // ═══════════════════════════════════════════════════════════
+    const CFG = {
+        storageKey: 'smschat_outbox_v1',      // тот же ключ, что у старого Outbox
+        maxRetries: 5,
+        retryDelayMs: 4000,
+        processIntervalMs: 2000,              // каждые 2 сек пробуем
+        stuckTimeoutMs: 3 * 60 * 1000,        // 3 минуты — задача считается зависшей
+        logPrefix: '⚡ [AutoOutbox]',
+    };
+
+    const log = (...a) => console.log(CFG.logPrefix, ...a);
+    const warn = (...a) => console.warn(CFG.logPrefix, ...a);
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОСТОЯНИЕ
+    // ═══════════════════════════════════════════════════════════
+    const AOB = {
+        queue: [],
+        processing: false,
+        _processTimer: null,
+        _lastProcessTs: 0,
+        _currentlyProcessingId: null,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  УТИЛИТЫ
+    // ═══════════════════════════════════════════════════════════
+    function genId() {
+        return 'aob_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+    }
+
+    function blobToBase64(blob) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(reader.result);
+            reader.onerror = reject;
+            reader.readAsDataURL(blob);
+        });
+    }
+
+    function base64ToBlob(base64, mime) {
+        const parts = base64.includes(',') ? base64.split(',') : [null, base64];
+        const bstr = atob(parts[1]);
+        const bytes = new Uint8Array(bstr.length);
+        for (let i = 0; i < bstr.length; i++) bytes[i] = bstr.charCodeAt(i);
+        return new Blob([bytes], { type: mime || 'application/octet-stream' });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЗАГРУЗКА / СОХРАНЕНИЕ (совместимо со старым форматом)
+    // ═══════════════════════════════════════════════════════════
+    function loadQueue() {
+        try {
+            const raw = localStorage.getItem(CFG.storageKey);
+            if (!raw) return [];
+            const data = JSON.parse(raw);
+            if (!Array.isArray(data)) return [];
+
+            // Нормализуем записи: старый формат → новый
+            return data
+                .filter(t => t && t.chatFile)
+                .map(normalizeTask);
+        } catch (e) {
+            warn('loadQueue error:', e);
+            return [];
+        }
+    }
+
+    /**
+     * Приводит задачу к единому виду.
+     * Поддерживает как старый формат (с blob в base64 внутри),
+     * так и новый (уже сериализованный).
+     */
+    function normalizeTask(t) {
+        const out = {
+            id: t.id || genId(),
+            chatFile: t.chatFile,
+            text: t.text || '',
+            replyTo: t.replyTo || null,
+            createdAt: t.createdAt || Date.now(),
+            retries: t.retries || 0,
+            status: t.status || 'pending',
+            errorMessage: t.errorMessage || null,
+            localMsgId: t.localMsgId || null,
+            // Данные вложений:
+            imageData: t.imageData || null,       // base64
+            imageMime: t.imageMime || 'image/jpeg',
+            audioData: t.audioData || null,       // base64 (или объект {data, duration, mime})
+            fileData: t.fileData || null,         // base64
+            fileName: t.fileName || null,
+            fileMime: t.fileMime || null,
+            audioFileData: t.audioFileData || null,
+            audioFileName: t.audioFileName || null,
+            audioFileMime: t.audioFileMime || null,
+            audioFileDuration: t.audioFileDuration || 0,
+            videoPayload: t.videoPayload || null,
+        };
+
+        // Обработка audioData (может быть объектом {data: base64, ...})
+        if (out.audioData && typeof out.audioData === 'object' && out.audioData.data) {
+            // Оставляем как есть — sendTask разберётся
+        }
+
+        return out;
+    }
+
+    async function saveQueue() {
+        try {
+            localStorage.setItem(CFG.storageKey, JSON.stringify(AOB.queue));
+        } catch (e) {
+            if (e.name === 'QuotaExceededError') {
+                warn('QuotaExceededError — сбрасываем самые тяжёлые задачи');
+                // Простое решение: если переполнено, удаляем вложения
+                // у самых старых задач
+                AOB.queue.forEach(t => {
+                    delete t.imageData;
+                    delete t.fileData;
+                    delete t.audioFileData;
+                });
+                try {
+                    localStorage.setItem(CFG.storageKey, JSON.stringify(AOB.queue));
+                } catch (e2) {}
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОБЫТИЕ: новая задача попадает в очередь
+    //  Сработает, если старый Outbox положил что-то в localStorage.
+    // ═══════════════════════════════════════════════════════════
+    function syncFromLocalStorage() {
+        const stored = loadQueue();
+        // Ищем задачи, которых нет у нас в памяти
+        const ourIds = new Set(AOB.queue.map(t => t.id));
+        let added = 0;
+        stored.forEach(t => {
+            if (!ourIds.has(t.id)) {
+                AOB.queue.push(t);
+                added++;
+            }
+        });
+        if (added > 0) {
+            log(`Загружено из localStorage: ${added} задач`);
+        }
+    }
+
+    // Перехватываем запись в localStorage — когда старый Outbox
+    // пишет новую задачу, мы её сразу видим.
+    const _origSetItem = localStorage.setItem.bind(localStorage);
+    localStorage.setItem = function(key, value) {
+        _origSetItem(key, value);
+        if (key === CFG.storageKey) {
+            // Отложенный синк — не блокируем вызывающий код
+            setTimeout(syncFromLocalStorage, 0);
+        }
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПРОВЕРКА СЕТИ
+    // ═══════════════════════════════════════════════════════════
+    function isOnline() {
+        // Доверяем только navigator.onLine
+        // (реальные сетевые ошибки будут обработаны при fetch)
+        return navigator.onLine === true;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ГЛАВНАЯ ФУНКЦИЯ: отправка одной задачи
+    //  ─────────────────────────────────────────────────────────
+    //  ⚠️ НЕ читает и НЕ пишет в глобальный state.
+    //  Всё нужное — из параметров задачи + state.savedPasswords
+    //  + state.token + state.username (только на чтение, это безопасно).
+    // ═══════════════════════════════════════════════════════════
+    async function sendTaskAutonomous(task) {
+        // ═══ 1. Проверяем входные данные ═══
+        if (typeof state === 'undefined') {
+            throw new Error('state недоступен');
+        }
+        if (!state.token) {
+            throw new Error('Нет токена');
+        }
+        if (!state.isAuthorized) {
+            throw new Error('Не авторизован');
+        }
+
+        const password = state.savedPasswords && state.savedPasswords[task.chatFile];
+        if (!password) {
+            throw new Error(`Нет пароля для чата ${task.chatFile}`);
+        }
+
+        const username = state.username;
+        const token = state.token;
+
+        log(`Отправка задачи ${task.id} в ${task.chatFile}`);
+
+        // ═══ 2. Загружаем файл чата ═══
+        const chatPath = `chats/${task.chatFile}.json`;
+        const chatUrl = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${chatPath}`;
+
+        // Сначала получаем через тот же путь, что и оригинал — с fallback
+        const fetchResult = await fetchFileForTask(token, chatPath);
+        if (!fetchResult || !fetchResult.exists) {
+            throw new Error('Чат не найден');
+        }
+
+        let fileContent = fetchResult.content;
+        let sha = fetchResult.sha;
+
+        if (!fileContent || fileContent.v !== CRYPTO.VERSION || !fileContent.salt) {
+            throw new Error('Неверный формат чата');
+        }
+
+        // ═══ 3. Деривим ключ ═══
+        const key = await deriveKey(password, fileContent.salt);
+
+        // ═══ 4. Формируем сообщение ═══
+        const messageId = Date.now();
+        const plainMsg = {
+            id: messageId,
+            username: username,
+            text: task.text || '',
+            time: new Date().toISOString(),
+        };
+
+        if (task.replyTo) {
+            plainMsg.replyTo = task.replyTo;
+        }
+
+        // ─── Вложения ───
+        // Каждое вложение: шифруем СВОИМ ключом (не CRYPTO._key!) и льём на GitHub
+
+        if (task.imageData) {
+            const blob = base64ToBlob(task.imageData, task.imageMime || 'image/jpeg');
+            const buf = await blob.arrayBuffer();
+            const attachName = generateAttachmentName('img', 'jpg');
+            await uploadAttachmentForTask(
+                token, task.chatFile, attachName, buf, key,
+                `📷 Фото (${formatFileSizeForTask(blob.size)})`
+            );
+            plainMsg.image = attachName;
+        }
+
+        if (task.audioData) {
+            // audioData может быть:
+            //  1. объектом { data: 'data:audio/webm;base64,...', duration, mime }
+            //  2. строкой 'data:audio/webm;base64,...'
+            let audioB64, audioMime, audioDuration;
+
+            if (typeof task.audioData === 'object' && task.audioData !== null) {
+                audioB64 = task.audioData.data || '';
+                audioMime = task.audioData.mime || 'audio/webm';
+                audioDuration = task.audioData.duration || 0;
+            } else {
+                audioB64 = task.audioData;
+                audioMime = task.audioMime || 'audio/webm';
+                audioDuration = task.audioDuration || 0;
+            }
+
+            const b64 = audioB64.includes(',') ? audioB64.split(',')[1] : audioB64;
+            const buf = base64ToArrayBuffer(b64);
+            const attachName = generateAttachmentName('aud', 'webm');
+            await uploadAttachmentForTask(
+                token, task.chatFile, attachName, buf, key,
+                `🎤 Голосовое (${formatFileSizeForTask(buf.byteLength)})`
+            );
+            plainMsg.audio = attachName;
+            plainMsg.audioDuration = audioDuration;
+            plainMsg.audioMime = audioMime;
+        }
+
+        if (task.fileData && task.fileName) {
+            const blob = base64ToBlob(task.fileData, task.fileMime || 'application/octet-stream');
+            const buf = await blob.arrayBuffer();
+            const ext = (task.fileName.split('.').pop() || 'bin')
+                .toLowerCase().replace(/[^a-z0-9]/g, '') || 'bin';
+            const attachName = generateAttachmentName('file', ext);
+            await uploadAttachmentForTask(
+                token, task.chatFile, attachName, buf, key,
+                task.fileName
+            );
+            plainMsg.file = attachName;
+            plainMsg.fileName = task.fileName;
+            plainMsg.fileMime = task.fileMime || 'application/octet-stream';
+            plainMsg.fileSize = blob.size;
+        }
+
+        if (task.audioFileData && task.audioFileName) {
+            const blob = base64ToBlob(task.audioFileData, task.audioFileMime || 'audio/mpeg');
+            const buf = await blob.arrayBuffer();
+            const ext = (task.audioFileName.split('.').pop() || 'mp3')
+                .toLowerCase().replace(/[^a-z0-9]/g, '') || 'mp3';
+            const attachName = generateAttachmentName('aud', ext);
+            await uploadAttachmentForTask(
+                token, task.chatFile, attachName, buf, key,
+                `🎵 ${task.audioFileName}`
+            );
+            plainMsg.audio = attachName;
+            plainMsg.audioDuration = task.audioFileDuration || 0;
+            plainMsg.audioMime = task.audioFileMime || 'audio/mpeg';
+            plainMsg.audioName = task.audioFileName;
+        }
+
+        if (task.videoPayload) {
+            Object.assign(plainMsg, task.videoPayload);
+        }
+
+        // ═══ 5. Шифруем сообщение ═══
+        const iv = generateIV();
+        const plaintext = new TextEncoder().encode(JSON.stringify(plainMsg));
+        const ciphertext = await crypto.subtle.encrypt(
+            { name: 'AES-GCM', iv }, key, plaintext
+        );
+
+        const encMsg = {
+            id: messageId,
+            time: new Date().toISOString(),
+            iv: arrayBufferToBase64(iv),
+            data: arrayBufferToBase64(ciphertext),
+        };
+
+        // ═══ 6. Сохраняем файл чата ═══
+        fileContent.messages.push(encMsg);
+        if (fileContent.messages.length > CONFIG.maxMessages) {
+            fileContent.messages = fileContent.messages.slice(-CONFIG.maxMessages);
+        }
+
+        const saveResult = await saveFileForTask(token, chatPath, fileContent, sha);
+
+        // ═══ 7. Обновляем meta.json ═══
+        try {
+            await updateMetaForTask(token, task.chatFile, messageId, fileContent.messages.length);
+        } catch (e) {
+            warn('meta update failed:', e.message);
+            // Не критично — meta обновится при следующем изменении
+        }
+
+        log(`✅ Задача ${task.id} доставлена! id=${messageId}`);
+
+        // ═══ 8. Инвалидируем кэши мета ═══
+        // Чтобы поллинг увидел изменения
+        if (state._metaEtagsByFile) {
+            state._metaEtagsByFile[task.chatFile] = null;
+        }
+        if (state.chatFile === task.chatFile) {
+            state._metaEtag = null;
+        }
+
+        return { messageId, plainMsg };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  НИЗКОУРОВНЕВЫЕ ХЕЛПЕРЫ (не используют state)
+    // ═══════════════════════════════════════════════════════════
+
+    function getHeadersForTask(token) {
+        return {
+            'Authorization': `token ${token}`,
+            'Accept': 'application/vnd.github.v3+json',
+            'Content-Type': 'application/json',
+        };
+    }
+
+    function formatFileSizeForTask(bytes) {
+        if (!bytes || bytes < 1024) return (bytes || 0) + ' Б';
+        if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' КБ';
+        return (bytes / 1024 / 1024).toFixed(2) + ' МБ';
+    }
+
+    /**
+     * Загружает файл чата через тот же путь, что и оригинал.
+     * Возвращает {exists, content, sha, commitSha, blobSha}.
+     */
+    async function fetchFileForTask(token, path) {
+        // Пробуем получить через contents API напрямую
+        const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${path}`;
+
+        const res = await fetch(url, {
+            headers: getHeadersForTask(token),
+            cache: 'no-store',
+        });
+
+        if (res.status === 404) return { exists: false };
+        if (res.status === 401) throw new Error('401');
+        if (res.status === 403) throw new Error('403');
+        if (!res.ok) throw new Error(`fetch: ${res.status}`);
+
+        const data = await res.json();
+        const decoded = base64ToUtf8((data.content || '').replace(/\n/g, ''));
+        const content = JSON.parse(decoded);
+
+        return {
+            exists: true,
+            content,
+            sha: data.sha,
+        };
+    }
+
+    /**
+     * Сохраняет файл чата.
+     */
+    async function saveFileForTask(token, path, content, sha) {
+        const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${path}`;
+        const jsonString = JSON.stringify(content);
+        const encoded = utf8ToBase64(jsonString);
+
+        const body = {
+            message: '💬 Обновление чата',
+            content: encoded,
+        };
+        if (sha) body.sha = sha;
+
+        const res = await fetch(url, {
+            method: 'PUT',
+            headers: getHeadersForTask(token),
+            body: JSON.stringify(body),
+            cache: 'no-store',
+        });
+
+        if (res.status === 409) {
+            throw new Error('409 CONFLICT');
+        }
+        if (res.status === 401) throw new Error('401');
+        if (res.status === 403) throw new Error('403');
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.message || `save: ${res.status}`);
+        }
+
+        const data = await res.json();
+        return {
+            blobSha: data.content.sha,
+            commitSha: data.commit.sha,
+        };
+    }
+
+    /**
+     * Обновляет meta.json для чата.
+     */
+    async function updateMetaForTask(token, chatFile, version, count) {
+        const path = `chats/${chatFile}.meta.json`;
+        const meta = {
+            v: 1,
+            version,
+            count,
+            updatedAt: new Date().toISOString(),
+        };
+        const jsonString = JSON.stringify(meta);
+        const encoded = utf8ToBase64(jsonString);
+
+        // Получаем sha текущего meta (если есть)
+        let existingSha = null;
+        try {
+            const getRes = await fetch(
+                `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${path}`,
+                { headers: getHeadersForTask(token), cache: 'no-store' }
+            );
+            if (getRes.ok) {
+                const d = await getRes.json();
+                existingSha = d.sha;
+            }
+        } catch (e) {}
+
+        const body = {
+            message: `📌 meta ${chatFile}`,
+            content: encoded,
+        };
+        if (existingSha) body.sha = existingSha;
+
+        const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${path}`;
+        const res = await fetch(url, {
+            method: 'PUT',
+            headers: getHeadersForTask(token),
+            body: JSON.stringify(body),
+            cache: 'no-store',
+        });
+
+        if (res.status === 409) {
+            // Конфликт — попробуем ещё раз без sha (перезапишем)
+            const body2 = { message: `📌 meta ${chatFile}`, content: encoded };
+            const res2 = await fetch(url, {
+                method: 'PUT',
+                headers: getHeadersForTask(token),
+                body: JSON.stringify(body2),
+                cache: 'no-store',
+            });
+            if (!res2.ok) throw new Error(`meta: ${res2.status}`);
+            return;
+        }
+        if (!res.ok) throw new Error(`meta: ${res.status}`);
+    }
+
+    /**
+     * Шифрует и заливает вложение на GitHub.
+     * Использует ПЕРЕДАННЫЙ ключ (не глобальный CRYPTO._key).
+     */
+    async function uploadAttachmentForTask(token, chatFile, attachName, plainBuf, key, displayName) {
+        // Шифруем
+        const iv = generateIV();
+        const cipher = await crypto.subtle.encrypt(
+            { name: 'AES-GCM', iv }, key, plainBuf
+        );
+
+        // Склеиваем iv + cipher
+        const ivBytes = new Uint8Array(iv);
+        const cipherBytes = new Uint8Array(cipher);
+        const combined = new Uint8Array(4 + ivBytes.length + cipherBytes.length);
+        new DataView(combined.buffer).setUint32(0, ivBytes.length);
+        combined.set(ivBytes, 4);
+        combined.set(cipherBytes, 4 + ivBytes.length);
+
+        // Base64
+        const base64Content = arrayBufferToBase64(combined.buffer);
+
+        // Заливаем
+        const path = `chats/${chatFile}/${attachName}`;
+        const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${path}`;
+        const body = JSON.stringify({
+            message: `📎 ${attachName}`,
+            content: base64Content,
+        });
+
+        const res = await fetch(url, {
+            method: 'PUT',
+            headers: getHeadersForTask(token),
+            body,
+            cache: 'no-store',
+        });
+
+        if (res.status === 409) throw new Error('409 CONFLICT (attachment)');
+        if (res.status === 401) throw new Error('401');
+        if (res.status === 403) throw new Error('403');
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.message || `upload: ${res.status}`);
+        }
+
+        return true;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОБРАБОТКА ОЧЕРЕДИ
+    // ═══════════════════════════════════════════════════════════
+    async function processQueue() {
+        if (AOB.processing) return;
+
+        // Условия запуска
+        if (!isOnline()) return;
+        if (typeof state === 'undefined' || !state.isAuthorized) return;
+        if (!state.token) return;
+
+        // Синхронизируем с localStorage (могли появиться новые задачи)
+        syncFromLocalStorage();
+
+        if (AOB.queue.length === 0) return;
+
+        AOB.processing = true;
+
+        try {
+            while (AOB.queue.length > 0) {
+                const task = AOB.queue[0];
+
+                // Ошибка — ждём ручного retry
+                if (task.status === 'error') {
+                    log(`Задача ${task.id} в статусе error — пропускаем`);
+                    break;
+                }
+
+                // Проверяем онлайн
+                if (!isOnline()) {
+                    log('Связь пропала — пауза');
+                    break;
+                }
+
+                AOB._currentlyProcessingId = task.id;
+                task.status = 'sending';
+                await saveQueue();
+                updateAllOutboxUI(task);
+
+                try {
+                    await sendTaskAutonomous(task);
+
+                    // Успех — удаляем
+                    AOB.queue.shift();
+                    await saveQueue();
+
+                    // Убираем DOM-узел если есть
+                    removeOutboxNode(task.id);
+
+                    // Обновляем счётчики
+                    updateAllBadges();
+
+                    // Звук
+                    try { if (soundManager) soundManager.play('send'); } catch (e) {}
+
+                    log(`Задача ${task.id} успешно отправлена`);
+
+                } catch (err) {
+                    warn(`Ошибка задачи ${task.id}:`, err.message);
+                    task.retries = (task.retries || 0) + 1;
+
+                    const isNetError = isNetworkError(err);
+
+                    if (isNetError && task.retries < CFG.maxRetries) {
+                        // Сетевая ошибка — оставляем в pending, ждём
+                        task.status = 'pending';
+                        await saveQueue();
+                        updateAllOutboxUI(task);
+                        log(`Сетевая ошибка, повтор позже (${task.retries}/${CFG.maxRetries})`);
+                        await new Promise(r => setTimeout(r, CFG.retryDelayMs));
+                        continue;
+                    }
+
+                    // Не сетевая или кончились попытки
+                    task.status = 'error';
+                    task.errorMessage = err.message || 'Ошибка';
+                    await saveQueue();
+                    updateAllOutboxUI(task);
+                    updateAllBadges();
+                    break;
+                } finally {
+                    AOB._currentlyProcessingId = null;
+                }
+            }
+        } finally {
+            AOB.processing = false;
+            updateAllBadges();
+        }
+    }
+
+    function isNetworkError(err) {
+        if (!err) return false;
+        if (!navigator.onLine) return true;
+        const msg = (err.message || '').toLowerCase();
+        if (msg.includes('failed to fetch')) return true;
+        if (msg.includes('networkerror')) return true;
+        if (msg.includes('network error')) return true;
+        if (err.name === 'TypeError') return true;
+        if (err.name === 'AbortError') return true;
+        return false;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  UI-ОБНОВЛЕНИЯ
+    // ═══════════════════════════════════════════════════════════
+
+    /**
+     * Убирает DOM-узел outbox-сообщения, если он есть.
+     * Работает ТОЛЬКО если мы сейчас в том чате.
+     */
+    function removeOutboxNode(taskId) {
+        if (typeof messagesInner === 'undefined' || !messagesInner) return;
+        const node = messagesInner.querySelector(
+            `.message-wrapper[data-outbox-task-id="${taskId}"]`
+        );
+        if (!node) return;
+
+        node.style.transition = 'opacity 0.25s, transform 0.25s';
+        node.style.opacity = '0';
+        node.style.transform = 'scale(0.95)';
+        setTimeout(() => node.remove(), 250);
+    }
+
+    /**
+     * Обновляет индикатор на конкретном outbox-сообщении.
+     */
+    function updateAllOutboxUI(task) {
+        if (typeof messagesInner === 'undefined' || !messagesInner) return;
+        const node = messagesInner.querySelector(
+            `.message-wrapper[data-outbox-task-id="${task.id}"]`
+        );
+        if (!node) return;
+
+        const indicator = node.querySelector('.outbox-indicator');
+        if (!indicator) return;
+
+        // Проверяем, совпадает ли отображаемый статус с реальным
+        const showsError = indicator.classList.contains('error');
+        const text = indicator.querySelector('.outbox-text')?.textContent || '';
+
+        const shouldBeError = task.status === 'error';
+        const shouldBeSending = task.status === 'sending';
+        const shouldBePending = task.status === 'pending';
+
+        const mismatch =
+            (shouldBeError && !showsError) ||
+            (shouldBeSending && text !== 'Отправка…') ||
+            (shouldBePending && text !== 'В очереди');
+
+        if (!mismatch) return;
+
+        // Перерисовываем
+        indicator.remove();
+        decorateOutboxNode(node, task);
+    }
+
+    function decorateOutboxNode(node, task) {
+        const msgEl = node.querySelector('.message');
+        if (!msgEl) return;
+
+        const indicator = document.createElement('div');
+        indicator.className = 'outbox-indicator';
+
+        if (task.status === 'error') {
+            indicator.classList.add('error');
+            indicator.innerHTML = `
+                <span class="outbox-icon">⚠️</span>
+                <span class="outbox-text">Не отправлено</span>
+                <button class="outbox-retry" title="Повторить">↻</button>
+                <button class="outbox-cancel" title="Удалить">✕</button>
+            `;
+            indicator.style.cursor = 'pointer';
+            indicator.addEventListener('click', (ev) => {
+                if (ev.target.closest('button')) return;
+                retryTask(task.id);
+            });
+        } else if (task.status === 'sending') {
+            indicator.innerHTML = `
+                <span class="outbox-spinner"></span>
+                <span class="outbox-text">Отправка…</span>
+            `;
+        } else {
+            indicator.innerHTML = `
+                <span class="outbox-spinner"></span>
+                <span class="outbox-text">В очереди</span>
+                <button class="outbox-cancel" title="Отменить">✕</button>
+            `;
+        }
+
+        const cancelBtn = indicator.querySelector('.outbox-cancel');
+        if (cancelBtn) {
+            cancelBtn.addEventListener('click', (ev) => {
+                ev.stopPropagation();
+                cancelTask(task.id);
+            });
+        }
+        const retryBtn = indicator.querySelector('.outbox-retry');
+        if (retryBtn) {
+            retryBtn.addEventListener('click', (ev) => {
+                ev.stopPropagation();
+                retryTask(task.id);
+            });
+        }
+
+        msgEl.appendChild(indicator);
+    }
+
+    /**
+     * Обновляет бейджи на кнопке «Назад» и в шапке чата.
+     */
+    function updateAllBadges() {
+        const total = AOB.queue.length;
+        const errors = AOB.queue.filter(t => t.status === 'error').length;
+
+        // Бейдж на кнопке «Назад»
+        try {
+            const backBtn = document.getElementById('backToChatsBtn');
+            if (backBtn) {
+                let badge = backBtn.querySelector('.auto-outbox-badge');
+                if (total > 0) {
+                    backBtn.style.position = 'relative';
+                    if (!badge) {
+                        badge = document.createElement('span');
+                        badge.className = 'auto-outbox-badge';
+                        backBtn.appendChild(badge);
+                    }
+                    badge.textContent = total > 99 ? '99+' : String(total);
+                    badge.classList.toggle('has-errors', errors > 0);
+                } else if (badge) {
+                    badge.remove();
+                }
+            }
+        } catch (e) {}
+
+        // Счётчик в шапке чата (только если в чате)
+        try {
+            const chatHeader = document.querySelector('#chatScreen .chat-header');
+            if (chatHeader && state?.currentScreen === 'chat') {
+                let counter = chatHeader.querySelector('.auto-outbox-counter');
+                if (total > 0) {
+                    if (!counter) {
+                        counter = document.createElement('div');
+                        counter.className = 'auto-outbox-counter';
+                        chatHeader.appendChild(counter);
+                    }
+                    counter.innerHTML = `
+                        <span>${errors > 0 ? '⚠️' : '⏳'}</span>
+                        <span>${total}</span>
+                    `;
+                    counter.classList.toggle('has-errors', errors > 0);
+                } else if (counter) {
+                    counter.remove();
+                }
+            }
+        } catch (e) {}
+
+        // Стили — добавляем один раз
+        if (!document.getElementById('autoOutboxStyles')) {
+            const style = document.createElement('style');
+            style.id = 'autoOutboxStyles';
+            style.textContent = `
+                #backToChatsBtn .auto-outbox-badge {
+                    position: absolute;
+                    top: -4px;
+                    right: -4px;
+                    min-width: 18px;
+                    height: 18px;
+                    padding: 0 5px;
+                    border-radius: 9px;
+                    background: linear-gradient(135deg, #ff9f43, #feca57);
+                    color: #1a1a2e;
+                    font-size: 10px;
+                    font-weight: 700;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    box-shadow: 0 2px 8px rgba(255,159,67,0.6);
+                    border: 2px solid #0a0a0f;
+                    line-height: 1;
+                    pointer-events: none;
+                    z-index: 5;
+                }
+                #backToChatsBtn .auto-outbox-badge.has-errors {
+                    background: linear-gradient(135deg, #ff6b6b, #ee5253);
+                    color: #fff;
+                }
+                .auto-outbox-counter {
+                    display: flex;
+                    align-items: center;
+                    gap: 4px;
+                    padding: 4px 8px;
+                    background: linear-gradient(135deg, rgba(255,159,67,0.2), rgba(254,202,87,0.15));
+                    border: 1px solid rgba(255,159,67,0.4);
+                    border-radius: 10px;
+                    font-size: 11px;
+                    font-weight: 700;
+                    color: #feca57;
+                    margin-right: 8px;
+                    flex-shrink: 0;
+                }
+                .auto-outbox-counter.has-errors {
+                    background: linear-gradient(135deg, rgba(255,107,107,0.25), rgba(238,82,83,0.15));
+                    border-color: rgba(255,107,107,0.5);
+                    color: #ff8a8a;
+                }
+            `;
+            document.head.appendChild(style);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНЫЕ ДЕЙСТВИЯ
+    // ═══════════════════════════════════════════════════════════
+
+    function cancelTask(taskId) {
+        const idx = AOB.queue.findIndex(t => t.id === taskId);
+        if (idx === -1) return;
+
+        const task = AOB.queue[idx];
+        if (task.status === 'sending') {
+            showToastSafe('⏳ Уже отправляется…', 1800);
+            return;
+        }
+
+        AOB.queue.splice(idx, 1);
+        saveQueue();
+        removeOutboxNode(taskId);
+        updateAllBadges();
+        try { soundManager.play('delete'); } catch (e) {}
+        showToastSafe('🗑️ Отправка отменена', 1500);
+
+        // Синхронизируем со старым OutboxQueue
+        syncToOldOutbox();
+    }
+
+    function retryTask(taskId) {
+        const task = AOB.queue.find(t => t.id === taskId);
+        if (!task) return;
+
+        task.status = 'pending';
+        task.retries = 0;
+        task.errorMessage = null;
+        saveQueue();
+        updateAllOutboxUI(task);
+
+        showToastSafe('🔄 Пробуем снова…', 1500);
+
+        if (isOnline()) {
+            processQueue();
+        }
+    }
+
+    function syncToOldOutbox() {
+        // Обновляем localStorage, чтобы старый OutboxQueue тоже видел изменения
+        saveQueue();
+    }
+
+    function showToastSafe(msg, dur) {
+        try {
+            if (typeof showToast === 'function') showToast(msg, dur);
+        } catch (e) {}
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ window.sendMessage — кладём в НАШУ очередь
+    // ═══════════════════════════════════════════════════════════
+    const _currentSendMessage = window.sendMessage;
+
+    window.sendMessage = async function(text, imageBlob, audioData, fileAttachment, audioFile, replyContext, videoPayload) {
+        // Проверяем: офлайн ли?
+        const offline = !navigator.onLine;
+
+        // Есть ли контент?
+        const hasContent = !!(
+            (text && text.trim()) ||
+            imageBlob instanceof Blob ||
+            audioData ||
+            (fileAttachment && fileAttachment.blob) ||
+            (audioFile && audioFile.blob) ||
+            videoPayload
+        );
+
+        // Если офлайн и есть контент — кладём в очередь
+        if (offline && hasContent && state?.chatFile) {
+            const task = {
+                id: genId(),
+                chatFile: state.chatFile,
+                text: text || '',
+                replyTo: replyContext || null,
+                createdAt: Date.now(),
+                retries: 0,
+                status: 'pending',
+            };
+
+            // Сериализуем вложения в base64
+            try {
+                if (imageBlob instanceof Blob) {
+                    task.imageData = await blobToBase64(imageBlob);
+                    task.imageMime = imageBlob.type || 'image/jpeg';
+                }
+                if (audioData) {
+                    task.audioData = audioData;
+                }
+                if (fileAttachment && fileAttachment.blob) {
+                    task.fileData = await blobToBase64(fileAttachment.blob);
+                    task.fileName = fileAttachment.name;
+                    task.fileMime = fileAttachment.mime;
+                }
+                if (audioFile && audioFile.blob) {
+                    task.audioFileData = await blobToBase64(audioFile.blob);
+                    task.audioFileName = audioFile.name;
+                    task.audioFileMime = audioFile.mime;
+                    task.audioFileDuration = audioFile.duration || 0;
+                }
+                if (videoPayload) {
+                    task.videoPayload = videoPayload;
+                }
+            } catch (e) {
+                console.error('AutoOutbox: ошибка сериализации', e);
+                // Если не смогли сериализовать — даём оригиналу попробовать
+                return _currentSendMessage.apply(this, arguments);
+            }
+
+            // Добавляем в очередь
+            AOB.queue.push(task);
+            await saveQueue();
+
+            // Рисуем в чате (если мы в этом чате)
+            if (state.chatFile === task.chatFile && state.currentScreen === 'chat') {
+                appendOutboxMessage(task);
+            }
+
+            updateAllBadges();
+
+            // Очищаем UI
+            if (typeof cancelReply === 'function') cancelReply();
+            if (typeof cancelComment === 'function' && typeof _commentToMsgId !== 'undefined' && _commentToMsgId) {
+                cancelComment();
+            }
+            if (typeof messageInput !== 'undefined' && messageInput) {
+                messageInput.value = '';
+                messageInput.style.height = 'auto';
+            }
+
+            try { soundManager.play('click'); } catch (e) {}
+            showToastSafe('📤 В очереди — отправится при появлении сети', 2200);
+
+            return;
+        }
+
+        // Онлайн — отправляем как обычно
+        return _currentSendMessage.apply(this, arguments);
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  РЕНДЕР outbox-сообщения в чате
+    // ═══════════════════════════════════════════════════════════
+    function appendOutboxMessage(task) {
+        if (typeof messagesInner === 'undefined' || !messagesInner) return;
+
+        // Уже отрисовано?
+        const existing = messagesInner.querySelector(
+            `.message-wrapper[data-outbox-task-id="${task.id}"]`
+        );
+        if (existing) return;
+
+        const plainMsg = {
+            id: task.localMsgId || (-Date.now()),
+            username: state.username,
+            text: task.text || '',
+            time: new Date(task.createdAt).toISOString(),
+            _outbox: true,
+            _outboxTaskId: task.id,
+        };
+
+        if (task.replyTo) plainMsg.replyTo = task.replyTo;
+        if (task.fileName) {
+            plainMsg.fileName = task.fileName;
+        }
+        if (task.audioFileName) {
+            plainMsg.audioName = task.audioFileName;
+        }
+
+        const html = buildMessageHTML(plainMsg, { noFade: false });
+        const temp = document.createElement('div');
+        temp.innerHTML = html;
+        const node = temp.firstElementChild;
+        if (!node) return;
+
+        node.dataset.outboxTaskId = task.id;
+        node.classList.add('outbox-message');
+        messagesInner.appendChild(node);
+
+        decorateOutboxNode(node, task);
+
+        // Скроллим вниз если мы внизу
+        try {
+            if (typeof scrollState !== 'undefined' && scrollState.isAtBottom) {
+                if (typeof scrollToBottom === 'function') scrollToBottom(true);
+            }
+        } catch (e) {}
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОТРИСОВКА ОЧЕРЕДИ ПРИ ВХОДЕ В ЧАТ
+    // ═══════════════════════════════════════════════════════════
+    function renderQueueForCurrentChat() {
+        if (typeof messagesInner === 'undefined' || !messagesInner) return;
+        if (!state?.chatFile || state.currentScreen !== 'chat') return;
+
+        const tasks = AOB.queue.filter(t => t.chatFile === state.chatFile);
+        tasks.forEach(t => appendOutboxMessage(t));
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ТАЙМЕРЫ И СОБЫТИЯ
+    // ═══════════════════════════════════════════════════════════
+
+    // Главный таймер — каждые N секунд пытаемся отправить
+    AOB._processTimer = setInterval(() => {
+        if (document.hidden) return;
+        if (AOB.queue.length === 0) return;
+        if (!isOnline()) return;
+        processQueue();
+    }, CFG.processIntervalMs);
+
+    // Мгновенный триггер при online
+    window.addEventListener('online', () => {
+        log('online event');
+        setTimeout(processQueue, 500);
+    });
+
+    // Триггер при возврате в приложение
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) return;
+        if (AOB.queue.length > 0 && isOnline()) {
+            setTimeout(processQueue, 300);
+        }
+    });
+
+    // При входе в чат — отрисовываем pending + триггерим процесс
+    if (typeof enterChat === 'function') {
+        const _orig = enterChat;
+        enterChat = async function(file, name, password) {
+            const r = await _orig.call(this, file, name, password);
+            setTimeout(() => {
+                renderQueueForCurrentChat();
+                if (AOB.queue.length > 0 && isOnline()) {
+                    processQueue();
+                }
+            }, 400);
+            return r;
+        };
+    }
+
+    // При показе списка чатов — просто триггерим очередь
+    if (typeof showChatsScreen === 'function') {
+        const _orig = showChatsScreen;
+        showChatsScreen = function() {
+            const r = _orig.apply(this, arguments);
+            setTimeout(() => {
+                if (AOB.queue.length > 0 && isOnline()) {
+                    processQueue();
+                }
+                updateAllBadges();
+            }, 300);
+            return r;
+        };
+    }
+
+    // Периодическая очистка "осиротевших" узлов
+    setInterval(() => {
+        if (typeof messagesInner === 'undefined' || !messagesInner) return;
+        const queueIds = new Set(AOB.queue.map(t => t.id));
+        messagesInner.querySelectorAll('.message-wrapper[data-outbox-task-id]').forEach(node => {
+            const id = node.dataset.outboxTaskId;
+            if (id && !queueIds.has(id)) {
+                node.style.transition = 'opacity 0.2s';
+                node.style.opacity = '0';
+                setTimeout(() => node.remove(), 200);
+            }
+        });
+        updateAllBadges();
+    }, 3000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ВОССТАНОВЛЕНИЕ ПРИ СТАРТЕ
+    // ═══════════════════════════════════════════════════════════
+    function initFromStorage() {
+        const saved = loadQueue();
+        if (saved.length === 0) return;
+
+        log(`Восстановлено из localStorage: ${saved.length} задач`);
+        AOB.queue = saved;
+
+        // Отрисовка
+        setTimeout(() => {
+            renderQueueForCurrentChat();
+            updateAllBadges();
+
+            // Триггерим процесс если онлайн
+            if (isOnline()) {
+                setTimeout(processQueue, 2000);
+            }
+        }, 3000);
+    }
+
+    // Ждём пока state будет готов
+    setTimeout(initFromStorage, 4000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API
+    // ═══════════════════════════════════════════════════════════
+    window.AutoOutbox = {
+        status: () => ({
+            queueSize: AOB.queue.length,
+            errorCount: AOB.queue.filter(t => t.status === 'error').length,
+            processing: AOB.processing,
+            currentlyProcessing: AOB._currentlyProcessingId,
+            online: isOnline(),
+            currentChat: state?.chatFile,
+            currentScreen: state?.currentScreen,
+            queue: AOB.queue.map(t => ({
+                id: t.id,
+                chat: t.chatFile,
+                status: t.status,
+                retries: t.retries,
+                text: (t.text || '').slice(0, 40),
+                createdAt: new Date(t.createdAt).toLocaleTimeString('ru-RU'),
+            })),
+        }),
+        process: () => processQueue(),
+        cancel: (id) => cancelTask(id),
+        retry: (id) => retryTask(id),
+        cancelAll: () => {
+            AOB.queue.forEach(t => removeOutboxNode(t.id));
+            AOB.queue = [];
+            saveQueue();
+            updateAllBadges();
+            showToastSafe('🗑️ Очередь очищена', 1500);
+        },
+        forceSync: () => {
+            syncFromLocalStorage();
+            updateAllBadges();
+            renderQueueForCurrentChat();
+        },
+    };
+
+    log('Автономная очередь запущена');
+    log('API: AutoOutbox.status() / .process() / .forceSync()');
+})();
+</script>
 </body>
 </html>
