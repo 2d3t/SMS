@@ -22671,26 +22671,166 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
     // ═══════════════════════════════════════════════════════════
     //  БЕЙДЖИ
     // ═══════════════════════════════════════════════════════════
-    function updateBadges() {
-        const unseen = R.events.filter(e => !e.seen).length;
-        ['radar2Badge', 'radar2BadgeChat'].forEach(id => {
-            const el = document.getElementById(id);
-            if (!el) return;
-            if (unseen > 0) {
-                el.textContent = unseen > 99 ? '99+' : String(unseen);
-                el.classList.add('show');
-            } else {
-                el.classList.remove('show');
-                el.textContent = '';
+   function updateBadges() {
+    const total = OB.queue.length;
+    const errors = OB.queue.filter(t => t.status === 'error').length;
+
+    // Обновляем title кнопки «Назад»
+    try {
+        const backBtn = document.getElementById('backToChatsBtn');
+        if (backBtn) {
+            const existingBadge = backBtn.querySelector('.outbox-badge');
+            if (existingBadge) existingBadge.remove();
+
+            if (total > 0) {
+                backBtn.style.position = 'relative';
+                const badge = document.createElement('span');
+                badge.className = 'outbox-badge';
+                badge.textContent = total > 99 ? '99+' : String(total);
+                if (errors > 0) badge.classList.add('has-errors');
+                backBtn.appendChild(badge);
             }
-        });
-        ['radar2Btn', 'radar2BtnChat'].forEach(id => {
-            const btn = document.getElementById(id);
-            if (btn) btn.classList.toggle('scanning', R.scanning);
-        });
-        const liveDot = document.querySelector('.r2-live-dot');
-        if (liveDot) liveDot.classList.toggle('active', R.enabled && !R.scanning);
+        }
+    } catch (e) {}
+
+    // 🆕 Счётчик в шапке чата — УБРАН (дублирует бейдж возле стрелочки)
+
+    // Стили для бейджей — добавим один раз
+    if (!document.getElementById('outboxStyles')) {
+        const style = document.createElement('style');
+        style.id = 'outboxStyles';
+        style.textContent = `
+            /* ─── Индикатор на сообщении ─── */
+            .message-wrapper.outbox-message .message {
+                position: relative;
+                padding-bottom: 32px;
+            }
+            .outbox-indicator {
+                position: absolute;
+                left: 10px;
+                right: 10px;
+                bottom: 6px;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                padding: 4px 10px;
+                background: rgba(0,0,0,0.35);
+                border-radius: 12px;
+                font-size: 11px;
+                color: rgba(255,255,255,0.85);
+                backdrop-filter: blur(6px);
+                -webkit-backdrop-filter: blur(6px);
+                pointer-events: auto;
+                user-select: none;
+            }
+            .outbox-indicator .outbox-spinner {
+                width: 12px;
+                height: 12px;
+                border: 2px solid rgba(255,255,255,0.25);
+                border-top-color: #fff;
+                border-radius: 50%;
+                animation: outboxSpin 0.8s linear infinite;
+                flex-shrink: 0;
+            }
+            @keyframes outboxSpin {
+                to { transform: rotate(360deg); }
+            }
+            .outbox-indicator .outbox-icon {
+                font-size: 13px;
+                flex-shrink: 0;
+            }
+            .outbox-indicator .outbox-text {
+                flex: 1;
+                min-width: 0;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .outbox-indicator .outbox-cancel,
+            .outbox-indicator .outbox-retry {
+                width: 22px;
+                height: 22px;
+                border-radius: 50%;
+                border: none;
+                background: rgba(255,255,255,0.15);
+                color: #fff;
+                font-size: 12px;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                flex-shrink: 0;
+                padding: 0;
+                line-height: 1;
+                transition: all 0.15s;
+            }
+            .outbox-indicator .outbox-cancel:hover {
+                background: rgba(255,107,107,0.5);
+            }
+            .outbox-indicator .outbox-retry:hover {
+                background: rgba(0,184,148,0.5);
+            }
+            .outbox-indicator .outbox-cancel:active,
+            .outbox-indicator .outbox-retry:active {
+                transform: scale(0.88);
+            }
+            .outbox-indicator.error {
+                background: rgba(255,107,107,0.25);
+                border: 1px solid rgba(255,107,107,0.5);
+                color: #ff8a8a;
+            }
+            .outbox-indicator.error .outbox-text {
+                color: #ff8a8a;
+                font-weight: 600;
+            }
+            .message-wrapper.outbox-message .message {
+                opacity: 0.92;
+            }
+            .message-wrapper.outbox-message .delete-btn {
+                display: none !important;
+            }
+
+            /* ─── Бейдж на кнопке «Назад» ─── */
+            #backToChatsBtn .outbox-badge {
+                position: absolute;
+                top: -4px;
+                right: -4px;
+                min-width: 18px;
+                height: 18px;
+                padding: 0 5px;
+                border-radius: 9px;
+                background: linear-gradient(135deg, #ff9f43, #feca57);
+                color: #1a1a2e;
+                font-size: 10px;
+                font-weight: 700;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                box-shadow: 0 2px 8px rgba(255,159,67,0.6);
+                border: 2px solid #0a0a0f;
+                line-height: 1;
+                pointer-events: none;
+                z-index: 5;
+            }
+            #backToChatsBtn .outbox-badge.has-errors {
+                background: linear-gradient(135deg, #ff6b6b, #ee5253);
+                color: #fff;
+                box-shadow: 0 2px 8px rgba(238,82,83,0.6);
+            }
+
+            /* 🆕 Стиль .outbox-header-counter оставлен на случай
+               если где-то в старой логике он ещё используется,
+               но фактически не создаётся */
+            .outbox-header-counter { display: none !important; }
+
+            /* ─── Скрываем индикатор в режиме мультивыбора ─── */
+            body.selection-mode .outbox-indicator {
+                display: none;
+            }
+        `;
+        document.head.appendChild(style);
     }
+}
     function hideBadges() {
         ['radar2Badge', 'radar2BadgeChat'].forEach(id => {
             const el = document.getElementById(id);
@@ -31675,6 +31815,197 @@ console.log('🧹 Модалка очистки кеша активна');
         console.log(`⚡ [CacheFirst] Мгновенный вход из кэша: ${file} (${cached.messages.length} сообщ.)`);
         return await _enterFastFromCache(file, name, password, cached);
     };
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🩹 ПАТЧ: АКТИВАЦИЯ ОФЛАЙН-РЕЖИМА ПРИ ВХОДЕ ИЗ КЭША
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: installCacheFirstEnterChat делает _enterFastFromCache
+//  без активации OfflineMode. Из-за этого OutboxQueue не перехватывает
+//  отправку, и сообщение падает с сетевой ошибкой.
+//
+//  Решение: после быстрого входа из кэша — проверить реальное
+//  состояние сети. Если офлайн — активировать OfflineMode и
+//  перевести input в режим очереди.
+// ═══════════════════════════════════════════════════════════════
+
+(function installCacheFirstOfflineBridge() {
+    'use strict';
+
+    // ─── Слушаем появление чата на экране после входа из кэша ───
+    // Мы не можем просто обернуть enterChat — installCacheFirstEnterChat
+    // уже обернул его. Поэтому патчим через MutationObserver + таймер
+    // на state.currentScreen === 'chat' && state.chatFile
+
+    let _lastActivatedFile = null;
+
+    async function checkAndActivateOffline(file) {
+        // Уже активировали для этого файла?
+        if (_lastActivatedFile === file) return;
+
+        // Реально ли офлайн?
+        const browserOffline = !navigator.onLine;
+        const netStateOffline = (typeof networkState !== 'undefined')
+            && networkState
+            && networkState.isOnline === false;
+
+        if (!browserOffline && !netStateOffline) {
+            // Онлайн — ничего не делаем
+            _lastActivatedFile = file;
+            return;
+        }
+
+        // ═══ Офлайн — активируем режим очереди ═══
+        _lastActivatedFile = file;
+        console.log('🩹 [CacheFirstOffline] Активирую офлайн-режим для', file);
+
+        // 1. Активируем OfflineMode (это создаст OfflineMode.isOffline() === true)
+        try {
+            if (typeof OfflineMode !== 'undefined' && OfflineMode.activate) {
+                OfflineMode.activate('cache-first-offline');
+            }
+        } catch (e) {
+            console.warn('🩹 [CacheFirstOffline] OfflineMode.activate error:', e);
+        }
+
+        // 2. Помечаем networkState как offline (если ещё не)
+        try {
+            if (typeof networkState !== 'undefined' && networkState) {
+                networkState.isOnline = false;
+            }
+        } catch (e) {}
+
+        // 3. Разблокируем input — пусть юзер пишет, сообщение уйдёт в очередь
+        //    (AntiFalseNet и NetIndicator уже разблокировали, но подстрахуемся)
+        setTimeout(() => {
+            try {
+                if (typeof messageInput !== 'undefined' && messageInput) {
+                    messageInput.disabled = false;
+                    messageInput.placeholder = 'Сообщение… (уйдёт в очередь)';
+                }
+                if (typeof sendBtn !== 'undefined' && sendBtn) {
+                    sendBtn.disabled = !state.isAuthorized;
+                }
+                if (typeof micBtn !== 'undefined' && micBtn) {
+                    micBtn.disabled = !state.isAuthorized;
+                }
+            } catch (e) {}
+        }, 100);
+
+        // 4. Обновим индикатор сети
+        setTimeout(() => {
+            try {
+                if (typeof window.NetIndicator !== 'undefined') {
+                    // На случай если есть API
+                }
+                // Форсим обновление через событие
+                window.dispatchEvent(new Event('offline'));
+            } catch (e) {}
+        }, 200);
+
+        // 5. Тихо показываем тост (не блокирующий)
+        setTimeout(() => {
+            try {
+                if (typeof showToast === 'function') {
+                    showToast('📵 Офлайн — сообщения уйдут в очередь', 2500);
+                }
+            } catch (e) {}
+        }, 400);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Следим за сменой currentScreen/chatFile
+    // ═══════════════════════════════════════════════════════════
+    setInterval(() => {
+        try {
+            if (state.currentScreen === 'chat' && state.chatFile) {
+                checkAndActivateOffline(state.chatFile);
+            } else {
+                // Вышли из чата — сбрасываем флаг, чтобы при следующем входе снова проверить
+                _lastActivatedFile = null;
+            }
+        } catch (e) {}
+    }, 1500);
+
+    // ═══════════════════════════════════════════════════════════
+    //  Также — синхронизация при возврате связи
+    //  Когда сеть вернётся — деактивируем офлайн, чтобы сообщения
+    //  уходили нормально
+    // ═══════════════════════════════════════════════════════════
+    window.addEventListener('online', () => {
+        console.log('🩹 [CacheFirstOffline] Событие online — деактивирую офлайн');
+        _lastActivatedFile = null;
+        try {
+            if (typeof OfflineMode !== 'undefined' && OfflineMode.deactivate) {
+                OfflineMode.deactivate();
+            }
+        } catch (e) {}
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    //  Прямой перехват sendMessage на случай, если OutboxQueue
+    //  по какой-то причине не сработал
+    // ═══════════════════════════════════════════════════════════
+    if (typeof window.sendMessage === 'function') {
+        const _prevSendMessage = window.sendMessage;
+
+        window.sendMessage = async function(text, imageBlob, audioData, fileAttachment, audioFile, replyContext, videoPayload) {
+            // Проверяем: реально ли офлайн?
+            const reallyOffline = !navigator.onLine
+                || (typeof networkState !== 'undefined' && networkState && networkState.isOnline === false);
+
+            const hasContent = !!(
+                (text && text.trim()) ||
+                imageBlob instanceof Blob ||
+                audioData ||
+                (fileAttachment && fileAttachment.blob) ||
+                (audioFile && audioFile.blob) ||
+                videoPayload
+            );
+
+            // Если офлайн и есть контент — но мы в режиме "чат из кэша"
+            // и OutboxQueue почему-то не перехватил — пробуем вручную
+            if (reallyOffline && hasContent && state.chatFile) {
+                // Проверяем, есть ли OutboxQueue и активен ли он
+                if (typeof OutboxQueue !== 'undefined' && OutboxQueue.getCount) {
+                    const beforeCount = OutboxQueue.getCount();
+
+                    // Форсим активацию офлайна
+                    try {
+                        if (typeof OfflineMode !== 'undefined' && OfflineMode.activate) {
+                            OfflineMode.activate('sendMessage-intercept');
+                        }
+                    } catch (e) {}
+
+                    // Вызываем оригинал — OutboxQueue должен перехватить
+                    const result = await _prevSendMessage.call(
+                        this, text, imageBlob, audioData, fileAttachment, audioFile, replyContext, videoPayload
+                    );
+
+                    // Проверяем: добавилось ли что-то в очередь?
+                    setTimeout(() => {
+                        const afterCount = OutboxQueue.getCount();
+                        if (afterCount > beforeCount) {
+                            console.log(`🩹 [CacheFirstOffline] Сообщение ушло в очередь (${beforeCount} → ${afterCount})`);
+                        }
+                    }, 100);
+
+                    return result;
+                }
+            }
+
+            // Обычная отправка
+            return _prevSendMessage.call(
+                this, text, imageBlob, audioData, fileAttachment, audioFile, replyContext, videoPayload
+            );
+        };
+    }
+
+    console.log('🩹 [CacheFirstOffline] Патч активен:');
+    console.log('   • Вход из кэша в офлайне → активируется OfflineMode');
+    console.log('   • Input разблокируется для записи в очередь');
+    console.log('   • При возврате связи — деактивация');
+})();
 
     // ═══════════════════════════════════════════════════════════
     //  МГНОВЕННЫЙ ВХОД ИЗ КЭША
