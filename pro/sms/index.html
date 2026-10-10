@@ -37480,13 +37480,12 @@ try {
 </script>
 <script>
 // ═══════════════════════════════════════════════════════════════
-//  🔐 БЕЗОПАСНЫЕ ПРИГЛАШЕНИЯ v3 (шифрованные билеты)
+//  🔐 БЕЗОПАСНЫЕ ПРИГЛАШЕНИЯ v3.1 (шифрованные билеты + гость)
 //  ─────────────────────────────────────────────────────────────
-//  Что нового vs v2:
-//   • Билет ШИФРУЕТСЯ AES-256-GCM перед отправкой в GitHub
-//   • Ключ шифрования передаётся в URL-ФРАГМЕНТЕ (#k=...)
-//   • Фрагмент НЕ уходит на сервер → GitHub видит только шум
-//   • GitHub Push Protection больше не блокирует пуш
+//  Что нового vs v3:
+//   • Гость ВСЕГДА входит как «Гость» (имя приглашающего не утекает)
+//   • Кнопка «Другие приложения…» = кнопка временной ссылки
+//   • Своя отдельная кнопка убрана (не дублируется)
 // ═══════════════════════════════════════════════════════════════
 
 (function installSecureInviteLinks() {
@@ -37498,14 +37497,17 @@ try {
     const CFG = {
         TTL_MS: 2 * 60 * 1000,
         TICKETS_PATH: 'tickets/',
-        URL_PARAM: 'invite',                 // ?invite=<id>
-        URL_FRAGMENT_KEY: 'k',               // #k=<aes_key_b64url>
+        URL_PARAM: 'invite',
+        URL_FRAGMENT_KEY: 'k',
 
         MY_TICKETS_KEY: 'smschat_my_tickets_v3',
         USED_TICKETS_KEY: 'smschat_used_tickets_v3',
 
         CLEANUP_INTERVAL_MS: 60 * 1000,
         ID_PREFIX: 't_',
+
+        // 🆕 Имя, под которым заходит гость
+        GUEST_USERNAME: 'Гость',
     };
 
     // ═══════════════════════════════════════════════════════════
@@ -37536,7 +37538,7 @@ try {
     }
 
     function genAesKey() {
-        return crypto.getRandomValues(new Uint8Array(32)); // 256 бит
+        return crypto.getRandomValues(new Uint8Array(32));
     }
 
     function ticketPath(ticketId) {
@@ -37551,60 +37553,32 @@ try {
     //  ШИФРОВАНИЕ БИЛЕТА (AES-256-GCM, случайный ключ)
     // ═══════════════════════════════════════════════════════════
     async function encryptTicketData(ticketData, aesKeyBytes) {
-        // Импортируем сырой ключ
         const key = await crypto.subtle.importKey(
-            'raw',
-            aesKeyBytes,
-            { name: 'AES-GCM' },
-            false,
-            ['encrypt']
+            'raw', aesKeyBytes,
+            { name: 'AES-GCM' }, false, ['encrypt']
         );
-
-        // IV
         const iv = crypto.getRandomValues(new Uint8Array(12));
-
-        // Кодируем JSON
         const plaintext = new TextEncoder().encode(JSON.stringify(ticketData));
-
-        // Шифруем
         const ciphertext = await crypto.subtle.encrypt(
-            { name: 'AES-GCM', iv },
-            key,
-            plaintext
+            { name: 'AES-GCM', iv }, key, plaintext
         );
-
-        // Возвращаем объект, где всё в base64
-        // (никаких читаемых строк!)
         return {
-            v: 3,                                 // версия формата
-            iv: toBase64Url(iv),                  // 12 байт
-            ct: toBase64Url(new Uint8Array(ciphertext)),  // шифротекст
+            v: 3,
+            iv: toBase64Url(iv),
+            ct: toBase64Url(new Uint8Array(ciphertext)),
         };
     }
 
     async function decryptTicketData(encryptedObj, aesKeyBytes) {
-        // Импортируем ключ
         const key = await crypto.subtle.importKey(
-            'raw',
-            aesKeyBytes,
-            { name: 'AES-GCM' },
-            false,
-            ['decrypt']
+            'raw', aesKeyBytes,
+            { name: 'AES-GCM' }, false, ['decrypt']
         );
-
-        // IV из base64url
         const iv = fromBase64Url(encryptedObj.iv);
-
-        // Шифротекст из base64url
         const ct = fromBase64Url(encryptedObj.ct);
-
-        // Расшифровка
         const plaintext = await crypto.subtle.decrypt(
-            { name: 'AES-GCM', iv },
-            key,
-            ct
+            { name: 'AES-GCM', iv }, key, ct
         );
-
         return JSON.parse(new TextDecoder().decode(plaintext));
     }
 
@@ -37779,13 +37753,14 @@ try {
             throw new Error('Чат не найден в списке');
         }
 
-        // ─── 1. Генерируем ключ + id ───
+        // ─── Генерируем ключ + id ───
         const ticketId = genTicketId();
         const aesKeyBytes = genAesKey();
         const now = Date.now();
         const expiresAt = now + CFG.TTL_MS;
 
-        // ─── 2. Формируем данные билета ───
+        // ─── Формируем данные билета ───
+        // 🆕 username приглашающего НЕ передаём
         const ticketData = {
             v: 3,
             iat: now,
@@ -37796,29 +37771,26 @@ try {
             },
             token: state.token,
             password: password,
-            username: state.username,
         };
 
-        // ─── 3. Шифруем ───
+        // ─── Шифруем ───
         const encryptedData = await encryptTicketData(ticketData, aesKeyBytes);
 
-        // ─── 4. Пушим в GitHub ───
+        // ─── Пушим в GitHub ───
         await createTicketOnGitHub(state.token, ticketId, encryptedData);
 
-        // ─── 5. Запоминаем локально ───
+        // ─── Запоминаем локально ───
         addMyTicket(ticketId, expiresAt, chatFile, chat.name || chatFile);
 
-        // ─── 6. Формируем URL ───
-        // ⚠️ Ключ идёт во ФРАГМЕНТЕ (#k=...), а не в query.
-        // Фрагмент НЕ отправляется на сервер → GitHub его не видит.
+        // ─── Формируем URL (ключ во фрагменте) ───
         const baseUrl = location.origin + location.pathname;
         const keyB64 = toBase64Url(aesKeyBytes);
         const url = `${baseUrl}?${CFG.URL_PARAM}=${ticketId}#${CFG.URL_FRAGMENT_KEY}=${keyB64}`;
 
-        // ─── 7. Таймер на удаление ───
+        // ─── Таймер на удаление ───
         scheduleTicketDeletion(ticketId, expiresAt);
 
-        console.log(`🔐 [SecureInvite v3] Создан зашифрованный билет ${ticketId} для «${chat.name}»`);
+        console.log(`🔐 [SecureInvite v3.1] Создан билет ${ticketId} для «${chat.name}»`);
 
         return { url, ticketId, expiresAt, chatName: chat.name || chatFile };
     }
@@ -37845,7 +37817,7 @@ try {
             const ok = await deleteTicketFromGitHub(state.token, ticketId);
             if (ok) {
                 removeMyTicket(ticketId);
-                console.log(`🗑️ [SecureInvite v3] Билет ${ticketId} удалён`);
+                console.log(`🗑️ [SecureInvite v3.1] Билет ${ticketId} удалён`);
             }
             _scheduledDeletions.delete(ticketId);
             return ok;
@@ -37858,7 +37830,7 @@ try {
         if (!state.token || !state.isAuthorized) return;
         const expired = getExpiredMyTickets();
         if (expired.length === 0) return;
-        console.log(`🧹 [SecureInvite v3] Удаляем ${expired.length} просроченных билетов…`);
+        console.log(`🧹 [SecureInvite v3.1] Удаляем ${expired.length} просроченных билетов…`);
         for (const t of expired) {
             await attemptDeleteTicket(t.id);
         }
@@ -37873,7 +37845,7 @@ try {
 
         if (!ticketId) return false;
 
-        console.log(`🔐 [SecureInvite v3] Обнаружен билет: ${ticketId}`);
+        console.log(`🔐 [SecureInvite v3.1] Обнаружен билет: ${ticketId}`);
 
         // ─── Ключ из фрагмента ───
         const hash = location.hash.replace(/^#/, '');
@@ -37881,7 +37853,7 @@ try {
         const keyB64 = hashParams.get(CFG.URL_FRAGMENT_KEY);
 
         if (!keyB64) {
-            console.warn('🔐 [SecureInvite v3] Нет ключа во фрагменте');
+            console.warn('🔐 [SecureInvite v3.1] Нет ключа во фрагменте');
             cleanUrl();
             showInviteError('invalid_format', 'В ссылке отсутствует ключ расшифровки');
             return true;
@@ -37937,10 +37909,9 @@ try {
             try {
                 ticket = await decryptTicketData(result.encryptedData, aesKeyBytes);
             } catch (e) {
-                console.error('🔐 [SecureInvite v3] Decrypt failed:', e);
+                console.error('🔐 [SecureInvite v3.1] Decrypt failed:', e);
                 hideInviteLoading();
                 cleanUrl();
-                // Билет прочитан, но расшифровать не смогли — удаляем его
                 deleteTicketFromGitHub(currentToken, ticketId).catch(() => {});
                 showInviteError('incomplete', 'Не удалось расшифровать билет — ключ не подходит');
                 return true;
@@ -37973,15 +37944,15 @@ try {
             // ─── УДАЛЯЕМ билет сразу ───
             try {
                 await deleteTicketFromGitHub(currentToken, ticketId);
-                console.log(`🗑️ [SecureInvite v3] Билет ${ticketId} удалён`);
+                console.log(`🗑️ [SecureInvite v3.1] Билет ${ticketId} удалён`);
             } catch (e) {
-                console.warn('🔐 [SecureInvite v3] Не удалось удалить билет:', e.message);
+                console.warn('🔐 [SecureInvite v3.1] Не удалось удалить билет:', e.message);
             }
 
             markTicketUsed(ticketId);
 
-            // ─── Применяем данные ───
-            state.username = ticket.username || 'Гость';
+            // ─── 🆕 Применяем данные: гость всегда «Гость» ───
+            state.username = CFG.GUEST_USERNAME;
             state.token = ticket.token;
             state.isAuthorized = true;
 
@@ -38022,7 +37993,7 @@ try {
                     return true;
                 }
             } catch (e) {
-                console.warn('🔐 [SecureInvite v3] Token check failed:', e.message);
+                console.warn('🔐 [SecureInvite v3.1] Token check failed:', e.message);
             }
 
             // ─── Автовход ───
@@ -38035,7 +38006,7 @@ try {
                     if (typeof soundManager !== 'undefined') soundManager.play('notification');
                 }
             } catch (e) {
-                console.error('🔐 [SecureInvite v3] enterChat failed:', e);
+                console.error('🔐 [SecureInvite v3.1] enterChat failed:', e);
                 hideInviteLoading();
                 if (typeof showChatsScreen === 'function') showChatsScreen();
                 showToast('⚠️ Чат добавлен, но не открылся: ' + e.message, 4000);
@@ -38044,7 +38015,7 @@ try {
             return true;
 
         } catch (e) {
-            console.error('🔐 [SecureInvite v3] Ошибка:', e);
+            console.error('🔐 [SecureInvite v3.1] Ошибка:', e);
             hideInviteLoading();
             cleanUrl();
             showInviteError('unknown', 'Ошибка: ' + e.message);
@@ -38116,36 +38087,6 @@ try {
             #secureInviteLoading .sil-sub {
                 font-size: 13px; color: #888; line-height: 1.5; max-width: 360px;
             }
-
-            .share-temp-invite-btn {
-                width: 100%;
-                display: flex; align-items: center; gap: 12px;
-                padding: 12px 14px;
-                background: linear-gradient(135deg, rgba(254,202,87,0.15), rgba(255,159,67,0.1));
-                border: 1px solid rgba(254,202,87,0.35);
-                border-radius: 12px; color: #fff;
-                cursor: pointer; transition: all 0.15s;
-                font-family: inherit; text-align: left; margin-bottom: 8px;
-            }
-            .share-temp-invite-btn:hover {
-                background: linear-gradient(135deg, rgba(254,202,87,0.25), rgba(255,159,67,0.18));
-                border-color: rgba(254,202,87,0.6);
-                transform: translateY(-1px);
-                box-shadow: 0 4px 14px rgba(254,202,87,0.25);
-            }
-            .share-temp-invite-btn:active { transform: scale(0.98); }
-            .share-temp-invite-btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
-            .share-temp-invite-btn .stib-icon {
-                width: 40px; height: 40px; border-radius: 12px;
-                background: linear-gradient(135deg, rgba(254,202,87,0.3), rgba(255,159,67,0.2));
-                display: flex; align-items: center; justify-content: center;
-                font-size: 20px; flex-shrink: 0;
-            }
-            .share-temp-invite-btn .stib-body { flex: 1; min-width: 0; }
-            .share-temp-invite-btn .stib-title {
-                font-size: 14px; font-weight: 700; color: #feca57; margin-bottom: 2px;
-            }
-            .share-temp-invite-btn .stib-sub { font-size: 11px; color: #a78bfa; }
 
             #secureInviteModal .inv-link-box {
                 background: rgba(0,0,0,0.3);
@@ -38287,6 +38228,7 @@ try {
                 <div class="inv-hint">
                     💡 Отправьте ссылку целиком — вместе с частью после #.
                     Без неё гость не сможет расшифровать билет.
+                    Гость войдёт в чат как «${CFG.GUEST_USERNAME}».
                 </div>
 
                 <div style="display:flex;gap:8px;margin-bottom:8px;">
@@ -38378,99 +38320,66 @@ try {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  UI: КНОПКА В SHARE-МОДАЛКЕ
+    //  🆕 ПЕРЕХВАТ КНОПКИ «ДРУГИЕ ПРИЛОЖЕНИЯ» → временная ссылка
     // ═══════════════════════════════════════════════════════════
-    function injectTempInviteButton() {
-        const modal = document.getElementById('shareToChatModal');
-        if (!modal) return;
-        const content = modal.querySelector('.form-modal-content');
-        if (!content) return;
+    function installExternalButtonInterceptor() {
+        document.addEventListener('click', async (e) => {
+            const btn = e.target.closest('#shareToExternalBtn');
+            if (!btn) return;
 
-        if (content.querySelector('.share-temp-invite-btn')) return;
+            const modal = document.getElementById('shareToChatModal');
+            if (!modal || !modal.classList.contains('active')) return;
 
-        const externalDivider = content.querySelector('#shareExternalDivider');
-        if (!externalDivider) return;
+            // Гасим оригинальный обработчик
+            e.stopImmediatePropagation();
+            e.preventDefault();
 
-        const btn = document.createElement('button');
-        btn.className = 'share-temp-invite-btn';
-        btn.type = 'button';
-        btn.innerHTML = `
-            <div class="stib-icon">🔐</div>
-            <div class="stib-body">
-                <div class="stib-title">Безопасная ссылка</div>
-                <div class="stib-sub">2 минуты · шифрованный билет</div>
-            </div>
-            <span style="color:#feca57;font-size:18px;">›</span>
-        `;
-
-        btn.addEventListener('click', async (e) => {
-            e.stopPropagation();
-
-            let targetFile = _shareToChat.selectedFile;
+            // Определяем целевой чат
+            let targetFile = (typeof _shareToChat !== 'undefined' && _shareToChat)
+                ? _shareToChat.selectedFile
+                : null;
             if (!targetFile && state.chatFile) targetFile = state.chatFile;
 
             if (!targetFile) {
-                showToast('❌ Сначала выберите чат из списка ниже', 2500);
+                showToast('❌ Сначала выберите чат из списка', 2500);
                 if (typeof soundManager !== 'undefined') soundManager.play('error');
                 return;
             }
+
             if (!state.savedPasswords[targetFile]) {
                 showToast('🔐 Пароль чата не сохранён — ссылку сделать нельзя', 3500);
                 if (typeof soundManager !== 'undefined') soundManager.play('error');
                 return;
             }
 
-            btn.disabled = true;
-            const origHTML = btn.innerHTML;
-            btn.innerHTML = `
-                <div class="stib-icon">⏳</div>
-                <div class="stib-body">
-                    <div class="stib-title">Создаём билет…</div>
-                    <div class="stib-sub">пару секунд</div>
-                </div>
-            `;
+            // Визуальный отклик
+            const originalContent = btn.innerHTML;
+            btn.style.pointerEvents = 'none';
+            btn.style.opacity = '0.6';
 
             try {
                 const { url, expiresAt, chatName } = await buildInviteLink(targetFile);
+
                 modal.classList.remove('active');
                 showInviteModal(url, { expiresAt, chatName });
+
                 if (typeof soundManager !== 'undefined') soundManager.play('send');
             } catch (err) {
-                console.error('🔐 [SecureInvite v3] buildInviteLink failed:', err);
+                console.error('🔐 [SecureInvite v3.1] buildInviteLink failed:', err);
                 showToast('❌ ' + err.message, 3500);
                 if (typeof soundManager !== 'undefined') soundManager.play('error');
             } finally {
-                btn.disabled = false;
-                btn.innerHTML = origHTML;
+                btn.style.pointerEvents = '';
+                btn.style.opacity = '';
+                btn.innerHTML = originalContent;
             }
-        });
-
-        externalDivider.parentNode.insertBefore(btn, externalDivider);
+        }, true);   // ⬅️ CAPTURE-фаза
     }
 
-    const modalObserver = new MutationObserver((mutations) => {
-        for (const mut of mutations) {
-            if (mut.type === 'attributes' && mut.attributeName === 'class') {
-                const el = mut.target;
-                if (el.id === 'shareToChatModal' && el.classList.contains('active')) {
-                    setTimeout(injectTempInviteButton, 50);
-                }
-            }
-        }
-    });
-
-    function startObserving() {
-        const modal = document.getElementById('shareToChatModal');
-        if (modal) {
-            modalObserver.observe(modal, { attributes: true, attributeFilter: ['class'] });
-        } else {
-            setTimeout(startObserving, 500);
-        }
-    }
-    startObserving();
+    installExternalButtonInterceptor();
 
     // ═══════════════════════════════════════════════════════════
-    //  ЗАПУСК
+    //  ЗАПУСК ОБРАБОТКИ ПРИГЛАШЕНИЯ
     // ═══════════════════════════════════════════════════════════
     let _attempts = 0;
     const _maxAttempts = 40;
@@ -38494,7 +38403,7 @@ try {
         }
 
         handleIncomingInvite().catch(err => {
-            console.error('🔐 [SecureInvite v3] Ошибка:', err);
+            console.error('🔐 [SecureInvite v3.1] Ошибка:', err);
             hideInviteLoading();
             showInviteError('unknown', err.message);
         });
@@ -38552,14 +38461,12 @@ try {
         },
     };
 
-    console.log('🔐 [SecureInvite v3] Шифрованные билеты активны:');
+    console.log('🔐 [SecureInvite v3.1] Шифрованные билеты активны:');
+    console.log('   • Гость входит как «' + CFG.GUEST_USERNAME + '»');
     console.log('   • Содержимое билета зашифровано AES-256-GCM');
     console.log('   • Ключ в URL-фрагменте (#k=...) — GitHub его не видит');
-    console.log('   • GitHub Push Protection не блокирует пуш');
+    console.log('   • Кнопка «Другие приложения» теперь = временная ссылка');
     console.log('   • Билет удаляется после первого чтения или через 2 мин');
-    console.log('');
-    console.log('   ⚠️ ВАЖНО: гость должен получить ссылку ЦЕЛИКОМ,');
-    console.log('      вместе с частью после #. Иначе не расшифрует.');
 })();
 </script>
 </body>
