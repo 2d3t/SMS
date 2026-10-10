@@ -37114,406 +37114,369 @@ try {
     console.log('   • WebM → MP4 конвертация в фоне');
     console.log('   • API: VideoNoteGift.open()');
 })();
-
+</script>
+<script>
 // ═══════════════════════════════════════════════════════════════
-//  🔔 СИСТЕМНЫЕ УВЕДОМЛЕНИЯ (Desktop Notifications)
+//  🟢 ФИКС ЗЕЛЁНОЙ ПОДСВЕТКИ v2 (для чатов с 2 участниками)
 //  ─────────────────────────────────────────────────────────────
-//  • Показывают уведомление при новом сообщении, когда вкладка неактивна
-//  • Клик по уведомлению → открывает нужный чат
-//  • Не требует Service Worker
-//  • Работает в Chrome / Edge / Firefox / Safari (с ограничениями)
+//  Логика:
+//   • Зашёл в чат → все непрочитанные от собеседника зелёные
+//   • Ответил (любым сообщением) → зелёное снимается СРАЗУ
+//   • Новые чужие во время сессии → НЕ зелёные (ты в чате)
+//   • Вышел → сессия закрыта
+//   • Пришло новое → бейдж в списке → зашёл → снова зелёное
 // ═══════════════════════════════════════════════════════════════
 
-(function installDesktopNotifications() {
+(function installGreenHighlightFix2() {
     'use strict';
 
-    // ─── Проверка поддержки ───
-    if (!('Notification' in window)) {
-        console.warn('🔔 [Notif] Браузер не поддерживает Notifications API');
-        return;
-    }
-
-    // ─── Состояние ───
-    const N = {
-        permission: Notification.permission,   // 'default' | 'granted' | 'denied'
-        lastShownTs: new Map(),                // { chatFile: lastNotificationTs } — антиспам
-        minIntervalMs: 1500,                   // не чаще 1 уведомления в 1.5 сек на чат
-        iconUrl: 'icon-192.png',
+    const SESSION = {
+        active: false,
+        chatFile: null,
+        firstUnreadIdx: -1,
+        firstUnreadId: null,
+        startedAt: 0,
+        maxDurationMs: 10 * 60 * 1000,   // 10 минут
+        _timer: null,
     };
 
-    // ═══════════════════════════════════════════════════════════
-    //  1. ЗАПРОС РАЗРЕШЕНИЯ
-    // ═══════════════════════════════════════════════════════════
-    async function requestPermission() {
-        if (!('Notification' in window)) return false;
-        if (Notification.permission === 'granted') return true;
-        if (Notification.permission === 'denied') {
-            console.warn('🔔 [Notif] Разрешение отклонено пользователем ранее');
-            return false;
-        }
+    function computeFirstUnreadIdx() {
+        const all = historyState.allMessages;
+        if (!all || all.length === 0) return -1;
 
-        try {
-            const result = await Notification.requestPermission();
-            N.permission = result;
-            if (result === 'granted') {
-                console.log('🔔 [Notif] Разрешение получено');
-                showWelcomeNotification();
-                return true;
+        const lastReadId = state.chatFile ? getLastReadId(state.chatFile) : null;
+        if (!lastReadId) {
+            for (let i = 0; i < all.length; i++) {
+                if (all[i].username !== state.username) return i;
             }
-            console.log('🔔 [Notif] Разрешение не выдано:', result);
-            return false;
-        } catch (e) {
-            console.warn('🔔 [Notif] requestPermission failed:', e);
-            return false;
+            return -1;
         }
+
+        for (let i = 0; i < all.length; i++) {
+            const m = all[i];
+            if (m.username === state.username) continue;
+            if (m.id > lastReadId) return i;
+        }
+        return -1;
     }
 
-    // Приветственное уведомление — чтобы пользователь понял, что всё работает
-    function showWelcomeNotification() {
-        try {
-            const notif = new Notification('🔔 Уведомления включены', {
-                body: 'Вы будете получать оповещения о новых сообщениях',
-                icon: N.iconUrl,
-                badge: N.iconUrl,
-                tag: 'welcome',
-                silent: true,
-            });
-            setTimeout(() => { try { notif.close(); } catch (e) {} }, 4000);
-        } catch (e) {}
+    function openUnreadSession() {
+        closeUnreadSession();
+
+        const idx = computeFirstUnreadIdx();
+        if (idx < 0) return;
+
+        SESSION.active = true;
+        SESSION.chatFile = state.chatFile;
+        SESSION.firstUnreadIdx = idx;
+        SESSION.firstUnreadId = historyState.allMessages[idx].id;
+        SESSION.startedAt = Date.now();
+
+        SESSION._timer = setTimeout(() => closeUnreadSession(), SESSION.maxDurationMs);
+
+        console.log(`🟢 [GreenFix2] Сессия открыта: idx=${idx}, id=${SESSION.firstUnreadId}`);
     }
 
-    // ═══════════════════════════════════════════════════════════
-    //  2. ПОКАЗ УВЕДОМЛЕНИЯ
-    // ═══════════════════════════════════════════════════════════
+    function closeUnreadSession() {
+        if (SESSION._timer) {
+            clearTimeout(SESSION._timer);
+            SESSION._timer = null;
+        }
+        SESSION.active = false;
+        SESSION.chatFile = null;
+        SESSION.firstUnreadIdx = -1;
+        SESSION.firstUnreadId = null;
+    }
+
     /**
-     * @param {object} opts
-     * @param {string} opts.chatFile — ID чата
-     * @param {string} opts.chatName — отображаемое имя чата
-     * @param {string} opts.sender   — ник отправителя
-     * @param {string} opts.text     — текст сообщения
-     * @param {number} opts.msgId    — ID сообщения (для перехода)
-     * @param {string} opts.preview  — эмодзи-превью вложения (📷, 🎤, …)
+     * 🆕 Снимает зелёное со ВСЕХ непрочитанных в DOM.
+     * Вызывается при первой отправке своего сообщения.
      */
-    function showNotification(opts) {
-        if (Notification.permission !== 'granted') return;
+    function clearAllUnreadInDom() {
+        const unreadWrappers = messagesInner.querySelectorAll('.message-wrapper.unread');
+        if (unreadWrappers.length === 0) return 0;
 
-        // Антиспам: не чаще одного уведомления на чат за minIntervalMs
-        const now = Date.now();
-        const last = N.lastShownTs.get(opts.chatFile) || 0;
-        if (now - last < N.minIntervalMs) return;
-        N.lastShownTs.set(opts.chatFile, now);
+        unreadWrappers.forEach(w => {
+            w.style.transition = 'box-shadow 0.5s ease, background 0.5s ease, border-color 0.5s ease';
+            w.classList.remove('unread');
+            setTimeout(() => { w.style.transition = ''; }, 600);
+        });
 
-        // Формируем заголовок и текст
-        const title = opts.chatName
-            ? `${opts.sender} · ${opts.chatName}`
-            : opts.sender;
-
-        let body = opts.text || '';
-        if (opts.preview && !body) {
-            body = opts.preview;
+        // Убираем divider «Новые сообщения»
+        const divider = messagesInner.querySelector('.unread-divider');
+        if (divider) {
+            divider.style.transition = 'opacity 0.5s ease';
+            divider.style.opacity = '0';
+            setTimeout(() => divider.remove(), 500);
         }
-        // Обрезаем длинные тексты
-        if (body.length > 200) body = body.slice(0, 197) + '…';
 
-        const notifOptions = {
-            body,
-            icon: N.iconUrl,
-            badge: N.iconUrl,
-            tag: `chat_${opts.chatFile}`,     // группируем по чату
-            renotify: true,                    // «перетряхиваем» при повторе
-            silent: false,                     // пусть звук будет системный
-            data: {
-                chatFile: opts.chatFile,
-                msgId: opts.msgId,
-                ts: now,
-            },
-        };
+        console.log(`🟢 [GreenFix2] Снято зелёное с ${unreadWrappers.length} сообщений`);
+        return unreadWrappers.length;
+    }
 
-        try {
-            const notif = new Notification(title, notifOptions);
-
-            // Клик по уведомлению
-            notif.onclick = (e) => {
-                e.preventDefault();
-                handleNotificationClick(opts.chatFile, opts.msgId);
-                try { notif.close(); } catch (err) {}
-            };
-
-            // Автозакрытие через 8 секунд
-            setTimeout(() => {
-                try { notif.close(); } catch (e) {}
-            }, 8000);
-
-            console.log(`🔔 [Notif] Показано: ${title} — ${body}`);
-        } catch (e) {
-            console.warn('🔔 [Notif] showNotification failed:', e);
+    function getActiveFirstUnreadIdx() {
+        if (!SESSION.active || SESSION.chatFile !== state.chatFile) {
+            return computeFirstUnreadIdx();
         }
+        const all = historyState.allMessages;
+        if (SESSION.firstUnreadIdx < all.length) {
+            const m = all[SESSION.firstUnreadIdx];
+            if (m && m.id === SESSION.firstUnreadId) {
+                return SESSION.firstUnreadIdx;
+            }
+        }
+        return computeFirstUnreadIdx();
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  3. КЛИК ПО УВЕДОМЛЕНИЮ
+    //  ПАТЧ renderHistory
     // ═══════════════════════════════════════════════════════════
-    async function handleNotificationClick(chatFile, msgId) {
-        // Фокусируем вкладку
-        try { window.focus(); } catch (e) {}
+    renderHistory = function() {
+        Object.keys(audioPlayers).forEach(id => {
+            try { audioPlayers[id].audio.pause(); } catch (e) {}
+            delete audioPlayers[id];
+        });
 
-        // Если мы уже в этом чате — просто скроллим
-        if (state.chatFile === chatFile && state.currentScreen === 'chat') {
-            if (typeof scrollToMessage === 'function' && msgId) {
-                scrollToMessage(msgId);
-            }
+        const all = historyState.allMessages;
+        const total = all.length;
+
+        if (total === 0) {
+            messagesInner.innerHTML = `
+                <div class="message system">💬 История пуста</div>
+                <div class="message system" style="font-size:12px;color:#555;">Напишите первое сообщение!</div>
+            `;
             return;
         }
 
-        // Нужен переход в другой чат
-        const chat = state.chats.find(c => c.file === chatFile);
-        if (!chat) {
-            console.warn('🔔 [Notif] Чат не найден:', chatFile);
-            return;
-        }
-        const password = state.savedPasswords[chatFile];
-        if (!password) {
-            console.warn('🔔 [Notif] Нет пароля для чата:', chatFile);
-            return;
-        }
+        const initial = Math.min(CONFIG.renderInitial, total);
+        const start = total - initial;
+        historyState.startIndex = start;
+        historyState.renderedCount = initial;
 
-        // Ставим флаг, чтобы renderHistory сразу прыгнул к сообщению
-        if (msgId) window._pendingJumpToMsgId = msgId;
+        let firstUnreadIdx = getActiveFirstUnreadIdx();
 
-        try {
-            if (typeof enterChat === 'function') {
-                await enterChat(chatFile, chat.name || chatFile, password);
-            }
-        } catch (e) {
-            console.error('🔔 [Notif] enterChat failed:', e);
-            window._pendingJumpToMsgId = null;
-        }
-    }
+        // Расширяем окно, если непрочитанное выше видимого
+        if (firstUnreadIdx >= 0 && firstUnreadIdx < start) {
+            const newStart = Math.max(0, firstUnreadIdx - 5);
+            historyState.startIndex = newStart;
+            historyState.renderedCount = total - newStart;
+            console.log(`🟢 [GreenFix2] Расширяем окно: ${start} → ${newStart}`);
 
-    // ═══════════════════════════════════════════════════════════
-    //  4. ХУК НА pollUpdates — перехватываем новые сообщения
-    // ═══════════════════════════════════════════════════════════
-    if (typeof pollUpdates === 'function') {
-        const _origPollUpdates = pollUpdates;
-
-        pollUpdates = async function() {
-            // Запоминаем текущее количество
-            const beforeCount = state.lastMessageCount;
-            const beforeChat = state.chatFile;
-
-            // Вызываем оригинал
-            const result = await _origPollUpdates.apply(this, arguments);
-
-            // ─── Проверяем, появились ли новые ───
-            const afterCount = state.lastMessageCount;
-
-            // Если сообщений не прибавилось — выходим
-            if (afterCount <= beforeCount) return result;
-
-            // Если мы не авторизованы — выходим
-            if (!state.isAuthorized) return result;
-
-            // Если мы в чате и вкладка активна — не показываем уведомление
-            // (пользователь и так видит)
-            const isUserWatching =
-                document.visibilityState === 'visible'
-                && state.currentScreen === 'chat'
-                && state.chatFile === beforeChat;
-
-            if (isUserWatching) return result;
-
-            // ─── Смотрим последние новые сообщения ───
-            // Из state.messages забираем те, что появились после beforeCount
-            const newMessages = state.messages.slice(beforeCount);
-            if (newMessages.length === 0) return result;
-
-            // Игнорируем свои сообщения
-            const foreignMessages = newMessages.filter(
-                m => m.username !== state.username
-            );
-            if (foreignMessages.length === 0) return result;
-
-            // ─── Берём самое свежее ───
-            const latest = foreignMessages[foreignMessages.length - 1];
-
-            // ─── Формируем preview ───
-            let preview = '';
-            if (latest.text && latest.text.trim()) {
-                preview = latest.text.trim();
-            } else if (latest.image) {
-                preview = '📷 Фото';
-            } else if (latest.audio) {
-                preview = (latest.audioName && latest.audioName.trim())
-                    ? `🎵 ${latest.audioName}`
-                    : '🎤 Голосовое';
-            } else if (latest.videoNote) {
-                preview = '🎥 Кружочек';
-            } else if (latest.video) {
-                preview = `🎬 ${latest.videoName || 'Видео'}`;
-            } else if (latest.file) {
-                preview = `📎 ${latest.fileName || 'Файл'}`;
-            } else {
-                preview = 'Сообщение';
+            let html = '';
+            if (newStart > 0) {
+                html += `<div class="history-sentinel" id="historySentinel">↑ Потяните вверх, чтобы загрузить ещё</div>`;
             }
 
-            // ─── Имя чата ───
-            const chat = state.chats.find(c => c.file === beforeChat);
-            const chatName = chat ? (chat.name || chat.file) : (beforeChat || '');
-
-            // ─── Показываем уведомление ───
-            showNotification({
-                chatFile: beforeChat,
-                chatName,
-                sender: latest.username || 'Кто-то',
-                text: preview,
-                msgId: latest.id,
-                preview,
-            });
-
-            // Если пришло несколько — добавим пометку
-            if (foreignMessages.length > 1) {
-                // Второе уведомление с общим количеством
-                // (не обязательно, но приятно)
-                // Просто отметим, что было ещё
-                console.log(`🔔 [Notif] +${foreignMessages.length - 1} других сообщений в этом поллинге`);
-            }
-
-            return result;
-        };
-
-        console.log('🔔 [Notif] pollUpdates пропатчен');
-    } else {
-        console.warn('🔔 [Notif] pollUpdates не найдена — уведомления не будут работать');
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  5. ХУК НА refreshUnreadBadges — уведомления о чужих чатах
-    //  (когда мы не в этом чате, а сообщение пришло в другой)
-    // ═══════════════════════════════════════════════════════════
-    if (typeof refreshUnreadBadges === 'function') {
-        const _origRefreshUnread = refreshUnreadBadges;
-
-        refreshUnreadBadges = async function() {
-            // Запоминаем состояние "до"
-            const before = new Map();
-            state.chats.forEach(c => {
-                before.set(c.file, c.unreadCount || 0);
-            });
-
-            const result = await _origRefreshUnread.apply(this, arguments);
-
-            // Если вкладка активна и мы в чате — уведомления не нужны
-            if (document.visibilityState === 'visible' && state.currentScreen === 'chat') {
-                return result;
-            }
-
-            // Смотрим, у каких чатов выросло число непрочитанных
-            state.chats.forEach(c => {
-                const prevCount = before.get(c.file) || 0;
-                const nowCount = c.unreadCount || 0;
-                if (nowCount > prevCount && c.unreadCount > 0) {
-                    const delta = nowCount - prevCount;
-                    // Игнорируем текущий чат (о нём уведомляет pollUpdates)
-                    if (c.file === state.chatFile) return;
-
-                    const chatName = c.name || c.file;
-                    showNotification({
-                        chatFile: c.file,
-                        chatName,
-                        sender: 'Новое сообщение',
-                        text: delta === 1
-                            ? `В чате «${chatName}» новое сообщение`
-                            : `В чате «${chatName}» ${delta} новых сообщений`,
-                        msgId: null,
-                    });
+            let lastDate = '';
+            for (let i = newStart; i < total; i++) {
+                const msg = all[i];
+                if (i === firstUnreadIdx && i > newStart) {
+                    html += `<div class="unread-divider">Новые сообщения</div>`;
                 }
+                const msgDate = formatDate(msg.time);
+                if (msgDate !== lastDate) {
+                    html += `<div class="message system">${msgDate}</div>`;
+                    lastDate = msgDate;
+                }
+                const isUnread = firstUnreadIdx >= 0 && i >= firstUnreadIdx
+                    && msg.username !== state.username;
+                html += buildMessageHTML(msg, { isUnread });
+            }
+
+            messagesInner.innerHTML = html;
+            messagesInner.dataset.lastDate = lastDate;
+            loadReplyThumbnails(messagesInner);
+            loadAttachmentsIn(messagesInner);
+
+            requestAnimationFrame(() => {
+                const unreadEl = messagesInner.querySelector('.message-wrapper.unread');
+                if (unreadEl) {
+                    unreadEl.scrollIntoView({ behavior: 'auto', block: 'center' });
+                } else {
+                    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                }
+                updateScrollButton();
             });
-
-            return result;
-        };
-
-        console.log('🔔 [Notif] refreshUnreadBadges пропатчен');
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  6. АВТОЗАПРОС РАЗРЕШЕНИЯ
-    //  — при первом успешном логине
-    //  — и через 15 секунд после загрузки, если уже авторизованы
-    // ═══════════════════════════════════════════════════════════
-
-    // Хук на login
-    if (typeof login === 'function') {
-        const _origLogin = login;
-        login = async function() {
-            const r = await _origLogin.apply(this, arguments);
-            // После успешного входа
-            if (state.isAuthorized && Notification.permission === 'default') {
-                setTimeout(() => requestPermission(), 1500);
-            }
-            return r;
-        };
-    }
-
-    // Хук на restoreSession
-    if (typeof restoreSession === 'function') {
-        const _origRestore = restoreSession;
-        restoreSession = async function() {
-            const r = await _origRestore.apply(this, arguments);
-            if (state.isAuthorized && Notification.permission === 'default') {
-                setTimeout(() => requestPermission(), 2000);
-            }
-            return r;
-        };
-    }
-
-    // Автозапрос через 15 сек после загрузки, если уже авторизованы
-    setTimeout(() => {
-        if (state && state.isAuthorized && Notification.permission === 'default') {
-            requestPermission();
+            return;
         }
-    }, 15000);
 
-    // ═══════════════════════════════════════════════════════════
-    //  7. ПУБЛИЧНОЕ API
-    // ═══════════════════════════════════════════════════════════
-    window.DesktopNotif = {
-        /** Запросить разрешение вручную */
-        request: () => requestPermission(),
+        let html = '';
+        if (start > 0) {
+            html += `<div class="history-sentinel" id="historySentinel">↑ Потяните вверх, чтобы загрузить ещё</div>`;
+        }
 
-        /** Показать тестовое уведомление */
-        test: () => {
-            if (Notification.permission !== 'granted') {
-                showToast('🔔 Сначала дайте разрешение');
-                requestPermission();
-                return;
+        let lastDate = '';
+        for (let i = start; i < total; i++) {
+            const msg = all[i];
+            if (i === firstUnreadIdx && i > start) {
+                html += `<div class="unread-divider">Новые сообщения</div>`;
             }
-            showNotification({
-                chatFile: state.chatFile || 'test',
-                chatName: 'Тест',
-                sender: 'Проверка',
-                text: 'Так выглядит уведомление о новом сообщении',
-                msgId: null,
-            });
-        },
+            const msgDate = formatDate(msg.time);
+            if (msgDate !== lastDate) {
+                html += `<div class="message system">${msgDate}</div>`;
+                lastDate = msgDate;
+            }
+            const isUnread = firstUnreadIdx >= 0 && i >= firstUnreadIdx
+                && msg.username !== state.username;
+            html += buildMessageHTML(msg, { isUnread });
+        }
 
-        /** Текущий статус */
-        status: () => ({
-            supported: 'Notification' in window,
-            permission: Notification.permission,
-        }),
+        messagesInner.innerHTML = html;
+        messagesInner.dataset.lastDate = lastDate;
+        loadReplyThumbnails(messagesInner);
+        loadAttachmentsIn(messagesInner);
 
-        /** Сброс антиспама (для тестов) */
-        resetAntiSpam: () => {
-            N.lastShownTs.clear();
-            console.log('🔔 [Notif] Антиспам сброшен');
+        requestAnimationFrame(() => {
+            if (firstUnreadIdx >= 0 && firstUnreadIdx >= start) {
+                const unreadEl = messagesInner.querySelector('.message-wrapper.unread');
+                if (unreadEl) {
+                    unreadEl.scrollIntoView({ behavior: 'auto', block: 'center' });
+                    return;
+                }
+            }
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+            updateScrollButton();
+        });
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  🆕 ГЛАВНОЕ: снимаем зелёное при первой отправке
+    // ═══════════════════════════════════════════════════════════
+    const _origSendMessage = window.sendMessage;
+
+    window.sendMessage = async function(text, imageBlob, audioData, fileAttachment, audioFile, replyContext, videoPayload) {
+        // Есть ли что-то для отправки?
+        const hasContent = !!(
+            (text && text.trim()) ||
+            imageBlob instanceof Blob ||
+            audioData ||
+            (fileAttachment && fileAttachment.blob) ||
+            (audioFile && audioFile.blob) ||
+            videoPayload
+        );
+
+        // Если сессия активна и есть что отправлять — снимаем зелёное
+        if (SESSION.active && SESSION.chatFile === state.chatFile && hasContent) {
+            clearAllUnreadInDom();
+            // Закрываем сессию — с этого момента новые чужие не подсвечиваем
+            closeUnreadSession();
+
+            // Записываем lastReadId на текущее последнее сообщение
+            // (чтобы при выходе и возврате старое не подсветилось снова)
+            setTimeout(() => {
+                if (state.chatFile === SESSION.chatFile || !SESSION.chatFile) {
+                    if (typeof markChatAsRead === 'function') markChatAsRead();
+                }
+            }, 500);
+        }
+
+        return _origSendMessage.apply(this, arguments);
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  🆕 Новые сообщения во время сессии — НЕ зелёные
+    //  (при 2 участниках ты в чате — значит читаешь live)
+    // ═══════════════════════════════════════════════════════════
+    // Ничего не делаем — appendMessages по умолчанию ставит
+    // isUnread: !state._chatEntered, что уже false.
+    // Дополнительно патчим чтобы гарантировать:
+    const _origAppendMessages = appendMessages;
+    appendMessages = function(newMsgs) {
+        if (!newMsgs || newMsgs.length === 0) {
+            return _origAppendMessages.apply(this, arguments);
+        }
+
+        // Если сессия активна — новые сообщения НЕ зелёные
+        if (SESSION.active && SESSION.chatFile === state.chatFile) {
+            // Обновляем сессию: сдвигаем firstUnreadIdx? Нет — 
+            // новые уже прочитаны (мы в чате). Оставляем старые зелёными.
+
+            // Просто добавляем сообщения как обычные
+            const temp = document.createElement('div');
+            let lastDate = messagesInner.dataset.lastDate || '';
+            let html = '';
+
+            for (const msg of newMsgs) {
+                const msgDate = formatDate(msg.time);
+                if (msgDate !== lastDate) {
+                    html += `<div class="message system">${msgDate}</div>`;
+                    lastDate = msgDate;
+                }
+                html += buildMessageHTML(msg, { isUnread: false });
+            }
+
+            messagesInner.dataset.lastDate = lastDate;
+            messagesInner.insertAdjacentHTML('beforeend', html);
+
+            historyState.allMessages.push(...newMsgs);
+            loadReplyThumbnails(messagesInner);
+            loadAttachmentsIn(messagesInner);
+            return;
+        }
+
+        return _origAppendMessages.apply(this, arguments);
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХУКИ жизненного цикла
+    // ═══════════════════════════════════════════════════════════
+    const _origEnterChat = enterChat;
+    enterChat = async function(file, name, password) {
+        const result = await _origEnterChat.call(this, file, name, password);
+
+        if (state.chatFile === file && state.currentScreen === 'chat') {
+            setTimeout(() => {
+                if (state.chatFile === file) {
+                    openUnreadSession();
+                    if (SESSION.active) {
+                        const hasUnreadInDom = messagesInner.querySelector('.message-wrapper.unread');
+                        if (!hasUnreadInDom && SESSION.firstUnreadIdx >= 0) {
+                            console.log('🟢 [GreenFix2] Перерисовка для показа зелёного');
+                            renderHistory();
+                        }
+                    }
+                }
+            }, 400);
+        }
+
+        return result;
+    };
+
+    const _origBackToChats = backToChats;
+    backToChats = function() {
+        closeUnreadSession();
+        return _origBackToChats.apply(this, arguments);
+    };
+
+    window.GreenHighlight = {
+        isActive: () => SESSION.active,
+        chatFile: () => SESSION.chatFile,
+        firstUnreadIdx: () => SESSION.firstUnreadIdx,
+        open: openUnreadSession,
+        close: closeUnreadSession,
+        clearNow: clearAllUnreadInDom,
+        diagnose: () => {
+            const all = historyState.allMessages;
+            const lastReadId = state.chatFile ? getLastReadId(state.chatFile) : null;
+            return {
+                chatFile: state.chatFile,
+                lastReadId,
+                totalMessages: all.length,
+                computedFirstUnreadIdx: computeFirstUnreadIdx(),
+                sessionActive: SESSION.active,
+                unreadInDom: messagesInner.querySelectorAll('.message-wrapper.unread').length,
+                dividerInDom: !!messagesInner.querySelector('.unread-divider'),
+            };
         },
     };
 
-    console.log('🔔 [Notif] Системные уведомления активны');
-    console.log(`   Текущий статус: ${Notification.permission}`);
-    console.log('   API: DesktopNotif.test() / .request() / .status()');
+    console.log('🟢 [GreenFix2] Патч установлен (2 участника)');
+    console.log('   • Зашёл → зелёное на всех непрочитанных');
+    console.log('   • Ответил (любым сообщением) → зелёное снимается');
+    console.log('   • Новые чужие во время сессии → НЕ зелёные');
+    console.log('   • Вышел → сессия закрыта');
+    console.log('   • API: GreenHighlight.diagnose()');
 })();
 </script>
-
 </body>
 </html>
