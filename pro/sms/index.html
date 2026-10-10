@@ -38361,20 +38361,21 @@ try {
     console.log('   • API: PersistentSession.status() / .clear()');
 })();
 </script>
+
 <script>
 // ═══════════════════════════════════════════════════════════════
-//  📹 ПРОСТОЙ ПАТЧ: КНОПКА ВИДЕО ЧЕРЕЗ ЭМУЛЯЦИЮ LONG-PRESS НА 🎤
+//  📹 ПАТЧ v2: КНОПКА ВИДЕО БЕЗ ВИЗУАЛЬНОГО НАЖАТИЯ 🎤
 //  ─────────────────────────────────────────────────────────────
-//  Логика:
-//   1. Добавляем кнопку 📹 рядом с 🎤
-//   2. При клике на 📹 — программно «жмём долго» на 🎤
-//   3. Старый long-press на 🎤 работает как раньше
+//  Изменения от v1:
+//   • Пробуем сначала вызвать VideoNoteGift.open() напрямую —
+//     это НЕ трогает визуальное состояние 🎤
+//   • Если его нет — fallback на эмуляцию (как было)
 // ═══════════════════════════════════════════════════════════════
 
-(function installSimpleVideoButton() {
+(function installSimpleVideoButtonV2() {
     'use strict';
 
-    console.log('📹 [SimpleVideoBtn] Установка…');
+    console.log('📹 [SimpleVideoBtn v2] Установка…');
 
     // ═══════════════════════════════════════════════════════════
     //  СТИЛИ
@@ -38428,103 +38429,94 @@ try {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ЭМУЛЯЦИЯ ДОЛГОГО НАЖАТИЯ НА 🎤
+    //  ТИХИЙ ЗАПУСК РЕКОРДЕРА (без визуального нажатия на 🎤)
+    // ═══════════════════════════════════════════════════════════
+    function silentOpenRecorder() {
+        // ─── Способ 1: VideoNoteGift.open ───
+        try {
+            if (typeof VideoNoteGift !== 'undefined'
+                && typeof VideoNoteGift.open === 'function') {
+                console.log('📹 [SimpleVideoBtn v2] Видео: прямой вызов VideoNoteGift.open()');
+                VideoNoteGift.open();
+                return true;
+            }
+        } catch (e) {
+            console.warn('📹 [SimpleVideoBtn v2] VideoNoteGift.open не сработал:', e);
+        }
+
+        // ─── Способ 2: window.openRecorder (на случай если он глобальный) ───
+        try {
+            if (typeof window.openRecorder === 'function') {
+                console.log('📹 [SimpleVideoBtn v2] Видео: вызов window.openRecorder()');
+                window.openRecorder();
+                return true;
+            }
+        } catch (e) {
+            console.warn('📹 [SimpleVideoBtn v2] window.openRecorder не сработал:', e);
+        }
+
+        // ─── Способ 3: Fallback — эмуляция long-press ───
+        console.log('📹 [SimpleVideoBtn v2] Fallback: эмуляция long-press на 🎤');
+        simulateLongPressOnMic();
+        return false;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  FALLBACK: эмуляция долгого нажатия (визуально видно)
     // ═══════════════════════════════════════════════════════════
     function simulateLongPressOnMic() {
         const micBtn = document.getElementById('micBtn');
-        if (!micBtn) {
-            console.warn('📹 [SimpleVideoBtn] micBtn не найден');
-            return;
-        }
+        if (!micBtn) return;
 
-        console.log('📹 [SimpleVideoBtn] Эмулируем долгое нажатие на 🎤');
-
-        // Определяем, touch-устройство или мышь
         const isTouchDevice = ('ontouchstart' in window) ||
                               (navigator.maxTouchPoints > 0);
 
         try {
             if (isTouchDevice) {
-                // ─── Создаём Touch и TouchEvent ───
+                const rect = micBtn.getBoundingClientRect();
                 const touch = new Touch({
                     identifier: Date.now(),
                     target: micBtn,
-                    clientX: micBtn.getBoundingClientRect().left + 20,
-                    clientY: micBtn.getBoundingClientRect().top + 20,
-                    screenX: 0,
-                    screenY: 0,
-                    pageX: 0,
-                    pageY: 0,
-                    radiusX: 10,
-                    radiusY: 10,
-                    rotationAngle: 0,
-                    force: 1,
+                    clientX: rect.left + rect.width / 2,
+                    clientY: rect.top + rect.height / 2,
+                    screenX: 0, screenY: 0,
+                    pageX: 0, pageY: 0,
+                    radiusX: 10, radiusY: 10,
+                    rotationAngle: 0, force: 1,
                 });
 
-                // touchstart
-                const touchStartEvent = new TouchEvent('touchstart', {
-                    bubbles: true,
-                    cancelable: true,
-                    view: window,
-                    touches: [touch],
-                    targetTouches: [touch],
+                micBtn.dispatchEvent(new TouchEvent('touchstart', {
+                    bubbles: true, cancelable: true, view: window,
+                    touches: [touch], targetTouches: [touch],
                     changedTouches: [touch],
-                });
-                micBtn.dispatchEvent(touchStartEvent);
+                }));
 
-                // Ждём 400 мс — этого достаточно, чтобы long-press
-                // (300-500 мс в реализации) сработал и открыл рекордер
                 setTimeout(() => {
-                    // touchend
-                    const touchEndEvent = new TouchEvent('touchend', {
-                        bubbles: true,
-                        cancelable: true,
-                        view: window,
-                        touches: [],
-                        targetTouches: [],
+                    micBtn.dispatchEvent(new TouchEvent('touchend', {
+                        bubbles: true, cancelable: true, view: window,
+                        touches: [], targetTouches: [],
                         changedTouches: [touch],
-                    });
-                    micBtn.dispatchEvent(touchEndEvent);
-                    console.log('📹 [SimpleVideoBtn] touchend отправлен');
+                    }));
                 }, 400);
-
             } else {
-                // ─── Desktop: mousedown + mouseup ───
-                const mousedownEvent = new MouseEvent('mousedown', {
-                    bubbles: true,
-                    cancelable: true,
-                    view: window,
-                    button: 0,
-                    buttons: 1,
-                });
-                micBtn.dispatchEvent(mousedownEvent);
-
+                micBtn.dispatchEvent(new MouseEvent('mousedown', {
+                    bubbles: true, cancelable: true, view: window,
+                    button: 0, buttons: 1,
+                }));
                 setTimeout(() => {
-                    const mouseupEvent = new MouseEvent('mouseup', {
-                        bubbles: true,
-                        cancelable: true,
-                        view: window,
-                        button: 0,
-                        buttons: 0,
-                    });
-                    micBtn.dispatchEvent(mouseupEvent);
-                    console.log('📹 [SimpleVideoBtn] mouseup отправлен');
+                    micBtn.dispatchEvent(new MouseEvent('mouseup', {
+                        bubbles: true, cancelable: true, view: window,
+                        button: 0, buttons: 0,
+                    }));
                 }, 400);
             }
         } catch (e) {
-            console.error('📹 [SimpleVideoBtn] Эмуляция провалилась:', e);
-            // Fallback: пробуем вызвать openRecorder напрямую
-            if (typeof VideoNoteGift !== 'undefined'
-                && typeof VideoNoteGift.open === 'function') {
-                VideoNoteGift.open();
-            } else if (typeof window.openRecorder === 'function') {
-                window.openRecorder();
-            }
+            console.error('📹 [SimpleVideoBtn v2] Эмуляция провалилась:', e);
         }
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ДОБАВЛЕНИЕ КНОПКИ 📹
+    //  ДОБАВЛЯЕМ КНОПКУ 📹
     // ═══════════════════════════════════════════════════════════
     function injectVideoButton() {
         const inputBar = document.getElementById('inputBar');
@@ -38544,10 +38536,8 @@ try {
         btn.title = 'Записать видео-кружочек (до 10 сек)';
         btn.innerHTML = '📹';
 
-        // Вставляем ПЕРЕД микрофоном
         actionButtons.insertBefore(btn, micBtn);
 
-        // Обработчик клика — запускаем эмуляцию long-press на 🎤
         btn.addEventListener('click', (e) => {
             e.stopPropagation();
             if (!state.isAuthorized || !state.chatFile) {
@@ -38559,7 +38549,7 @@ try {
                 return;
             }
 
-            // Закрываем панели эмодзи/вложений, если открыты
+            // Закрываем панели эмодзи/вложений
             try {
                 if (typeof _emojiPanelOpen !== 'undefined' && _emojiPanelOpen
                     && typeof toggleEmojiPanel === 'function') {
@@ -38571,30 +38561,15 @@ try {
                 }
             } catch (err) {}
 
+            // Вибрация на самой кнопке 📹 (можно убрать, если не нужна)
             if (navigator.vibrate) navigator.vibrate(12);
 
-            // Эмулируем долгое нажатие на микрофон
-            simulateLongPressOnMic();
+            // Тихий запуск рекордера
+            silentOpenRecorder();
         });
 
-        console.log('📹 [SimpleVideoBtn] Кнопка 📹 добавлена');
+        console.log('📹 [SimpleVideoBtn v2] Кнопка 📹 добавлена');
         return true;
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  СЛЕДИМ ЗА ПЕРЕРИСОВКОЙ ПАНЕЛИ
-    // ═══════════════════════════════════════════════════════════
-    function watchInputBar() {
-        const observer = new MutationObserver(() => {
-            if (!document.getElementById('videoNoteBtn')) {
-                const inputBar = document.getElementById('inputBar');
-                const micBtn = inputBar && inputBar.querySelector('#micBtn');
-                if (inputBar && micBtn) {
-                    injectVideoButton();
-                }
-            }
-        });
-        observer.observe(document.body, { childList: true, subtree: true });
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -38613,27 +38588,37 @@ try {
 
         injectStyles();
         injectVideoButton();
-        watchInputBar();
 
-        console.log('📹 [SimpleVideoBtn] ✅ Патч установлен');
+        // Следим за перерисовкой панели
+        const observer = new MutationObserver(() => {
+            if (!document.getElementById('videoNoteBtn')) {
+                const inputBar = document.getElementById('inputBar');
+                const micBtn = inputBar && inputBar.querySelector('#micBtn');
+                if (inputBar && micBtn) injectVideoButton();
+            }
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+
+        console.log('📹 [SimpleVideoBtn v2] ✅ Патч установлен');
     }
 
     tryInit();
 
     // ═══════════════════════════════════════════════════════════
-    //  API ДЛЯ ОТЛАДКИ
+    //  API
     // ═══════════════════════════════════════════════════════════
     window.SimpleVideoButton = {
         status: () => ({
             buttonExists: !!document.getElementById('videoNoteBtn'),
             micBtnExists: !!document.getElementById('micBtn'),
-            videoNoteGiftReady: typeof VideoNoteGift !== 'undefined',
+            videoNoteGiftReady: typeof VideoNoteGift !== 'undefined'
+                && typeof VideoNoteGift.open === 'function',
+            openRecorderGlobal: typeof window.openRecorder === 'function',
         }),
-        test: () => {
-            simulateLongPressOnMic();
-        },
+        test: () => silentOpenRecorder(),
     };
 })();
 </script>
+
 </body>
 </html>
