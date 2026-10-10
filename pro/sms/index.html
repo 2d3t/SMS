@@ -37974,15 +37974,14 @@ try {
 </script>
 <script>
 // ═══════════════════════════════════════════════════════════════
-//  🔑 PERSISTENT SESSION + EXPIRED SCREEN + PWA HINT
+//  🔑 PERSISTENT SESSION v2 (без PWA-подсказок и оверлеев)
 //  ─────────────────────────────────────────────────────────────
 //  1. Сохраняет токен в localStorage навсегда
 //  2. При старте тихо восстанавливает сессию
 //  3. Если токен невалиден — экран «Сессия истекла»
-//  4. Один раз показывает плашку «Добавить на главный экран»
 // ═══════════════════════════════════════════════════════════════
 
-(function installPersistentSessionV1() {
+(function installPersistentSessionV2() {
     'use strict';
 
     console.log('🔑 [PersistentSession] Установка патча…');
@@ -37994,18 +37993,16 @@ try {
         LS_TOKEN: 'chathub_token',
         LS_USERNAME: 'chathub_username',
         LS_REMEMBER: 'chathub_remember',
-        LS_PWA_HINT_SHOWN: 'chathub_pwa_hint_shown',
-        LS_SESSION_SOURCE: 'chathub_session_source', // 'invite' | 'manual'
+        LS_SESSION_SOURCE: 'chathub_session_source',
     };
 
     // ═══════════════════════════════════════════════════════════
-    //  СТИЛИ
+    //  СТИЛИ (только для экрана «Сессия истекла»)
     // ═══════════════════════════════════════════════════════════
-    if (!document.getElementById('persistentSessionStyles')) {
+    if (!document.getElementById('persistentSessionStylesV2')) {
         const style = document.createElement('style');
-        style.id = 'persistentSessionStyles';
+        style.id = 'persistentSessionStylesV2';
         style.textContent = `
-            /* ═══ Экран «Сессия истекла» ═══ */
             #sessionExpiredScreen {
                 position: fixed;
                 inset: 0;
@@ -38072,98 +38069,6 @@ try {
                 -webkit-tap-highlight-color: transparent;
             }
             #sessionExpiredScreen .ses-btn:active { transform: scale(0.96); }
-
-            /* ═══ Плашка «Добавить на главный экран» ═══ */
-            #pwaInstallHint {
-                position: fixed;
-                left: 50%;
-                bottom: 20px;
-                transform: translateX(-50%) translateY(150%);
-                width: calc(100% - 24px);
-                max-width: 440px;
-                background: linear-gradient(135deg, rgba(26,26,46,0.98), rgba(20,20,35,0.98));
-                backdrop-filter: blur(20px);
-                -webkit-backdrop-filter: blur(20px);
-                border: 1px solid rgba(108,92,231,0.4);
-                border-radius: 18px;
-                padding: 14px 16px;
-                display: flex;
-                align-items: center;
-                gap: 12px;
-                z-index: 9990;
-                box-shadow: 0 16px 48px rgba(0,0,0,0.7),
-                            0 0 0 1px rgba(108,92,231,0.15);
-                transition: transform 0.4s cubic-bezier(0.22, 0.61, 0.36, 1),
-                            opacity 0.3s;
-                opacity: 0;
-                pointer-events: none;
-            }
-            #pwaInstallHint.show {
-                transform: translateX(-50%) translateY(0);
-                opacity: 1;
-                pointer-events: auto;
-            }
-            #pwaInstallHint .pih-icon {
-                width: 46px;
-                height: 46px;
-                border-radius: 14px;
-                background: linear-gradient(135deg, #6c5ce7, #00b894);
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                font-size: 22px;
-                flex-shrink: 0;
-                box-shadow: 0 4px 14px rgba(108,92,231,0.4);
-            }
-            #pwaInstallHint .pih-body {
-                flex: 1;
-                min-width: 0;
-            }
-            #pwaInstallHint .pih-title {
-                font-size: 14px;
-                font-weight: 700;
-                color: #fff;
-                margin-bottom: 3px;
-            }
-            #pwaInstallHint .pih-sub {
-                font-size: 11px;
-                color: #a78bfa;
-                line-height: 1.4;
-            }
-            #pwaInstallHint .pih-close {
-                width: 32px;
-                height: 32px;
-                border-radius: 50%;
-                border: 1px solid rgba(255,255,255,0.08);
-                background: rgba(255,255,255,0.04);
-                color: #888;
-                font-size: 14px;
-                cursor: pointer;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                flex-shrink: 0;
-                transition: all 0.15s;
-                padding: 0;
-                -webkit-tap-highlight-color: transparent;
-            }
-            #pwaInstallHint .pih-close:hover {
-                background: rgba(255,107,107,0.15);
-                color: #ff6b6b;
-                border-color: rgba(255,107,107,0.3);
-            }
-            #pwaInstallHint .pih-close:active { transform: scale(0.9); }
-
-            @media (max-width: 480px) {
-                #pwaInstallHint {
-                    bottom: 12px;
-                    padding: 12px 14px;
-                    gap: 10px;
-                }
-                #pwaInstallHint .pih-icon { width: 40px; height: 40px; font-size: 19px; }
-                #pwaInstallHint .pih-title { font-size: 13px; }
-                #pwaInstallHint .pih-sub { font-size: 10px; }
-            }
         `;
         document.head.appendChild(style);
     }
@@ -38179,7 +38084,6 @@ try {
             'token-revoked': 'Ваш токен доступа больше не действует.',
             'token-invalid': 'Ваш токен доступа недействителен.',
             'no-token': 'Сессия не найдена.',
-            'network-fail': 'Не удалось проверить доступ. Проверьте интернет и попробуйте снова.',
         };
 
         const msg = messages[reason] || 'Сессия больше не активна.';
@@ -38199,18 +38103,14 @@ try {
         document.body.appendChild(screen);
 
         screen.querySelector('#sesOkBtn').addEventListener('click', () => {
-            // Чистим всю сессию
             clearSession();
             screen.remove();
-            // Показываем экран авторизации
             if (typeof showAuthScreen === 'function') {
                 showAuthScreen();
             }
-            // Чистим URL от возможных параметров
             history.replaceState({}, '', location.origin + location.pathname);
         });
 
-        // Скрываем всё остальное
         try {
             if (authScreen) authScreen.style.display = 'none';
             if (chatsScreen) chatsScreen.style.display = 'none';
@@ -38219,7 +38119,7 @@ try {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ОЧИСТКА СЕССИИ
+    //  РАБОТА С СЕССИЕЙ
     // ═══════════════════════════════════════════════════════════
     function clearSession() {
         try {
@@ -38231,9 +38131,6 @@ try {
         console.log('🔑 [PersistentSession] Сессия очищена');
     }
 
-    // ═══════════════════════════════════════════════════════════
-    //  СОХРАНЕНИЕ СЕССИИ
-    // ═══════════════════════════════════════════════════════════
     function saveSession(username, token, source) {
         try {
             localStorage.setItem(CFG.LS_USERNAME, username);
@@ -38260,87 +38157,7 @@ try {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ПЛАШКА «ДОБАВИТЬ НА ГЛАВНЫЙ ЭКРАН»
-    // ═══════════════════════════════════════════════════════════
-    function showPwaHint() {
-        // Уже показывали?
-        try {
-            if (localStorage.getItem(CFG.LS_PWA_HINT_SHOWN) === '1') return;
-        } catch (e) {}
-
-        // Уже установлено как PWA?
-        const isStandalone =
-            window.matchMedia('(display-mode: standalone)').matches ||
-            window.navigator.standalone === true ||
-            document.referrer.includes('android-app://');
-        if (isStandalone) {
-            // Уже приложение — нечего предлагать
-            try { localStorage.setItem(CFG.LS_PWA_HINT_SHOWN, '1'); } catch (e) {}
-            return;
-        }
-
-        // Отложенный показ — чтобы не мешать входу
-        setTimeout(() => {
-            let hint = document.getElementById('pwaInstallHint');
-            if (hint) hint.remove();
-
-            hint = document.createElement('div');
-            hint.id = 'pwaInstallHint';
-            hint.innerHTML = `
-                <div class="pih-icon">📱</div>
-                <div class="pih-body">
-                    <div class="pih-title">Добавить на главный экран</div>
-                    <div class="pih-sub">Открывайте чат в один тап — как обычное приложение</div>
-                </div>
-                <button class="pih-close" id="pihCloseBtn" title="Скрыть">✕</button>
-            `;
-            document.body.appendChild(hint);
-
-            requestAnimationFrame(() => hint.classList.add('show'));
-
-            hint.querySelector('#pihCloseBtn').addEventListener('click', () => {
-                hint.classList.remove('show');
-                try { localStorage.setItem(CFG.LS_PWA_HINT_SHOWN, '1'); } catch (e) {}
-                setTimeout(() => hint.remove(), 400);
-            });
-
-            // Автоскрытие через 12 секунд
-            setTimeout(() => {
-                if (hint.parentNode) {
-                    hint.classList.remove('show');
-                    try { localStorage.setItem(CFG.LS_PWA_HINT_SHOWN, '1'); } catch (e) {}
-                    setTimeout(() => hint.remove(), 400);
-                }
-            }, 12000);
-
-            // Показ зелёного кружка-индикатора, что приложение можно установить
-            if (navigator.vibrate) navigator.vibrate(15);
-        }, 3000); // через 3 секунды после входа
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ПЕРЕХВАТ СОБЫТИЯ beforeinstallprompt (Chrome)
-    //  Если Chrome сам предложит установку — просто не мешаем ему.
-    //  Но перехватываем, чтобы потом можно было показать нашу плашку.
-    // ═══════════════════════════════════════════════════════════
-    let _deferredInstallPrompt = null;
-
-    window.addEventListener('beforeinstallprompt', (e) => {
-        e.preventDefault();
-        _deferredInstallPrompt = e;
-        console.log('📱 [PWA] Chrome предложил установку — запоминаем');
-    });
-
-    window.addEventListener('appinstalled', () => {
-        console.log('📱 [PWA] Приложение установлено');
-        try { localStorage.setItem(CFG.LS_PWA_HINT_SHOWN, '1'); } catch (e) {}
-        const hint = document.getElementById('pwaInstallHint');
-        if (hint) hint.remove();
-    });
-
-    // ═══════════════════════════════════════════════════════════
-    //  ТИХАЯ ПРОВЕРКА ТОКЕНА ПРИ СТАРТЕ
-    //  Возвращает: 'ok' | 'network-fail' | 'token-invalid'
+    //  ТИХАЯ ПРОВЕРКА ТОКЕНА
     // ═══════════════════════════════════════════════════════════
     async function checkTokenSilently(token) {
         try {
@@ -38377,7 +38194,7 @@ try {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ГЛАВНАЯ ФУНКЦИЯ: ВОССТАНОВЛЕНИЕ СЕССИИ
+    //  ГЛАВНАЯ ФУНКЦИЯ: ТИХОЕ ВОССТАНОВЛЕНИЕ СЕССИИ
     // ═══════════════════════════════════════════════════════════
     async function tryRestoreSession() {
         const session = loadSession();
@@ -38387,31 +38204,21 @@ try {
             return false;
         }
 
-        console.log(`🔑 [PersistentSession] Найдена сессия для ${session.username} (${session.source})`);
-
-        // Показываем оверлей загрузки (как при автозапуске чата)
-        const overlay = document.getElementById('autostartOverlay');
-        const nameEl = document.getElementById('autostartChatName');
-        if (overlay && nameEl) {
-            nameEl.textContent = 'восстанавливаем доступ…';
-            overlay.classList.add('show');
-        }
+        console.log(`🔑 [PersistentSession] Найдена сессия: ${session.username} (${session.source})`);
 
         try {
-            // Проверяем токен
+            // Проверяем токен (без оверлеев — просто молча)
             const check = await checkTokenSilently(session.token);
 
             if (check === 'token-invalid') {
                 console.warn('🔑 [PersistentSession] Токен невалиден');
-                if (overlay) overlay.classList.remove('show');
                 showSessionExpiredScreen('token-revoked');
-                return true; // обработали
+                return true;
             }
 
             if (check === 'network-fail') {
-                console.warn('🔑 [PersistentSession] Сеть недоступна — пробуем офлайн');
-                // Тихо продолжаем в офлайн-режиме
-                // (офлайн-кэш всё равно покажет чаты)
+                console.warn('🔑 [PersistentSession] Сеть недоступна — офлайн-режим');
+
                 state.username = session.username;
                 state.token = session.token;
                 state.isAuthorized = true;
@@ -38423,7 +38230,6 @@ try {
                     OfflineMode.activate('restore-offline');
                 }
 
-                if (overlay) overlay.classList.remove('show');
                 if (typeof showChatsScreen === 'function') showChatsScreen();
 
                 console.log('🔑 [PersistentSession] Восстановлено офлайн');
@@ -38435,7 +38241,6 @@ try {
             state.token = session.token;
             state.isAuthorized = true;
 
-            // Загружаем чаты и пароли
             if (typeof loadChatsList === 'function') loadChatsList();
             if (typeof loadSavedPasswords === 'function') loadSavedPasswords();
 
@@ -38445,7 +38250,7 @@ try {
             if (rememberMeInput) rememberMeInput.checked = true;
             if (rememberWarning) rememberWarning.style.display = 'block';
 
-            // Пытаемся запустить автозапуск чата (если настроен)
+            // Пробуем автозапуск чата
             let launched = false;
             try {
                 const autorunFile = (typeof getAutorunChat === 'function') ? getAutorunChat() : null;
@@ -38457,21 +38262,14 @@ try {
             }
 
             if (!launched) {
-                // Открываем список чатов
-                if (overlay) overlay.classList.remove('show');
                 if (typeof showChatsScreen === 'function') showChatsScreen();
             }
 
-            // Показываем подсказку про PWA
-            showPwaHint();
-
-            console.log('🔑 [PersistentSession] Сессия успешно восстановлена');
+            console.log('🔑 [PersistentSession] Сессия восстановлена');
             return true;
 
         } catch (e) {
-            console.error('🔑 [PersistentSession] Ошибка восстановления:', e);
-            if (overlay) overlay.classList.remove('show');
-            // Не блокируем — покажем обычный экран авторизации
+            console.error('🔑 [PersistentSession] Ошибка:', e);
             return false;
         }
     }
@@ -38483,12 +38281,8 @@ try {
         const _origLogin = login;
         login = async function() {
             const result = await _origLogin.apply(this, arguments);
-
-            // После успешного логина — сохраняем сессию
             if (state.isAuthorized && state.token && state.username) {
                 saveSession(state.username, state.token, 'manual');
-                // Показываем подсказку про PWA
-                showPwaHint();
             }
             return result;
         };
@@ -38508,33 +38302,24 @@ try {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ХУК В ПРИВЕТСТВЕННЫЙ ЭКРАН ПРИГЛАШЕНИЯ
-    //  Когда пользователь ввёл имя через Welcome-экран —
+    //  ХУК НА ПРИВЕТСТВЕННЫЙ ЭКРАН ПРИГЛАШЕНИЯ
+    //  Как только Welcome-экран закрылся и пользователь в чате —
     //  сохраняем сессию с источником 'invite'.
     // ═══════════════════════════════════════════════════════════
-    // Патчим функцию submit внутри showWelcomeScreen через
-    // переопределение самой функции. Но она в IIFE предыдущего патча.
-    // Поэтому — просто наблюдаем за появлением сессии.
-
-    // MutationObserver на welcomeInviteScreen — когда он исчезает,
-    // значит пользователь вошёл. Сохраняем сессию.
     const welcomeObserver = new MutationObserver(() => {
         const welcome = document.getElementById('welcomeInviteScreen');
         if (!welcome && state.isAuthorized && state.token && state.username) {
-            // Welcome-экран удалён — сохраняем сессию как invite
             const source = localStorage.getItem(CFG.LS_SESSION_SOURCE);
             if (source !== 'invite') {
                 saveSession(state.username, state.token, 'invite');
                 console.log('🔑 [PersistentSession] Сессия сохранена (invite)');
             }
-            // Показываем подсказку про PWA
-            showPwaHint();
         }
     });
     welcomeObserver.observe(document.body, { childList: true, subtree: true });
 
     // ═══════════════════════════════════════════════════════════
-    //  ПУБЛИЧНОЕ API
+    //  API
     // ═══════════════════════════════════════════════════════════
     window.PersistentSession = {
         get: loadSession,
@@ -38542,7 +38327,6 @@ try {
         clear: clearSession,
         showExpired: showSessionExpiredScreen,
         restore: tryRestoreSession,
-        showPwaHint,
         status: () => {
             const s = loadSession();
             return {
@@ -38550,36 +38334,30 @@ try {
                 username: s ? s.username : null,
                 source: s ? s.source : null,
                 tokenPreview: s && s.token ? s.token.slice(0, 8) + '…' : null,
-                pwaHintShown: localStorage.getItem(CFG.LS_PWA_HINT_SHOWN) === '1',
             };
         },
     };
 
     // ═══════════════════════════════════════════════════════════
-    //  ЗАПУСК: при старте пробуем восстановить сессию
+    //  ЗАПУСК
     // ═══════════════════════════════════════════════════════════
-    // Не запускаем, если в URL есть приглашение — там своя логика.
     const urlHasInvite = new URLSearchParams(location.search).get('invite');
 
     if (!urlHasInvite) {
-        // Ждём, пока основной скрипт выполнится
         setTimeout(async () => {
             const restored = await tryRestoreSession();
             if (restored) {
                 console.log('🔑 [PersistentSession] Автовосстановление сработало');
-            } else {
-                console.log('🔑 [PersistentSession] Восстановление не требуется');
             }
-        }, 1200); // ждём, пока все модули инициализируются
+        }, 1200);
     } else {
         console.log('🔑 [PersistentSession] Приглашение в URL — ждём его обработки');
     }
 
-    console.log('🔑 [PersistentSession] Патч установлен:');
-    console.log('   • Токен сохраняется в localStorage навсегда');
-    console.log('   • Автовосстановление сессии при старте');
+    console.log('🔑 [PersistentSession] Патч установлен (тихий режим):');
+    console.log('   • Токен сохраняется в localStorage');
+    console.log('   • Автовосстановление без оверлеев');
     console.log('   • Экран «Сессия истекла» при невалидном токене');
-    console.log('   • Подсказка про PWA — один раз после входа');
     console.log('   • API: PersistentSession.status() / .clear()');
 })();
 </script>
