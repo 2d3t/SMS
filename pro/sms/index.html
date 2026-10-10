@@ -37480,48 +37480,36 @@ try {
 </script>
 <script>
 // ═══════════════════════════════════════════════════════════════
-//  🔗 ВРЕМЕННЫЕ ССЫЛКИ-ПРИГЛАШЕНИЯ (2 минуты)
+//  🔗 ВРЕМЕННЫЕ ССЫЛКИ-ПРИГЛАШЕНИЯ v2 (с приветственным экраном)
 //  ─────────────────────────────────────────────────────────────
-//  • Кнопка «🔗 Временная ссылка» в модалке шаринга
-//  • В ссылке: токен + пароль чата + имя + ID + время + подпись
+//  • Кнопка «Другие приложения…» генерирует временную ссылку
+//  • Новый пользователь вводит имя перед входом в чат
 //  • Ссылка живёт 2 минуты, потом 410 Gone
 //  • Подпись HMAC-SHA256 — защита от подделки
-//  • При переходе: автовход + чистка URL
 // ═══════════════════════════════════════════════════════════════
 
-(function installTemporaryInviteLinks() {
+(function installTemporaryInviteLinksV2() {
     'use strict';
 
     // ═══════════════════════════════════════════════════════════
     //  КОНФИГ
     // ═══════════════════════════════════════════════════════════
     const CFG = {
-        // Сколько живёт ссылка
-        TTL_MS: 2 * 60 * 1000,       // 2 минуты
-        // TTL_MS: 10 * 60 * 1000,   // раскомментируй для 10 минут
-
-        // URL-параметр, по которому ловим приглашение
+        TTL_MS: 2 * 60 * 1000,
         URL_PARAM: 'invite',
-
-        // Префикс для HMAC (соль приложения — не секретная, но фиксированная)
         HMAC_PREFIX: 'smschat-invite-v1:',
-
-        // Хранилище для проверки «одноразовости» (можно выключить)
         USED_KEY: 'smschat_used_invites_v1',
-        ENABLE_ONETIME: true,        // true — каждая ссылка работает 1 раз
+        ENABLE_ONETIME: true,
     };
 
     // ═══════════════════════════════════════════════════════════
-    //  УТИЛИТЫ: base64url (безопасный для URL)
+    //  УТИЛИТЫ: base64url
     // ═══════════════════════════════════════════════════════════
     function toBase64Url(str) {
         const utf8 = new TextEncoder().encode(str);
         let binary = '';
         utf8.forEach(b => binary += String.fromCharCode(b));
-        return btoa(binary)
-            .replace(/\+/g, '-')
-            .replace(/\//g, '_')
-            .replace(/=+$/, '');
+        return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
     }
 
     function fromBase64Url(b64url) {
@@ -37534,22 +37522,11 @@ try {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  HMAC-SHA256 (Web Crypto)
+    //  HMAC-SHA256
     // ═══════════════════════════════════════════════════════════
     async function getHmacKey() {
-        // Ключ деривим из префикса + UA (чтобы ссылка не работала,
-        // если её открыли в другом браузере/устройстве — это доп. защита)
-        // Но! Это сломает «отправил другу» — у друга другой UA.
-        // Поэтому ключ = только префикс. Подпись защищает от
-        // случайных/простых подделок, не от мотивированного атакующего.
         const enc = new TextEncoder();
-        return crypto.subtle.importKey(
-            'raw',
-            enc.encode(CFG.HMAC_PREFIX),
-            { name: 'HMAC', hash: 'SHA-256' },
-            false,
-            ['sign', 'verify']
-        );
+        return crypto.subtle.importKey('raw', enc.encode(CFG.HMAC_PREFIX), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']);
     }
 
     async function signPayload(payloadStr) {
@@ -37572,384 +37549,125 @@ try {
             const sigBytes = new Uint8Array(binary.length);
             for (let i = 0; i < binary.length; i++) sigBytes[i] = binary.charCodeAt(i);
             return await crypto.subtle.verify('HMAC', key, sigBytes, enc.encode(payloadStr));
-        } catch (e) {
-            return false;
-        }
+        } catch (e) { return false; }
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ХРАНИЛИЩЕ ИСПОЛЬЗОВАННЫХ ССЫЛОК (для one-time режима)
+    //  ХРАНИЛИЩЕ ОДНОРАЗОВЫХ ССЫЛОК
     // ═══════════════════════════════════════════════════════════
     function loadUsedInvites() {
-        try {
-            const raw = localStorage.getItem(CFG.USED_KEY);
-            return raw ? JSON.parse(raw) : {};
-        } catch (e) { return {}; }
+        try { return JSON.parse(localStorage.getItem(CFG.USED_KEY) || '{}'); } catch (e) { return {}; }
     }
-
     function markInviteUsed(jti) {
         if (!CFG.ENABLE_ONETIME || !jti) return;
         try {
             const used = loadUsedInvites();
             used[jti] = Date.now();
-            // Чистим старые (> 1 час)
             const cutoff = Date.now() - 60 * 60 * 1000;
-            for (const k of Object.keys(used)) {
-                if (used[k] < cutoff) delete used[k];
-            }
+            for (const k of Object.keys(used)) { if (used[k] < cutoff) delete used[k]; }
             localStorage.setItem(CFG.USED_KEY, JSON.stringify(used));
         } catch (e) {}
     }
-
     function isInviteUsed(jti) {
         if (!CFG.ENABLE_ONETIME || !jti) return false;
-        const used = loadUsedInvites();
-        return !!used[jti];
+        return !!loadUsedInvites()[jti];
     }
 
     // ═══════════════════════════════════════════════════════════
     //  ГЕНЕРАЦИЯ ССЫЛКИ
     // ═══════════════════════════════════════════════════════════
     async function buildInviteLink(chatFile) {
-        // ─── 1. Проверяем, что у нас есть всё нужное ───
-        if (!state.isAuthorized || !state.token) {
-            throw new Error('Нужна авторизация');
-        }
-        if (!chatFile) {
-            throw new Error('Чат не указан');
-        }
+        if (!state.isAuthorized || !state.token) throw new Error('Нужна авторизация');
+        if (!chatFile) throw new Error('Чат не указан');
         const password = state.savedPasswords[chatFile];
-        if (!password) {
-            throw new Error('Пароль чата не сохранён. Сохраните его при входе и попробуйте снова.');
-        }
+        if (!password) throw new Error('Пароль чата не сохранён');
         const chat = state.chats.find(c => c.file === chatFile);
-        if (!chat) {
-            throw new Error('Чат не найден в списке');
-        }
+        if (!chat) throw new Error('Чат не найден');
 
-        // ─── 2. Формируем payload ───
         const now = Date.now();
         const jti = 'inv_' + now + '_' + Math.random().toString(36).slice(2, 10);
 
         const payload = {
-            v: 1,                       // версия формата
-            jti: jti,                   // уникальный ID (для one-time)
-            iat: now,                   // issued at
-            exp: now + CFG.TTL_MS,      // expires at
-            chat: {
-                file: chatFile,
-                name: chat.name || chatFile,
-            },
-            // ⚠️ ВНИМАНИЕ: токен и пароль в открытом виде (внутри base64).
-            // Это осознанный компромисс ради UX. Защита — короткий TTL.
-            token: state.token,
-            password: password,
-            username: state.username,
+            v: 1, jti, iat: now, exp: now + CFG.TTL_MS,
+            chat: { file: chatFile, name: chat.name || chatFile },
+            token: state.token, password: password, username: state.username,
         };
 
-        const payloadStr = JSON.stringify(payload);
-        const payloadB64 = toBase64Url(payloadStr);
-
-        // ─── 3. Подпись ───
+        const payloadB64 = toBase64Url(JSON.stringify(payload));
         const signature = await signPayload(payloadB64);
-
-        // ─── 4. Собираем URL ───
-        // Берём текущий origin + pathname (без hash и search)
         const baseUrl = location.origin + location.pathname;
         const url = `${baseUrl}?${CFG.URL_PARAM}=${payloadB64}.${signature}`;
 
-        return {
-            url,
-            payload,
-            expiresAt: payload.exp,
-        };
+        return { url, payload };
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ПРОВЕРКА И РАСШИФРОВКА ССЫЛКИ (при загрузке)
+    //  ПРОВЕРКА ССЫЛКИ
     // ═══════════════════════════════════════════════════════════
     async function parseAndValidateInvite(rawParam) {
-        // ─── 1. Формат: <payloadB64>.<signature> ───
         const dotIdx = rawParam.lastIndexOf('.');
-        if (dotIdx < 0) {
-            return { ok: false, reason: 'invalid_format', message: 'Неверный формат ссылки' };
-        }
+        if (dotIdx < 0) return { ok: false, reason: 'invalid_format', message: 'Неверный формат ссылки' };
         const payloadB64 = rawParam.slice(0, dotIdx);
         const signature = rawParam.slice(dotIdx + 1);
 
-        if (!payloadB64 || !signature) {
-            return { ok: false, reason: 'invalid_format', message: 'Неверный формат ссылки' };
-        }
-
-        // ─── 2. Проверяем подпись ───
         const sigValid = await verifySignature(payloadB64, signature);
-        if (!sigValid) {
-            return { ok: false, reason: 'bad_signature', message: 'Подпись ссылки недействительна' };
-        }
+        if (!sigValid) return { ok: false, reason: 'bad_signature', message: 'Подпись ссылки недействительна' };
 
-        // ─── 3. Распаковываем payload ───
         let payload;
-        try {
-            const json = fromBase64Url(payloadB64);
-            payload = JSON.parse(json);
-        } catch (e) {
-            return { ok: false, reason: 'bad_payload', message: 'Не удалось прочитать ссылку' };
-        }
+        try { payload = JSON.parse(fromBase64Url(payloadB64)); }
+        catch (e) { return { ok: false, reason: 'bad_payload', message: 'Не удалось прочитать ссылку' }; }
 
-        // ─── 4. Проверяем версию ───
-        if (payload.v !== 1) {
-            return { ok: false, reason: 'bad_version', message: 'Неподдерживаемая версия ссылки' };
-        }
-
-        // ─── 5. Проверяем срок ───
+        if (payload.v !== 1) return { ok: false, reason: 'bad_version', message: 'Неподдерживаемая версия' };
         const now = Date.now();
-        if (!payload.exp || now > payload.exp) {
-            const expiredAgo = payload.exp ? Math.round((now - payload.exp) / 1000) : 0;
-            return {
-                ok: false,
-                reason: 'expired',
-                message: `Ссылка истекла ${expiredAgo} сек назад`,
-                expiredAgo,
-            };
-        }
-
-        // ─── 6. Проверяем one-time ───
-        if (CFG.ENABLE_ONETIME && payload.jti && isInviteUsed(payload.jti)) {
-            return { ok: false, reason: 'used', message: 'Ссылка уже была использована' };
-        }
-
-        // ─── 7. Валидация обязательных полей ───
-        if (!payload.token || !payload.password || !payload.chat?.file) {
-            return { ok: false, reason: 'incomplete', message: 'Ссылка повреждена' };
-        }
+        if (!payload.exp || now > payload.exp) return { ok: false, reason: 'expired', message: 'Ссылка истекла' };
+        if (isInviteUsed(payload.jti)) return { ok: false, reason: 'used', message: 'Ссылка уже использована' };
+        if (!payload.token || !payload.password || !payload.chat?.file) return { ok: false, reason: 'incomplete', message: 'Ссылка повреждена' };
 
         return { ok: true, payload };
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  UI: модалка с результатом
+    //  UI: СТИЛИ
     // ═══════════════════════════════════════════════════════════
     function ensureInviteStyles() {
-        if (document.getElementById('inviteLinkStyles')) return;
+        if (document.getElementById('inviteLinkStylesV2')) return;
         const style = document.createElement('style');
-        style.id = 'inviteLinkStyles';
+        style.id = 'inviteLinkStylesV2';
         style.textContent = `
-            #inviteLinkModal .inv-link-box {
-                background: rgba(0,0,0,0.3);
-                border: 1px solid rgba(108,92,231,0.35);
-                border-radius: 12px;
-                padding: 10px 12px;
-                margin-bottom: 14px;
-                word-break: break-all;
-                font-family: 'SF Mono', 'Courier New', monospace;
-                font-size: 11px;
-                color: #a78bfa;
-                max-height: 120px;
-                overflow-y: auto;
-                line-height: 1.5;
-                user-select: text;
-                -webkit-user-select: text;
-            }
-            #inviteLinkModal .inv-timer {
-                display: flex;
-                align-items: center;
-                gap: 10px;
-                padding: 10px 14px;
-                background: linear-gradient(135deg, rgba(254,202,87,0.15), rgba(255,159,67,0.1));
-                border: 1px solid rgba(254,202,87,0.4);
-                border-radius: 12px;
-                margin-bottom: 14px;
-                font-size: 13px;
-                color: #feca57;
-                font-weight: 600;
-            }
-            #inviteLinkModal .inv-timer-icon {
-                font-size: 20px;
-                flex-shrink: 0;
-            }
-            #inviteLinkModal .inv-timer-bar {
-                flex: 1;
-                height: 4px;
-                background: rgba(0,0,0,0.3);
-                border-radius: 2px;
-                overflow: hidden;
-                position: relative;
-            }
-            #inviteLinkModal .inv-timer-fill {
-                position: absolute;
-                left: 0; top: 0; bottom: 0;
-                background: linear-gradient(90deg, #00b894, #feca57);
-                border-radius: 2px;
-                transition: width 1s linear;
-            }
-            #inviteLinkModal .inv-countdown {
-                font-variant-numeric: tabular-nums;
-                font-weight: 700;
-                min-width: 40px;
-                text-align: right;
-            }
-            #inviteLinkModal .inv-warn {
-                background: rgba(255,107,107,0.08);
-                border: 1px solid rgba(255,107,107,0.25);
-                border-radius: 10px;
-                padding: 10px 12px;
-                font-size: 11px;
-                color: #ff8a8a;
-                line-height: 1.6;
-                margin-bottom: 14px;
-            }
-            #inviteLinkModal .inv-actions {
-                display: flex;
-                gap: 8px;
-            }
+            /* === Модалка с готовой ссылкой === */
+            #inviteLinkModal .inv-link-box { background: rgba(0,0,0,0.3); border: 1px solid rgba(108,92,231,0.35); border-radius: 12px; padding: 10px 12px; margin-bottom: 14px; word-break: break-all; font-family: 'SF Mono', 'Courier New', monospace; font-size: 11px; color: #a78bfa; max-height: 120px; overflow-y: auto; line-height: 1.5; user-select: text; -webkit-user-select: text; }
+            #inviteLinkModal .inv-timer { display: flex; align-items: center; gap: 10px; padding: 10px 14px; background: linear-gradient(135deg, rgba(254,202,87,0.15), rgba(255,159,67,0.1)); border: 1px solid rgba(254,202,87,0.4); border-radius: 12px; margin-bottom: 14px; font-size: 13px; color: #feca57; font-weight: 600; }
+            #inviteLinkModal .inv-timer-bar { flex: 1; height: 4px; background: rgba(0,0,0,0.3); border-radius: 2px; overflow: hidden; position: relative; }
+            #inviteLinkModal .inv-timer-fill { position: absolute; left: 0; top: 0; bottom: 0; background: linear-gradient(90deg, #00b894, #feca57); border-radius: 2px; transition: width 1s linear; }
+            #inviteLinkModal .inv-countdown { font-variant-numeric: tabular-nums; font-weight: 700; min-width: 40px; text-align: right; }
+            #inviteLinkModal .inv-warn { background: rgba(255,107,107,0.08); border: 1px solid rgba(255,107,107,0.25); border-radius: 10px; padding: 10px 12px; font-size: 11px; color: #ff8a8a; line-height: 1.6; margin-bottom: 14px; }
+            #inviteLinkModal .inv-actions { display: flex; gap: 8px; }
             #inviteLinkModal .inv-actions .btn { flex: 1; }
 
-            /* Кнопка в share-модалке */
-            .share-temp-invite-btn {
-                width: 100%;
-                display: flex;
-                align-items: center;
-                gap: 12px;
-                padding: 12px 14px;
-                background: linear-gradient(135deg, rgba(254,202,87,0.15), rgba(255,159,67,0.1));
-                border: 1px solid rgba(254,202,87,0.35);
-                border-radius: 12px;
-                color: #fff;
-                cursor: pointer;
-                transition: all 0.15s;
-                font-family: inherit;
-                text-align: left;
-                margin-bottom: 8px;
-            }
-            .share-temp-invite-btn:hover {
-                background: linear-gradient(135deg, rgba(254,202,87,0.25), rgba(255,159,67,0.18));
-                border-color: rgba(254,202,87,0.6);
-                transform: translateY(-1px);
-                box-shadow: 0 4px 14px rgba(254,202,87,0.25);
-            }
-            .share-temp-invite-btn:active {
-                transform: scale(0.98);
-            }
-            .share-temp-invite-btn:disabled {
-                opacity: 0.4;
-                cursor: not-allowed;
-                transform: none;
-            }
-            .share-temp-invite-btn .stib-icon {
-                width: 40px;
-                height: 40px;
-                border-radius: 12px;
-                background: linear-gradient(135deg, rgba(254,202,87,0.3), rgba(255,159,67,0.2));
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                font-size: 20px;
-                flex-shrink: 0;
-            }
-            .share-temp-invite-btn .stib-body {
-                flex: 1;
-                min-width: 0;
-            }
-            .share-temp-invite-btn .stib-title {
-                font-size: 14px;
-                font-weight: 700;
-                color: #feca57;
-                margin-bottom: 2px;
-            }
-            .share-temp-invite-btn .stib-sub {
-                font-size: 11px;
-                color: #a78bfa;
-            }
+            /* === Приветственный экран === */
+            #welcomeInviteScreen { position: fixed; inset: 0; background: linear-gradient(135deg, #0a0a0f, #1a1a2e); z-index: 10000; display: none; flex-direction: column; align-items: center; justify-content: center; padding: 30px; text-align: center; animation: invErrFade 0.4s ease; }
+            #welcomeInviteScreen.show { display: flex; }
+            #welcomeInviteScreen .wis-icon { font-size: 64px; margin-bottom: 12px; line-height: 1; }
+            #welcomeInviteScreen .wis-title { font-size: 24px; font-weight: 700; color: #fff; margin-bottom: 8px; }
+            #welcomeInviteScreen .wis-sub { font-size: 14px; color: #888; line-height: 1.6; max-width: 400px; margin-bottom: 24px; }
+            #welcomeInviteScreen .wis-input-wrap { width: 100%; max-width: 380px; margin-bottom: 20px; }
+            #welcomeInviteScreen .wis-input-wrap input { width: 100%; padding: 16px 18px; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1); border-radius: 14px; color: #fff; font-size: 17px; text-align: center; outline: none; transition: all 0.3s; }
+            #welcomeInviteScreen .wis-input-wrap input:focus { border-color: #6c5ce7; background: rgba(255,255,255,0.08); box-shadow: 0 0 0 4px rgba(108,92,231,0.15); }
+            #welcomeInviteScreen .wis-input-wrap input::placeholder { color: #555; }
+            #welcomeInviteScreen .wis-btn { padding: 14px 40px; border-radius: 14px; border: none; background: linear-gradient(135deg, #6c5ce7, #00b894); color: #fff; font-size: 16px; font-weight: 600; cursor: pointer; font-family: inherit; transition: all 0.2s; }
+            #welcomeInviteScreen .wis-btn:active { transform: scale(0.96); }
+            #welcomeInviteScreen .wis-btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
 
-            /* Экран ошибки приглашения */
-            #inviteErrorScreen {
-                position: fixed;
-                inset: 0;
-                background: linear-gradient(135deg, #0a0a0f, #1a1a2e);
-                z-index: 10000;
-                display: none;
-                flex-direction: column;
-                align-items: center;
-                justify-content: center;
-                padding: 30px;
-                text-align: center;
-                animation: invErrFade 0.3s ease;
-            }
+            /* === Экран ошибки === */
+            #inviteErrorScreen { position: fixed; inset: 0; background: linear-gradient(135deg, #0a0a0f, #1a1a2e); z-index: 10000; display: none; flex-direction: column; align-items: center; justify-content: center; padding: 30px; text-align: center; }
             #inviteErrorScreen.show { display: flex; }
-            @keyframes invErrFade {
-                from { opacity: 0; }
-                to { opacity: 1; }
-            }
-            #inviteErrorScreen .ies-icon {
-                font-size: 72px;
-                margin-bottom: 16px;
-                line-height: 1;
-            }
-            #inviteErrorScreen .ies-title {
-                font-size: 22px;
-                font-weight: 700;
-                color: #fff;
-                margin-bottom: 10px;
-            }
-            #inviteErrorScreen .ies-message {
-                font-size: 14px;
-                color: #aaa;
-                line-height: 1.6;
-                max-width: 400px;
-                margin-bottom: 24px;
-            }
-            #inviteErrorScreen .ies-btn {
-                padding: 12px 28px;
-                border-radius: 12px;
-                border: none;
-                background: linear-gradient(135deg, #6c5ce7, #00b894);
-                color: #fff;
-                font-size: 15px;
-                font-weight: 600;
-                cursor: pointer;
-                font-family: inherit;
-            }
-            #inviteErrorScreen .ies-btn:active {
-                transform: scale(0.96);
-            }
+            #inviteErrorScreen .ies-icon { font-size: 72px; margin-bottom: 16px; line-height: 1; }
+            #inviteErrorScreen .ies-title { font-size: 22px; font-weight: 700; color: #fff; margin-bottom: 10px; }
+            #inviteErrorScreen .ies-message { font-size: 14px; color: #aaa; line-height: 1.6; max-width: 400px; margin-bottom: 24px; }
+            #inviteErrorScreen .ies-btn { padding: 12px 28px; border-radius: 12px; border: none; background: linear-gradient(135deg, #6c5ce7, #00b894); color: #fff; font-size: 15px; font-weight: 600; cursor: pointer; font-family: inherit; }
+            #inviteErrorScreen .ies-btn:active { transform: scale(0.96); }
 
-            /* Экран загрузки приглашения */
-            #inviteLoadingScreen {
-                position: fixed;
-                inset: 0;
-                background: linear-gradient(135deg, #0a0a0f, #1a1a2e);
-                z-index: 10000;
-                display: none;
-                flex-direction: column;
-                align-items: center;
-                justify-content: center;
-                padding: 30px;
-                text-align: center;
-            }
-            #inviteLoadingScreen.show { display: flex; }
-            #inviteLoadingScreen .ils-spinner {
-                width: 56px;
-                height: 56px;
-                border: 4px solid rgba(108,92,231,0.2);
-                border-top-color: #6c5ce7;
-                border-right-color: #00b894;
-                border-radius: 50%;
-                animation: ilsSpin 0.9s linear infinite;
-                margin-bottom: 20px;
-            }
-            @keyframes ilsSpin { to { transform: rotate(360deg); } }
-            #inviteLoadingScreen .ils-title {
-                font-size: 18px;
-                font-weight: 700;
-                color: #fff;
-                margin-bottom: 8px;
-            }
-            #inviteLoadingScreen .ils-sub {
-                font-size: 13px;
-                color: #888;
-                line-height: 1.5;
-                max-width: 360px;
-            }
+            @keyframes invErrFade { from { opacity: 0; } to { opacity: 1; } }
         `;
         document.head.appendChild(style);
     }
@@ -37961,7 +37679,6 @@ try {
 
     function showInviteModal(url, payload) {
         ensureInviteStyles();
-
         let modal = document.getElementById('inviteLinkModal');
         if (modal) modal.remove();
 
@@ -37971,143 +37688,159 @@ try {
         modal.innerHTML = `
             <div class="form-modal-content" style="max-width:460px;">
                 <h2>🔗 Временная ссылка</h2>
-
                 <div class="inv-timer">
                     <span class="inv-timer-icon">⏱</span>
-                    <div class="inv-timer-bar">
-                        <div class="inv-timer-fill" id="invTimerFill" style="width:100%"></div>
-                    </div>
+                    <div class="inv-timer-bar"><div class="inv-timer-fill" id="invTimerFill" style="width:100%"></div></div>
                     <span class="inv-countdown" id="invCountdown">--</span>
                 </div>
-
                 <div class="inv-link-box" id="invLinkBox">${url}</div>
-
                 <div class="inv-warn">
                     ⚠️ В ссылке зашифрован ваш <strong>GitHub-токен и пароль чата</strong>.
-                    Не публикуйте её в открытых чатах. Через ${Math.round(CFG.TTL_MS/1000)} секунд
-                    она перестанет работать.
+                    Не публикуйте её в открытых чатах. Через ${Math.round(CFG.TTL_MS/1000)} секунд она перестанет работать.
                 </div>
-
                 <div class="inv-actions" style="margin-bottom:8px;">
                     <button class="btn btn-secondary" id="invCopyBtn">📋 Копировать</button>
                     <button class="btn" id="invShareBtn">📤 Поделиться</button>
                 </div>
-
-                <div class="modal-actions">
-                    <button class="btn btn-secondary" id="invCloseBtn" style="width:100%;">Закрыть</button>
-                </div>
-            </div>
-        `;
+                <div class="modal-actions"><button class="btn btn-secondary" id="invCloseBtn" style="width:100%;">Закрыть</button></div>
+            </div>`;
         document.body.appendChild(modal);
 
         const linkBox = modal.querySelector('#invLinkBox');
         const countdownEl = modal.querySelector('#invCountdown');
         const fillEl = modal.querySelector('#invTimerFill');
 
-        // ─── Таймер ───
         if (_inviteTimerInterval) clearInterval(_inviteTimerInterval);
         const tick = () => {
             const remaining = payload.exp - Date.now();
             if (remaining <= 0) {
-                countdownEl.textContent = '0s';
-                fillEl.style.width = '0%';
-                clearInterval(_inviteTimerInterval);
-                _inviteTimerInterval = null;
-                // Красная рамка
+                countdownEl.textContent = '0s'; fillEl.style.width = '0%';
+                clearInterval(_inviteTimerInterval); _inviteTimerInterval = null;
                 linkBox.style.borderColor = 'rgba(255,107,107,0.6)';
                 linkBox.style.color = '#ff6b6b';
                 return;
             }
             const totalSec = Math.round(remaining / 1000);
-            const mins = Math.floor(totalSec / 60);
-            const secs = totalSec % 60;
-            countdownEl.textContent = mins > 0
-                ? `${mins}:${secs.toString().padStart(2, '0')}`
-                : `${secs}s`;
+            countdownEl.textContent = totalSec >= 60 ? `${Math.floor(totalSec/60)}:${(totalSec%60).toString().padStart(2,'0')}` : `${totalSec}s`;
             fillEl.style.width = ((remaining / CFG.TTL_MS) * 100) + '%';
         };
         tick();
         _inviteTimerInterval = setInterval(tick, 250);
 
-        // ─── Кнопка «Копировать» ───
         modal.querySelector('#invCopyBtn').addEventListener('click', async () => {
-            try {
-                await navigator.clipboard.writeText(url);
-                showToast('📋 Ссылка скопирована', 1500);
-                soundManager.play('click');
-            } catch (e) {
-                // Fallback: выделяем текст
-                const range = document.createRange();
-                range.selectNodeContents(linkBox);
-                const sel = window.getSelection();
-                sel.removeAllRanges();
-                sel.addRange(range);
-                showToast('📋 Выделите и скопируйте вручную', 2000);
-            }
+            try { await navigator.clipboard.writeText(url); showToast('📋 Ссылка скопирована', 1500); soundManager.play('click'); }
+            catch (e) { showToast('📋 Выделите и скопируйте вручную', 2000); }
         });
 
-        // ─── Кнопка «Поделиться» ───
         modal.querySelector('#invShareBtn').addEventListener('click', async () => {
             if (navigator.share) {
-                try {
-                    await navigator.share({
-                        title: `Приглашение в «${payload.chat.name}»`,
-                        text: `Присоединяйся к чату! Ссылка действует 2 минуты:`,
-                        url: url,
-                    });
-                    return;
-                } catch (e) {
-                    if (e.name === 'AbortError') return;
-                }
+                try { await navigator.share({ title: `Приглашение в «${payload.chat.name}»`, url }); return; }
+                catch (e) { if (e.name === 'AbortError') return; }
             }
-            // Fallback: копируем
-            try {
-                await navigator.clipboard.writeText(url);
-                showToast('📋 Ссылка скопирована (share недоступен)', 2000);
-            } catch (e) {
-                showToast('❌ Не удалось поделиться', 2000);
-            }
+            try { await navigator.clipboard.writeText(url); showToast('📋 Ссылка скопирована', 2000); }
+            catch (e) { showToast('❌ Не удалось поделиться', 2000); }
         });
 
-        // ─── Закрыть ───
-        const close = () => {
-            modal.remove();
-            if (_inviteTimerInterval) {
-                clearInterval(_inviteTimerInterval);
-                _inviteTimerInterval = null;
-            }
-        };
+        const close = () => { modal.remove(); if (_inviteTimerInterval) { clearInterval(_inviteTimerInterval); _inviteTimerInterval = null; } };
         modal.querySelector('#invCloseBtn').addEventListener('click', close);
-        modal.addEventListener('click', (e) => {
-            if (e.target === modal) close();
-        });
-        document.addEventListener('keydown', function escHandler(ev) {
-            if (ev.key === 'Escape') {
-                close();
-                document.removeEventListener('keydown', escHandler);
-            }
-        });
+        modal.addEventListener('click', (e) => { if (e.target === modal) close(); });
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ЭКРАНЫ ОШИБКИ И ЗАГРУЗКИ ПРИГЛАШЕНИЯ
+    //  ЭКРАНЫ: ПРИВЕТСТВИЕ / ОШИБКА
     // ═══════════════════════════════════════════════════════════
+    function showWelcomeScreen(payload) {
+        ensureInviteStyles();
+        let screen = document.getElementById('welcomeInviteScreen');
+        if (screen) screen.remove();
+
+        screen = document.createElement('div');
+        screen.id = 'welcomeInviteScreen';
+        screen.className = 'show';
+        screen.innerHTML = `
+            <div class="wis-icon">👋</div>
+            <div class="wis-title">Добро пожаловать!</div>
+            <div class="wis-sub">Вас пригласили в чат «${escapeHtml(payload.chat.name)}».<br>Введите ваше имя, чтобы продолжить.</div>
+            <div class="wis-input-wrap">
+                <input type="text" id="wisNameInput" placeholder="Ваше имя" maxlength="20" autocomplete="off" spellcheck="false">
+            </div>
+            <button class="wis-btn" id="wisSubmitBtn">Войти в чат</button>
+        `;
+        document.body.appendChild(screen);
+
+        const input = screen.querySelector('#wisNameInput');
+        const btn = screen.querySelector('#wisSubmitBtn');
+
+        setTimeout(() => input.focus(), 300);
+
+        const submit = async () => {
+            const name = input.value.trim();
+            if (name.length < 2) { showToast('❌ Имя должно быть не короче 2 символов', 2000); return; }
+            if (name.length > 20) { showToast('❌ Имя не должно быть длиннее 20 символов', 2000); return; }
+
+            btn.disabled = true;
+            btn.textContent = '⏳ Подключаемся…';
+
+            try {
+                // Применяем токен и пользователя
+                state.username = name;
+                state.token = payload.token;
+                state.isAuthorized = true;
+                localStorage.setItem('chathub_username', name);
+
+                if (typeof loadChatsList === 'function') loadChatsList();
+                if (typeof loadSavedPasswords === 'function') loadSavedPasswords();
+
+                // Добавляем/обновляем чат
+                const chatFile = payload.chat.file;
+                const chatName = payload.chat.name || chatFile;
+                if (!state.chats.find(c => c.file === chatFile)) {
+                    state.chats.push({ name: chatName, file: chatFile, createdAt: new Date().toISOString() });
+                }
+                if (typeof saveChatsList === 'function') saveChatsList();
+
+                // Сохраняем пароль
+                state.savedPasswords[chatFile] = payload.password;
+                if (typeof saveSavedPasswords === 'function') saveSavedPasswords();
+
+                // Обновляем поля на экране авторизации
+                if (usernameInput) usernameInput.value = name;
+                if (tokenInput) tokenInput.value = state.token;
+
+                // Входим в чат
+                await enterChat(chatFile, chatName, payload.password);
+
+                screen.remove();
+                showToast(`✅ Добро пожаловать в «${chatName}», ${name}!`, 3000);
+                soundManager.play('notification');
+
+            } catch (e) {
+                console.error('🔗 [Invite v2] Ошибка входа:', e);
+                btn.disabled = false;
+                btn.textContent = 'Войти в чат';
+                showToast('❌ Не удалось войти: ' + e.message, 4000);
+                showInviteError('unknown', 'Не удалось открыть чат. Возможно, ссылка устарела или токен недействителен.');
+            }
+        };
+
+        btn.addEventListener('click', submit);
+        input.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
+    }
+
     function showInviteError(reason, message) {
         ensureInviteStyles();
-
         let screen = document.getElementById('inviteErrorScreen');
         if (screen) screen.remove();
 
         const configs = {
-            expired:   { icon: '⏰', title: 'Ссылка истекла' },
-            used:      { icon: '🚫', title: 'Ссылка уже использована' },
+            expired: { icon: '⏰', title: 'Ссылка истекла' },
+            used: { icon: '🚫', title: 'Ссылка уже использована' },
             bad_signature: { icon: '🔒', title: 'Подпись недействительна' },
             invalid_format: { icon: '❓', title: 'Неверная ссылка' },
             bad_payload: { icon: '❓', title: 'Ссылка повреждена' },
             bad_version: { icon: '❓', title: 'Устаревшая ссылка' },
             incomplete: { icon: '❓', title: 'Ссылка неполная' },
-            network:   { icon: '📵', title: 'Нет связи' },
-            unknown:   { icon: '❌', title: 'Ошибка' },
+            unknown: { icon: '❌', title: 'Ошибка' },
         };
         const cfg = configs[reason] || configs.unknown;
 
@@ -38123,31 +37856,9 @@ try {
         document.body.appendChild(screen);
 
         screen.querySelector('#iesOkBtn').addEventListener('click', () => {
-            // Чистим URL
-            const cleanUrl = location.origin + location.pathname;
-            history.replaceState({}, '', cleanUrl);
+            history.replaceState({}, '', location.origin + location.pathname);
             screen.remove();
         });
-    }
-
-    function showInviteLoading() {
-        ensureInviteStyles();
-        let screen = document.getElementById('inviteLoadingScreen');
-        if (screen) return;
-        screen = document.createElement('div');
-        screen.id = 'inviteLoadingScreen';
-        screen.className = 'show';
-        screen.innerHTML = `
-            <div class="ils-spinner"></div>
-            <div class="ils-title">Подключаемся…</div>
-            <div class="ils-sub">Открываем приглашение.<br>Это займёт пару секунд.</div>
-        `;
-        document.body.appendChild(screen);
-    }
-
-    function hideInviteLoading() {
-        const screen = document.getElementById('inviteLoadingScreen');
-        if (screen) screen.remove();
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -38158,315 +37869,718 @@ try {
         const rawParam = params.get(CFG.URL_PARAM);
         if (!rawParam) return false;
 
-        console.log('🔗 [Invite] Обнаружено приглашение в URL');
+        console.log('🔗 [Invite v2] Обнаружено приглашение');
+        const result = await parseAndValidateInvite(rawParam);
 
-        showInviteLoading();
-
-        try {
-            const result = await parseAndValidateInvite(rawParam);
-
-            if (!result.ok) {
-                console.warn('🔗 [Invite] Невалидное приглашение:', result.reason);
-                hideInviteLoading();
-                showInviteError(result.reason, result.message);
-                // Чистим URL
-                const cleanUrl = location.origin + location.pathname;
-                history.replaceState({}, '', cleanUrl);
-                return true;
-            }
-
-            const payload = result.payload;
-            console.log('🔗 [Invite] Валидное приглашение:', {
-                chat: payload.chat.name,
-                file: payload.chat.file,
-                expiresIn: Math.round((payload.exp - Date.now()) / 1000) + 's',
-            });
-
-            // ─── Отмечаем как использованное (если one-time) ───
-            markInviteUsed(payload.jti);
-
-            // ─── Чистим URL сразу, чтобы при перезагрузке не сработало снова ───
-            const cleanUrl = location.origin + location.pathname;
-            history.replaceState({}, '', cleanUrl);
-
-            // ─── Применяем токен и username ───
-            state.username = payload.username || 'Гость';
-            state.token = payload.token;
-            state.isAuthorized = true;
-
-            // Сохраняем в localStorage, как при обычном входе
-            // (без галочки «запомнить» — на сессию)
-            try {
-                localStorage.setItem('chathub_username', state.username);
-                // НЕ сохраняем токен в localStorage надолго — только на текущую сессию
-                // При следующем запуске пользователь снова введёт свой токен
-            } catch (e) {}
-
-            // ─── Загружаем списки чатов ───
-            if (typeof loadChatsList === 'function') loadChatsList();
-            if (typeof loadSavedPasswords === 'function') loadSavedPasswords();
-
-            // ─── Добавляем/обновляем чат в списке ───
-            const chatFile = payload.chat.file;
-            const chatName = payload.chat.name || chatFile;
-            const existing = state.chats.find(c => c.file === chatFile);
-
-            if (existing) {
-                existing.name = chatName;
-            } else {
-                state.chats.push({
-                    name: chatName,
-                    file: chatFile,
-                    createdAt: new Date().toISOString(),
-                });
-            }
-            if (typeof saveChatsList === 'function') saveChatsList();
-
-            // ─── Сохраняем пароль чата ───
-            state.savedPasswords[chatFile] = payload.password;
-            if (typeof saveSavedPasswords === 'function') saveSavedPasswords();
-
-            // ─── Обновляем поля на экране авторизации (на случай logout) ───
-            if (usernameInput) usernameInput.value = state.username;
-            if (tokenInput) tokenInput.value = state.token;
-
-            // ─── Тихонько проверяем токен в фоне (не блокируя) ───
-            // Если токен невалиден — покажем ошибку
-            try {
-                const accessCheck = await validateTokenAccess(state.token);
-                if (!accessCheck.ok) {
-                    hideInviteLoading();
-                    showInviteError('unknown',
-                        'Токен в ссылке недействителен: ' + accessCheck.message +
-                        '\n\nПопросите отправителя обновить токен и создать новую ссылку.');
-                    return true;
-                }
-            } catch (e) {
-                // Сетевая ошибка — не критично, продолжаем
-                console.warn('🔗 [Invite] Проверка токена не удалась:', e.message);
-            }
-
-            // ─── Автовход в чат ───
-            hideInviteLoading();
-
-            try {
-                if (typeof enterChat === 'function') {
-                    await enterChat(chatFile, chatName, payload.password);
-                    showToast(`✅ Добро пожаловать в «${chatName}»!`, 3000);
-                    soundManager.play('notification');
-                }
-            } catch (e) {
-                console.error('🔗 [Invite] Ошибка входа в чат:', e);
-                hideInviteLoading();
-                showChatsScreen();
-                showToast('⚠️ Чат добавлен, но не открылся: ' + e.message, 4000);
-            }
-
-            return true;
-        } catch (e) {
-            console.error('🔗 [Invite] Неожиданная ошибка:', e);
-            hideInviteLoading();
-            showInviteError('unknown', 'Внутренняя ошибка: ' + e.message);
+        if (!result.ok) {
+            showInviteError(result.reason, result.message);
+            history.replaceState({}, '', location.origin + location.pathname);
             return true;
         }
+
+        const payload = result.payload;
+        markInviteUsed(payload.jti);
+        history.replaceState({}, '', location.origin + location.pathname);
+        showWelcomeScreen(payload);
+        return true;
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  UI: КНОПКА В SHARE-МОДАЛКЕ
+    //  ПЕРЕХВАТ КНОПКИ «Другие приложения…»
     // ═══════════════════════════════════════════════════════════
-    function injectTempInviteButton() {
-        const modal = document.getElementById('shareToChatModal');
-        if (!modal) return;
-        const content = modal.querySelector('.form-modal-content');
-        if (!content) return;
-
-        // Уже вставлена?
-        if (content.querySelector('.share-temp-invite-btn')) return;
-
-        // Находим, КУДА вставить — перед блоком "или внешние приложения"
-        const externalDivider = content.querySelector('#shareExternalDivider');
-        if (!externalDivider) return;
-
-        const btn = document.createElement('button');
-        btn.className = 'share-temp-invite-btn';
-        btn.type = 'button';
-        btn.innerHTML = `
-            <div class="stib-icon">🔗</div>
-            <div class="stib-body">
-                <div class="stib-title">Временная ссылка</div>
-                <div class="stib-sub">2 минуты · гостевой доступ</div>
-            </div>
-            <span style="color:#feca57;font-size:18px;">›</span>
-        `;
+    function interceptExternalShareButton() {
+        const btn = document.getElementById('shareToExternalBtn');
+        if (!btn || btn._tempInviteAttached) return;
+        btn._tempInviteAttached = true;
 
         btn.addEventListener('click', async (e) => {
-            e.stopPropagation();
+            e.stopImmediatePropagation();
+            e.preventDefault();
 
-            // Определяем, для какого чата делаем ссылку
-            // Приоритет: выбранный чат в списке, иначе — текущий
-            let targetFile = _shareToChat.selectedFile;
-            if (!targetFile && state.chatFile) {
-                targetFile = state.chatFile;
-            }
-
+            let targetFile = _shareToChat.selectedFile || state.chatFile;
             if (!targetFile) {
                 showToast('❌ Сначала выберите чат из списка ниже', 2500);
-                soundManager.play('error');
                 return;
             }
-
-            // Проверяем наличие пароля
             if (!state.savedPasswords[targetFile]) {
                 showToast('🔐 Пароль чата не сохранён — ссылку сделать нельзя', 3500);
-                soundManager.play('error');
                 return;
             }
 
             btn.disabled = true;
-            const origHTML = btn.innerHTML;
-            btn.innerHTML = `
-                <div class="stib-icon">⏳</div>
-                <div class="stib-body">
-                    <div class="stib-title">Создаём…</div>
-                    <div class="stib-sub">пару секунд</div>
-                </div>
-            `;
+            const originalHTML = btn.innerHTML;
+            btn.innerHTML = `<div style="width:40px;height:40px;border-radius:12px;background:rgba(108,92,231,0.3);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0;">⏳</div><div style="flex:1;min-width:0;text-align:left;"><div style="font-size:14px;font-weight:600;color:#fff;">Создаём ссылку…</div><div style="font-size:11px;color:#888;margin-top:2px;">пару секунд</div></div>`;
 
             try {
                 const { url, payload } = await buildInviteLink(targetFile);
-
-                // Закрываем share-модалку и открываем модалку с ссылкой
-                modal.classList.remove('active');
+                document.getElementById('shareToChatModal').classList.remove('active');
                 showInviteModal(url, payload);
                 soundManager.play('send');
-
             } catch (err) {
-                console.error('🔗 [Invite] buildInviteLink failed:', err);
+                console.error('🔗 [Invite v2] Ошибка:', err);
                 showToast('❌ ' + err.message, 3500);
                 soundManager.play('error');
             } finally {
                 btn.disabled = false;
-                btn.innerHTML = origHTML;
+                btn.innerHTML = originalHTML;
             }
-        });
-
-        // Вставляем ПЕРЕД divider'ом «или»
-        externalDivider.parentNode.insertBefore(btn, externalDivider);
+        }, true); // capture
     }
 
-    // Наблюдаем за появлением модалки
-    const modalObserver = new MutationObserver((mutations) => {
-        for (const mut of mutations) {
-            if (mut.type === 'attributes' && mut.attributeName === 'class') {
-                const el = mut.target;
-                if (el.id === 'shareToChatModal' && el.classList.contains('active')) {
-                    setTimeout(injectTempInviteButton, 50);
-                }
-            }
+    // Наблюдаем за появлением кнопки
+    const observer = new MutationObserver(() => {
+        if (document.getElementById('shareToExternalBtn')) {
+            interceptExternalShareButton();
         }
     });
-
-    function startObserving() {
-        const modal = document.getElementById('shareToChatModal');
-        if (modal) {
-            modalObserver.observe(modal, { attributes: true, attributeFilter: ['class'] });
-        } else {
-            setTimeout(startObserving, 500);
-        }
-    }
-    startObserving();
+    observer.observe(document.body, { childList: true, subtree: true });
+    setTimeout(interceptExternalShareButton, 2000);
 
     // ═══════════════════════════════════════════════════════════
     //  ЗАПУСК ОБРАБОТКИ ПРИ ЗАГРУЗКЕ
     // ═══════════════════════════════════════════════════════════
-
-    // Ждём, пока основной код инициализируется
-    // (нужны функции showChatsScreen, enterChat, validateTokenAccess и т.д.)
     let _inviteAttempts = 0;
-    const _maxInviteAttempts = 40;   // 40 × 250 = 10 сек
-
     function tryHandleInvite() {
         _inviteAttempts++;
-
-        // Проверяем, что URL содержит параметр
         const params = new URLSearchParams(location.search);
-        if (!params.get(CFG.URL_PARAM)) return;   // ничего нет — выходим
+        if (!params.get(CFG.URL_PARAM)) return;
 
-        // Проверяем, что нужные функции готовы
-        const ready = (
-            typeof showChatsScreen === 'function' &&
-            typeof enterChat === 'function' &&
-            typeof validateTokenAccess === 'function' &&
-            typeof loadChatsList === 'function' &&
-            typeof loadSavedPasswords === 'function'
-        );
-
-        if (!ready && _inviteAttempts < _maxInviteAttempts) {
+        const ready = (typeof showChatsScreen === 'function' && typeof enterChat === 'function' && typeof validateTokenAccess === 'function');
+        if (!ready && _inviteAttempts < 40) {
             setTimeout(tryHandleInvite, 250);
             return;
         }
-
-        if (!ready) {
-            console.warn('🔗 [Invite] Функции не готовы, но пробуем');
-        }
-
-        // Запускаем обработку
         handleIncomingInvite().catch(err => {
-            console.error('🔗 [Invite] Ошибка:', err);
-            hideInviteLoading();
+            console.error('🔗 [Invite v2] Ошибка:', err);
             showInviteError('unknown', err.message);
         });
     }
-
-    // Небольшая задержка, чтобы основной скрипт точно выполнился
     setTimeout(tryHandleInvite, 800);
 
     // ═══════════════════════════════════════════════════════════
-    //  PUBLIC API (для тестов)
+    //  API
     // ═══════════════════════════════════════════════════════════
     window.TempInvite = {
         build: (chatFile) => buildInviteLink(chatFile || state.chatFile),
         parse: (raw) => parseAndValidateInvite(raw),
         config: CFG,
-        test: async () => {
-            if (!state.chatFile) {
-                console.log('❌ Открой чат');
-                return;
+    };
+
+    console.log('🔗 [Invite v2] Система активна:');
+    console.log('   • Кнопка «Другие приложения…» → создание временной ссылки');
+    console.log('   • Новый пользователь вводит имя перед входом');
+    console.log(`   • TTL: ${Math.round(CFG.TTL_MS / 1000)} секунд`);
+})();
+</script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🔑 PERSISTENT SESSION + EXPIRED SCREEN + PWA HINT
+//  ─────────────────────────────────────────────────────────────
+//  1. Сохраняет токен в localStorage навсегда
+//  2. При старте тихо восстанавливает сессию
+//  3. Если токен невалиден — экран «Сессия истекла»
+//  4. Один раз показывает плашку «Добавить на главный экран»
+// ═══════════════════════════════════════════════════════════════
+
+(function installPersistentSessionV1() {
+    'use strict';
+
+    console.log('🔑 [PersistentSession] Установка патча…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  КОНФИГ
+    // ═══════════════════════════════════════════════════════════
+    const CFG = {
+        LS_TOKEN: 'chathub_token',
+        LS_USERNAME: 'chathub_username',
+        LS_REMEMBER: 'chathub_remember',
+        LS_PWA_HINT_SHOWN: 'chathub_pwa_hint_shown',
+        LS_SESSION_SOURCE: 'chathub_session_source', // 'invite' | 'manual'
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  СТИЛИ
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('persistentSessionStyles')) {
+        const style = document.createElement('style');
+        style.id = 'persistentSessionStyles';
+        style.textContent = `
+            /* ═══ Экран «Сессия истекла» ═══ */
+            #sessionExpiredScreen {
+                position: fixed;
+                inset: 0;
+                background: linear-gradient(135deg, #0a0a0f, #1a1a2e);
+                z-index: 10000;
+                display: none;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                padding: 30px;
+                text-align: center;
+                animation: sesFadeIn 0.4s ease;
             }
+            #sessionExpiredScreen.show { display: flex; }
+            @keyframes sesFadeIn {
+                from { opacity: 0; }
+                to   { opacity: 1; }
+            }
+            #sessionExpiredScreen .ses-icon {
+                font-size: 80px;
+                margin-bottom: 16px;
+                line-height: 1;
+                animation: sesIconPulse 2.5s ease-in-out infinite;
+            }
+            @keyframes sesIconPulse {
+                0%, 100% { transform: scale(1); opacity: 1; }
+                50%      { transform: scale(1.08); opacity: 0.85; }
+            }
+            #sessionExpiredScreen .ses-title {
+                font-size: 24px;
+                font-weight: 700;
+                color: #fff;
+                margin-bottom: 12px;
+            }
+            #sessionExpiredScreen .ses-message {
+                font-size: 15px;
+                color: #aaa;
+                line-height: 1.6;
+                max-width: 420px;
+                margin-bottom: 12px;
+            }
+            #sessionExpiredScreen .ses-hint {
+                background: rgba(108,92,231,0.08);
+                border: 1px solid rgba(108,92,231,0.25);
+                border-radius: 12px;
+                padding: 12px 16px;
+                font-size: 13px;
+                color: #a78bfa;
+                line-height: 1.5;
+                max-width: 420px;
+                margin-bottom: 26px;
+            }
+            #sessionExpiredScreen .ses-btn {
+                padding: 14px 34px;
+                border-radius: 14px;
+                border: none;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                color: #fff;
+                font-size: 16px;
+                font-weight: 600;
+                cursor: pointer;
+                font-family: inherit;
+                transition: transform 0.15s;
+                -webkit-tap-highlight-color: transparent;
+            }
+            #sessionExpiredScreen .ses-btn:active { transform: scale(0.96); }
+
+            /* ═══ Плашка «Добавить на главный экран» ═══ */
+            #pwaInstallHint {
+                position: fixed;
+                left: 50%;
+                bottom: 20px;
+                transform: translateX(-50%) translateY(150%);
+                width: calc(100% - 24px);
+                max-width: 440px;
+                background: linear-gradient(135deg, rgba(26,26,46,0.98), rgba(20,20,35,0.98));
+                backdrop-filter: blur(20px);
+                -webkit-backdrop-filter: blur(20px);
+                border: 1px solid rgba(108,92,231,0.4);
+                border-radius: 18px;
+                padding: 14px 16px;
+                display: flex;
+                align-items: center;
+                gap: 12px;
+                z-index: 9990;
+                box-shadow: 0 16px 48px rgba(0,0,0,0.7),
+                            0 0 0 1px rgba(108,92,231,0.15);
+                transition: transform 0.4s cubic-bezier(0.22, 0.61, 0.36, 1),
+                            opacity 0.3s;
+                opacity: 0;
+                pointer-events: none;
+            }
+            #pwaInstallHint.show {
+                transform: translateX(-50%) translateY(0);
+                opacity: 1;
+                pointer-events: auto;
+            }
+            #pwaInstallHint .pih-icon {
+                width: 46px;
+                height: 46px;
+                border-radius: 14px;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 22px;
+                flex-shrink: 0;
+                box-shadow: 0 4px 14px rgba(108,92,231,0.4);
+            }
+            #pwaInstallHint .pih-body {
+                flex: 1;
+                min-width: 0;
+            }
+            #pwaInstallHint .pih-title {
+                font-size: 14px;
+                font-weight: 700;
+                color: #fff;
+                margin-bottom: 3px;
+            }
+            #pwaInstallHint .pih-sub {
+                font-size: 11px;
+                color: #a78bfa;
+                line-height: 1.4;
+            }
+            #pwaInstallHint .pih-close {
+                width: 32px;
+                height: 32px;
+                border-radius: 50%;
+                border: 1px solid rgba(255,255,255,0.08);
+                background: rgba(255,255,255,0.04);
+                color: #888;
+                font-size: 14px;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                flex-shrink: 0;
+                transition: all 0.15s;
+                padding: 0;
+                -webkit-tap-highlight-color: transparent;
+            }
+            #pwaInstallHint .pih-close:hover {
+                background: rgba(255,107,107,0.15);
+                color: #ff6b6b;
+                border-color: rgba(255,107,107,0.3);
+            }
+            #pwaInstallHint .pih-close:active { transform: scale(0.9); }
+
+            @media (max-width: 480px) {
+                #pwaInstallHint {
+                    bottom: 12px;
+                    padding: 12px 14px;
+                    gap: 10px;
+                }
+                #pwaInstallHint .pih-icon { width: 40px; height: 40px; font-size: 19px; }
+                #pwaInstallHint .pih-title { font-size: 13px; }
+                #pwaInstallHint .pih-sub { font-size: 10px; }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЭКРАН «СЕССИЯ ИСТЕКЛА»
+    // ═══════════════════════════════════════════════════════════
+    function showSessionExpiredScreen(reason) {
+        let screen = document.getElementById('sessionExpiredScreen');
+        if (screen) screen.remove();
+
+        const messages = {
+            'token-revoked': 'Ваш токен доступа больше не действует.',
+            'token-invalid': 'Ваш токен доступа недействителен.',
+            'no-token': 'Сессия не найдена.',
+            'network-fail': 'Не удалось проверить доступ. Проверьте интернет и попробуйте снова.',
+        };
+
+        const msg = messages[reason] || 'Сессия больше не активна.';
+
+        screen = document.createElement('div');
+        screen.id = 'sessionExpiredScreen';
+        screen.className = 'show';
+        screen.innerHTML = `
+            <div class="ses-icon">🔑</div>
+            <div class="ses-title">Сессия истекла</div>
+            <div class="ses-message">${escapeHtml(msg)}</div>
+            <div class="ses-hint">
+                💬 Попросите владельца репозитория дать вам <strong>новую ссылку-приглашение</strong>
+            </div>
+            <button class="ses-btn" id="sesOkBtn">Понятно</button>
+        `;
+        document.body.appendChild(screen);
+
+        screen.querySelector('#sesOkBtn').addEventListener('click', () => {
+            // Чистим всю сессию
+            clearSession();
+            screen.remove();
+            // Показываем экран авторизации
+            if (typeof showAuthScreen === 'function') {
+                showAuthScreen();
+            }
+            // Чистим URL от возможных параметров
+            history.replaceState({}, '', location.origin + location.pathname);
+        });
+
+        // Скрываем всё остальное
+        try {
+            if (authScreen) authScreen.style.display = 'none';
+            if (chatsScreen) chatsScreen.style.display = 'none';
+            if (chatScreen) chatScreen.style.display = 'none';
+        } catch (e) {}
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОЧИСТКА СЕССИИ
+    // ═══════════════════════════════════════════════════════════
+    function clearSession() {
+        try {
+            localStorage.removeItem(CFG.LS_TOKEN);
+            localStorage.removeItem(CFG.LS_USERNAME);
+            localStorage.removeItem(CFG.LS_REMEMBER);
+            localStorage.removeItem(CFG.LS_SESSION_SOURCE);
+        } catch (e) {}
+        console.log('🔑 [PersistentSession] Сессия очищена');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОХРАНЕНИЕ СЕССИИ
+    // ═══════════════════════════════════════════════════════════
+    function saveSession(username, token, source) {
+        try {
+            localStorage.setItem(CFG.LS_USERNAME, username);
+            localStorage.setItem(CFG.LS_TOKEN, token);
+            localStorage.setItem(CFG.LS_REMEMBER, '1');
+            localStorage.setItem(CFG.LS_SESSION_SOURCE, source || 'manual');
+            console.log(`🔑 [PersistentSession] Сессия сохранена (${source || 'manual'})`);
+        } catch (e) {
+            console.warn('🔑 [PersistentSession] saveSession failed:', e);
+        }
+    }
+
+    function loadSession() {
+        try {
+            const username = localStorage.getItem(CFG.LS_USERNAME);
+            const token = localStorage.getItem(CFG.LS_TOKEN);
+            const remember = localStorage.getItem(CFG.LS_REMEMBER) === '1';
+            const source = localStorage.getItem(CFG.LS_SESSION_SOURCE) || 'manual';
+            if (!username || !token || !remember) return null;
+            return { username, token, source };
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЛАШКА «ДОБАВИТЬ НА ГЛАВНЫЙ ЭКРАН»
+    // ═══════════════════════════════════════════════════════════
+    function showPwaHint() {
+        // Уже показывали?
+        try {
+            if (localStorage.getItem(CFG.LS_PWA_HINT_SHOWN) === '1') return;
+        } catch (e) {}
+
+        // Уже установлено как PWA?
+        const isStandalone =
+            window.matchMedia('(display-mode: standalone)').matches ||
+            window.navigator.standalone === true ||
+            document.referrer.includes('android-app://');
+        if (isStandalone) {
+            // Уже приложение — нечего предлагать
+            try { localStorage.setItem(CFG.LS_PWA_HINT_SHOWN, '1'); } catch (e) {}
+            return;
+        }
+
+        // Отложенный показ — чтобы не мешать входу
+        setTimeout(() => {
+            let hint = document.getElementById('pwaInstallHint');
+            if (hint) hint.remove();
+
+            hint = document.createElement('div');
+            hint.id = 'pwaInstallHint';
+            hint.innerHTML = `
+                <div class="pih-icon">📱</div>
+                <div class="pih-body">
+                    <div class="pih-title">Добавить на главный экран</div>
+                    <div class="pih-sub">Открывайте чат в один тап — как обычное приложение</div>
+                </div>
+                <button class="pih-close" id="pihCloseBtn" title="Скрыть">✕</button>
+            `;
+            document.body.appendChild(hint);
+
+            requestAnimationFrame(() => hint.classList.add('show'));
+
+            hint.querySelector('#pihCloseBtn').addEventListener('click', () => {
+                hint.classList.remove('show');
+                try { localStorage.setItem(CFG.LS_PWA_HINT_SHOWN, '1'); } catch (e) {}
+                setTimeout(() => hint.remove(), 400);
+            });
+
+            // Автоскрытие через 12 секунд
+            setTimeout(() => {
+                if (hint.parentNode) {
+                    hint.classList.remove('show');
+                    try { localStorage.setItem(CFG.LS_PWA_HINT_SHOWN, '1'); } catch (e) {}
+                    setTimeout(() => hint.remove(), 400);
+                }
+            }, 12000);
+
+            // Показ зелёного кружка-индикатора, что приложение можно установить
+            if (navigator.vibrate) navigator.vibrate(15);
+        }, 3000); // через 3 секунды после входа
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ СОБЫТИЯ beforeinstallprompt (Chrome)
+    //  Если Chrome сам предложит установку — просто не мешаем ему.
+    //  Но перехватываем, чтобы потом можно было показать нашу плашку.
+    // ═══════════════════════════════════════════════════════════
+    let _deferredInstallPrompt = null;
+
+    window.addEventListener('beforeinstallprompt', (e) => {
+        e.preventDefault();
+        _deferredInstallPrompt = e;
+        console.log('📱 [PWA] Chrome предложил установку — запоминаем');
+    });
+
+    window.addEventListener('appinstalled', () => {
+        console.log('📱 [PWA] Приложение установлено');
+        try { localStorage.setItem(CFG.LS_PWA_HINT_SHOWN, '1'); } catch (e) {}
+        const hint = document.getElementById('pwaInstallHint');
+        if (hint) hint.remove();
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    //  ТИХАЯ ПРОВЕРКА ТОКЕНА ПРИ СТАРТЕ
+    //  Возвращает: 'ok' | 'network-fail' | 'token-invalid'
+    // ═══════════════════════════════════════════════════════════
+    async function checkTokenSilently(token) {
+        try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 30000);
+
+            const res = await fetch(
+                `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}`,
+                {
+                    headers: {
+                        'Authorization': `token ${token}`,
+                        'Accept': 'application/vnd.github.v3+json',
+                    },
+                    signal: controller.signal,
+                    cache: 'no-store',
+                }
+            );
+            clearTimeout(timeoutId);
+
+            if (res.status === 401) return 'token-invalid';
+            if (res.status === 403) return 'token-invalid';
+            if (res.status === 404) return 'token-invalid';
+            if (!res.ok) return 'network-fail';
+
+            const data = await res.json();
+            if (!data.permissions || data.permissions.push !== true) {
+                return 'token-invalid';
+            }
+            return 'ok';
+        } catch (e) {
+            if (e.name === 'AbortError') return 'network-fail';
+            return 'network-fail';
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ГЛАВНАЯ ФУНКЦИЯ: ВОССТАНОВЛЕНИЕ СЕССИИ
+    // ═══════════════════════════════════════════════════════════
+    async function tryRestoreSession() {
+        const session = loadSession();
+
+        if (!session) {
+            console.log('🔑 [PersistentSession] Нет сохранённой сессии');
+            return false;
+        }
+
+        console.log(`🔑 [PersistentSession] Найдена сессия для ${session.username} (${session.source})`);
+
+        // Показываем оверлей загрузки (как при автозапуске чата)
+        const overlay = document.getElementById('autostartOverlay');
+        const nameEl = document.getElementById('autostartChatName');
+        if (overlay && nameEl) {
+            nameEl.textContent = 'восстанавливаем доступ…';
+            overlay.classList.add('show');
+        }
+
+        try {
+            // Проверяем токен
+            const check = await checkTokenSilently(session.token);
+
+            if (check === 'token-invalid') {
+                console.warn('🔑 [PersistentSession] Токен невалиден');
+                if (overlay) overlay.classList.remove('show');
+                showSessionExpiredScreen('token-revoked');
+                return true; // обработали
+            }
+
+            if (check === 'network-fail') {
+                console.warn('🔑 [PersistentSession] Сеть недоступна — пробуем офлайн');
+                // Тихо продолжаем в офлайн-режиме
+                // (офлайн-кэш всё равно покажет чаты)
+                state.username = session.username;
+                state.token = session.token;
+                state.isAuthorized = true;
+
+                if (typeof loadChatsList === 'function') loadChatsList();
+                if (typeof loadSavedPasswords === 'function') loadSavedPasswords();
+
+                if (typeof OfflineMode !== 'undefined' && OfflineMode.activate) {
+                    OfflineMode.activate('restore-offline');
+                }
+
+                if (overlay) overlay.classList.remove('show');
+                if (typeof showChatsScreen === 'function') showChatsScreen();
+
+                console.log('🔑 [PersistentSession] Восстановлено офлайн');
+                return true;
+            }
+
+            // Токен валиден — восстанавливаем полную сессию
+            state.username = session.username;
+            state.token = session.token;
+            state.isAuthorized = true;
+
+            // Загружаем чаты и пароли
+            if (typeof loadChatsList === 'function') loadChatsList();
+            if (typeof loadSavedPasswords === 'function') loadSavedPasswords();
+
+            // Заполняем поля на экране авторизации (на случай logout)
+            if (usernameInput) usernameInput.value = session.username;
+            if (tokenInput) tokenInput.value = session.token;
+            if (rememberMeInput) rememberMeInput.checked = true;
+            if (rememberWarning) rememberWarning.style.display = 'block';
+
+            // Пытаемся запустить автозапуск чата (если настроен)
+            let launched = false;
             try {
-                const { url, payload } = await buildInviteLink(state.chatFile);
-                console.log('🔗 Ссылка:', url);
-                console.log('⏱ Истекает через:', Math.round((payload.exp - Date.now()) / 1000) + 'с');
-                // Проверим сами себя
-                const params = new URLSearchParams(url.split('?')[1]);
-                const raw = params.get(CFG.URL_PARAM);
-                const parsed = await parseAndValidateInvite(raw);
-                console.log('✅ Валидация:', parsed);
+                const autorunFile = (typeof getAutorunChat === 'function') ? getAutorunChat() : null;
+                if (autorunFile) {
+                    launched = await tryAutostartChat();
+                }
             } catch (e) {
-                console.error('❌ Ошибка:', e);
+                console.warn('🔑 [PersistentSession] tryAutostartChat failed:', e);
             }
-        },
-        // Проверить «свежесть» ссылки без открытия
-        check: async (raw) => {
-            const r = await parseAndValidateInvite(raw);
-            if (r.ok) {
-                const remain = Math.round((r.payload.exp - Date.now()) / 1000);
-                console.log(`✅ Валидна. Осталось: ${remain}с. Чат: ${r.payload.chat.name}`);
-            } else {
-                console.log(`❌ Невалидна: ${r.reason} — ${r.message}`);
+
+            if (!launched) {
+                // Открываем список чатов
+                if (overlay) overlay.classList.remove('show');
+                if (typeof showChatsScreen === 'function') showChatsScreen();
             }
-            return r;
+
+            // Показываем подсказку про PWA
+            showPwaHint();
+
+            console.log('🔑 [PersistentSession] Сессия успешно восстановлена');
+            return true;
+
+        } catch (e) {
+            console.error('🔑 [PersistentSession] Ошибка восстановления:', e);
+            if (overlay) overlay.classList.remove('show');
+            // Не блокируем — покажем обычный экран авторизации
+            return false;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ LOGIN (обычная авторизация)
+    // ═══════════════════════════════════════════════════════════
+    if (typeof login === 'function') {
+        const _origLogin = login;
+        login = async function() {
+            const result = await _origLogin.apply(this, arguments);
+
+            // После успешного логина — сохраняем сессию
+            if (state.isAuthorized && state.token && state.username) {
+                saveSession(state.username, state.token, 'manual');
+                // Показываем подсказку про PWA
+                showPwaHint();
+            }
+            return result;
+        };
+        console.log('🔑 [PersistentSession] login перехвачен');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ LOGOUT
+    // ═══════════════════════════════════════════════════════════
+    if (typeof logout === 'function') {
+        const _origLogout = logout;
+        logout = function() {
+            clearSession();
+            return _origLogout.apply(this, arguments);
+        };
+        console.log('🔑 [PersistentSession] logout перехвачен');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХУК В ПРИВЕТСТВЕННЫЙ ЭКРАН ПРИГЛАШЕНИЯ
+    //  Когда пользователь ввёл имя через Welcome-экран —
+    //  сохраняем сессию с источником 'invite'.
+    // ═══════════════════════════════════════════════════════════
+    // Патчим функцию submit внутри showWelcomeScreen через
+    // переопределение самой функции. Но она в IIFE предыдущего патча.
+    // Поэтому — просто наблюдаем за появлением сессии.
+
+    // MutationObserver на welcomeInviteScreen — когда он исчезает,
+    // значит пользователь вошёл. Сохраняем сессию.
+    const welcomeObserver = new MutationObserver(() => {
+        const welcome = document.getElementById('welcomeInviteScreen');
+        if (!welcome && state.isAuthorized && state.token && state.username) {
+            // Welcome-экран удалён — сохраняем сессию как invite
+            const source = localStorage.getItem(CFG.LS_SESSION_SOURCE);
+            if (source !== 'invite') {
+                saveSession(state.username, state.token, 'invite');
+                console.log('🔑 [PersistentSession] Сессия сохранена (invite)');
+            }
+            // Показываем подсказку про PWA
+            showPwaHint();
+        }
+    });
+    welcomeObserver.observe(document.body, { childList: true, subtree: true });
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API
+    // ═══════════════════════════════════════════════════════════
+    window.PersistentSession = {
+        get: loadSession,
+        save: saveSession,
+        clear: clearSession,
+        showExpired: showSessionExpiredScreen,
+        restore: tryRestoreSession,
+        showPwaHint,
+        status: () => {
+            const s = loadSession();
+            return {
+                hasSession: !!s,
+                username: s ? s.username : null,
+                source: s ? s.source : null,
+                tokenPreview: s && s.token ? s.token.slice(0, 8) + '…' : null,
+                pwaHintShown: localStorage.getItem(CFG.LS_PWA_HINT_SHOWN) === '1',
+            };
         },
     };
 
-    console.log('🔗 Временные приглашения активны');
-    console.log(`   • TTL: ${Math.round(CFG.TTL_MS / 1000)} секунд`);
-    console.log(`   • One-time: ${CFG.ENABLE_ONETIME ? 'да' : 'нет'}`);
-    console.log('   • Кнопка «🔗 Временная ссылка» — в модалке шаринга');
-    console.log('');
-    console.log('   API для тестов:');
-    console.log('     TempInvite.test()         — создать ссылку для текущего чата');
-    console.log('     TempInvite.check("...")   — проверить ссылку');
+    // ═══════════════════════════════════════════════════════════
+    //  ЗАПУСК: при старте пробуем восстановить сессию
+    // ═══════════════════════════════════════════════════════════
+    // Не запускаем, если в URL есть приглашение — там своя логика.
+    const urlHasInvite = new URLSearchParams(location.search).get('invite');
+
+    if (!urlHasInvite) {
+        // Ждём, пока основной скрипт выполнится
+        setTimeout(async () => {
+            const restored = await tryRestoreSession();
+            if (restored) {
+                console.log('🔑 [PersistentSession] Автовосстановление сработало');
+            } else {
+                console.log('🔑 [PersistentSession] Восстановление не требуется');
+            }
+        }, 1200); // ждём, пока все модули инициализируются
+    } else {
+        console.log('🔑 [PersistentSession] Приглашение в URL — ждём его обработки');
+    }
+
+    console.log('🔑 [PersistentSession] Патч установлен:');
+    console.log('   • Токен сохраняется в localStorage навсегда');
+    console.log('   • Автовосстановление сессии при старте');
+    console.log('   • Экран «Сессия истекла» при невалидном токене');
+    console.log('   • Подсказка про PWA — один раз после входа');
+    console.log('   • API: PersistentSession.status() / .clear()');
 })();
 </script>
 </body>
