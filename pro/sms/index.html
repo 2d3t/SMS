@@ -33398,5 +33398,436 @@ try {
     log('API: AutoOutbox.status() / .process() / .forceSync()');
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🩹 ПАТЧ: НЕ ПОКАЗЫВАТЬ «НЕПРОЧИТАННОЕ» НА СВОИХ СООБЩЕНИЯХ
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: при пересылке файла в другой чат или доставке
+//  офлайн-сообщения, чат помечается как «есть непрочитанные»,
+//  даже если автор всех новых сообщений — сам пользователь.
+//
+//  Решение:
+//   1. В doShareToChat — не помечать чат как непрочитанный,
+//      если мы сами туда только что написали.
+//   2. В sendTaskAutonomous (AutoOutbox) — то же самое.
+//   3. В checkUnreadForAllChats — расшифровывать последние
+//      сообщения и считать непрочитанными ТОЛЬКО чужие.
+// ═══════════════════════════════════════════════════════════════
+
+(function installNoSelfUnreadPatch() {
+    'use strict';
+
+    console.log('🩹 [NoSelfUnread] Установка патча…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  1. Патч doShareToChat
+    //  Убираем установку hasUnread для случая пересылки.
+    // ═══════════════════════════════════════════════════════════
+    if (typeof doShareToChat === 'function') {
+        const _origDoShare = doShareToChat;
+
+        doShareToChat = async function(targetFile, targetPassword, blob, fileName, mime, meta) {
+            const result = await _origDoShare.call(
+                this, targetFile, targetPassword, blob, fileName, mime, meta
+            );
+
+            // После успешной пересылки — сбрасываем hasUnread
+            // для целевого чата (мы же сами туда написали!)
+            try {
+                const chat = state.chats.find(c => c.file === targetFile);
+                if (chat) {
+                    delete chat.hasUnread;
+                    delete chat.unreadCount;
+                    saveChatsList();
+
+                    // Если сейчас открыт список чатов — перерисуем
+                    if (state.currentScreen === 'chats' && typeof renderChatsList === 'function') {
+                        renderChatsList();
+                    }
+                }
+            } catch (e) {
+                console.warn('🩹 [NoSelfUnread] doShareToChat cleanup failed:', e);
+            }
+
+            return result;
+        };
+
+        console.log('🩹 [NoSelfUnread] patched: doShareToChat');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  2. Патч updateMetaForTask (используется AutoOutbox)
+    //  После обновления meta для офлайн-отправленного сообщения
+    //  сбрасываем флаг «непрочитанное» у чата.
+    //
+    //  ⚠️ updateMetaForTask — внутри IIFE AutoOutbox, но её можно
+    //  поймать через AutoOutbox._test или через хак.
+    //  Проще — следить за localStorage 'smschat_outbox_v1' и
+    //  после успешной отправки вручную сбрасывать бейджи.
+    // ═══════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. ГЛАВНОЕ: переписываем checkUnreadForAllChats
+    //  ─────────────────────────────────────────────────────────
+    //  Идея: вместо того чтобы считать все новые сообщения
+    //  непрочитанными, мы расшифровываем последние N и смотрим,
+    //  есть ли среди них чужие.
+    // ═══════════════════════════════════════════════════════════
+
+    if (typeof checkUnreadForAllChats === 'function') {
+        const _origCheck = checkUnreadForAllChats;
+
+        // Своя реализация — более точная
+        checkUnreadForAllChats = async function() {
+            const result = {};
+            const passwords = state.savedPasswords;
+
+            const tasks = state.chats.map(async (chat) => {
+                const file = chat.file;
+                try {
+                    const cachedEtag = state._metaEtagsByFile[file] || null;
+                    let metaRes;
+                    try {
+                        metaRes = await fetchMetaFast(file, cachedEtag);
+                    } catch (e) {
+                        if (chat.hasUnread) {
+                            result[file] = { hasUnread: true, count: chat.unreadCount || 0 };
+                        }
+                        return;
+                    }
+
+                    if (metaRes.notModified) {
+                        if (chat.hasUnread) {
+                            result[file] = { hasUnread: true, count: chat.unreadCount || 0 };
+                        }
+                        return;
+                    }
+                    if (!metaRes.exists) {
+                        state._metaEtagsByFile[file] = null;
+                        return;
+                    }
+
+                    state._metaEtagsByFile[file] = metaRes.etag || null;
+                    const metaVersion = metaRes.content && metaRes.content.version;
+                    if (!metaVersion) return;
+
+                    chat._lastMetaVersion = metaVersion;
+                    saveChatsList();
+
+                    const lastReadId = getLastReadId(file);
+                    if (lastReadId && metaVersion <= lastReadId) return;
+
+                    if (!passwords[file]) {
+                        result[file] = { hasUnread: true, count: 0 };
+                        return;
+                    }
+
+                    // ═══ Загружаем файл чата ═══
+                    const path = getChatPath(file);
+                    const res = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
+                    if (!res.exists) return;
+
+                    const content = res.content;
+                    if (!content || content.v !== CRYPTO.VERSION) return;
+
+                    const encMessages = content.messages || [];
+                    if (encMessages.length === 0) return;
+
+                    // ═══ Собираем ID новых (непрочитанных) сообщений ═══
+                    const newEncMessages = [];
+                    for (const enc of encMessages) {
+                        if (!lastReadId || enc.id > lastReadId) {
+                            newEncMessages.push(enc);
+                        }
+                    }
+                    if (newEncMessages.length === 0) return;
+
+                    // ═══ 🆕 ГЛАВНОЕ: расшифровываем и проверяем автора ═══
+                    // Расшифровываем не все, а только последние 50
+                    // (чтобы не грузить систему)
+                    let foreignCount = 0;
+                    const toCheck = newEncMessages.slice(-50);
+
+                    let decryptedAny = false;
+                    for (const enc of toCheck) {
+                        try {
+                            // Используем уже существующую decryptMessage —
+                            // она работает с CRYPTO._key
+                            // Но нам нужен ключ целевого чата!
+
+                            // Деривим ключ целевого чата
+                            const key = await deriveKey(
+                                passwords[file],
+                                content.salt
+                            );
+
+                            // Расшифровываем через crypto.subtle напрямую
+                            const iv = new Uint8Array(base64ToArrayBuffer(enc.iv));
+                            const ciphertext = base64ToArrayBuffer(enc.data);
+                            const plaintext = await crypto.subtle.decrypt(
+                                { name: 'AES-GCM', iv },
+                                key,
+                                ciphertext
+                            );
+                            const payload = JSON.parse(new TextDecoder().decode(plaintext));
+
+                            decryptedAny = true;
+                            if (payload.username !== state.username) {
+                                foreignCount++;
+                            }
+                        } catch (e) {
+                            // Не смогли расшифровать — считаем «чужим»
+                            // на всякий случай (лучше показать, чем пропустить)
+                            foreignCount++;
+                        }
+                    }
+
+                    // Если все сообщения — наши — считаем чат прочитанным
+                    if (decryptedAny && foreignCount === 0) {
+                        // Автоматически помечаем как прочитанное
+                        setLastReadId(file, metaVersion);
+                        // Убираем флаг непрочитанного
+                        if (chat.hasUnread) {
+                            delete chat.hasUnread;
+                            delete chat.unreadCount;
+                            saveChatsList();
+                        }
+                        return;
+                    }
+
+                    // Есть чужие — ставим счётчик
+                    if (foreignCount > 0) {
+                        result[file] = {
+                            hasUnread: true,
+                            count: foreignCount,
+                        };
+                    } else if (decryptedAny) {
+                        // Ничего чужого — не помечаем
+                    } else {
+                        // Не смогли расшифровать — консервативно помечаем
+                        result[file] = { hasUnread: true, count: newEncMessages.length };
+                    }
+
+                } catch (e) {
+                    console.warn('🩹 [NoSelfUnread] checkUnread error for', file, e.message);
+                    if (chat.hasUnread) {
+                        result[file] = { hasUnread: true, count: chat.unreadCount || 0 };
+                    }
+                }
+            });
+
+            await Promise.all(tasks);
+            return result;
+        };
+
+        console.log('🩹 [NoSelfUnread] patched: checkUnreadForAllChats (расшифровка + фильтр по автору)');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  4. Патч updateMeta
+    //  Когда обновляется meta после отправки сообщения —
+    //  сразу помечаем чат как прочитанный (мы же сами написали).
+    // ═══════════════════════════════════════════════════════════
+    if (typeof updateMeta === 'function') {
+        const _origUpdateMeta = updateMeta;
+
+        updateMeta = async function(file, version, count) {
+            const result = await _origUpdateMeta.call(this, file, version, count);
+
+            // 🆕 После обновления meta — сбрасываем флаг «непрочитанное»
+            // у этого чата, если мы авторизованы и это наше сообщение
+            try {
+                if (state.isAuthorized && file) {
+                    const chat = state.chats.find(c => c.file === file);
+                    if (chat) {
+                        delete chat.hasUnread;
+                        delete chat.unreadCount;
+                        saveChatsList();
+                    }
+
+                    // Если открыт экран чатов — перерисуем без бейджа
+                    if (state.currentScreen === 'chats' && typeof renderChatsList === 'function') {
+                        // Дебаунс, чтобы не дёргать при множественных вызовах
+                        if (updateMeta._renderTimer) {
+                            clearTimeout(updateMeta._renderTimer);
+                        }
+                        updateMeta._renderTimer = setTimeout(() => {
+                            renderChatsList();
+                        }, 300);
+                    }
+
+                    // Также обновляем lastReadId для этого чата
+                    // (чтобы поллинг не считал наши сообщения новыми)
+                    if (version && getLastReadId(file) !== version) {
+                        const lastRead = getLastReadId(file);
+                        if (!lastRead || version > lastRead) {
+                            setLastReadId(file, version);
+                        }
+                    }
+                }
+            } catch (e) {
+                console.warn('🩹 [NoSelfUnread] updateMeta cleanup failed:', e);
+            }
+
+            return result;
+        };
+
+        console.log('🩹 [NoSelfUnread] patched: updateMeta (авто-сброс непрочитанного)');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  5. Патч refreshUnreadBadges
+    //  После нашего обновлённого checkUnreadForAllChats
+    //  перерисовываем бейджи корректно.
+    // ═══════════════════════════════════════════════════════════
+    // (refreshUnreadBadges уже использует checkUnreadForAllChats,
+    //  так что менять её не нужно — патч применится автоматически)
+
+    // ═══════════════════════════════════════════════════════════
+    //  6. Патч AutoOutbox — после успешной отправки сбрасываем бейдж
+    // ═══════════════════════════════════════════════════════════
+    if (typeof AutoOutbox !== 'undefined') {
+        // Оборачиваем status, чтобы при вызове синхронизировать флаги
+        const _origStatus = AutoOutbox.status;
+        AutoOutbox.status = function() {
+            const st = _origStatus.call(this);
+
+            // При каждом вызове status — проверяем, нет ли "пустых"
+            // непрочитанных (все наши сообщения)
+            // Делаем это редко, чтобы не грузить
+
+            return st;
+        };
+
+        // Основное: перехватываем process и после успеха сбрасываем флаги
+        const _origProcess = AutoOutbox.process;
+        AutoOutbox.process = async function() {
+            const beforeLen = AutoOutbox.status().queueSize;
+            const result = await _origProcess.call(this);
+
+            // После обработки — если очередь уменьшилась, значит что-то отправилось
+            setTimeout(() => {
+                const afterLen = AutoOutbox.status().queueSize;
+                if (afterLen < beforeLen) {
+                    // Что-то отправилось — синхронизируем бейджи
+                    if (state.currentScreen === 'chats' && typeof refreshUnreadBadges === 'function') {
+                        refreshUnreadBadges().catch(() => {});
+                    }
+
+                    // Также убираем hasUnread у чатов, куда только что отправили
+                    // (определяем по недавно обновлённым meta)
+                    state.chats.forEach(c => {
+                        if (c.hasUnread && c.unreadCount === 0) {
+                            delete c.hasUnread;
+                            delete c.unreadCount;
+                        }
+                    });
+                    saveChatsList();
+                    if (state.currentScreen === 'chats' && typeof renderChatsList === 'function') {
+                        renderChatsList();
+                    }
+                }
+            }, 500);
+
+            return result;
+        };
+
+        console.log('🩹 [NoSelfUnread] patched: AutoOutbox.process');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  7. Разовая очистка на старте
+    //  При загрузке приложения — пройтись по всем чатам и убрать
+    //  флаги hasUnread там, где нет реальных чужих сообщений.
+    // ═══════════════════════════════════════════════════════════
+    setTimeout(async () => {
+        if (!state.isAuthorized || !state.token) return;
+
+        console.log('🩹 [NoSelfUnread] Первичная очистка ложных бейджей…');
+
+        // Просто вызываем нашу новую версию checkUnreadForAllChats
+        // (она автоматически уберёт ложные флаги)
+        try {
+            if (state.currentScreen === 'chats' && typeof refreshUnreadBadges === 'function') {
+                await refreshUnreadBadges();
+                console.log('🩹 [NoSelfUnread] Очистка завершена');
+            }
+        } catch (e) {
+            console.warn('🩹 [NoSelfUnread] Первичная очистка failed:', e);
+        }
+    }, 8000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API ДЛЯ ОТЛАДКИ
+    // ═══════════════════════════════════════════════════════════
+    window.NoSelfUnread = {
+        // Проверить конкретный чат
+        check: async (file) => {
+            const chat = state.chats.find(c => c.file === file);
+            if (!chat) return { error: 'Чат не найден' };
+
+            const password = state.savedPasswords[file];
+            if (!password) return { error: 'Нет пароля' };
+
+            const path = getChatPath(file);
+            const res = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
+            if (!res.exists) return { error: 'Файл не найден' };
+
+            const content = res.content;
+            const lastReadId = getLastReadId(file);
+            const encMessages = content.messages || [];
+
+            const newOnes = encMessages.filter(enc => !lastReadId || enc.id > lastReadId);
+            if (newOnes.length === 0) return { hasUnread: false, reason: 'Нет новых' };
+
+            const key = await deriveKey(password, content.salt);
+            let mine = 0, foreign = 0;
+
+            for (const enc of newOnes) {
+                try {
+                    const iv = new Uint8Array(base64ToArrayBuffer(enc.iv));
+                    const ciphertext = base64ToArrayBuffer(enc.data);
+                    const plaintext = await crypto.subtle.decrypt(
+                        { name: 'AES-GCM', iv }, key, ciphertext
+                    );
+                    const payload = JSON.parse(new TextDecoder().decode(plaintext));
+                    if (payload.username === state.username) mine++;
+                    else foreign++;
+                } catch (e) {
+                    foreign++;
+                }
+            }
+
+            return {
+                totalNew: newOnes.length,
+                mine,
+                foreign,
+                hasUnread: foreign > 0,
+                shouldClearBadge: foreign === 0,
+            };
+        },
+
+        // Принудительно очистить все бейджи (для теста)
+        clearAll: () => {
+            state.chats.forEach(c => {
+                delete c.hasUnread;
+                delete c.unreadCount;
+            });
+            saveChatsList();
+            if (state.currentScreen === 'chats' && typeof renderChatsList === 'function') {
+                renderChatsList();
+            }
+            if (typeof updateAppBadge === 'function') updateAppBadge(0);
+            console.log('🩹 [NoSelfUnread] Все бейджи очищены');
+        },
+    };
+
+    console.log('🩹 [NoSelfUnread] Патч установлен полностью');
+    console.log('   • checkUnreadForAllChats теперь расшифровывает и фильтрует по автору');
+    console.log('   • updateMeta авто-сбрасывает непрочитанное');
+    console.log('   • doShareToChat не помечает чат непрочитанным');
+    console.log('   • API: NoSelfUnread.check("chat_xxx")');
+})();
+</script>
 </body>
 </html>
