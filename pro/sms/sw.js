@@ -1,5 +1,5 @@
 // sw.js - Универсальный кеш + уведомления
-const CACHE_NAME = 'sms-pwa-v114-namesmsradarbright4secremontradaracircle';
+const CACHE_NAME = 'sms-pwa-v114-namesmsradarbright4secremontradaracircletestvneshinf';
 
 const FILES_TO_CACHE = [
     '/SMS/pro/sms/index.html',
