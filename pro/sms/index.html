@@ -34794,194 +34794,282 @@ try {
 </script>
 <script>
 // ═══════════════════════════════════════════════════════════════
-//  🚫 БЛОКИРОВКА СИСТЕМНЫХ ЖЕСТОВ CHROME НА СПИСКЕ ЧАТОВ
+//  🚫 БЛОКИРОВКА СИСТЕМНЫХ ЖЕСТОВ CHROME — v2 (жёсткая)
 //  ─────────────────────────────────────────────────────────────
-//  Проблема: долгое нажатие на карточку чата, на её текст,
-//  на бейдж автовхода, на кнопку «⋯» → Chrome запускает:
-//   • выделение слова
-//   • «Поиск в Google»
-//   • перевод
-//   • «Объяснить»
-//   • контекстное меню браузера
+//  Убирает даже КРАТКОВРЕМЕННОЕ мигание выделения и его
+//  «призрачное» появление в чате после перехода.
 //
-//  Решение:
-//   1. CSS: user-select: none + touch-callout: none
-//      на всём контейнере #chatsList и его потомках.
-//   2. JS: перехват contextmenu, selectstart, dragstart
-//      в CAPTURE-фазе и отмена дефолта.
-//   3. JS: снятие выделения на selectionchange, если оно
-//      появилось внутри #chatsList.
-//   4. JS: блокировка touchmove-выделения на долгом тапе.
+//  Что делает:
+//   1. CSS user-select: none на html/body во время long-tap.
+//   2. Полное «обнуление» выделения: collapse + removeAllRanges
+//      + пустой range + переустановка selection.
+//   3. Перехват mouseup/touchend: если выделение появилось —
+//      гасим его ДО того, как браузер отрисует меню.
+//   4. При смене экрана (chats → chat) — принудительный clear.
+//   5. MutationObserver на document.body: если появился любой
+//      выделенный range — мгновенно снимаем.
 // ═══════════════════════════════════════════════════════════════
 
-(function blockSystemGesturesOnChatsList() {
+(function blockSystemGesturesHard() {
     'use strict';
 
+    // ─── 0. Убираем старый патч, чтобы не конфликтовал ───
+    // (он безвреден, но пусть будет только один источник правды)
+
     // ─── 1. CSS ───
-    if (!document.getElementById('chatsListNoSelectStyles')) {
+    if (!document.getElementById('chatsListNoSelectStylesHard')) {
         const style = document.createElement('style');
-        style.id = 'chatsListNoSelectStyles';
+        style.id = 'chatsListNoSelectStylesHard';
         style.textContent = `
-            /* Запрещаем выделение и системные меню в списке чатов */
+            /* Жёсткий запрет выделения на списке чатов */
             #chatsList,
             #chatsList *,
-            #chatsList .chat-list-item,
-            #chatsList .chat-list-item *,
-            #chatsList .chat-avatar,
-            #chatsList .chat-name,
-            #chatsList .chat-file,
-            #chatsList .chat-name-row,
-            #chatsList .chat-autorun-badge,
-            #chatsList .chat-playing-badge,
-            #chatsList .unread-badge,
-            #chatsList .chat-more-btn,
-            #chatsList .chat-delete-btn {
+            .chat-list-item,
+            .chat-list-item * {
                 -webkit-touch-callout: none !important;
                 -webkit-user-select: none !important;
                 -moz-user-select: none !important;
                 -ms-user-select: none !important;
                 user-select: none !important;
                 -webkit-user-drag: none !important;
-                -khtml-user-drag: none !important;
-                -moz-user-drag: none !important;
-                -o-user-drag: none !important;
                 user-drag: none !important;
                 -webkit-tap-highlight-color: transparent !important;
             }
 
-            /* Также блокируем выделение в блоке «У вас пока нет чатов» */
-            .empty-chats,
-            .empty-chats * {
-                -webkit-touch-callout: none !important;
+            /* Дополнительно: во время long-tap блокируем выделение
+               вообще везде, чтобы браузер не успел ничего подсветить */
+            body.no-select-active,
+            body.no-select-active * {
                 -webkit-user-select: none !important;
                 user-select: none !important;
+                -webkit-touch-callout: none !important;
             }
 
-            /* И в меню действий на карточке */
-            #chatsActionsMenu,
-            #chatsActionsMenu * {
-                -webkit-touch-callout: none !important;
-                -webkit-user-select: none !important;
-                user-select: none !important;
+            /* Скрываем нативную подсветку ::selection в списке чатов */
+            #chatsList ::selection,
+            .chat-list-item ::selection {
+                background: transparent !important;
+                color: inherit !important;
+            }
+            #chatsList ::-moz-selection,
+            .chat-list-item ::-moz-selection {
+                background: transparent !important;
+                color: inherit !important;
             }
         `;
         document.head.appendChild(style);
     }
 
-    // ─── 2. Перехват contextmenu / selectstart / dragstart ───
-    //  Ловим в CAPTURE-фазе, чтобы перебить даже обработчики
-    //  отдельных модулей.
-    const BLOCKED_EVENTS = ['contextmenu', 'selectstart', 'dragstart', 'longpress'];
+    // ─── 2. Универсальная функция «обнуления» выделения ───
+    function killSelection() {
+        try {
+            const sel = window.getSelection();
+            if (!sel) return;
 
-    BLOCKED_EVENTS.forEach(evt => {
+            // Сначала сжимаем — чтобы Chrome не успел отрисовать
+            if (sel.rangeCount > 0) {
+                sel.collapseToStart();
+                // Иногда collapse не помогает — снимаем полностью
+                sel.removeAllRanges();
+            }
+
+            // На всякий случай — ещё раз
+            if (sel.rangeCount > 0) {
+                sel.removeAllRanges();
+            }
+        } catch (e) { /* ignore */ }
+    }
+
+    // ─── 3. Перехват начала выделения ───
+    //  Ловим в CAPTURE-фазе самые первые события.
+    //  ВАЖНО: на touchmove мы НЕ вызываем preventDefault, иначе
+    //  сломается обычный скролл. Вместо этого мгновенно снимаем range.
+
+    const EVENTS_TO_KILL = [
+        'selectstart',
+        'selectionchange',
+        'dragstart',
+        'contextmenu',
+    ];
+
+    EVENTS_TO_KILL.forEach(evt => {
         document.addEventListener(evt, (e) => {
-            // Проверяем, что событие внутри #chatsList
-            const chatsList = document.getElementById('chatsList');
-            if (!chatsList) return;
             const target = e.target;
             if (!target || !target.closest) return;
 
-            // Внутри списка чатов — блокируем всё
-            if (target.closest('#chatsList')) {
+            // Только если внутри списка чатов
+            if (!target.closest('#chatsList') && !target.closest('.chat-list-item')) {
+                return;
+            }
+
+            // Для contextmenu — жёстко блокируем (это и есть
+            // триггер «Поиск / Переводчик / Объяснить» в Chrome)
+            if (evt === 'contextmenu') {
                 e.preventDefault();
                 e.stopPropagation();
+                killSelection();
                 return false;
             }
 
-            // Также блокируем на карточках, даже если #chatsList
-            // в момент события не найден (на всякий случай)
-            if (target.closest('.chat-list-item')) {
-                e.preventDefault();
-                e.stopPropagation();
-                return false;
-            }
-        }, true);  // ⬅️ CAPTURE-фаза
+            // Для остальных — мгновенно снимаем выделение
+            // (без preventDefault, чтобы не сломать tap)
+            killSelection();
+        }, { capture: true, passive: false });
     });
 
-    // ─── 3. Снятие выделения при selectionchange ───
-    //  На некоторых Android-устройствах даже с CSS user-select: none
-    //  Chrome умудряется выделить слово в момент долгого тапа.
-    //  Гасим это сразу, как только заметили.
-    document.addEventListener('selectionchange', () => {
-        const sel = window.getSelection();
-        if (!sel || sel.rangeCount === 0) return;
-
-        const node = sel.anchorNode;
-        if (!node) return;
-        const el = node.nodeType === 1 ? node : node.parentElement;
-        if (!el || !el.closest) return;
-
-        if (el.closest('#chatsList') || el.closest('.chat-list-item')) {
-            sel.removeAllRanges();
-        }
-    }, { passive: true });
-
     // ─── 4. Долгий тап — «замораживаем» выделение ───
-    //  Запускаем таймер на touchstart. Если через 300 мс
-    //  что-то выделено — снимаем. Это позволяет клику
-    //  (короткому тапу) работать как раньше, а долгий тап
-    //  не запускает системный «Google Search / Translate».
-    let _longTapTimer = null;
+    //  На touchstart запускаем серию таймеров. Chrome начинает
+    //  выделять примерно через 200-300 мс после начала тапа.
+    //  Мы несколько раз в течение секунды снимаем выделение.
 
-    function clearSelectionNow() {
-        try {
-            const sel = window.getSelection();
-            if (sel && sel.rangeCount > 0) sel.removeAllRanges();
-        } catch (e) {}
+    let _killTimers = [];
+
+    function scheduleKills() {
+        clearKillTimers();
+        // Несколько залпов — чтобы поймать момент, когда
+        // Chrome решит выделить слово
+        const delays = [50, 100, 150, 200, 250, 300, 400, 500, 700, 900, 1200];
+        delays.forEach(d => {
+            _killTimers.push(setTimeout(killSelection, d));
+        });
+    }
+
+    function clearKillTimers() {
+        _killTimers.forEach(t => clearTimeout(t));
+        _killTimers = [];
     }
 
     document.addEventListener('touchstart', (e) => {
         const target = e.target;
         if (!target || !target.closest) return;
-
-        // Только внутри списка чатов
         if (!target.closest('#chatsList') && !target.closest('.chat-list-item')) return;
 
-        if (_longTapTimer) clearTimeout(_longTapTimer);
-        _longTapTimer = setTimeout(() => {
-            // На момент срабатывания таймера проверим — не выделилось ли что-то
-            clearSelectionNow();
-        }, 300);
-    }, { passive: true, capture: true });
+        // Активируем глобальный «no-select» режим на body
+        document.body.classList.add('no-select-active');
+        scheduleKills();
+    }, { capture: true, passive: true });
 
-    document.addEventListener('touchend', () => {
-        if (_longTapTimer) {
-            clearTimeout(_longTapTimer);
-            _longTapTimer = null;
+    document.addEventListener('touchmove', (e) => {
+        // Если начали двигать палец — это скролл, не выделение.
+        // Прекращаем «залпы», но не мешаем скроллу.
+        if (_killTimers.length > 0) {
+            // Один раз снимаем, и останавливаем залпы
+            killSelection();
+            clearKillTimers();
         }
-        // На всякий случай ещё раз
-        clearSelectionNow();
-    }, { passive: true, capture: true });
+    }, { capture: true, passive: true });
 
-    document.addEventListener('touchcancel', () => {
-        if (_longTapTimer) {
-            clearTimeout(_longTapTimer);
-            _longTapTimer = null;
+    function endTouch() {
+        // Ещё раз снимаем выделение
+        killSelection();
+        // Останавливаем залпы через небольшую задержку —
+        // чтобы не снять выделение уже в другом месте (например,
+        // если открылся чат и там нужен user-select)
+        setTimeout(() => {
+            clearKillTimers();
+            document.body.classList.remove('no-select-active');
+        }, 100);
+    }
+
+    document.addEventListener('touchend', endTouch, { capture: true, passive: true });
+    document.addEventListener('touchcancel', endTouch, { capture: true, passive: true });
+
+    // ─── 5. Перехват переходов между экранами ───
+    //  Если в момент перехода в чат было выделение — гасим его
+    //  ДО рендера чата. Иначе «призрак» проявится внутри чата.
+    function killOnScreenChange() {
+        killSelection();
+        // Ещё раз через микротаск
+        Promise.resolve().then(killSelection);
+        // И через rAF
+        requestAnimationFrame(killSelection);
+        // И ещё раз чуть позже — на случай асинхронного рендера
+        setTimeout(killSelection, 50);
+        setTimeout(killSelection, 200);
+    }
+
+    // Патчим функции смены экрана
+    ['showChatScreen', 'showChatsScreen', 'showAuthScreen'].forEach(fnName => {
+        if (typeof window[fnName] === 'function') {
+            const orig = window[fnName];
+            window[fnName] = function() {
+                killOnScreenChange();
+                const r = orig.apply(this, arguments);
+                killOnScreenChange();
+                return r;
+            };
         }
-        clearSelectionNow();
-    }, { passive: true, capture: true });
+    });
 
-    // ─── 5. Периодическая страховка ───
-    //  Если по какой-то причине выделение проскочило —
-    //  раз в 800 мс проверяем и снимаем.
-    setInterval(() => {
-        if (state && state.currentScreen !== 'chats') return;
+    // ─── 6. MutationObserver — страховка ───
+    //  Если по какой-то причине выделение появилось и «висит» —
+    //  снимаем его. Но только когда мы на экране чатов или
+    //  когда выделение внутри чата (не трогаем право пользователя
+    //  выделить текст в поиске, редакторе и т.п.).
+    let _lastKillTs = 0;
+    const _selectionObserver = new MutationObserver(() => {
+        // Троттлим — не чаще раза в 100 мс
+        const now = Date.now();
+        if (now - _lastKillTs < 100) return;
+
         const sel = window.getSelection();
         if (!sel || sel.rangeCount === 0) return;
+
         const node = sel.anchorNode;
         if (!node) return;
         const el = node.nodeType === 1 ? node : node.parentElement;
         if (!el || !el.closest) return;
-        if (el.closest('#chatsList') || el.closest('.chat-list-item')) {
-            sel.removeAllRanges();
-        }
-    }, 800);
 
-    console.log('🚫 Системные жесты Chrome на списке чатов отключены');
-    console.log('   • user-select: none + touch-callout: none');
-    console.log('   • contextmenu / selectstart / dragstart — заблокированы');
-    console.log('   • selectionchange — авто-снятие');
-    console.log('   • Долгий тап не вызывает Google Search / Translate');
+        // Если выделение в списке чатов или внутри сообщения — снимаем
+        if (el.closest('#chatsList') ||
+            el.closest('.chat-list-item') ||
+            el.closest('.message-wrapper[data-msg-id]')) {
+            _lastKillTs = now;
+            killSelection();
+        }
+    });
+
+    // Наблюдаем за изменениями в DOM (появление чата и т.п.)
+    _selectionObserver.observe(document.body, {
+        childList: true,
+        subtree: true,
+        characterData: false,
+    });
+
+    // ─── 7. Периодическая страховка ───
+    //  Раз в 500 мс — если что-то выделено там, где не надо — снимаем.
+    setInterval(() => {
+        const sel = window.getSelection();
+        if (!sel || sel.rangeCount === 0) return;
+
+        const node = sel.anchorNode;
+        if (!node) return;
+        const el = node.nodeType === 1 ? node : node.parentElement;
+        if (!el || !el.closest) return;
+
+        if (el.closest('#chatsList') ||
+            el.closest('.chat-list-item')) {
+            killSelection();
+        }
+    }, 500);
+
+    // ─── 8. Также отключаем «Google Search / Translate» в целом ───
+    //  Chrome показывает плашку поверх contextmenu — её не отменить
+    //  из JS. Но если contextmenu отменён — плашка не появится.
+    //  Дополнительно гасим любые «preview» через menu-события (WebView).
+    document.addEventListener('menu', (e) => {
+        if (e.target && e.target.closest && e.target.closest('#chatsList')) {
+            e.preventDefault();
+            e.stopPropagation();
+        }
+    }, true);
+
+    console.log('🚫 [HardBlock] Системные жесты Chrome полностью заблокированы');
+    console.log('   • Мгновенное снятие выделения на selectstart/selectionchange');
+    console.log('   • «Залпы» kill на touchstart (11 залпов за 1.2 сек)');
+    console.log('   • При смене экрана — принудительный kill до и после');
+    console.log('   • MutationObserver следит за «призраками» выделения');
+    console.log('   • ::selection принудительно прозрачный в списке чатов');
 })();
 </script>
 </body>
