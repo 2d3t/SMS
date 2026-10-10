@@ -35074,403 +35074,656 @@ try {
 </script>
 <script>
 // ═══════════════════════════════════════════════════════════════
-//  🩹 CHROME BACK-BUTTON FIX v1
+//  🧊 BACKGROUND-FRIENDLY FREEZE v1
 //  ─────────────────────────────────────────────────────────────
-//  Чиним «залипание» при разворачивании PWA в Chrome.
+//  Разделяем жизнь приложения на 3 режима:
 //
-//  Причины проблемы:
-//   1) history.pushState на load и в popstate засоряют стек
-//   2) При visibilitychange → visible сразу летит куча fetch'ей
-//   3) Не все setInterval-поллинги уважают document.hidden
+//   1) VISIBLE (обычная работа) — всё работает: UI, поллинги,
+//      observers, анимации, звуки.
 //
-//  Что делает патч:
-//   1) Отключает паразитный pushState на load
-//   2) Убирает повторный pushState внутри popstate
-//   3) Ставит глобальный стоп-кран __appHidden
-//   4) Троттлит все фоновые fetch'и при hidden / сразу после visible
-//   5) Даёт браузеру 600 мс дорисовать снапшот перед возобновлением
+//   2) JUST-RESUMED (первые 1500 мс после разворота) —
+//      ПОЛНАЯ ТИШИНА. Chrome дорисовывает снапшот, ничего
+//      не должно ему мешать.
+//
+//   3) HIDDEN (свёрнуто) — работает ТОЛЬКО звуковой поллинг
+//      раз в 90 сек. Все observers, rAF, интервалы <30 сек
+//      и UI-поллинги спят.
+//
+//  Звук уведомлений в фоне сохраняется (пока Chrome не заморозит
+//  вкладку — это ограничение браузера, ~5-10 минут).
 // ═══════════════════════════════════════════════════════════════
 
-(function installChromeBackButtonFix() {
+(function installBackgroundFriendlyFreeze() {
     'use strict';
 
-    console.log('🩹 [ChromeBackFix] Установка патча…');
+    console.log('🧊 [Freeze] Установка патча…');
 
     // ═══════════════════════════════════════════════════════════
-    //  1. ГЛОБАЛЬНЫЙ ФЛАГ «приложение свёрнуто / только что развернулось»
+    //  КОНФИГ
     // ═══════════════════════════════════════════════════════════
-    //  __appHidden       — true, пока вкладка/приложение в фоне
-    //  __appJustResumed  — true в течение ~800 мс после visible
-    //                      (чтобы всё фоновое ждало, пока дорисуется снапшот)
-    window.__appHidden = document.hidden;
-    window.__appJustResumed = false;
+    const CFG = {
+        // Сколько тишины после разворота, чтобы Chrome дорисовал снапшот
+        justResumedMs: 1500,
 
-    let _resumeTimer = null;
+        // Интервал звукового поллинга в hidden
+        hiddenPollMs: 90000,   // 90 сек
 
-    document.addEventListener('visibilitychange', () => {
-        if (document.hidden) {
-            window.__appHidden = true;
-            window.__appJustResumed = false;
+        // Задержка перед первым звуковым поллингом после ухода в hidden
+        hiddenFirstPollDelayMs: 5000,
 
-            if (_resumeTimer) {
-                clearTimeout(_resumeTimer);
-                _resumeTimer = null;
-            }
-
-            // Останавливаем поллинг текущего чата
-            try {
-                if (typeof stopPolling === 'function') stopPolling();
-            } catch (e) {}
-
-            // 🆕 Сообщаем OfflineMode, что мы ушли в фон —
-            //     это отдельная ветка, чтобы не триггерить
-            //     «офлайн-баннер» при разворачивании
-            try {
-                if (typeof OfflineMode !== 'undefined' && OfflineMode.deactivate) {
-                    // не активируем и не деактивируем — просто никак
-                }
-            } catch (e) {}
-
-            console.log('🩹 [ChromeBackFix] Приложение свёрнуто');
-
-        } else {
-            // 🆕 Плавное разворачивание:
-            //     СНАЧАЛА даём Chrome 600 мс отрисовать снапшот,
-            //     только ПОТОМ возобновляем поллинги и сеть.
-            window.__appHidden = false;
-            window.__appJustResumed = true;
-
-            console.log('🩹 [ChromeBackFix] Разворачиваемся — пауза 600 мс');
-
-            if (_resumeTimer) clearTimeout(_resumeTimer);
-            _resumeTimer = setTimeout(() => {
-                window.__appJustResumed = false;
-                _resumeTimer = null;
-
-                console.log('🩹 [ChromeBackFix] Возобновляем фоновые задачи');
-
-                // Возобновляем поллинг, если мы в чате
-                try {
-                    if (state && state.chatFile && state.currentScreen === 'chat') {
-                        if (typeof startPolling === 'function') startPolling();
-                    }
-                } catch (e) {}
-
-                // Обновляем непрочитанные (осторожно, с задержкой)
-                try {
-                    if (state && state.currentScreen === 'chats') {
-                        if (typeof refreshUnreadBadges === 'function') {
-                            refreshUnreadBadges().catch(() => {});
-                        }
-                    }
-                } catch (e) {}
-            }, 600);
-        }
-    });
-
-    // ═══════════════════════════════════════════════════════════
-    //  2. УБИРАЕМ ПАРАЗИТНЫЙ pushState НА LOAD
-    //     Оригинальный installAndroidBackButton вешает свой
-    //     обработчик на 'load' и кладёт лишнюю запись в стек.
-    //     Мы не можем «отменить» уже зарегистрированный listener,
-    //     но можем обнулить эффект: сразу после load очистим
-    //     состояние истории через replaceState.
-    // ═══════════════════════════════════════════════════════════
-    window.addEventListener('load', () => {
-        // Даём другим load-обработчикам выполниться
-        setTimeout(() => {
-            try {
-                // Заменяем текущую запись — не пушим новую
-                // Это оставит стек коротким, но не пустым
-                history.replaceState(
-                    { screen: state && state.currentScreen || 'auth' },
-                    '',
-                    location.href
-                );
-                console.log('🩹 [ChromeBackFix] load: replaceState вместо лишней записи');
-            } catch (e) {}
-        }, 0);
-    });
-
-    // ═══════════════════════════════════════════════════════════
-    //  3. ПЕРЕХВАТ POPSTATE — не пушим обратно запись
-    //     Оригинальный обработчик делает history.pushState
-    //     при каждом возврате из чата. Это засоряет стек и
-    //     ломает сворачивание в Chrome.
-    //     Мы вешаем СВОЙ обработчик в capture-фазе и гасим
-    //     поведение оригинала.
-    // ═══════════════════════════════════════════════════════════
-    window.addEventListener('popstate', (e) => {
-        // Если мы были в чате — просто выходим в список чатов
-        if (state && state.currentScreen === 'chat' && state.chatFile) {
-            // Гасим дальнейшую обработку оригинала
-            e.stopImmediatePropagation();
-
-            // Закрываем модалки если открыты
-            try {
-                if (typeof closeImageModal === 'function') closeImageModal();
-            } catch (err) {}
-            try {
-                if (typeof closeVideoModal === 'function') closeVideoModal();
-            } catch (err) {}
-            document.querySelectorAll('.image-modal.active').forEach(m => {
-                m.classList.remove('active');
-            });
-
-            // Выходим в список чатов
-            try {
-                if (typeof backToChats === 'function') backToChats();
-            } catch (err) {}
-
-            if (navigator.vibrate) navigator.vibrate(15);
-            return;
-        }
-
-        // Если мы в списке чатов — пусть Chrome обрабатывает сам
-        // (выход из приложения или закрытие модалки)
-        if (state && state.currentScreen === 'chats') {
-            const anyModalOpen = document.querySelector('.image-modal.active');
-            if (anyModalOpen) {
-                // Закрываем модалку без создания новой записи
-                e.stopImmediatePropagation();
-                anyModalOpen.classList.remove('active');
-                return;
-            }
-            // Иначе — пусть выходит
-        }
-    }, true);   // ⬅️ capture-фаза — перехватываем раньше оригинала
-
-    // ═══════════════════════════════════════════════════════════
-    //  4. ТРОТТЛИМ ФОНОВЫЕ FETCH'И
-    //     Пока приложение свёрнуто или сразу после разворачивания —
-    //     не пускаем никакие фоновые GET к GitHub.
-    //     PUT/POST (отправка) — пропускаем всегда.
-    // ═══════════════════════════════════════════════════════════
-    const _origFetch = window.fetch.bind(window);
-
-    window.fetch = function(url, opts) {
-        const urlStr = typeof url === 'string' ? url : (url && url.url) || '';
-        const isGitHub = urlStr.includes('api.github.com');
-        const method = (opts && opts.method) || 'GET';
-        const isWrite = method === 'PUT' || method === 'POST' || method === 'DELETE';
-
-        // Разрешаем всё, что связано с записью
-        if (isWrite || !isGitHub) {
-            return _origFetch(url, opts);
-        }
-
-        // Фоновый GET:
-        //  1) при hidden — не пускаем совсем
-        //  2) сразу после visible (в течение 600 мс) — тоже не пускаем,
-        //     чтобы не грузить основной поток, пока Chrome рисует снапшот
-        if (window.__appHidden || window.__appJustResumed) {
-            const err = new TypeError('AppHidden-Throttled');
-            err._chromeBackFix = true;
-            return Promise.reject(err);
-        }
-
-        // Пользовательские запросы (по кнопке «Проверить», «Потянуть»)
-        // помечаем флагом opts._userInitiated = true, тогда пропускаем.
-        if (opts && opts._userInitiated === true) {
-            return _origFetch(url, opts);
-        }
-
-        return _origFetch(url, opts);
+        // Сколько последних сообщений расшифровывать для проверки
+        // (чтобы не тянуть весь чат при каждой проверке)
+        tailCheckCount: 5,
     };
 
-    // 🆕 Чтобы поведение фильтра не сломало уже написанные
-    //     патчи (AutoRefresh, RateLimitPacifier) — они используют
-    //     _origFetchBeforeThrottle — дадим им «прозрачный» доступ
-    //     через тот же самый fetch.
-    //     Ничего дополнительно не делаем — просто фильтр выше
-    //     пропускает запросы дальше, если они не фоновые.
+    // ═══════════════════════════════════════════════════════════
+    //  СОСТОЯНИЕ
+    // ═══════════════════════════════════════════════════════════
+    const ST = {
+        hidden: document.hidden,
+        justResumed: false,
+        _resumeTimer: null,
+
+        // Реестры для восстановления
+        observers: new Set(),          // все MutationObserver
+        resizeObservers: new Set(),    // все ResizeObserver
+        intervals: new Map(),          // id → { fn, delay, args, isFast }
+
+        // Звуковой поллинг
+        soundPollTimer: null,
+
+        // Уже показали нотификацию для этих id (чтобы не спамить)
+        notifiedMsgIds: new Set(),
+    };
+
+    // Глобальные флаги — их будут проверять другие патчи
+    window.__appHidden = ST.hidden;
+    window.__appJustResumed = false;
 
     // ═══════════════════════════════════════════════════════════
-    //  5. ОБОРАЧИВАЕМ setInterval — добавляем проверку __appHidden
-    //     Ко всем «сетевым» интервалам, которые уже крутятся,
-    //     патч сам применит фильтр через fetch. Но чтобы не тратить
-    //     зря CPU — дополнительно пропускаем сам вызов колбэка.
+    //  1. ПАТЧ MutationObserver.prototype.observe
+    //     Сохраняем все активные observers, чтобы уметь их
+    //     выключать и включать обратно.
     // ═══════════════════════════════════════════════════════════
-    const _origSetInterval = window.setInterval;
-    window.setInterval = function(fn, delay, ...args) {
-        // Патчим только интервалы, где явно может быть сеть:
-        //  - < 60 сек — все «частые» поллинги
-        //  - в теле fn есть слова fetch / load / poll / refresh / check
-        const needsGuard = delay < 60000;
-        if (!needsGuard) {
-            return _origSetInterval.call(this, fn, delay, ...args);
+    const _origObserve = MutationObserver.prototype.observe;
+    const _origDisconnect = MutationObserver.prototype.disconnect;
+
+    MutationObserver.prototype.observe = function(target, opts) {
+        this._freezeTarget = target;
+        this._freezeOpts = opts;
+        this._freezeActive = true;
+        ST.observers.add(this);
+
+        try {
+            return _origObserve.call(this, target, opts);
+        } catch (e) {
+            console.warn('🧊 [Freeze] observe failed:', e);
         }
+    };
+
+    MutationObserver.prototype.disconnect = function() {
+        this._freezeActive = false;
+        ST.observers.delete(this);
+        try {
+            return _origDisconnect.call(this);
+        } catch (e) {}
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  2. ПАТЧ ResizeObserver.prototype.observe
+    // ═══════════════════════════════════════════════════════════
+    if (typeof ResizeObserver !== 'undefined') {
+        const _origROObserve = ResizeObserver.prototype.observe;
+        const _origRODisconnect = ResizeObserver.prototype.disconnect;
+
+        ResizeObserver.prototype.observe = function(target, opts) {
+            this._freezeTarget = target;
+            this._freezeOpts = opts;
+            this._freezeActive = true;
+            ST.resizeObservers.add(this);
+
+            try {
+                return _origROObserve.call(this, target, opts);
+            } catch (e) {}
+        };
+
+        ResizeObserver.prototype.disconnect = function() {
+            this._freezeActive = false;
+            ST.resizeObservers.delete(this);
+            try {
+                return _origRODisconnect.call(this);
+            } catch (e) {}
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. ПАТЧ requestAnimationFrame
+    //     В justResumed — откладываем на конец паузы.
+    // ═══════════════════════════════════════════════════════════
+    const _origRAF = window.requestAnimationFrame.bind(window);
+
+    window.requestAnimationFrame = function(cb) {
+        if (window.__appHidden) {
+            // В hidden — вообще не запускаем rAF
+            // (вернём фейковый id, чтобы код не падал)
+            return -1;
+        }
+        if (window.__appJustResumed) {
+            // Откладываем до конца паузы
+            return _origRAF.call(window, () => {
+                setTimeout(cb, CFG.justResumedMs);
+            });
+        }
+        return _origRAF.call(window, cb);
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  4. ПАТЧ setInterval
+    //     В hidden — глушим всё, что меньше 30000 мс.
+    //     В justResumed — глушим всё.
+    //     Большие интервалы (>30 сек) в hidden продолжают идти.
+    // ═══════════════════════════════════════════════════════════
+    const _origSetInterval = window.setInterval.bind(window);
+    const _origClearInterval = window.clearInterval.bind(window);
+
+    window.setInterval = function(fn, delay, ...args) {
+        const originalDelay = delay;
+        const isFast = delay < 30000;
 
         const wrapped = function() {
-            // При свёрнутом приложении — молчим
-            if (window.__appHidden) return;
-            // Сразу после разворачивания — тоже молчим (Chrome дорисовывает)
+            // В hidden — не пускаем быстрые интервалы
+            if (window.__appHidden && isFast) return;
+            // Сразу после разворота — глушим всё подряд
             if (window.__appJustResumed) return;
 
             try {
                 return fn.apply(this, arguments);
             } catch (e) {
-                // Не даём одной задаче уронить остальные
-                console.warn('🩹 [ChromeBackFix] interval task failed:', e);
+                console.warn('🧊 [Freeze] interval task failed:', e);
             }
         };
 
-        return _origSetInterval.call(this, wrapped, delay, ...args);
+        const id = _origSetInterval.call(window, wrapped, delay, ...args);
+
+        // Запоминаем для отладки
+        ST.intervals.set(id, {
+            delay: originalDelay,
+            isFast,
+            wrappedFn: fn,
+        });
+
+        return id;
+    };
+
+    window.clearInterval = function(id) {
+        ST.intervals.delete(id);
+        try {
+            return _origClearInterval.call(window, id);
+        } catch (e) {}
     };
 
     // ═══════════════════════════════════════════════════════════
-    //  6. АДРЕСНО ГЛУШИМ КОНКРЕТНЫЕ POLLING-ФУНКЦИИ
-    //     Некоторые уже имеют проверки document.hidden внутри,
-    //     но не учитывают __appJustResumed. Подстрахуемся.
+    //  5. ПАТЧ setTimeout — не критичен, но пусть тоже
+    //     уважает justResumed для длинных таймаутов.
+    //     (Короткие setTimeout оставляем — они часто для UI)
     // ═══════════════════════════════════════════════════════════
-    function wrapWithGuard(fnName) {
-        if (typeof window[fnName] !== 'function') return;
-        const orig = window[fnName];
-        if (orig._chromeBackGuarded) return;
+    const _origSetTimeout = window.setTimeout.bind(window);
+
+    window.setTimeout = function(fn, delay = 0, ...args) {
+        // В hidden — длинные таймауты (>5 сек) откладываем до visible,
+        // но короткие пропускаем (они нужны для базовой работы).
+        // В justResumed — откладываем все > 100 мс.
+        if (typeof fn !== 'function') {
+            return _origSetTimeout.call(window, fn, delay, ...args);
+        }
 
         const wrapped = function() {
-            if (window.__appHidden) return;
-            if (window.__appJustResumed) return;
+            if (window.__appHidden && delay > 5000) return;
+            if (window.__appJustResumed && delay > 100) {
+                // Отложим на конец паузы
+                _origSetTimeout.call(window, fn, CFG.justResumedMs, ...args);
+                return;
+            }
             try {
-                return orig.apply(this, arguments);
+                return fn.apply(this, arguments);
             } catch (e) {
-                console.warn(`🩹 [ChromeBackFix] ${fnName} failed:`, e);
+                console.warn('🧊 [Freeze] timeout task failed:', e);
             }
         };
-        wrapped._chromeBackGuarded = true;
-        window[fnName] = wrapped;
+
+        return _origSetTimeout.call(window, wrapped, delay, ...args);
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  6. УПРАВЛЕНИЕ OBSERVERS
+    // ═══════════════════════════════════════════════════════════
+    function pauseAllObservers() {
+        let paused = 0;
+        ST.observers.forEach(obs => {
+            if (obs._freezeActive) {
+                try {
+                    _origDisconnect.call(obs);
+                    paused++;
+                } catch (e) {}
+            }
+        });
+        ST.resizeObservers.forEach(obs => {
+            if (obs._freezeActive) {
+                try {
+                    _origRODisconnect.call(obs);
+                    paused++;
+                } catch (e) {}
+            }
+        });
+        return paused;
     }
 
-    // Только те функции, что мы точно знаем — они не критичны,
-    // их вызов можно отбросить при hidden/justResumed
-    [
-        'watchOtherChats',        // BackButtonBadge
-        'refreshUnreadBadges',    // общий счётчик непрочитанных
-        'pollUpdates',            // основной поллинг чата
-    ].forEach(wrapWithGuard);
+    function resumeAllObservers() {
+        let resumed = 0;
+        ST.observers.forEach(obs => {
+            if (obs._freezeActive && obs._freezeTarget) {
+                try {
+                    _origObserve.call(obs, obs._freezeTarget, obs._freezeOpts);
+                    resumed++;
+                } catch (e) {}
+            }
+        });
+        ST.resizeObservers.forEach(obs => {
+            if (obs._freezeActive && obs._freezeTarget) {
+                try {
+                    _origROObserve.call(obs, obs._freezeTarget, obs._freezeOpts);
+                    resumed++;
+                } catch (e) {}
+            }
+        });
+        return resumed;
+    }
 
     // ═══════════════════════════════════════════════════════════
-    //  7. ОБНУЛЯЕМ СТЕК ИСТОРИИ (мягко)
-    //     Проходимся по текущему стеку и убираем лишние записи
-    //     через replaceState — оставляем только «одну лишнюю»,
-    //     чтобы системный «Назад» работал корректно.
+    //  7. ЗВУКОВОЙ ПОЛЛИНГ (работает в hidden)
+    //     Единственная задача, которой разрешено работать, пока
+    //     приложение свёрнуто. Проверяет meta.json всех чатов,
+    //     при изменениях — расшифровывает хвост и играет звук,
+    //     если есть ЧУЖИЕ новые сообщения.
     // ═══════════════════════════════════════════════════════════
-    //  ⚠️  К сожалению, JS не даёт возможности узнать длину
-    //      history.length в PWA (всегда 1 или 2). Поэтому просто
-    //      делаем один replaceState, чтобы текущее состояние было
-    //      «нашим».
-    setTimeout(() => {
+    async function soundPollTick() {
+        // Условия
+        if (!window.__appHidden) return;   // только в hidden
+        if (!state.isAuthorized || !state.token) return;
+        if (!navigator.onLine) return;
+        if (state.chats.length === 0) return;
+
+        // Не спамим нотификациями
         try {
-            history.replaceState(
-                { screen: (state && state.currentScreen) || 'auth' },
-                '',
-                location.href
-            );
-        } catch (e) {}
-    }, 1500);
-
-    // ═══════════════════════════════════════════════════════════
-    //  8. ЗАЩИЩАЕМ ОТ «ГОНКИ» ПРИ РАЗВОРАЧИВАНИИ
-    //     Пока Chrome дорисовывает снапшот — не даём никаким
-    //     patched-функциям делать массовые обновления DOM.
-    //     Просто пропускаем MutationObserver-триггеры.
-    // ═══════════════════════════════════════════════════════════
-    //  Уже сделано через fetch-фильтр и setInterval-обёртку.
-    //  Дополнительно: если во время __appJustResumed кто-то
-    //  попытается выполнить тяжёлый рендер — мы просто откладываем.
-    //  Но у нас нет универсального способа это сделать.
-    //  Поэтому — не перегружаем логику.
-
-    // ═══════════════════════════════════════════════════════════
-    //  9. ГЛУШИМ ЛИШНИЕ TOAST'Ы О СЕТИ ПОСЛЕ РАЗВОРАЧИВАНИЯ
-    //     При возврате могут прилететь ложные «Соединение потеряно»
-    //     из-за временного отсутствия fetch'ей.
-    // ═══════════════════════════════════════════════════════════
-    if (typeof window.showToast === 'function') {
-        const _origShowToast = window.showToast;
-        window.showToast = function(text, duration) {
-            if (window.__appJustResumed && typeof text === 'string') {
-                if (text.includes('Соединение') ||
-                    text.includes('сети') ||
-                    text.includes('Нет подключения') ||
-                    text.includes('Офлайн')) {
-                    console.log(`🩹 [ChromeBackFix] Подавлен ложный тост: "${text}"`);
-                    return;
+            const tasks = state.chats.map(async (chat) => {
+                try {
+                    await checkChatForNewForeignMessages(chat);
+                } catch (e) {
+                    // тихо
                 }
+            });
+            await Promise.all(tasks);
+        } catch (e) {
+            console.warn('🧊 [Freeze] soundPollTick error:', e);
+        }
+    }
+
+    /**
+     * Проверяет один чат: есть ли новые ЧУЖИЕ сообщения.
+     * Если есть — играет звук и показывает нотификацию.
+     */
+    async function checkChatForNewForeignMessages(chat) {
+        const file = chat.file;
+
+        // ─── 1. Лёгкий запрос meta.json ───
+        let metaRes;
+        try {
+            const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/chats/${file}.meta.json`;
+            const res = await fetch(url, {
+                headers: {
+                    'Authorization': `token ${state.token}`,
+                    'Accept': 'application/vnd.github.v3+json',
+                },
+                cache: 'no-store',
+            });
+            if (!res.ok) return;
+            const data = await res.json();
+            const meta = JSON.parse(base64ToUtf8((data.content || '').replace(/\n/g, '')));
+            if (!meta || !meta.version) return;
+            metaRes = meta;
+        } catch (e) {
+            return;
+        }
+
+        // ─── 2. Сравниваем с последним известным ───
+        const lastKnownVersion = chat._lastMetaVersion || 0;
+        if (metaRes.version <= lastKnownVersion) return;
+
+        // Обновляем
+        chat._lastMetaVersion = metaRes.version;
+
+        // ─── 3. Есть изменения — расшифровываем хвост ───
+        const password = state.savedPasswords[file];
+        if (!password) {
+            // Не знаем пароль — просто играем звук (что-то новое)
+            playSoundForChat(file, null);
+            return;
+        }
+
+        let content;
+        try {
+            const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/chats/${file}.json`;
+            const res = await fetch(url, {
+                headers: {
+                    'Authorization': `token ${state.token}`,
+                    'Accept': 'application/vnd.github.v3+json',
+                },
+                cache: 'no-store',
+            });
+            if (!res.ok) return;
+            const data = await res.json();
+            content = JSON.parse(base64ToUtf8((data.content || '').replace(/\n/g, '')));
+        } catch (e) {
+            return;
+        }
+
+        if (!content || content.v !== CRYPTO.VERSION || !content.salt) return;
+
+        // ─── 4. Расшифровываем ПОСЛЕДНИЕ N ───
+        const encMessages = content.messages || [];
+        if (encMessages.length === 0) return;
+
+        const tail = encMessages.slice(-CFG.tailCheckCount);
+
+        // Деривим ключ
+        let key;
+        try {
+            key = await deriveKey(password, content.salt);
+        } catch (e) {
+            return;
+        }
+
+        // ─── 5. Ищем чужие сообщения ───
+        const foreignMessages = [];
+        for (const enc of tail) {
+            try {
+                const iv = new Uint8Array(base64ToArrayBuffer(enc.iv));
+                const ciphertext = base64ToArrayBuffer(enc.data);
+                const plaintext = await crypto.subtle.decrypt(
+                    { name: 'AES-GCM', iv }, key, ciphertext
+                );
+                const payload = JSON.parse(new TextDecoder().decode(plaintext));
+
+                if (payload.username !== state.username) {
+                    // Ещё не показывали нотификацию для этого id?
+                    if (!ST.notifiedMsgIds.has(enc.id)) {
+                        foreignMessages.push({
+                            id: enc.id,
+                            username: payload.username,
+                            text: payload.text || '',
+                            hasAttach: !!(payload.image || payload.audio || payload.file || payload.video || payload.videoNote),
+                        });
+                    }
+                }
+            } catch (e) {
+                // не смогли расшифровать — пропускаем
             }
-            return _origShowToast.apply(this, arguments);
-        };
+        }
+
+        if (foreignMessages.length === 0) return;
+
+        // ─── 6. Помечаем как notified ───
+        foreignMessages.forEach(m => ST.notifiedMsgIds.add(m.id));
+
+        // Обрезаем set, чтобы не рос бесконечно
+        if (ST.notifiedMsgIds.size > 500) {
+            const arr = Array.from(ST.notifiedMsgIds).slice(-200);
+            ST.notifiedMsgIds = new Set(arr);
+        }
+
+        // ─── 7. Играем звук ───
+        playSoundForChat(file, foreignMessages, chat);
+    }
+
+    /**
+     * Играет звук уведомления (один раз на пачку) и показывает
+     * системную нотификацию, если возможно.
+     */
+    function playSoundForChat(file, messages, chat) {
+        // ─── Звук ───
+        try {
+            if (typeof soundManager !== 'undefined' && soundManager.play) {
+                soundManager.play('notification');
+            }
+        } catch (e) {}
+
+        // ─── Вибрация (если браузер разрешает в фоне) ───
+        try {
+            if (navigator.vibrate) navigator.vibrate([80, 40, 80]);
+        } catch (e) {}
+
+        // ─── Системная нотификация ───
+        try {
+            if (!('Notification' in window)) return;
+            if (Notification.permission !== 'granted') return;
+
+            const chatName = chat ? (chat.name || chat.file) : file;
+            const preview = (messages && messages.length > 0)
+                ? (messages[messages.length - 1].text || '📎 вложение').slice(0, 100)
+                : 'Новое сообщение';
+            const fromName = (messages && messages[0] && messages[0].username) || 'Кто-то';
+
+            new Notification(`💬 ${chatName}`, {
+                body: `${fromName}: ${preview}`,
+                icon: 'icon-192.png',
+                tag: `chat-${file}`,   // объединяет нотификации одного чата
+                renotify: true,
+                silent: true,          // звук уже проиграли сами
+            });
+        } catch (e) {}
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  10. PWA-СПЕЦИФИЧНО: ПРИ РАЗВОРАЧИВАНИИ ЧЕРЕЗ «RECENTS»
-    //      Иногда Chrome восстанавливает страницу с состоянием
-    //      из BFCache (back/forward cache). Там document.hidden
-    //      может быть false, но снапшот ещё не отрисован.
-    //      Даём «страховочный» таймаут после pageshow.
+    //  8. УПРАВЛЕНИЕ ЗВУКОВЫМ ПОЛЛИНГОМ
+    // ═══════════════════════════════════════════════════════════
+    function startSoundPolling() {
+        stopSoundPolling();
+
+        // Первый тик через небольшую задержку
+        _origSetTimeout.call(window, soundPollTick, CFG.hiddenFirstPollDelayMs);
+
+        // Потом — раз в 90 сек
+        ST.soundPollTimer = _origSetInterval.call(
+            window,
+            soundPollTick,
+            CFG.hiddenPollMs
+        );
+
+        console.log(`🧊 [Freeze] Звуковой поллинг запущен (раз в ${CFG.hiddenPollMs / 1000} сек)`);
+    }
+
+    function stopSoundPolling() {
+        if (ST.soundPollTimer) {
+            try {
+                _origClearInterval.call(window, ST.soundPollTimer);
+            } catch (e) {}
+            ST.soundPollTimer = null;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  9. ГЛАВНЫЙ ОБРАБОТЧИК visibilitychange
+    // ═══════════════════════════════════════════════════════════
+    function onHidden() {
+        ST.hidden = true;
+        window.__appHidden = true;
+        window.__appJustResumed = false;
+
+        if (ST._resumeTimer) {
+            clearTimeout(ST._resumeTimer);
+            ST._resumeTimer = null;
+        }
+
+        console.log('🧊 [Freeze] → HIDDEN: замораживаем всё, кроме звукового поллинга');
+
+        // Останавливаем поллинг текущего чата (он визуальный)
+        try {
+            if (typeof stopPolling === 'function') stopPolling();
+        } catch (e) {}
+
+        // Замораживаем observers
+        const paused = pauseAllObservers();
+        console.log(`🧊 [Freeze] Observers приостановлено: ${paused}`);
+
+        // Запускаем звуковой поллинг
+        startSoundPolling();
+    }
+
+    function onVisible() {
+        ST.hidden = false;
+        window.__appHidden = false;
+        window.__appJustResumed = true;
+
+        console.log('🧊 [Freeze] → VISIBLE: пауза 1.5 сек для снапшота Chrome');
+
+        // Останавливаем звуковой поллинг
+        stopSoundPolling();
+
+        // Отменяем предыдущий таймер
+        if (ST._resumeTimer) clearTimeout(ST._resumeTimer);
+
+        ST._resumeTimer = setTimeout(() => {
+            window.__appJustResumed = false;
+            ST._resumeTimer = null;
+
+            console.log('🧊 [Freeze] Разворот завершён — возобновляем observers и поллинги');
+
+            // Возобновляем observers
+            const resumed = resumeAllObservers();
+            console.log(`🧊 [Freeze] Observers возобновлено: ${resumed}`);
+
+            // Возобновляем поллинг текущего чата
+            try {
+                if (state && state.chatFile && state.currentScreen === 'chat') {
+                    if (typeof startPolling === 'function') startPolling();
+                    // И сразу один раз поллим — чтобы догнать свежие сообщения
+                    if (typeof pollUpdates === 'function') {
+                        _origSetTimeout.call(window, () => {
+                            try { pollUpdates(); } catch (e) {}
+                        }, 100);
+                    }
+                }
+            } catch (e) {}
+
+            // На экране чатов — обновляем бейджи
+            try {
+                if (state && state.currentScreen === 'chats') {
+                    if (typeof refreshUnreadBadges === 'function') {
+                        refreshUnreadBadges().catch(() => {});
+                    }
+                }
+            } catch (e) {}
+        }, CFG.justResumedMs);
+    }
+
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+            onHidden();
+        } else {
+            onVisible();
+        }
+    });
+
+    // При старте — определяем текущее состояние
+    if (document.hidden) {
+        onHidden();
+    } else {
+        // Мы на старте visible — ничего не блокируем
+        window.__appHidden = false;
+        window.__appJustResumed = false;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  10. ОБРАБОТКА pageshow (BFCache)
     // ═══════════════════════════════════════════════════════════
     window.addEventListener('pageshow', (e) => {
         if (e.persisted) {
-            // Страница восстановлена из BFCache
-            console.log('🩹 [ChromeBackFix] Восстановление из BFCache');
+            console.log('🧊 [Freeze] Восстановление из BFCache — ставим паузу');
             window.__appJustResumed = true;
             setTimeout(() => {
                 window.__appJustResumed = false;
-                console.log('🩹 [ChromeBackFix] BFCache — фоновые задачи возобновлены');
-            }, 600);
+            }, CFG.justResumedMs);
         }
     });
 
     // ═══════════════════════════════════════════════════════════
-    //  11. ПУБЛИЧНОЕ API ДЛЯ ОТЛАДКИ
+    //  11. ЗАПРОС РАЗРЕШЕНИЯ НА НОТИФИКАЦИИ
+    //     Один раз, при первой авторизации.
     // ═══════════════════════════════════════════════════════════
-    window.ChromeBackFix = {
-        status: () => ({
-            appHidden: window.__appHidden,
-            justResumed: window.__appJustResumed,
-            currentScreen: (state && state.currentScreen) || 'unknown',
-            chatFile: (state && state.chatFile) || null,
-            historyLength: history.length,
-            historyState: history.state,
-        }),
-        // Форсировать «свёрнутое» состояние (для тестов)
-        simulateHidden: () => {
-            window.__appHidden = true;
-            window.__appJustResumed = false;
-            console.log('🩹 [ChromeBackFix] Симуляция hidden');
-        },
-        // Форсировать «разворачивание» (для тестов)
-        simulateResumed: () => {
-            window.__appHidden = false;
-            window.__appJustResumed = true;
-            setTimeout(() => {
-                window.__appJustResumed = false;
-            }, 600);
-            console.log('🩹 [ChromeBackFix] Симуляция resumed');
-        },
-        // Полный сброс флагов
-        reset: () => {
-            window.__appHidden = document.hidden;
-            window.__appJustResumed = false;
-            if (_resumeTimer) {
-                clearTimeout(_resumeTimer);
-                _resumeTimer = null;
+    setTimeout(() => {
+        if (state && state.isAuthorized && 'Notification' in window) {
+            if (Notification.permission === 'default') {
+                // Спрашиваем через некоторое время, чтобы не пугать сразу
+                setTimeout(() => {
+                    try {
+                        Notification.requestPermission().then(perm => {
+                            console.log('🧊 [Freeze] Разрешение на нотификации:', perm);
+                        }).catch(() => {});
+                    } catch (e) {}
+                }, 5000);
             }
-            console.log('🩹 [ChromeBackFix] Состояние сброшено');
+        }
+    }, 10000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  12. ПУБЛИЧНОЕ API ДЛЯ ОТЛАДКИ
+    // ═══════════════════════════════════════════════════════════
+    window.BackgroundFreeze = {
+        status: () => ({
+            hidden: ST.hidden,
+            justResumed: window.__appJustResumed,
+            observersTracked: ST.observers.size,
+            resizeObserversTracked: ST.resizeObservers.size,
+            intervalsTracked: ST.intervals.size,
+            fastIntervals: Array.from(ST.intervals.values()).filter(i => i.isFast).length,
+            soundPollRunning: !!ST.soundPollTimer,
+            notifiedMsgIdsSize: ST.notifiedMsgIds.size,
+            notificationPermission: ('Notification' in window)
+                ? Notification.permission
+                : 'unsupported',
+        }),
+
+        // Форсировать hidden (для тестов)
+        simulateHidden: () => onHidden(),
+
+        // Форсировать visible (для тестов)
+        simulateVisible: () => onVisible(),
+
+        // Принудительно протестировать звук
+        testSound: () => {
+            playSoundForChat('__test__', [{ username: 'Test', text: 'Test' }], { name: 'Test Chat' });
+        },
+
+        // Очистить список notified
+        clearNotified: () => {
+            ST.notifiedMsgIds.clear();
+            console.log('🧊 [Freeze] notifiedMsgIds очищен');
         },
     };
 
-    console.log('🩹 [ChromeBackFix] Патч установлен:');
-    console.log('   • load: replaceState вместо pushState');
-    console.log('   • popstate: не пушим обратно, гасим оригинал');
-    console.log('   • visibilitychange: 600 мс пауза перед возобновлением');
-    console.log('   • fetch: не пускаем фоновые GET при hidden/justResumed');
-    console.log('   • setInterval: обёрнут проверками __appHidden');
-    console.log('   • Ложные тосты о сети подавлены после разворачивания');
-    console.log('   • pageshow (BFCache): тоже уважаем паузу');
+    console.log('🧊 [Freeze] Патч установлен:');
+    console.log('   • VISIBLE:    всё работает');
+    console.log('   • JUST-RESUMED: 1500 мс тишины (Chrome дорисует снапшот)');
+    console.log('   • HIDDEN:     звуковой поллинг раз в 90 сек + нотификации');
+    console.log('   • Observers и rAF замораживаются в hidden');
+    console.log('   • Интервалы <30 сек не работают в hidden');
+    console.log('   • Интервалы >30 сек работают в hidden');
     console.log('');
-    console.log('   Отладка: ChromeBackFix.status()');
-    console.log('   Тест: ChromeBackFix.simulateHidden() / .simulateResumed()');
+    console.log('   Отладка:');
+    console.log('     BackgroundFreeze.status()          — состояние');
+    console.log('     BackgroundFreeze.simulateHidden()  — тест hidden');
+    console.log('     BackgroundFreeze.simulateVisible() — тест visible');
+    console.log('     BackgroundFreeze.testSound()       — тест звука');
 })();
 </script>
 </body>
