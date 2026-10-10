@@ -36013,6 +36013,161 @@ try {
     console.log('   • Лёгкая пульсация масштаба');
     console.log('   • Длительность: 2 секунды (было 1.2)');
 })();
+// ═══════════════════════════════════════════════════════════════
+//  🩹 ПАТЧ: Принудительное обновление сообщения перед прыжком
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: когда Radar ловит событие (комментарий/реакция),
+//  historyState.allMessages может содержать УСТАРЕВШУЮ версию
+//  сообщения. При прыжке показывается старое состояние — без
+//  нового комментария или реакции.
+//
+//  Решение: перед scrollToMessage принудительно перечитываем
+//  сообщение из GitHub.
+// ═══════════════════════════════════════════════════════════════
+
+(function installFreshMessageOnJump() {
+    'use strict';
+
+    if (typeof scrollToMessage !== 'function') {
+        console.warn('🩹 [FreshJump] scrollToMessage не найден');
+        return;
+    }
+
+    const _origScrollToMessage = scrollToMessage;
+
+    /**
+     * Свежая загрузка одного сообщения из GitHub.
+     * Обновляет его в historyState.allMessages и в DOM.
+     */
+    async function refreshMessageFromGitHub(msgId) {
+        if (!state.chatFile || !state.token || !CRYPTO._key) return false;
+
+        try {
+            const path = getChatPath(state.chatFile);
+            const result = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
+            if (!result.exists || !result.content) return false;
+
+            const content = result.content;
+            if (content.v !== CRYPTO.VERSION || !content.salt) return false;
+
+            // Соль могла измениться
+            if (content.salt !== state.salt) {
+                state.salt = content.salt;
+                CRYPTO._key = await deriveKey(state.chatPassword, state.salt);
+            }
+
+            // Ищем нужное сообщение
+            const encMessages = content.messages || [];
+            const enc = encMessages.find(m => String(m.id) === String(msgId));
+            if (!enc) return false;
+
+            // Расшифровываем
+            const freshMsg = await decryptMessage(enc);
+            if (!freshMsg) return false;
+
+            // ═══ Обновляем в historyState ═══
+            const idx = historyState.allMessages.findIndex(
+                m => String(m.id) === String(msgId)
+            );
+            if (idx >= 0) {
+                historyState.allMessages[idx] = freshMsg;
+            } else {
+                historyState.allMessages.push(freshMsg);
+            }
+
+            // ═══ Обновляем в state.messages ═══
+            const sIdx = state.messages.findIndex(
+                m => String(m.id) === String(msgId)
+            );
+            if (sIdx >= 0) {
+                state.messages[sIdx] = freshMsg;
+            } else {
+                state.messages.push(freshMsg);
+            }
+
+            // ═══ Перерисовываем узел в DOM ═══
+            const wrapper = messagesInner.querySelector(
+                `.message-wrapper[data-msg-id="${msgId}"]`
+            );
+            if (wrapper) {
+                // Полностью заменяем HTML обёртки новым
+                const html = buildMessageHTML(freshMsg, { noFade: true });
+                const temp = document.createElement('div');
+                temp.innerHTML = html;
+                const newWrapper = temp.firstElementChild;
+
+                if (newWrapper) {
+                    // Сохраняем подсветку если была
+                    if (wrapper.classList.contains('highlight-flash')) {
+                        newWrapper.classList.add('highlight-flash');
+                    }
+                    if (wrapper.classList.contains('long')) {
+                        newWrapper.classList.add('long');
+                    }
+
+                    wrapper.replaceWith(newWrapper);
+
+                    // Прогружаем вложения
+                    loadAttachmentsIn(newWrapper);
+                    loadReplyThumbnails(newWrapper);
+
+                    // Инициализируем аудио-плееры
+                    setTimeout(initAudioPlayers, 0);
+                }
+
+                return true;
+            }
+
+            return false;
+        } catch (e) {
+            console.warn('🩹 [FreshJump] refreshMessageFromGitHub failed:', e);
+            return false;
+        }
+    }
+
+    // ─── Патчим scrollToMessage ───
+    scrollToMessage = async function(msgId) {
+        if (!msgId) return;
+
+        // Если мы в этом чате — сначала подтягиваем свежую версию сообщения
+        if (state.chatFile && state.isAuthorized && state.token) {
+            try {
+                await refreshMessageFromGitHub(msgId);
+            } catch (e) {
+                console.warn('🩹 [FreshJump] refresh failed, продолжаем со старой версией:', e);
+            }
+        }
+
+        // Вызываем оригинал
+        return _origScrollToMessage.call(this, msgId);
+    };
+
+    // ─── Также патчим jumpToPlayingTrack-подобный сценарий ───
+    // В EventRadarFix мы перехватываем клики. Добавим обновление и туда.
+    document.addEventListener('click', async (e) => {
+        const card = e.target.closest('.r2-event[data-chat-file]');
+        if (!card) return;
+
+        const overlay = document.getElementById('radar2Overlay');
+        if (!overlay || !overlay.classList.contains('show')) return;
+
+        const chatFile = card.dataset.chatFile;
+        const msgId = parseInt(card.dataset.msgId);
+        if (isNaN(msgId) || !chatFile) return;
+
+        // Если мы уже в этом чате — обновляем сообщение немедленно
+        if (state.chatFile === chatFile) {
+            // Небольшая задержка, чтобы EventRadarFix закрыл оверлей
+            setTimeout(async () => {
+                await refreshMessageFromGitHub(msgId);
+                // После обновления — заново скроллим и подсвечиваем
+                _origScrollToMessage.call(null, msgId);
+            }, 350);
+        }
+    }, true);   // capture-фаза, чтобы сработало раньше EventRadarFix
+
+    console.log('🩹 [FreshJump] Патч установлен — при прыжке обновляем сообщение из GitHub');
+})();
 </script>
 </body>
 </html>
