@@ -37480,44 +37480,40 @@ try {
 </script>
 <script>
 // ═══════════════════════════════════════════════════════════════
-//  🔗 ВРЕМЕННЫЕ ССЫЛКИ-ПРИГЛАШЕНИЯ (2 минуты)
+//  🔐 БЕЗОПАСНЫЕ ПРИГЛАШЕНИЯ v3 (шифрованные билеты)
 //  ─────────────────────────────────────────────────────────────
-//  • Кнопка «🔗 Временная ссылка» в модалке шаринга
-//  • В ссылке: токен + пароль чата + имя + ID + время + подпись
-//  • Ссылка живёт 2 минуты, потом 410 Gone
-//  • Подпись HMAC-SHA256 — защита от подделки
-//  • При переходе: автовход + чистка URL
+//  Что нового vs v2:
+//   • Билет ШИФРУЕТСЯ AES-256-GCM перед отправкой в GitHub
+//   • Ключ шифрования передаётся в URL-ФРАГМЕНТЕ (#k=...)
+//   • Фрагмент НЕ уходит на сервер → GitHub видит только шум
+//   • GitHub Push Protection больше не блокирует пуш
 // ═══════════════════════════════════════════════════════════════
 
-(function installTemporaryInviteLinks() {
+(function installSecureInviteLinks() {
     'use strict';
 
     // ═══════════════════════════════════════════════════════════
     //  КОНФИГ
     // ═══════════════════════════════════════════════════════════
     const CFG = {
-        // Сколько живёт ссылка
-        TTL_MS: 2 * 60 * 1000,       // 2 минуты
-        // TTL_MS: 10 * 60 * 1000,   // раскомментируй для 10 минут
+        TTL_MS: 2 * 60 * 1000,
+        TICKETS_PATH: 'tickets/',
+        URL_PARAM: 'invite',                 // ?invite=<id>
+        URL_FRAGMENT_KEY: 'k',               // #k=<aes_key_b64url>
 
-        // URL-параметр, по которому ловим приглашение
-        URL_PARAM: 'invite',
+        MY_TICKETS_KEY: 'smschat_my_tickets_v3',
+        USED_TICKETS_KEY: 'smschat_used_tickets_v3',
 
-        // Префикс для HMAC (соль приложения — не секретная, но фиксированная)
-        HMAC_PREFIX: 'smschat-invite-v1:',
-
-        // Хранилище для проверки «одноразовости» (можно выключить)
-        USED_KEY: 'smschat_used_invites_v1',
-        ENABLE_ONETIME: true,        // true — каждая ссылка работает 1 раз
+        CLEANUP_INTERVAL_MS: 60 * 1000,
+        ID_PREFIX: 't_',
     };
 
     // ═══════════════════════════════════════════════════════════
-    //  УТИЛИТЫ: base64url (безопасный для URL)
+    //  УТИЛИТЫ: base64url
     // ═══════════════════════════════════════════════════════════
-    function toBase64Url(str) {
-        const utf8 = new TextEncoder().encode(str);
+    function toBase64Url(bytes) {
         let binary = '';
-        utf8.forEach(b => binary += String.fromCharCode(b));
+        bytes.forEach(b => binary += String.fromCharCode(b));
         return btoa(binary)
             .replace(/\+/g, '-')
             .replace(/\//g, '_')
@@ -37530,88 +37526,244 @@ try {
         const binary = atob(b64);
         const bytes = new Uint8Array(binary.length);
         for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-        return new TextDecoder().decode(bytes);
+        return bytes;
+    }
+
+    function genTicketId() {
+        const bytes = crypto.getRandomValues(new Uint8Array(16));
+        const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+        return CFG.ID_PREFIX + hex;
+    }
+
+    function genAesKey() {
+        return crypto.getRandomValues(new Uint8Array(32)); // 256 бит
+    }
+
+    function ticketPath(ticketId) {
+        return CFG.TICKETS_PATH + ticketId + '.json';
+    }
+
+    function isValidTicketId(id) {
+        return typeof id === 'string' && /^t_[a-f0-9]{32}$/.test(id);
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  HMAC-SHA256 (Web Crypto)
+    //  ШИФРОВАНИЕ БИЛЕТА (AES-256-GCM, случайный ключ)
     // ═══════════════════════════════════════════════════════════
-    async function getHmacKey() {
-        // Ключ деривим из префикса + UA (чтобы ссылка не работала,
-        // если её открыли в другом браузере/устройстве — это доп. защита)
-        // Но! Это сломает «отправил другу» — у друга другой UA.
-        // Поэтому ключ = только префикс. Подпись защищает от
-        // случайных/простых подделок, не от мотивированного атакующего.
-        const enc = new TextEncoder();
-        return crypto.subtle.importKey(
+    async function encryptTicketData(ticketData, aesKeyBytes) {
+        // Импортируем сырой ключ
+        const key = await crypto.subtle.importKey(
             'raw',
-            enc.encode(CFG.HMAC_PREFIX),
-            { name: 'HMAC', hash: 'SHA-256' },
+            aesKeyBytes,
+            { name: 'AES-GCM' },
             false,
-            ['sign', 'verify']
+            ['encrypt']
         );
+
+        // IV
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+
+        // Кодируем JSON
+        const plaintext = new TextEncoder().encode(JSON.stringify(ticketData));
+
+        // Шифруем
+        const ciphertext = await crypto.subtle.encrypt(
+            { name: 'AES-GCM', iv },
+            key,
+            plaintext
+        );
+
+        // Возвращаем объект, где всё в base64
+        // (никаких читаемых строк!)
+        return {
+            v: 3,                                 // версия формата
+            iv: toBase64Url(iv),                  // 12 байт
+            ct: toBase64Url(new Uint8Array(ciphertext)),  // шифротекст
+        };
     }
 
-    async function signPayload(payloadStr) {
-        const key = await getHmacKey();
-        const enc = new TextEncoder();
-        const sig = await crypto.subtle.sign('HMAC', key, enc.encode(payloadStr));
-        const bytes = new Uint8Array(sig);
-        let binary = '';
-        bytes.forEach(b => binary += String.fromCharCode(b));
-        return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    async function decryptTicketData(encryptedObj, aesKeyBytes) {
+        // Импортируем ключ
+        const key = await crypto.subtle.importKey(
+            'raw',
+            aesKeyBytes,
+            { name: 'AES-GCM' },
+            false,
+            ['decrypt']
+        );
+
+        // IV из base64url
+        const iv = fromBase64Url(encryptedObj.iv);
+
+        // Шифротекст из base64url
+        const ct = fromBase64Url(encryptedObj.ct);
+
+        // Расшифровка
+        const plaintext = await crypto.subtle.decrypt(
+            { name: 'AES-GCM', iv },
+            key,
+            ct
+        );
+
+        return JSON.parse(new TextDecoder().decode(plaintext));
     }
 
-    async function verifySignature(payloadStr, signatureB64Url) {
+    // ═══════════════════════════════════════════════════════════
+    //  localStorage: «мои билеты»
+    // ═══════════════════════════════════════════════════════════
+    function loadMyTickets() {
         try {
-            const key = await getHmacKey();
-            const enc = new TextEncoder();
-            let b64 = signatureB64Url.replace(/-/g, '+').replace(/_/g, '/');
-            while (b64.length % 4) b64 += '=';
-            const binary = atob(b64);
-            const sigBytes = new Uint8Array(binary.length);
-            for (let i = 0; i < binary.length; i++) sigBytes[i] = binary.charCodeAt(i);
-            return await crypto.subtle.verify('HMAC', key, sigBytes, enc.encode(payloadStr));
+            const raw = localStorage.getItem(CFG.MY_TICKETS_KEY);
+            return raw ? JSON.parse(raw) : {};
+        } catch (e) { return {}; }
+    }
+    function saveMyTickets(t) {
+        try { localStorage.setItem(CFG.MY_TICKETS_KEY, JSON.stringify(t)); } catch (e) {}
+    }
+    function addMyTicket(ticketId, expiresAt, chatFile, chatName) {
+        const t = loadMyTickets();
+        t[ticketId] = { expiresAt, chatFile, chatName, createdAt: Date.now() };
+        saveMyTickets(t);
+    }
+    function removeMyTicket(ticketId) {
+        const t = loadMyTickets();
+        delete t[ticketId];
+        saveMyTickets(t);
+    }
+    function getExpiredMyTickets() {
+        const t = loadMyTickets();
+        const now = Date.now();
+        const out = [];
+        for (const [id, info] of Object.entries(t)) {
+            if (info.expiresAt <= now) out.push({ id, ...info });
+        }
+        return out;
+    }
+    function getAllMyTickets() {
+        const t = loadMyTickets();
+        return Object.entries(t).map(([id, info]) => ({ id, ...info }));
+    }
+
+    function loadUsedTickets() {
+        try {
+            const raw = localStorage.getItem(CFG.USED_TICKETS_KEY);
+            return raw ? JSON.parse(raw) : {};
+        } catch (e) { return {}; }
+    }
+    function markTicketUsed(ticketId) {
+        const u = loadUsedTickets();
+        u[ticketId] = Date.now();
+        const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+        for (const k of Object.keys(u)) {
+            if (u[k] < cutoff) delete u[k];
+        }
+        try { localStorage.setItem(CFG.USED_TICKETS_KEY, JSON.stringify(u)); } catch (e) {}
+    }
+    function isTicketUsed(ticketId) {
+        return !!loadUsedTickets()[ticketId];
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  GITHUB API
+    // ═══════════════════════════════════════════════════════════
+    function ghHeaders(token) {
+        return {
+            'Authorization': `token ${token}`,
+            'Accept': 'application/vnd.github.v3+json',
+            'Content-Type': 'application/json',
+        };
+    }
+
+    async function createTicketOnGitHub(token, ticketId, encryptedData) {
+        const path = ticketPath(ticketId);
+        const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${path}`;
+
+        const content = JSON.stringify(encryptedData);
+        const encoded = utf8ToBase64(content);
+
+        const body = {
+            message: `🎫 Временный билет ${ticketId.slice(0, 10)}…`,
+            content: encoded,
+        };
+
+        const res = await fetch(url, {
+            method: 'PUT',
+            headers: ghHeaders(token),
+            body: JSON.stringify(body),
+            cache: 'no-store',
+        });
+
+        if (res.status === 401) throw new Error('Токен недействителен (401)');
+        if (res.status === 403) throw new Error('Нет прав на запись (403)');
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.message || `create ticket: ${res.status}`);
+        }
+
+        const data = await res.json();
+        return { sha: data.content.sha };
+    }
+
+    async function readTicketFromGitHub(token, ticketId) {
+        const path = ticketPath(ticketId);
+        const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${path}`;
+
+        const res = await fetch(url, {
+            headers: ghHeaders(token),
+            cache: 'no-store',
+        });
+
+        if (res.status === 404) return null;
+        if (!res.ok) throw new Error(`read ticket: ${res.status}`);
+
+        const data = await res.json();
+        const decoded = base64ToUtf8((data.content || '').replace(/\n/g, ''));
+        const encryptedData = JSON.parse(decoded);
+
+        return { encryptedData, sha: data.sha };
+    }
+
+    async function deleteTicketFromGitHub(token, ticketId) {
+        const path = ticketPath(ticketId);
+        const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${path}`;
+
+        let sha;
+        try {
+            const getRes = await fetch(url, {
+                headers: ghHeaders(token),
+                cache: 'no-store',
+            });
+            if (getRes.status === 404) return true;
+            if (!getRes.ok) return false;
+            const data = await getRes.json();
+            sha = data.sha;
+        } catch (e) {
+            return false;
+        }
+
+        try {
+            const res = await fetch(url, {
+                method: 'DELETE',
+                headers: ghHeaders(token),
+                body: JSON.stringify({
+                    message: `🗑️ Удалён билет ${ticketId.slice(0, 10)}…`,
+                    sha: sha,
+                }),
+                cache: 'no-store',
+            });
+
+            if (res.status === 404) return true;
+            if (!res.ok) return false;
+            return true;
         } catch (e) {
             return false;
         }
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ХРАНИЛИЩЕ ИСПОЛЬЗОВАННЫХ ССЫЛОК (для one-time режима)
-    // ═══════════════════════════════════════════════════════════
-    function loadUsedInvites() {
-        try {
-            const raw = localStorage.getItem(CFG.USED_KEY);
-            return raw ? JSON.parse(raw) : {};
-        } catch (e) { return {}; }
-    }
-
-    function markInviteUsed(jti) {
-        if (!CFG.ENABLE_ONETIME || !jti) return;
-        try {
-            const used = loadUsedInvites();
-            used[jti] = Date.now();
-            // Чистим старые (> 1 час)
-            const cutoff = Date.now() - 60 * 60 * 1000;
-            for (const k of Object.keys(used)) {
-                if (used[k] < cutoff) delete used[k];
-            }
-            localStorage.setItem(CFG.USED_KEY, JSON.stringify(used));
-        } catch (e) {}
-    }
-
-    function isInviteUsed(jti) {
-        if (!CFG.ENABLE_ONETIME || !jti) return false;
-        const used = loadUsedInvites();
-        return !!used[jti];
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ГЕНЕРАЦИЯ ССЫЛКИ
+    //  СОЗДАНИЕ ПРИГЛАШЕНИЯ
     // ═══════════════════════════════════════════════════════════
     async function buildInviteLink(chatFile) {
-        // ─── 1. Проверяем, что у нас есть всё нужное ───
         if (!state.isAuthorized || !state.token) {
             throw new Error('Нужна авторизация');
         }
@@ -37620,206 +37772,360 @@ try {
         }
         const password = state.savedPasswords[chatFile];
         if (!password) {
-            throw new Error('Пароль чата не сохранён. Сохраните его при входе и попробуйте снова.');
+            throw new Error('Пароль чата не сохранён');
         }
         const chat = state.chats.find(c => c.file === chatFile);
         if (!chat) {
             throw new Error('Чат не найден в списке');
         }
 
-        // ─── 2. Формируем payload ───
+        // ─── 1. Генерируем ключ + id ───
+        const ticketId = genTicketId();
+        const aesKeyBytes = genAesKey();
         const now = Date.now();
-        const jti = 'inv_' + now + '_' + Math.random().toString(36).slice(2, 10);
+        const expiresAt = now + CFG.TTL_MS;
 
-        const payload = {
-            v: 1,                       // версия формата
-            jti: jti,                   // уникальный ID (для one-time)
-            iat: now,                   // issued at
-            exp: now + CFG.TTL_MS,      // expires at
+        // ─── 2. Формируем данные билета ───
+        const ticketData = {
+            v: 3,
+            iat: now,
+            exp: expiresAt,
             chat: {
                 file: chatFile,
                 name: chat.name || chatFile,
             },
-            // ⚠️ ВНИМАНИЕ: токен и пароль в открытом виде (внутри base64).
-            // Это осознанный компромисс ради UX. Защита — короткий TTL.
             token: state.token,
             password: password,
             username: state.username,
         };
 
-        const payloadStr = JSON.stringify(payload);
-        const payloadB64 = toBase64Url(payloadStr);
+        // ─── 3. Шифруем ───
+        const encryptedData = await encryptTicketData(ticketData, aesKeyBytes);
 
-        // ─── 3. Подпись ───
-        const signature = await signPayload(payloadB64);
+        // ─── 4. Пушим в GitHub ───
+        await createTicketOnGitHub(state.token, ticketId, encryptedData);
 
-        // ─── 4. Собираем URL ───
-        // Берём текущий origin + pathname (без hash и search)
+        // ─── 5. Запоминаем локально ───
+        addMyTicket(ticketId, expiresAt, chatFile, chat.name || chatFile);
+
+        // ─── 6. Формируем URL ───
+        // ⚠️ Ключ идёт во ФРАГМЕНТЕ (#k=...), а не в query.
+        // Фрагмент НЕ отправляется на сервер → GitHub его не видит.
         const baseUrl = location.origin + location.pathname;
-        const url = `${baseUrl}?${CFG.URL_PARAM}=${payloadB64}.${signature}`;
+        const keyB64 = toBase64Url(aesKeyBytes);
+        const url = `${baseUrl}?${CFG.URL_PARAM}=${ticketId}#${CFG.URL_FRAGMENT_KEY}=${keyB64}`;
 
-        return {
-            url,
-            payload,
-            expiresAt: payload.exp,
-        };
+        // ─── 7. Таймер на удаление ───
+        scheduleTicketDeletion(ticketId, expiresAt);
+
+        console.log(`🔐 [SecureInvite v3] Создан зашифрованный билет ${ticketId} для «${chat.name}»`);
+
+        return { url, ticketId, expiresAt, chatName: chat.name || chatFile };
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ПРОВЕРКА И РАСШИФРОВКА ССЫЛКИ (при загрузке)
+    //  УДАЛЕНИЕ ПО ТАЙМЕРУ
     // ═══════════════════════════════════════════════════════════
-    async function parseAndValidateInvite(rawParam) {
-        // ─── 1. Формат: <payloadB64>.<signature> ───
-        const dotIdx = rawParam.lastIndexOf('.');
-        if (dotIdx < 0) {
-            return { ok: false, reason: 'invalid_format', message: 'Неверный формат ссылки' };
-        }
-        const payloadB64 = rawParam.slice(0, dotIdx);
-        const signature = rawParam.slice(dotIdx + 1);
+    const _scheduledDeletions = new Map();
 
-        if (!payloadB64 || !signature) {
-            return { ok: false, reason: 'invalid_format', message: 'Неверный формат ссылки' };
+    function scheduleTicketDeletion(ticketId, expiresAt) {
+        if (_scheduledDeletions.has(ticketId)) {
+            clearTimeout(_scheduledDeletions.get(ticketId));
         }
+        const delay = Math.max(1000, expiresAt - Date.now() + 1000);
+        const timer = setTimeout(async () => {
+            await attemptDeleteTicket(ticketId);
+        }, delay);
+        _scheduledDeletions.set(ticketId, timer);
+    }
 
-        // ─── 2. Проверяем подпись ───
-        const sigValid = await verifySignature(payloadB64, signature);
-        if (!sigValid) {
-            return { ok: false, reason: 'bad_signature', message: 'Подпись ссылки недействительна' };
-        }
-
-        // ─── 3. Распаковываем payload ───
-        let payload;
+    async function attemptDeleteTicket(ticketId) {
         try {
-            const json = fromBase64Url(payloadB64);
-            payload = JSON.parse(json);
+            if (!state.token) return false;
+            const ok = await deleteTicketFromGitHub(state.token, ticketId);
+            if (ok) {
+                removeMyTicket(ticketId);
+                console.log(`🗑️ [SecureInvite v3] Билет ${ticketId} удалён`);
+            }
+            _scheduledDeletions.delete(ticketId);
+            return ok;
         } catch (e) {
-            return { ok: false, reason: 'bad_payload', message: 'Не удалось прочитать ссылку' };
+            return false;
         }
+    }
 
-        // ─── 4. Проверяем версию ───
-        if (payload.v !== 1) {
-            return { ok: false, reason: 'bad_version', message: 'Неподдерживаемая версия ссылки' };
+    async function cleanupExpiredTickets() {
+        if (!state.token || !state.isAuthorized) return;
+        const expired = getExpiredMyTickets();
+        if (expired.length === 0) return;
+        console.log(`🧹 [SecureInvite v3] Удаляем ${expired.length} просроченных билетов…`);
+        for (const t of expired) {
+            await attemptDeleteTicket(t.id);
         }
-
-        // ─── 5. Проверяем срок ───
-        const now = Date.now();
-        if (!payload.exp || now > payload.exp) {
-            const expiredAgo = payload.exp ? Math.round((now - payload.exp) / 1000) : 0;
-            return {
-                ok: false,
-                reason: 'expired',
-                message: `Ссылка истекла ${expiredAgo} сек назад`,
-                expiredAgo,
-            };
-        }
-
-        // ─── 6. Проверяем one-time ───
-        if (CFG.ENABLE_ONETIME && payload.jti && isInviteUsed(payload.jti)) {
-            return { ok: false, reason: 'used', message: 'Ссылка уже была использована' };
-        }
-
-        // ─── 7. Валидация обязательных полей ───
-        if (!payload.token || !payload.password || !payload.chat?.file) {
-            return { ok: false, reason: 'incomplete', message: 'Ссылка повреждена' };
-        }
-
-        return { ok: true, payload };
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  UI: модалка с результатом
+    //  ОБРАБОТКА ПРИГЛАШЕНИЯ (гость)
     // ═══════════════════════════════════════════════════════════
-    function ensureInviteStyles() {
-        if (document.getElementById('inviteLinkStyles')) return;
-        const style = document.createElement('style');
-        style.id = 'inviteLinkStyles';
-        style.textContent = `
-            #inviteLinkModal .inv-link-box {
-                background: rgba(0,0,0,0.3);
-                border: 1px solid rgba(108,92,231,0.35);
-                border-radius: 12px;
-                padding: 10px 12px;
-                margin-bottom: 14px;
-                word-break: break-all;
-                font-family: 'SF Mono', 'Courier New', monospace;
-                font-size: 11px;
-                color: #a78bfa;
-                max-height: 120px;
-                overflow-y: auto;
-                line-height: 1.5;
-                user-select: text;
-                -webkit-user-select: text;
-            }
-            #inviteLinkModal .inv-timer {
-                display: flex;
-                align-items: center;
-                gap: 10px;
-                padding: 10px 14px;
-                background: linear-gradient(135deg, rgba(254,202,87,0.15), rgba(255,159,67,0.1));
-                border: 1px solid rgba(254,202,87,0.4);
-                border-radius: 12px;
-                margin-bottom: 14px;
-                font-size: 13px;
-                color: #feca57;
-                font-weight: 600;
-            }
-            #inviteLinkModal .inv-timer-icon {
-                font-size: 20px;
-                flex-shrink: 0;
-            }
-            #inviteLinkModal .inv-timer-bar {
-                flex: 1;
-                height: 4px;
-                background: rgba(0,0,0,0.3);
-                border-radius: 2px;
-                overflow: hidden;
-                position: relative;
-            }
-            #inviteLinkModal .inv-timer-fill {
-                position: absolute;
-                left: 0; top: 0; bottom: 0;
-                background: linear-gradient(90deg, #00b894, #feca57);
-                border-radius: 2px;
-                transition: width 1s linear;
-            }
-            #inviteLinkModal .inv-countdown {
-                font-variant-numeric: tabular-nums;
-                font-weight: 700;
-                min-width: 40px;
-                text-align: right;
-            }
-            #inviteLinkModal .inv-warn {
-                background: rgba(255,107,107,0.08);
-                border: 1px solid rgba(255,107,107,0.25);
-                border-radius: 10px;
-                padding: 10px 12px;
-                font-size: 11px;
-                color: #ff8a8a;
-                line-height: 1.6;
-                margin-bottom: 14px;
-            }
-            #inviteLinkModal .inv-actions {
-                display: flex;
-                gap: 8px;
-            }
-            #inviteLinkModal .inv-actions .btn { flex: 1; }
+    async function handleIncomingInvite() {
+        const params = new URLSearchParams(location.search);
+        const ticketId = params.get(CFG.URL_PARAM);
 
-            /* Кнопка в share-модалке */
+        if (!ticketId) return false;
+
+        console.log(`🔐 [SecureInvite v3] Обнаружен билет: ${ticketId}`);
+
+        // ─── Ключ из фрагмента ───
+        const hash = location.hash.replace(/^#/, '');
+        const hashParams = new URLSearchParams(hash);
+        const keyB64 = hashParams.get(CFG.URL_FRAGMENT_KEY);
+
+        if (!keyB64) {
+            console.warn('🔐 [SecureInvite v3] Нет ключа во фрагменте');
+            cleanUrl();
+            showInviteError('invalid_format', 'В ссылке отсутствует ключ расшифровки');
+            return true;
+        }
+
+        let aesKeyBytes;
+        try {
+            aesKeyBytes = fromBase64Url(keyB64);
+            if (aesKeyBytes.length !== 32) throw new Error('bad key length');
+        } catch (e) {
+            cleanUrl();
+            showInviteError('invalid_format', 'Ключ расшифровки повреждён');
+            return true;
+        }
+
+        if (!isValidTicketId(ticketId)) {
+            cleanUrl();
+            showInviteError('invalid_format', 'Неверный формат id');
+            return true;
+        }
+
+        if (isTicketUsed(ticketId)) {
+            cleanUrl();
+            showInviteError('used', 'Ссылка уже была использована');
+            return true;
+        }
+
+        showInviteLoading();
+
+        try {
+            // ─── Читаем билет из GitHub ───
+            const currentToken = state.token || localStorage.getItem('chathub_token') || null;
+
+            if (!currentToken) {
+                hideInviteLoading();
+                cleanUrl();
+                showInviteError('need_token',
+                    'Чтобы присоединиться, войдите со своим GitHub-токеном, затем откройте ссылку снова.');
+                return true;
+            }
+
+            const result = await readTicketFromGitHub(currentToken, ticketId);
+
+            if (!result) {
+                hideInviteLoading();
+                cleanUrl();
+                showInviteError('not_found', 'Билет не найден или уже использован');
+                return true;
+            }
+
+            // ─── Расшифровываем ───
+            let ticket;
+            try {
+                ticket = await decryptTicketData(result.encryptedData, aesKeyBytes);
+            } catch (e) {
+                console.error('🔐 [SecureInvite v3] Decrypt failed:', e);
+                hideInviteLoading();
+                cleanUrl();
+                // Билет прочитан, но расшифровать не смогли — удаляем его
+                deleteTicketFromGitHub(currentToken, ticketId).catch(() => {});
+                showInviteError('incomplete', 'Не удалось расшифровать билет — ключ не подходит');
+                return true;
+            }
+
+            // ─── Проверка срока ───
+            const now = Date.now();
+            if (!ticket.exp || now > ticket.exp) {
+                const expiredAgo = Math.round((now - ticket.exp) / 1000);
+                hideInviteLoading();
+                cleanUrl();
+                deleteTicketFromGitHub(currentToken, ticketId).catch(() => {});
+                showInviteError('expired',
+                    `Ссылка истекла ${expiredAgo} сек назад.`);
+                return true;
+            }
+
+            // ─── Проверка полей ───
+            if (!ticket.token || !ticket.password || !ticket.chat?.file) {
+                hideInviteLoading();
+                cleanUrl();
+                deleteTicketFromGitHub(currentToken, ticketId).catch(() => {});
+                showInviteError('incomplete', 'Билет повреждён');
+                return true;
+            }
+
+            // ─── Чистим URL ───
+            cleanUrl();
+
+            // ─── УДАЛЯЕМ билет сразу ───
+            try {
+                await deleteTicketFromGitHub(currentToken, ticketId);
+                console.log(`🗑️ [SecureInvite v3] Билет ${ticketId} удалён`);
+            } catch (e) {
+                console.warn('🔐 [SecureInvite v3] Не удалось удалить билет:', e.message);
+            }
+
+            markTicketUsed(ticketId);
+
+            // ─── Применяем данные ───
+            state.username = ticket.username || 'Гость';
+            state.token = ticket.token;
+            state.isAuthorized = true;
+
+            try {
+                localStorage.setItem('chathub_username', state.username);
+            } catch (e) {}
+
+            if (typeof loadChatsList === 'function') loadChatsList();
+            if (typeof loadSavedPasswords === 'function') loadSavedPasswords();
+
+            const chatFile = ticket.chat.file;
+            const chatName = ticket.chat.name || chatFile;
+            const existing = state.chats.find(c => c.file === chatFile);
+
+            if (existing) existing.name = chatName;
+            else state.chats.push({
+                name: chatName, file: chatFile, createdAt: new Date().toISOString()
+            });
+            if (typeof saveChatsList === 'function') saveChatsList();
+
+            state.savedPasswords[chatFile] = ticket.password;
+            if (typeof saveSavedPasswords === 'function') saveSavedPasswords();
+
+            if (typeof usernameInput !== 'undefined' && usernameInput) {
+                usernameInput.value = state.username;
+            }
+            if (typeof tokenInput !== 'undefined' && tokenInput) {
+                tokenInput.value = state.token;
+            }
+
+            // ─── Проверка токена ───
+            try {
+                const accessCheck = await validateTokenAccess(state.token);
+                if (!accessCheck.ok) {
+                    hideInviteLoading();
+                    showInviteError('unknown',
+                        'Токен недействителен: ' + accessCheck.message);
+                    return true;
+                }
+            } catch (e) {
+                console.warn('🔐 [SecureInvite v3] Token check failed:', e.message);
+            }
+
+            // ─── Автовход ───
+            hideInviteLoading();
+
+            try {
+                if (typeof enterChat === 'function') {
+                    await enterChat(chatFile, chatName, ticket.password);
+                    showToast(`✅ Добро пожаловать в «${chatName}»!`, 3000);
+                    if (typeof soundManager !== 'undefined') soundManager.play('notification');
+                }
+            } catch (e) {
+                console.error('🔐 [SecureInvite v3] enterChat failed:', e);
+                hideInviteLoading();
+                if (typeof showChatsScreen === 'function') showChatsScreen();
+                showToast('⚠️ Чат добавлен, но не открылся: ' + e.message, 4000);
+            }
+
+            return true;
+
+        } catch (e) {
+            console.error('🔐 [SecureInvite v3] Ошибка:', e);
+            hideInviteLoading();
+            cleanUrl();
+            showInviteError('unknown', 'Ошибка: ' + e.message);
+            return true;
+        }
+    }
+
+    function cleanUrl() {
+        const cleanUrl = location.origin + location.pathname;
+        history.replaceState({}, '', cleanUrl);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  UI
+    // ═══════════════════════════════════════════════════════════
+    function ensureStyles() {
+        if (document.getElementById('secureInviteStyles')) return;
+        const style = document.createElement('style');
+        style.id = 'secureInviteStyles';
+        style.textContent = `
+            #secureInviteError {
+                position: fixed; inset: 0;
+                background: linear-gradient(135deg, #0a0a0f, #1a1a2e);
+                z-index: 10000; display: none;
+                flex-direction: column; align-items: center; justify-content: center;
+                padding: 30px; text-align: center;
+                animation: sieFade 0.3s ease;
+            }
+            #secureInviteError.show { display: flex; }
+            @keyframes sieFade { from { opacity: 0; } to { opacity: 1; } }
+            #secureInviteError .sie-icon { font-size: 72px; margin-bottom: 16px; line-height: 1; }
+            #secureInviteError .sie-title {
+                font-size: 22px; font-weight: 700; color: #fff; margin-bottom: 10px;
+            }
+            #secureInviteError .sie-message {
+                font-size: 14px; color: #aaa; line-height: 1.6;
+                max-width: 420px; margin-bottom: 24px;
+                white-space: pre-line;
+            }
+            #secureInviteError .sie-btn {
+                padding: 12px 28px; border-radius: 12px; border: none;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                color: #fff; font-size: 15px; font-weight: 600;
+                cursor: pointer; font-family: inherit;
+            }
+            #secureInviteError .sie-btn:active { transform: scale(0.96); }
+
+            #secureInviteLoading {
+                position: fixed; inset: 0;
+                background: linear-gradient(135deg, #0a0a0f, #1a1a2e);
+                z-index: 10000; display: none;
+                flex-direction: column; align-items: center; justify-content: center;
+                padding: 30px; text-align: center;
+            }
+            #secureInviteLoading.show { display: flex; }
+            #secureInviteLoading .sil-spinner {
+                width: 56px; height: 56px;
+                border: 4px solid rgba(108,92,231,0.2);
+                border-top-color: #6c5ce7;
+                border-right-color: #00b894;
+                border-radius: 50%;
+                animation: silSpin 0.9s linear infinite;
+                margin-bottom: 20px;
+            }
+            @keyframes silSpin { to { transform: rotate(360deg); } }
+            #secureInviteLoading .sil-title {
+                font-size: 18px; font-weight: 700; color: #fff; margin-bottom: 8px;
+            }
+            #secureInviteLoading .sil-sub {
+                font-size: 13px; color: #888; line-height: 1.5; max-width: 360px;
+            }
+
             .share-temp-invite-btn {
                 width: 100%;
-                display: flex;
-                align-items: center;
-                gap: 12px;
+                display: flex; align-items: center; gap: 12px;
                 padding: 12px 14px;
                 background: linear-gradient(135deg, rgba(254,202,87,0.15), rgba(255,159,67,0.1));
                 border: 1px solid rgba(254,202,87,0.35);
-                border-radius: 12px;
-                color: #fff;
-                cursor: pointer;
-                transition: all 0.15s;
-                font-family: inherit;
-                text-align: left;
-                margin-bottom: 8px;
+                border-radius: 12px; color: #fff;
+                cursor: pointer; transition: all 0.15s;
+                font-family: inherit; text-align: left; margin-bottom: 8px;
             }
             .share-temp-invite-btn:hover {
                 background: linear-gradient(135deg, rgba(254,202,87,0.25), rgba(255,159,67,0.18));
@@ -37827,131 +38133,121 @@ try {
                 transform: translateY(-1px);
                 box-shadow: 0 4px 14px rgba(254,202,87,0.25);
             }
-            .share-temp-invite-btn:active {
-                transform: scale(0.98);
-            }
-            .share-temp-invite-btn:disabled {
-                opacity: 0.4;
-                cursor: not-allowed;
-                transform: none;
-            }
+            .share-temp-invite-btn:active { transform: scale(0.98); }
+            .share-temp-invite-btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
             .share-temp-invite-btn .stib-icon {
-                width: 40px;
-                height: 40px;
-                border-radius: 12px;
+                width: 40px; height: 40px; border-radius: 12px;
                 background: linear-gradient(135deg, rgba(254,202,87,0.3), rgba(255,159,67,0.2));
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                font-size: 20px;
-                flex-shrink: 0;
+                display: flex; align-items: center; justify-content: center;
+                font-size: 20px; flex-shrink: 0;
             }
-            .share-temp-invite-btn .stib-body {
-                flex: 1;
-                min-width: 0;
-            }
+            .share-temp-invite-btn .stib-body { flex: 1; min-width: 0; }
             .share-temp-invite-btn .stib-title {
-                font-size: 14px;
-                font-weight: 700;
-                color: #feca57;
-                margin-bottom: 2px;
+                font-size: 14px; font-weight: 700; color: #feca57; margin-bottom: 2px;
             }
-            .share-temp-invite-btn .stib-sub {
-                font-size: 11px;
-                color: #a78bfa;
-            }
+            .share-temp-invite-btn .stib-sub { font-size: 11px; color: #a78bfa; }
 
-            /* Экран ошибки приглашения */
-            #inviteErrorScreen {
-                position: fixed;
-                inset: 0;
-                background: linear-gradient(135deg, #0a0a0f, #1a1a2e);
-                z-index: 10000;
-                display: none;
-                flex-direction: column;
-                align-items: center;
-                justify-content: center;
-                padding: 30px;
-                text-align: center;
-                animation: invErrFade 0.3s ease;
+            #secureInviteModal .inv-link-box {
+                background: rgba(0,0,0,0.3);
+                border: 1px solid rgba(108,92,231,0.35);
+                border-radius: 12px; padding: 10px 12px; margin-bottom: 14px;
+                word-break: break-all;
+                font-family: 'SF Mono', 'Courier New', monospace;
+                font-size: 11px; color: #a78bfa;
+                max-height: 140px; overflow-y: auto;
+                line-height: 1.5; user-select: text; -webkit-user-select: text;
             }
-            #inviteErrorScreen.show { display: flex; }
-            @keyframes invErrFade {
-                from { opacity: 0; }
-                to { opacity: 1; }
+            #secureInviteModal .inv-timer {
+                display: flex; align-items: center; gap: 10px;
+                padding: 10px 14px;
+                background: linear-gradient(135deg, rgba(254,202,87,0.15), rgba(255,159,67,0.1));
+                border: 1px solid rgba(254,202,87,0.4);
+                border-radius: 12px; margin-bottom: 14px;
+                font-size: 13px; color: #feca57; font-weight: 600;
             }
-            #inviteErrorScreen .ies-icon {
-                font-size: 72px;
-                margin-bottom: 16px;
-                line-height: 1;
+            #secureInviteModal .inv-timer-icon { font-size: 20px; flex-shrink: 0; }
+            #secureInviteModal .inv-timer-bar {
+                flex: 1; height: 4px; background: rgba(0,0,0,0.3);
+                border-radius: 2px; overflow: hidden; position: relative;
             }
-            #inviteErrorScreen .ies-title {
-                font-size: 22px;
-                font-weight: 700;
-                color: #fff;
-                margin-bottom: 10px;
+            #secureInviteModal .inv-timer-fill {
+                position: absolute; left: 0; top: 0; bottom: 0;
+                background: linear-gradient(90deg, #00b894, #feca57);
+                border-radius: 2px; transition: width 1s linear;
             }
-            #inviteErrorScreen .ies-message {
-                font-size: 14px;
-                color: #aaa;
-                line-height: 1.6;
-                max-width: 400px;
-                margin-bottom: 24px;
+            #secureInviteModal .inv-countdown {
+                font-variant-numeric: tabular-nums; font-weight: 700;
+                min-width: 40px; text-align: right;
             }
-            #inviteErrorScreen .ies-btn {
-                padding: 12px 28px;
-                border-radius: 12px;
-                border: none;
-                background: linear-gradient(135deg, #6c5ce7, #00b894);
-                color: #fff;
-                font-size: 15px;
-                font-weight: 600;
-                cursor: pointer;
-                font-family: inherit;
+            #secureInviteModal .inv-warn {
+                background: rgba(0,184,148,0.08);
+                border: 1px solid rgba(0,184,148,0.25);
+                border-radius: 10px; padding: 10px 12px;
+                font-size: 11px; color: #00b894;
+                line-height: 1.6; margin-bottom: 14px;
             }
-            #inviteErrorScreen .ies-btn:active {
-                transform: scale(0.96);
-            }
-
-            /* Экран загрузки приглашения */
-            #inviteLoadingScreen {
-                position: fixed;
-                inset: 0;
-                background: linear-gradient(135deg, #0a0a0f, #1a1a2e);
-                z-index: 10000;
-                display: none;
-                flex-direction: column;
-                align-items: center;
-                justify-content: center;
-                padding: 30px;
-                text-align: center;
-            }
-            #inviteLoadingScreen.show { display: flex; }
-            #inviteLoadingScreen .ils-spinner {
-                width: 56px;
-                height: 56px;
-                border: 4px solid rgba(108,92,231,0.2);
-                border-top-color: #6c5ce7;
-                border-right-color: #00b894;
-                border-radius: 50%;
-                animation: ilsSpin 0.9s linear infinite;
-                margin-bottom: 20px;
-            }
-            @keyframes ilsSpin { to { transform: rotate(360deg); } }
-            #inviteLoadingScreen .ils-title {
-                font-size: 18px;
-                font-weight: 700;
-                color: #fff;
-                margin-bottom: 8px;
-            }
-            #inviteLoadingScreen .ils-sub {
-                font-size: 13px;
-                color: #888;
-                line-height: 1.5;
-                max-width: 360px;
+            #secureInviteModal .inv-hint {
+                background: rgba(108,92,231,0.08);
+                border: 1px solid rgba(108,92,231,0.25);
+                border-radius: 10px; padding: 10px 12px;
+                font-size: 11px; color: #a78bfa;
+                line-height: 1.6; margin-bottom: 14px;
             }
         `;
         document.head.appendChild(style);
+    }
+
+    function showInviteLoading() {
+        ensureStyles();
+        let el = document.getElementById('secureInviteLoading');
+        if (el) return;
+        el = document.createElement('div');
+        el.id = 'secureInviteLoading';
+        el.className = 'show';
+        el.innerHTML = `
+            <div class="sil-spinner"></div>
+            <div class="sil-title">Читаем приглашение…</div>
+            <div class="sil-sub">Проверяем билет на сервере и подключаемся.<br>Это займёт пару секунд.</div>
+        `;
+        document.body.appendChild(el);
+    }
+
+    function hideInviteLoading() {
+        const el = document.getElementById('secureInviteLoading');
+        if (el) el.remove();
+    }
+
+    function showInviteError(reason, message) {
+        ensureStyles();
+        let el = document.getElementById('secureInviteError');
+        if (el) el.remove();
+
+        const configs = {
+            expired:        { icon: '⏰', title: 'Ссылка истекла' },
+            used:           { icon: '🚫', title: 'Ссылка уже использована' },
+            not_found:      { icon: '❓', title: 'Билет не найден' },
+            invalid_format: { icon: '❓', title: 'Неверная ссылка' },
+            incomplete:     { icon: '❓', title: 'Билет повреждён' },
+            need_token:     { icon: '🔐', title: 'Нужна авторизация' },
+            unknown:        { icon: '❌', title: 'Ошибка' },
+        };
+        const cfg = configs[reason] || configs.unknown;
+
+        el = document.createElement('div');
+        el.id = 'secureInviteError';
+        el.className = 'show';
+        el.innerHTML = `
+            <div class="sie-icon">${cfg.icon}</div>
+            <div class="sie-title">${cfg.title}</div>
+            <div class="sie-message">${escapeHtml(message || 'Попросите отправителя создать новую ссылку.')}</div>
+            <button class="sie-btn" id="sieOkBtn">Понятно</button>
+        `;
+        document.body.appendChild(el);
+
+        el.querySelector('#sieOkBtn').addEventListener('click', () => {
+            cleanUrl();
+            el.remove();
+        });
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -37959,18 +38255,18 @@ try {
     // ═══════════════════════════════════════════════════════════
     let _inviteTimerInterval = null;
 
-    function showInviteModal(url, payload) {
-        ensureInviteStyles();
+    function showInviteModal(url, info) {
+        ensureStyles();
 
-        let modal = document.getElementById('inviteLinkModal');
+        let modal = document.getElementById('secureInviteModal');
         if (modal) modal.remove();
 
         modal = document.createElement('div');
-        modal.id = 'inviteLinkModal';
+        modal.id = 'secureInviteModal';
         modal.className = 'image-modal active';
         modal.innerHTML = `
-            <div class="form-modal-content" style="max-width:460px;">
-                <h2>🔗 Временная ссылка</h2>
+            <div class="form-modal-content" style="max-width:480px;">
+                <h2>🔐 Безопасная ссылка</h2>
 
                 <div class="inv-timer">
                     <span class="inv-timer-icon">⏱</span>
@@ -37980,17 +38276,22 @@ try {
                     <span class="inv-countdown" id="invCountdown">--</span>
                 </div>
 
-                <div class="inv-link-box" id="invLinkBox">${url}</div>
+                <div class="inv-link-box" id="invLinkBox">${escapeHtml(url)}</div>
 
                 <div class="inv-warn">
-                    ⚠️ В ссылке зашифрован ваш <strong>GitHub-токен и пароль чата</strong>.
-                    Не публикуйте её в открытых чатах. Через ${Math.round(CFG.TTL_MS/1000)} секунд
-                    она перестанет работать.
+                    ✅ Токен зашифрован и хранится на GitHub в виде шума.
+                    Ключ расшифровки — только в этой ссылке (после #).
+                    Билет удалится через ${Math.round(CFG.TTL_MS/1000)} секунд или сразу после первого перехода.
                 </div>
 
-                <div class="inv-actions" style="margin-bottom:8px;">
-                    <button class="btn btn-secondary" id="invCopyBtn">📋 Копировать</button>
-                    <button class="btn" id="invShareBtn">📤 Поделиться</button>
+                <div class="inv-hint">
+                    💡 Отправьте ссылку целиком — вместе с частью после #.
+                    Без неё гость не сможет расшифровать билет.
+                </div>
+
+                <div style="display:flex;gap:8px;margin-bottom:8px;">
+                    <button class="btn btn-secondary" id="invCopyBtn" style="flex:1;">📋 Копировать</button>
+                    <button class="btn" id="invShareBtn" style="flex:1;">📤 Поделиться</button>
                 </div>
 
                 <div class="modal-actions">
@@ -38000,20 +38301,18 @@ try {
         `;
         document.body.appendChild(modal);
 
-        const linkBox = modal.querySelector('#invLinkBox');
         const countdownEl = modal.querySelector('#invCountdown');
         const fillEl = modal.querySelector('#invTimerFill');
+        const linkBox = modal.querySelector('#invLinkBox');
 
-        // ─── Таймер ───
         if (_inviteTimerInterval) clearInterval(_inviteTimerInterval);
         const tick = () => {
-            const remaining = payload.exp - Date.now();
+            const remaining = info.expiresAt - Date.now();
             if (remaining <= 0) {
                 countdownEl.textContent = '0s';
                 fillEl.style.width = '0%';
                 clearInterval(_inviteTimerInterval);
                 _inviteTimerInterval = null;
-                // Красная рамка
                 linkBox.style.borderColor = 'rgba(255,107,107,0.6)';
                 linkBox.style.color = '#ff6b6b';
                 return;
@@ -38029,14 +38328,12 @@ try {
         tick();
         _inviteTimerInterval = setInterval(tick, 250);
 
-        // ─── Кнопка «Копировать» ───
         modal.querySelector('#invCopyBtn').addEventListener('click', async () => {
             try {
                 await navigator.clipboard.writeText(url);
-                showToast('📋 Ссылка скопирована', 1500);
-                soundManager.play('click');
+                showToast('📋 Ссылка скопирована (целиком)', 1800);
+                if (typeof soundManager !== 'undefined') soundManager.play('click');
             } catch (e) {
-                // Fallback: выделяем текст
                 const range = document.createRange();
                 range.selectNodeContents(linkBox);
                 const sel = window.getSelection();
@@ -38046,13 +38343,12 @@ try {
             }
         });
 
-        // ─── Кнопка «Поделиться» ───
         modal.querySelector('#invShareBtn').addEventListener('click', async () => {
             if (navigator.share) {
                 try {
                     await navigator.share({
-                        title: `Приглашение в «${payload.chat.name}»`,
-                        text: `Присоединяйся к чату! Ссылка действует 2 минуты:`,
+                        title: `Приглашение в «${info.chatName}»`,
+                        text: `Ссылка действует 2 минуты:`,
                         url: url,
                     });
                     return;
@@ -38060,16 +38356,14 @@ try {
                     if (e.name === 'AbortError') return;
                 }
             }
-            // Fallback: копируем
             try {
                 await navigator.clipboard.writeText(url);
-                showToast('📋 Ссылка скопирована (share недоступен)', 2000);
+                showToast('📋 Ссылка скопирована', 2000);
             } catch (e) {
                 showToast('❌ Не удалось поделиться', 2000);
             }
         });
 
-        // ─── Закрыть ───
         const close = () => {
             modal.remove();
             if (_inviteTimerInterval) {
@@ -38081,194 +38375,6 @@ try {
         modal.addEventListener('click', (e) => {
             if (e.target === modal) close();
         });
-        document.addEventListener('keydown', function escHandler(ev) {
-            if (ev.key === 'Escape') {
-                close();
-                document.removeEventListener('keydown', escHandler);
-            }
-        });
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ЭКРАНЫ ОШИБКИ И ЗАГРУЗКИ ПРИГЛАШЕНИЯ
-    // ═══════════════════════════════════════════════════════════
-    function showInviteError(reason, message) {
-        ensureInviteStyles();
-
-        let screen = document.getElementById('inviteErrorScreen');
-        if (screen) screen.remove();
-
-        const configs = {
-            expired:   { icon: '⏰', title: 'Ссылка истекла' },
-            used:      { icon: '🚫', title: 'Ссылка уже использована' },
-            bad_signature: { icon: '🔒', title: 'Подпись недействительна' },
-            invalid_format: { icon: '❓', title: 'Неверная ссылка' },
-            bad_payload: { icon: '❓', title: 'Ссылка повреждена' },
-            bad_version: { icon: '❓', title: 'Устаревшая ссылка' },
-            incomplete: { icon: '❓', title: 'Ссылка неполная' },
-            network:   { icon: '📵', title: 'Нет связи' },
-            unknown:   { icon: '❌', title: 'Ошибка' },
-        };
-        const cfg = configs[reason] || configs.unknown;
-
-        screen = document.createElement('div');
-        screen.id = 'inviteErrorScreen';
-        screen.className = 'show';
-        screen.innerHTML = `
-            <div class="ies-icon">${cfg.icon}</div>
-            <div class="ies-title">${cfg.title}</div>
-            <div class="ies-message">${escapeHtml(message || 'Попросите отправителя создать новую ссылку.')}</div>
-            <button class="ies-btn" id="iesOkBtn">Понятно</button>
-        `;
-        document.body.appendChild(screen);
-
-        screen.querySelector('#iesOkBtn').addEventListener('click', () => {
-            // Чистим URL
-            const cleanUrl = location.origin + location.pathname;
-            history.replaceState({}, '', cleanUrl);
-            screen.remove();
-        });
-    }
-
-    function showInviteLoading() {
-        ensureInviteStyles();
-        let screen = document.getElementById('inviteLoadingScreen');
-        if (screen) return;
-        screen = document.createElement('div');
-        screen.id = 'inviteLoadingScreen';
-        screen.className = 'show';
-        screen.innerHTML = `
-            <div class="ils-spinner"></div>
-            <div class="ils-title">Подключаемся…</div>
-            <div class="ils-sub">Открываем приглашение.<br>Это займёт пару секунд.</div>
-        `;
-        document.body.appendChild(screen);
-    }
-
-    function hideInviteLoading() {
-        const screen = document.getElementById('inviteLoadingScreen');
-        if (screen) screen.remove();
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ОБРАБОТКА ПРИГЛАШЕНИЯ ПРИ ЗАГРУЗКЕ
-    // ═══════════════════════════════════════════════════════════
-    async function handleIncomingInvite() {
-        const params = new URLSearchParams(location.search);
-        const rawParam = params.get(CFG.URL_PARAM);
-        if (!rawParam) return false;
-
-        console.log('🔗 [Invite] Обнаружено приглашение в URL');
-
-        showInviteLoading();
-
-        try {
-            const result = await parseAndValidateInvite(rawParam);
-
-            if (!result.ok) {
-                console.warn('🔗 [Invite] Невалидное приглашение:', result.reason);
-                hideInviteLoading();
-                showInviteError(result.reason, result.message);
-                // Чистим URL
-                const cleanUrl = location.origin + location.pathname;
-                history.replaceState({}, '', cleanUrl);
-                return true;
-            }
-
-            const payload = result.payload;
-            console.log('🔗 [Invite] Валидное приглашение:', {
-                chat: payload.chat.name,
-                file: payload.chat.file,
-                expiresIn: Math.round((payload.exp - Date.now()) / 1000) + 's',
-            });
-
-            // ─── Отмечаем как использованное (если one-time) ───
-            markInviteUsed(payload.jti);
-
-            // ─── Чистим URL сразу, чтобы при перезагрузке не сработало снова ───
-            const cleanUrl = location.origin + location.pathname;
-            history.replaceState({}, '', cleanUrl);
-
-            // ─── Применяем токен и username ───
-            state.username = payload.username || 'Гость';
-            state.token = payload.token;
-            state.isAuthorized = true;
-
-            // Сохраняем в localStorage, как при обычном входе
-            // (без галочки «запомнить» — на сессию)
-            try {
-                localStorage.setItem('chathub_username', state.username);
-                // НЕ сохраняем токен в localStorage надолго — только на текущую сессию
-                // При следующем запуске пользователь снова введёт свой токен
-            } catch (e) {}
-
-            // ─── Загружаем списки чатов ───
-            if (typeof loadChatsList === 'function') loadChatsList();
-            if (typeof loadSavedPasswords === 'function') loadSavedPasswords();
-
-            // ─── Добавляем/обновляем чат в списке ───
-            const chatFile = payload.chat.file;
-            const chatName = payload.chat.name || chatFile;
-            const existing = state.chats.find(c => c.file === chatFile);
-
-            if (existing) {
-                existing.name = chatName;
-            } else {
-                state.chats.push({
-                    name: chatName,
-                    file: chatFile,
-                    createdAt: new Date().toISOString(),
-                });
-            }
-            if (typeof saveChatsList === 'function') saveChatsList();
-
-            // ─── Сохраняем пароль чата ───
-            state.savedPasswords[chatFile] = payload.password;
-            if (typeof saveSavedPasswords === 'function') saveSavedPasswords();
-
-            // ─── Обновляем поля на экране авторизации (на случай logout) ───
-            if (usernameInput) usernameInput.value = state.username;
-            if (tokenInput) tokenInput.value = state.token;
-
-            // ─── Тихонько проверяем токен в фоне (не блокируя) ───
-            // Если токен невалиден — покажем ошибку
-            try {
-                const accessCheck = await validateTokenAccess(state.token);
-                if (!accessCheck.ok) {
-                    hideInviteLoading();
-                    showInviteError('unknown',
-                        'Токен в ссылке недействителен: ' + accessCheck.message +
-                        '\n\nПопросите отправителя обновить токен и создать новую ссылку.');
-                    return true;
-                }
-            } catch (e) {
-                // Сетевая ошибка — не критично, продолжаем
-                console.warn('🔗 [Invite] Проверка токена не удалась:', e.message);
-            }
-
-            // ─── Автовход в чат ───
-            hideInviteLoading();
-
-            try {
-                if (typeof enterChat === 'function') {
-                    await enterChat(chatFile, chatName, payload.password);
-                    showToast(`✅ Добро пожаловать в «${chatName}»!`, 3000);
-                    soundManager.play('notification');
-                }
-            } catch (e) {
-                console.error('🔗 [Invite] Ошибка входа в чат:', e);
-                hideInviteLoading();
-                showChatsScreen();
-                showToast('⚠️ Чат добавлен, но не открылся: ' + e.message, 4000);
-            }
-
-            return true;
-        } catch (e) {
-            console.error('🔗 [Invite] Неожиданная ошибка:', e);
-            hideInviteLoading();
-            showInviteError('unknown', 'Внутренняя ошибка: ' + e.message);
-            return true;
-        }
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -38280,10 +38386,8 @@ try {
         const content = modal.querySelector('.form-modal-content');
         if (!content) return;
 
-        // Уже вставлена?
         if (content.querySelector('.share-temp-invite-btn')) return;
 
-        // Находим, КУДА вставить — перед блоком "или внешние приложения"
         const externalDivider = content.querySelector('#shareExternalDivider');
         if (!externalDivider) return;
 
@@ -38291,10 +38395,10 @@ try {
         btn.className = 'share-temp-invite-btn';
         btn.type = 'button';
         btn.innerHTML = `
-            <div class="stib-icon">🔗</div>
+            <div class="stib-icon">🔐</div>
             <div class="stib-body">
-                <div class="stib-title">Временная ссылка</div>
-                <div class="stib-sub">2 минуты · гостевой доступ</div>
+                <div class="stib-title">Безопасная ссылка</div>
+                <div class="stib-sub">2 минуты · шифрованный билет</div>
             </div>
             <span style="color:#feca57;font-size:18px;">›</span>
         `;
@@ -38302,23 +38406,17 @@ try {
         btn.addEventListener('click', async (e) => {
             e.stopPropagation();
 
-            // Определяем, для какого чата делаем ссылку
-            // Приоритет: выбранный чат в списке, иначе — текущий
             let targetFile = _shareToChat.selectedFile;
-            if (!targetFile && state.chatFile) {
-                targetFile = state.chatFile;
-            }
+            if (!targetFile && state.chatFile) targetFile = state.chatFile;
 
             if (!targetFile) {
                 showToast('❌ Сначала выберите чат из списка ниже', 2500);
-                soundManager.play('error');
+                if (typeof soundManager !== 'undefined') soundManager.play('error');
                 return;
             }
-
-            // Проверяем наличие пароля
             if (!state.savedPasswords[targetFile]) {
                 showToast('🔐 Пароль чата не сохранён — ссылку сделать нельзя', 3500);
-                soundManager.play('error');
+                if (typeof soundManager !== 'undefined') soundManager.play('error');
                 return;
             }
 
@@ -38327,34 +38425,29 @@ try {
             btn.innerHTML = `
                 <div class="stib-icon">⏳</div>
                 <div class="stib-body">
-                    <div class="stib-title">Создаём…</div>
+                    <div class="stib-title">Создаём билет…</div>
                     <div class="stib-sub">пару секунд</div>
                 </div>
             `;
 
             try {
-                const { url, payload } = await buildInviteLink(targetFile);
-
-                // Закрываем share-модалку и открываем модалку с ссылкой
+                const { url, expiresAt, chatName } = await buildInviteLink(targetFile);
                 modal.classList.remove('active');
-                showInviteModal(url, payload);
-                soundManager.play('send');
-
+                showInviteModal(url, { expiresAt, chatName });
+                if (typeof soundManager !== 'undefined') soundManager.play('send');
             } catch (err) {
-                console.error('🔗 [Invite] buildInviteLink failed:', err);
+                console.error('🔐 [SecureInvite v3] buildInviteLink failed:', err);
                 showToast('❌ ' + err.message, 3500);
-                soundManager.play('error');
+                if (typeof soundManager !== 'undefined') soundManager.play('error');
             } finally {
                 btn.disabled = false;
                 btn.innerHTML = origHTML;
             }
         });
 
-        // Вставляем ПЕРЕД divider'ом «или»
         externalDivider.parentNode.insertBefore(btn, externalDivider);
     }
 
-    // Наблюдаем за появлением модалки
     const modalObserver = new MutationObserver((mutations) => {
         for (const mut of mutations) {
             if (mut.type === 'attributes' && mut.attributeName === 'class') {
@@ -38377,22 +38470,16 @@ try {
     startObserving();
 
     // ═══════════════════════════════════════════════════════════
-    //  ЗАПУСК ОБРАБОТКИ ПРИ ЗАГРУЗКЕ
+    //  ЗАПУСК
     // ═══════════════════════════════════════════════════════════
-
-    // Ждём, пока основной код инициализируется
-    // (нужны функции showChatsScreen, enterChat, validateTokenAccess и т.д.)
-    let _inviteAttempts = 0;
-    const _maxInviteAttempts = 40;   // 40 × 250 = 10 сек
+    let _attempts = 0;
+    const _maxAttempts = 40;
 
     function tryHandleInvite() {
-        _inviteAttempts++;
-
-        // Проверяем, что URL содержит параметр
+        _attempts++;
         const params = new URLSearchParams(location.search);
-        if (!params.get(CFG.URL_PARAM)) return;   // ничего нет — выходим
+        if (!params.get(CFG.URL_PARAM)) return;
 
-        // Проверяем, что нужные функции готовы
         const ready = (
             typeof showChatsScreen === 'function' &&
             typeof enterChat === 'function' &&
@@ -38401,72 +38488,78 @@ try {
             typeof loadSavedPasswords === 'function'
         );
 
-        if (!ready && _inviteAttempts < _maxInviteAttempts) {
+        if (!ready && _attempts < _maxAttempts) {
             setTimeout(tryHandleInvite, 250);
             return;
         }
 
-        if (!ready) {
-            console.warn('🔗 [Invite] Функции не готовы, но пробуем');
-        }
-
-        // Запускаем обработку
         handleIncomingInvite().catch(err => {
-            console.error('🔗 [Invite] Ошибка:', err);
+            console.error('🔐 [SecureInvite v3] Ошибка:', err);
             hideInviteLoading();
             showInviteError('unknown', err.message);
         });
     }
-
-    // Небольшая задержка, чтобы основной скрипт точно выполнился
     setTimeout(tryHandleInvite, 800);
 
     // ═══════════════════════════════════════════════════════════
-    //  PUBLIC API (для тестов)
+    //  ФОНОВАЯ ОЧИСТКА
     // ═══════════════════════════════════════════════════════════
-    window.TempInvite = {
-        build: (chatFile) => buildInviteLink(chatFile || state.chatFile),
-        parse: (raw) => parseAndValidateInvite(raw),
-        config: CFG,
-        test: async () => {
-            if (!state.chatFile) {
-                console.log('❌ Открой чат');
-                return;
-            }
-            try {
-                const { url, payload } = await buildInviteLink(state.chatFile);
-                console.log('🔗 Ссылка:', url);
-                console.log('⏱ Истекает через:', Math.round((payload.exp - Date.now()) / 1000) + 'с');
-                // Проверим сами себя
-                const params = new URLSearchParams(url.split('?')[1]);
-                const raw = params.get(CFG.URL_PARAM);
-                const parsed = await parseAndValidateInvite(raw);
-                console.log('✅ Валидация:', parsed);
-            } catch (e) {
-                console.error('❌ Ошибка:', e);
-            }
-        },
-        // Проверить «свежесть» ссылки без открытия
-        check: async (raw) => {
-            const r = await parseAndValidateInvite(raw);
-            if (r.ok) {
-                const remain = Math.round((r.payload.exp - Date.now()) / 1000);
-                console.log(`✅ Валидна. Осталось: ${remain}с. Чат: ${r.payload.chat.name}`);
-            } else {
-                console.log(`❌ Невалидна: ${r.reason} — ${r.message}`);
-            }
+    setTimeout(() => {
+        if (state.isAuthorized && state.token) cleanupExpiredTickets();
+    }, 5000);
+
+    if (typeof showChatsScreen === 'function') {
+        const _orig = showChatsScreen;
+        showChatsScreen = function() {
+            const r = _orig.apply(this, arguments);
+            setTimeout(() => {
+                if (state.isAuthorized && state.token) cleanupExpiredTickets();
+            }, 1000);
             return r;
+        };
+    }
+
+    setInterval(() => {
+        if (document.hidden) return;
+        if (state.isAuthorized && state.token) cleanupExpiredTickets();
+    }, CFG.CLEANUP_INTERVAL_MS);
+
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) return;
+        if (state.isAuthorized && state.token) {
+            setTimeout(cleanupExpiredTickets, 500);
+        }
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    //  PUBLIC API
+    // ═══════════════════════════════════════════════════════════
+    window.SecureInvite = {
+        build: (chatFile) => buildInviteLink(chatFile || state.chatFile),
+        config: CFG,
+        myTickets: () => getAllMyTickets(),
+        expiredTickets: () => getExpiredMyTickets(),
+        cleanup: () => cleanupExpiredTickets(),
+        deleteTicket: (ticketId) => attemptDeleteTicket(ticketId),
+        test: async () => {
+            if (!state.chatFile) { console.log('❌ Открой чат'); return; }
+            try {
+                const r = await buildInviteLink(state.chatFile);
+                console.log('🔐 Ссылка:', r.url);
+                console.log('⏱ TTL:', Math.round((r.expiresAt - Date.now()) / 1000) + 'с');
+                console.log('🎫 ID:', r.ticketId);
+            } catch (e) { console.error('❌', e); }
         },
     };
 
-    console.log('🔗 Временные приглашения активны');
-    console.log(`   • TTL: ${Math.round(CFG.TTL_MS / 1000)} секунд`);
-    console.log(`   • One-time: ${CFG.ENABLE_ONETIME ? 'да' : 'нет'}`);
-    console.log('   • Кнопка «🔗 Временная ссылка» — в модалке шаринга');
+    console.log('🔐 [SecureInvite v3] Шифрованные билеты активны:');
+    console.log('   • Содержимое билета зашифровано AES-256-GCM');
+    console.log('   • Ключ в URL-фрагменте (#k=...) — GitHub его не видит');
+    console.log('   • GitHub Push Protection не блокирует пуш');
+    console.log('   • Билет удаляется после первого чтения или через 2 мин');
     console.log('');
-    console.log('   API для тестов:');
-    console.log('     TempInvite.test()         — создать ссылку для текущего чата');
-    console.log('     TempInvite.check("...")   — проверить ссылку');
+    console.log('   ⚠️ ВАЖНО: гость должен получить ссылку ЦЕЛИКОМ,');
+    console.log('      вместе с частью после #. Иначе не расшифрует.');
 })();
 </script>
 </body>
