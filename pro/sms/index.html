@@ -37114,6 +37114,405 @@ try {
     console.log('   • WebM → MP4 конвертация в фоне');
     console.log('   • API: VideoNoteGift.open()');
 })();
+
+// ═══════════════════════════════════════════════════════════════
+//  🔔 СИСТЕМНЫЕ УВЕДОМЛЕНИЯ (Desktop Notifications)
+//  ─────────────────────────────────────────────────────────────
+//  • Показывают уведомление при новом сообщении, когда вкладка неактивна
+//  • Клик по уведомлению → открывает нужный чат
+//  • Не требует Service Worker
+//  • Работает в Chrome / Edge / Firefox / Safari (с ограничениями)
+// ═══════════════════════════════════════════════════════════════
+
+(function installDesktopNotifications() {
+    'use strict';
+
+    // ─── Проверка поддержки ───
+    if (!('Notification' in window)) {
+        console.warn('🔔 [Notif] Браузер не поддерживает Notifications API');
+        return;
+    }
+
+    // ─── Состояние ───
+    const N = {
+        permission: Notification.permission,   // 'default' | 'granted' | 'denied'
+        lastShownTs: new Map(),                // { chatFile: lastNotificationTs } — антиспам
+        minIntervalMs: 1500,                   // не чаще 1 уведомления в 1.5 сек на чат
+        iconUrl: 'icon-192.png',
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  1. ЗАПРОС РАЗРЕШЕНИЯ
+    // ═══════════════════════════════════════════════════════════
+    async function requestPermission() {
+        if (!('Notification' in window)) return false;
+        if (Notification.permission === 'granted') return true;
+        if (Notification.permission === 'denied') {
+            console.warn('🔔 [Notif] Разрешение отклонено пользователем ранее');
+            return false;
+        }
+
+        try {
+            const result = await Notification.requestPermission();
+            N.permission = result;
+            if (result === 'granted') {
+                console.log('🔔 [Notif] Разрешение получено');
+                showWelcomeNotification();
+                return true;
+            }
+            console.log('🔔 [Notif] Разрешение не выдано:', result);
+            return false;
+        } catch (e) {
+            console.warn('🔔 [Notif] requestPermission failed:', e);
+            return false;
+        }
+    }
+
+    // Приветственное уведомление — чтобы пользователь понял, что всё работает
+    function showWelcomeNotification() {
+        try {
+            const notif = new Notification('🔔 Уведомления включены', {
+                body: 'Вы будете получать оповещения о новых сообщениях',
+                icon: N.iconUrl,
+                badge: N.iconUrl,
+                tag: 'welcome',
+                silent: true,
+            });
+            setTimeout(() => { try { notif.close(); } catch (e) {} }, 4000);
+        } catch (e) {}
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  2. ПОКАЗ УВЕДОМЛЕНИЯ
+    // ═══════════════════════════════════════════════════════════
+    /**
+     * @param {object} opts
+     * @param {string} opts.chatFile — ID чата
+     * @param {string} opts.chatName — отображаемое имя чата
+     * @param {string} opts.sender   — ник отправителя
+     * @param {string} opts.text     — текст сообщения
+     * @param {number} opts.msgId    — ID сообщения (для перехода)
+     * @param {string} opts.preview  — эмодзи-превью вложения (📷, 🎤, …)
+     */
+    function showNotification(opts) {
+        if (Notification.permission !== 'granted') return;
+
+        // Антиспам: не чаще одного уведомления на чат за minIntervalMs
+        const now = Date.now();
+        const last = N.lastShownTs.get(opts.chatFile) || 0;
+        if (now - last < N.minIntervalMs) return;
+        N.lastShownTs.set(opts.chatFile, now);
+
+        // Формируем заголовок и текст
+        const title = opts.chatName
+            ? `${opts.sender} · ${opts.chatName}`
+            : opts.sender;
+
+        let body = opts.text || '';
+        if (opts.preview && !body) {
+            body = opts.preview;
+        }
+        // Обрезаем длинные тексты
+        if (body.length > 200) body = body.slice(0, 197) + '…';
+
+        const notifOptions = {
+            body,
+            icon: N.iconUrl,
+            badge: N.iconUrl,
+            tag: `chat_${opts.chatFile}`,     // группируем по чату
+            renotify: true,                    // «перетряхиваем» при повторе
+            silent: false,                     // пусть звук будет системный
+            data: {
+                chatFile: opts.chatFile,
+                msgId: opts.msgId,
+                ts: now,
+            },
+        };
+
+        try {
+            const notif = new Notification(title, notifOptions);
+
+            // Клик по уведомлению
+            notif.onclick = (e) => {
+                e.preventDefault();
+                handleNotificationClick(opts.chatFile, opts.msgId);
+                try { notif.close(); } catch (err) {}
+            };
+
+            // Автозакрытие через 8 секунд
+            setTimeout(() => {
+                try { notif.close(); } catch (e) {}
+            }, 8000);
+
+            console.log(`🔔 [Notif] Показано: ${title} — ${body}`);
+        } catch (e) {
+            console.warn('🔔 [Notif] showNotification failed:', e);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. КЛИК ПО УВЕДОМЛЕНИЮ
+    // ═══════════════════════════════════════════════════════════
+    async function handleNotificationClick(chatFile, msgId) {
+        // Фокусируем вкладку
+        try { window.focus(); } catch (e) {}
+
+        // Если мы уже в этом чате — просто скроллим
+        if (state.chatFile === chatFile && state.currentScreen === 'chat') {
+            if (typeof scrollToMessage === 'function' && msgId) {
+                scrollToMessage(msgId);
+            }
+            return;
+        }
+
+        // Нужен переход в другой чат
+        const chat = state.chats.find(c => c.file === chatFile);
+        if (!chat) {
+            console.warn('🔔 [Notif] Чат не найден:', chatFile);
+            return;
+        }
+        const password = state.savedPasswords[chatFile];
+        if (!password) {
+            console.warn('🔔 [Notif] Нет пароля для чата:', chatFile);
+            return;
+        }
+
+        // Ставим флаг, чтобы renderHistory сразу прыгнул к сообщению
+        if (msgId) window._pendingJumpToMsgId = msgId;
+
+        try {
+            if (typeof enterChat === 'function') {
+                await enterChat(chatFile, chat.name || chatFile, password);
+            }
+        } catch (e) {
+            console.error('🔔 [Notif] enterChat failed:', e);
+            window._pendingJumpToMsgId = null;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  4. ХУК НА pollUpdates — перехватываем новые сообщения
+    // ═══════════════════════════════════════════════════════════
+    if (typeof pollUpdates === 'function') {
+        const _origPollUpdates = pollUpdates;
+
+        pollUpdates = async function() {
+            // Запоминаем текущее количество
+            const beforeCount = state.lastMessageCount;
+            const beforeChat = state.chatFile;
+
+            // Вызываем оригинал
+            const result = await _origPollUpdates.apply(this, arguments);
+
+            // ─── Проверяем, появились ли новые ───
+            const afterCount = state.lastMessageCount;
+
+            // Если сообщений не прибавилось — выходим
+            if (afterCount <= beforeCount) return result;
+
+            // Если мы не авторизованы — выходим
+            if (!state.isAuthorized) return result;
+
+            // Если мы в чате и вкладка активна — не показываем уведомление
+            // (пользователь и так видит)
+            const isUserWatching =
+                document.visibilityState === 'visible'
+                && state.currentScreen === 'chat'
+                && state.chatFile === beforeChat;
+
+            if (isUserWatching) return result;
+
+            // ─── Смотрим последние новые сообщения ───
+            // Из state.messages забираем те, что появились после beforeCount
+            const newMessages = state.messages.slice(beforeCount);
+            if (newMessages.length === 0) return result;
+
+            // Игнорируем свои сообщения
+            const foreignMessages = newMessages.filter(
+                m => m.username !== state.username
+            );
+            if (foreignMessages.length === 0) return result;
+
+            // ─── Берём самое свежее ───
+            const latest = foreignMessages[foreignMessages.length - 1];
+
+            // ─── Формируем preview ───
+            let preview = '';
+            if (latest.text && latest.text.trim()) {
+                preview = latest.text.trim();
+            } else if (latest.image) {
+                preview = '📷 Фото';
+            } else if (latest.audio) {
+                preview = (latest.audioName && latest.audioName.trim())
+                    ? `🎵 ${latest.audioName}`
+                    : '🎤 Голосовое';
+            } else if (latest.videoNote) {
+                preview = '🎥 Кружочек';
+            } else if (latest.video) {
+                preview = `🎬 ${latest.videoName || 'Видео'}`;
+            } else if (latest.file) {
+                preview = `📎 ${latest.fileName || 'Файл'}`;
+            } else {
+                preview = 'Сообщение';
+            }
+
+            // ─── Имя чата ───
+            const chat = state.chats.find(c => c.file === beforeChat);
+            const chatName = chat ? (chat.name || chat.file) : (beforeChat || '');
+
+            // ─── Показываем уведомление ───
+            showNotification({
+                chatFile: beforeChat,
+                chatName,
+                sender: latest.username || 'Кто-то',
+                text: preview,
+                msgId: latest.id,
+                preview,
+            });
+
+            // Если пришло несколько — добавим пометку
+            if (foreignMessages.length > 1) {
+                // Второе уведомление с общим количеством
+                // (не обязательно, но приятно)
+                // Просто отметим, что было ещё
+                console.log(`🔔 [Notif] +${foreignMessages.length - 1} других сообщений в этом поллинге`);
+            }
+
+            return result;
+        };
+
+        console.log('🔔 [Notif] pollUpdates пропатчен');
+    } else {
+        console.warn('🔔 [Notif] pollUpdates не найдена — уведомления не будут работать');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  5. ХУК НА refreshUnreadBadges — уведомления о чужих чатах
+    //  (когда мы не в этом чате, а сообщение пришло в другой)
+    // ═══════════════════════════════════════════════════════════
+    if (typeof refreshUnreadBadges === 'function') {
+        const _origRefreshUnread = refreshUnreadBadges;
+
+        refreshUnreadBadges = async function() {
+            // Запоминаем состояние "до"
+            const before = new Map();
+            state.chats.forEach(c => {
+                before.set(c.file, c.unreadCount || 0);
+            });
+
+            const result = await _origRefreshUnread.apply(this, arguments);
+
+            // Если вкладка активна и мы в чате — уведомления не нужны
+            if (document.visibilityState === 'visible' && state.currentScreen === 'chat') {
+                return result;
+            }
+
+            // Смотрим, у каких чатов выросло число непрочитанных
+            state.chats.forEach(c => {
+                const prevCount = before.get(c.file) || 0;
+                const nowCount = c.unreadCount || 0;
+                if (nowCount > prevCount && c.unreadCount > 0) {
+                    const delta = nowCount - prevCount;
+                    // Игнорируем текущий чат (о нём уведомляет pollUpdates)
+                    if (c.file === state.chatFile) return;
+
+                    const chatName = c.name || c.file;
+                    showNotification({
+                        chatFile: c.file,
+                        chatName,
+                        sender: 'Новое сообщение',
+                        text: delta === 1
+                            ? `В чате «${chatName}» новое сообщение`
+                            : `В чате «${chatName}» ${delta} новых сообщений`,
+                        msgId: null,
+                    });
+                }
+            });
+
+            return result;
+        };
+
+        console.log('🔔 [Notif] refreshUnreadBadges пропатчен');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  6. АВТОЗАПРОС РАЗРЕШЕНИЯ
+    //  — при первом успешном логине
+    //  — и через 15 секунд после загрузки, если уже авторизованы
+    // ═══════════════════════════════════════════════════════════
+
+    // Хук на login
+    if (typeof login === 'function') {
+        const _origLogin = login;
+        login = async function() {
+            const r = await _origLogin.apply(this, arguments);
+            // После успешного входа
+            if (state.isAuthorized && Notification.permission === 'default') {
+                setTimeout(() => requestPermission(), 1500);
+            }
+            return r;
+        };
+    }
+
+    // Хук на restoreSession
+    if (typeof restoreSession === 'function') {
+        const _origRestore = restoreSession;
+        restoreSession = async function() {
+            const r = await _origRestore.apply(this, arguments);
+            if (state.isAuthorized && Notification.permission === 'default') {
+                setTimeout(() => requestPermission(), 2000);
+            }
+            return r;
+        };
+    }
+
+    // Автозапрос через 15 сек после загрузки, если уже авторизованы
+    setTimeout(() => {
+        if (state && state.isAuthorized && Notification.permission === 'default') {
+            requestPermission();
+        }
+    }, 15000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  7. ПУБЛИЧНОЕ API
+    // ═══════════════════════════════════════════════════════════
+    window.DesktopNotif = {
+        /** Запросить разрешение вручную */
+        request: () => requestPermission(),
+
+        /** Показать тестовое уведомление */
+        test: () => {
+            if (Notification.permission !== 'granted') {
+                showToast('🔔 Сначала дайте разрешение');
+                requestPermission();
+                return;
+            }
+            showNotification({
+                chatFile: state.chatFile || 'test',
+                chatName: 'Тест',
+                sender: 'Проверка',
+                text: 'Так выглядит уведомление о новом сообщении',
+                msgId: null,
+            });
+        },
+
+        /** Текущий статус */
+        status: () => ({
+            supported: 'Notification' in window,
+            permission: Notification.permission,
+        }),
+
+        /** Сброс антиспама (для тестов) */
+        resetAntiSpam: () => {
+            N.lastShownTs.clear();
+            console.log('🔔 [Notif] Антиспам сброшен');
+        },
+    };
+
+    console.log('🔔 [Notif] Системные уведомления активны');
+    console.log(`   Текущий статус: ${Notification.permission}`);
+    console.log('   API: DesktopNotif.test() / .request() / .status()');
+})();
 </script>
 
 </body>
