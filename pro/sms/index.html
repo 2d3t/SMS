@@ -33829,5 +33829,638 @@ try {
     console.log('   • API: NoSelfUnread.check("chat_xxx")');
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🩹 МЕГА-ПАТЧ v1: ФИКС ПРЫЖКА К ТРЕКУ + ОЧИСТКА ПАМЯТИ
+//  ─────────────────────────────────────────────────────────────
+//  Проблема 1: При клике на трек в плеере — скролл сбрасывается
+//              вниз из-за гонки между scrollToBottom и jumpToMessage
+//  Проблема 2: blob:URL утекают после очистки кэша
+// ═══════════════════════════════════════════════════════════════
+
+(function installMegaFix() {
+    'use strict';
+
+    console.log('🩹 [MegaFix] Установка патча…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЧАСТЬ 1: ФИКС ПРЫЖКА К ТРЕКУ
+    // ═══════════════════════════════════════════════════════════
+
+    // Флаг «мы в режиме прыжка к конкретному сообщению».
+    // Пока активен — все scrollToBottom игнорируются.
+    const JumpLock = {
+        active: false,
+        targetMsgId: null,
+        startedAt: 0,
+        maxDurationMs: 15000,   // максимум 15 сек — потом принудительно снимем
+        _timer: null,
+
+        start(msgId) {
+            this.active = true;
+            this.targetMsgId = msgId;
+            this.startedAt = Date.now();
+
+            if (this._timer) clearTimeout(this._timer);
+            this._timer = setTimeout(() => {
+                console.warn('🩹 [JumpLock] Таймаут — снимаю принудительно');
+                this.stop();
+            }, this.maxDurationMs);
+
+            console.log(`🔒 [JumpLock] Заблокирован скролл вниз для msg ${msgId}`);
+        },
+
+        stop() {
+            if (!this.active) return;
+            this.active = false;
+            this.targetMsgId = null;
+            if (this._timer) {
+                clearTimeout(this._timer);
+                this._timer = null;
+            }
+            console.log('🔓 [JumpLock] Разблокирован');
+        },
+
+        isActive() {
+            return this.active && (Date.now() - this.startedAt) < this.maxDurationMs;
+        },
+    };
+
+    // ─── Патч scrollToBottom: блокируем во время прыжка ───
+    if (typeof scrollToBottom === 'function') {
+        const _origScrollToBottom = scrollToBottom;
+
+        scrollToBottom = function(force = false) {
+            if (JumpLock.isActive() && !force) {
+                // Игнорируем все «мягкие» вызовы во время прыжка
+                return;
+            }
+            if (JumpLock.isActive() && force) {
+                // Даже force игнорируем, если это не финальный скролл
+                // (финальный будет вызван вручную через _forceScrollToBottom)
+                return;
+            }
+            return _origScrollToBottom.apply(this, arguments);
+        };
+
+        // Сохраняем оригинал под специальным именем — для обхода блокировки
+        window._forceScrollToBottom = function(force = true) {
+            return _origScrollToBottom.call(this, force);
+        };
+
+        console.log('🩹 [MegaFix] patched: scrollToBottom (учитывает JumpLock)');
+    }
+
+    // ─── Патч scrollToBottomNow — тоже под блокировку ───
+    if (typeof scrollToBottomNow === 'function') {
+        const _origScrollToBottomNow = scrollToBottomNow;
+        scrollToBottomNow = function() {
+            if (JumpLock.isActive()) return;
+            return _origScrollToBottomNow.apply(this, arguments);
+        };
+    }
+
+    // ─── Патч _scheduleBottomCatchup — не «догоняем» вниз во время прыжка ───
+    if (typeof _scheduleBottomCatchup === 'function') {
+        const _origCatchup = _scheduleBottomCatchup;
+        _scheduleBottomCatchup = function() {
+            if (JumpLock.isActive()) {
+                console.log('🩹 [MegaFix] catchup отменён — идёт прыжок');
+                return;
+            }
+            return _origCatchup.apply(this, arguments);
+        };
+    }
+
+    // ─── Патч activateInitialFreeze — не активировать во время прыжка ───
+    if (typeof window.activateInitialFreeze === 'function') {
+        const _origFreeze = window.activateInitialFreeze;
+        window.activateInitialFreeze = function(durationMs) {
+            if (JumpLock.isActive()) {
+                console.log('🩹 [MegaFix] initialFreeze отменён — идёт прыжок');
+                return;
+            }
+            return _origFreeze.call(this, durationMs);
+        };
+    }
+
+    // ─── Патч jumpToPlayingTrack — ставим JumpLock ───
+    if (typeof window.jumpToPlayingTrack === 'function') {
+        const _origJumpToPlaying = window.jumpToPlayingTrack;
+
+        window.jumpToPlayingTrack = async function() {
+            const targetChat = (typeof GlobalPlayer !== 'undefined')
+                ? GlobalPlayer.currentChatFile
+                : null;
+            const targetMsgId = (typeof GlobalPlayer !== 'undefined')
+                ? GlobalPlayer.currentMsgId
+                : null;
+
+            if (!targetChat || !targetMsgId) {
+                return _origJumpToPlaying.apply(this, arguments);
+            }
+
+            const wasInSameChat = (state.chatFile === targetChat);
+
+            // 🆕 Ставим блокировку ДО входа в чат (если переходим)
+            if (!wasInSameChat) {
+                JumpLock.start(targetMsgId);
+            } else {
+                // Мы уже в чате — блокируем сразу, ненадолго
+                JumpLock.start(targetMsgId);
+            }
+
+            try {
+                const result = await _origJumpToPlaying.apply(this, arguments);
+                return result;
+            } catch (e) {
+                // При ошибке снимаем блокировку
+                JumpLock.stop();
+                throw e;
+            }
+        };
+
+        console.log('🩹 [MegaFix] patched: jumpToPlayingTrack (ставит JumpLock)');
+    }
+
+    // ─── Патч scrollToMessage — тоже ставит JumpLock ───
+    // (это используется при клике на цитату ответа и в поиске)
+    if (typeof scrollToMessage === 'function') {
+        const _origScrollToMessage = scrollToMessage;
+
+        scrollToMessage = function(msgId) {
+            if (!msgId) return;
+
+            const targetMsgId = parseInt(msgId);
+
+            // Если сообщение уже в DOM — не блокируем (короткий путь)
+            const existing = messagesInner.querySelector(
+                `.message-wrapper[data-msg-id="${targetMsgId}"]`
+            );
+
+            if (existing) {
+                // Быстрый скролл — блокируем ненадолго
+                JumpLock.start(targetMsgId);
+                doScrollAndFlash(existing, targetMsgId);
+                cascadeScrollToElement(existing, targetMsgId);
+
+                // Снимаем блокировку через 3 секунды
+                setTimeout(() => JumpLock.stop(), 3000);
+                return;
+            }
+
+            // Длинный путь — полный renderHistory
+            JumpLock.start(targetMsgId);
+            window._pendingJumpToMsgId = targetMsgId;
+            renderHistory();
+
+            setTimeout(() => JumpLock.stop(), 5000);
+        };
+
+        console.log('🩹 [MegaFix] patched: scrollToMessage (ставит JumpLock)');
+    }
+
+    // ─── Финальное снятие JumpLock после успешного прыжка ───
+    // Слушаем появление целевого сообщения в DOM — если оно найдено
+    // и подсвечено, снимаем блокировку через 1.5 сек.
+
+    const _jumpLockObserver = new MutationObserver(() => {
+        if (!JumpLock.isActive()) return;
+        const targetId = JumpLock.targetMsgId;
+        if (!targetId) return;
+
+        const el = messagesInner.querySelector(
+            `.message-wrapper[data-msg-id="${targetId}"].highlight-flash`
+        );
+        if (el) {
+            // Сообщение найдено и подсвечено — снимаем блокировку через 1.5 сек
+            setTimeout(() => {
+                if (JumpLock.isActive() && JumpLock.targetMsgId === targetId) {
+                    JumpLock.stop();
+                }
+            }, 1500);
+        }
+    });
+
+    _jumpLockObserver.observe(messagesInner, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['class'],
+    });
+
+    console.log('🔒 [MegaFix] JumpLock полностью установлен');
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЧАСТЬ 2: ЦЕНТРАЛИЗОВАННЫЙ ТРЕКЕР BLOB-URL
+    // ═══════════════════════════════════════════════════════════
+
+    // ─── Реестр всех созданных blob:URL ───
+    // { url: { createdAt, refCount, tag } }
+    const BlobRegistry = new Map();
+
+    // ─── Обёртка URL.createObjectURL ───
+    const _origCreateObjectURL = URL.createObjectURL.bind(URL);
+    const _origRevokeObjectURL = URL.revokeObjectURL.bind(URL);
+
+    URL.createObjectURL = function(obj) {
+        const url = _origCreateObjectURL(obj);
+
+        // Регистрируем
+        BlobRegistry.set(url, {
+            createdAt: Date.now(),
+            size: obj && obj.size ? obj.size : 0,
+            type: obj && obj.type ? obj.type : 'unknown',
+            refCount: 1,
+            tag: _currentTag,   // контекст, в котором создан
+        });
+
+        return url;
+    };
+
+    URL.revokeObjectURL = function(url) {
+        if (!url) return;
+        BlobRegistry.delete(url);
+        try {
+            _origRevokeObjectURL(url);
+        } catch (e) {}
+    };
+
+    // Переменная контекста — устанавливается в разных местах
+    let _currentTag = 'general';
+
+    function setBlobTag(tag) {
+        _currentTag = tag;
+    }
+
+    // ─── Гарантированная очистка ───
+
+    /**
+     * Полная очистка _attachmentCache с revoke ВСЕХ URL.
+     * Заменяет оригинальную clearAttachmentCache.
+     */
+    function thoroughClearAttachmentCache() {
+        if (typeof _attachmentCache === 'undefined') return;
+
+        // 🆕 Защищаем URL, которые сейчас играют в плеере
+        const protectedUrls = new Set();
+
+        if (typeof GlobalPlayer !== 'undefined') {
+            if (GlobalPlayer.queue) {
+                for (const track of GlobalPlayer.queue) {
+                    if (track.src) protectedUrls.add(track.src);
+                    if (track.coverUrl) protectedUrls.add(track.coverUrl);
+                }
+            }
+            if (GlobalPlayer.audioEl && GlobalPlayer.audioEl.src) {
+                protectedUrls.add(GlobalPlayer.audioEl.src);
+            }
+        }
+
+        // 🆕 Защищаем URL, которые сейчас в DOM (видимы пользователю)
+        try {
+            document.querySelectorAll('img[src^="blob:"], audio[src^="blob:"], video[src^="blob:"]')
+                .forEach(el => {
+                    if (el.src) protectedUrls.add(el.src);
+                });
+        } catch (e) {}
+
+        let revoked = 0;
+        let protectedCount = 0;
+
+        _attachmentCache.forEach((url, name) => {
+            if (protectedUrls.has(url)) {
+                protectedCount++;
+                return;
+            }
+
+            try {
+                URL.revokeObjectURL(url);
+                revoked++;
+            } catch (e) {}
+        });
+
+        // Очищаем саму мапу
+        _attachmentCache.clear();
+        if (typeof _pendingAttachmentLoads !== 'undefined') {
+            _pendingAttachmentLoads.clear();
+        }
+
+        console.log(`🧹 [MegaFix] _attachmentCache очищен: ${revoked} URL revoked, ${protectedCount} защищено`);
+    }
+
+    // Патчим глобальную clearAttachmentCache
+    if (typeof window.clearAttachmentCache === 'function') {
+        window.clearAttachmentCache = thoroughClearAttachmentCache;
+        console.log('🩹 [MegaFix] patched: clearAttachmentCache → thoroughClearAttachmentCache');
+    }
+
+    /**
+     * Очистка blob:URL, которые больше не используются.
+     * Проходим по реестру, смотрим, используется ли URL в:
+     *   - _attachmentCache
+     *   - DOM
+     *   - GlobalPlayer
+     *   - galleryState
+     * Если нигде — revoke.
+     */
+    function cleanupOrphanedBlobs() {
+        // Собираем «живые» URL
+        const liveUrls = new Set();
+
+        // 1. Из _attachmentCache
+        if (typeof _attachmentCache !== 'undefined') {
+            _attachmentCache.forEach(url => liveUrls.add(url));
+        }
+
+        // 2. Из DOM
+        try {
+            document.querySelectorAll('[src^="blob:"]')
+                .forEach(el => {
+                    if (el.src) liveUrls.add(el.src);
+                });
+        } catch (e) {}
+
+        // 3. Из GlobalPlayer
+        if (typeof GlobalPlayer !== 'undefined') {
+            if (GlobalPlayer.queue) {
+                for (const track of GlobalPlayer.queue) {
+                    if (track.src) liveUrls.add(track.src);
+                    if (track.coverUrl) liveUrls.add(track.coverUrl);
+                }
+            }
+            if (GlobalPlayer.audioEl && GlobalPlayer.audioEl.src) {
+                liveUrls.add(GlobalPlayer.audioEl.src);
+            }
+        }
+
+        // 4. Из galleryState
+        if (typeof galleryState !== 'undefined' && galleryState.images) {
+            galleryState.images.forEach(url => liveUrls.add(url));
+        }
+
+        // 5. Из _mp4Cache (для видео)
+        if (typeof _mp4Cache !== 'undefined' && _mp4Cache instanceof Map) {
+            // Ключ — исходный URL, значение — blob (не blob:URL),
+            // поэтому не учитываем
+        }
+
+        // 6. Из открытых модалок
+        try {
+            const videoModal = document.getElementById('videoModalPlayer');
+            if (videoModal && videoModal.src) liveUrls.add(videoModal.src);
+        } catch (e) {}
+
+        // Теперь проходим по реестру и revoke всё, что не живо
+        let orphaned = 0;
+        let orphanedBytes = 0;
+
+        BlobRegistry.forEach((info, url) => {
+            if (liveUrls.has(url)) return;
+
+            // Даём «молодым» URL время — вдруг они ещё не попали в DOM
+            const age = Date.now() - info.createdAt;
+            if (age < 30000) return;   // младше 30 сек — не трогаем
+
+            try {
+                URL.revokeObjectURL(url);
+                BlobRegistry.delete(url);
+                orphaned++;
+                orphanedBytes += info.size || 0;
+            } catch (e) {}
+        });
+
+        if (orphaned > 0) {
+            console.log(`🧹 [MegaFix] Очищено осиротевших blob:URL: ${orphaned} (${(orphanedBytes / 1024).toFixed(1)} КБ)`);
+        }
+
+        return { orphaned, bytes: orphanedBytes };
+    }
+
+    /**
+     * Принудительная очистка всего — для logout.
+     */
+    function emergencyCleanup() {
+        let revoked = 0;
+        let bytes = 0;
+
+        BlobRegistry.forEach((info, url) => {
+            // При logout защищаем только то, что в плеере
+            // (плеер тоже очищается, но на всякий случай)
+            try {
+                URL.revokeObjectURL(url);
+                revoked++;
+                bytes += info.size || 0;
+            } catch (e) {}
+        });
+
+        BlobRegistry.clear();
+
+        console.log(`🧨 [MegaFix] Emergency cleanup: ${revoked} URL revoked (${(bytes / 1024).toFixed(1)} КБ)`);
+    }
+
+    // ─── Патч logout — гарантированная очистка ───
+    if (typeof logout === 'function') {
+        const _origLogout = logout;
+        logout = function() {
+            emergencyCleanup();
+            return _origLogout.apply(this, arguments);
+        };
+    }
+
+    // ─── Патч deleteChat / removeChatFromList ───
+    if (typeof removeChatFromList === 'function') {
+        const _origRemoveChat = removeChatFromList;
+        removeChatFromList = function(file) {
+            const result = _origRemoveChat.apply(this, arguments);
+            // После удаления чата — чистим «осиротевшие»
+            setTimeout(cleanupOrphanedBlobs, 1000);
+            return result;
+        };
+    }
+
+    // ─── Периодическая очистка (раз в 60 секунд) ───
+    setInterval(() => {
+        if (document.hidden) return;
+        cleanupOrphanedBlobs();
+    }, 60000);
+
+    // ─── Очистка при visibilitychange:hidden ───
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState !== 'hidden') return;
+        // Небольшая задержка, чтобы все операции завершились
+        setTimeout(cleanupOrphanedBlobs, 2000);
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЧАСТЬ 3: ЗАЩИТА ОТ ДВОЙНОЙ ОЧИСТКИ КЭША
+    //  При ручной очистке кэша (модалка) — гарантированно
+    //  вызываем revoke для всех выбранных чатов
+    // ═══════════════════════════════════════════════════════════
+
+    if (typeof doClearSelectedCache === 'function') {
+        const _origClearSelected = doClearSelectedCache;
+
+        doClearSelectedCache = async function() {
+            // Собираем URL, которые надо будет revoke
+            const urlsToCheck = new Set();
+
+            if (typeof _selectedCacheFiles !== 'undefined') {
+                // Перед очисткой — заберём attachNames из выбранных чатов
+                const attachNamesToClear = new Set();
+
+                if (typeof OfflineCache !== 'undefined' && OfflineCache.getChat) {
+                    for (const file of _selectedCacheFiles) {
+                        try {
+                            const cached = await OfflineCache.getChat(file);
+                            if (cached && Array.isArray(cached.messages)) {
+                                for (const msg of cached.messages) {
+                                    if (msg.image) attachNamesToClear.add(msg.image);
+                                    if (msg.audio) attachNamesToClear.add(msg.audio);
+                                    if (msg.file) attachNamesToClear.add(msg.file);
+                                    if (msg.video) attachNamesToClear.add(msg.video);
+                                    if (msg.videoNote) attachNamesToClear.add(msg.videoNote);
+                                    if (msg.audioCover) attachNamesToClear.add(msg.audioCover);
+                                }
+                            }
+                        } catch (e) {}
+                    }
+                }
+
+                // Собираем URL из _attachmentCache, которые надо удалить
+                if (typeof _attachmentCache !== 'undefined') {
+                    attachNamesToClear.forEach(name => {
+                        const url = _attachmentCache.get(name);
+                        if (url) urlsToCheck.add(url);
+                    });
+                }
+            }
+
+            // Защищаем то, что в плеере
+            const protectedUrls = new Set();
+            if (typeof GlobalPlayer !== 'undefined') {
+                if (GlobalPlayer.queue) {
+                    for (const track of GlobalPlayer.queue) {
+                        if (track.src) protectedUrls.add(track.src);
+                        if (track.coverUrl) protectedUrls.add(track.coverUrl);
+                    }
+                }
+                if (GlobalPlayer.audioEl && GlobalPlayer.audioEl.src) {
+                    protectedUrls.add(GlobalPlayer.audioEl.src);
+                }
+            }
+
+            // Вызываем оригинал
+            const result = await _origClearSelected.apply(this, arguments);
+
+            // После — гарантированно revoke всё, что не защищено
+            let revoked = 0;
+            urlsToCheck.forEach(url => {
+                if (protectedUrls.has(url)) return;
+                try {
+                    URL.revokeObjectURL(url);
+                    BlobRegistry.delete(url);
+                    revoked++;
+                } catch (e) {}
+            });
+
+            console.log(`🧹 [MegaFix] После ручной очистки: ${revoked} blob:URL revoked`);
+
+            // И «осиротевшие»
+            setTimeout(cleanupOrphanedBlobs, 500);
+
+            return result;
+        };
+
+        console.log('🩹 [MegaFix] patched: doClearSelectedCache (гарантированная очистка)');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЧАСТЬ 4: ЯВНЫЙ СБРОС БЛОКИРОВКИ ПРИ СМЕНЕ ЧАТА
+    //  Если пользователь ушёл из чата — блокировка не нужна
+    // ═══════════════════════════════════════════════════════════
+
+    if (typeof backToChats === 'function') {
+        const _origBack = backToChats;
+        backToChats = function() {
+            JumpLock.stop();
+            return _origBack.apply(this, arguments);
+        };
+    }
+
+    if (typeof showChatsScreen === 'function') {
+        const _origShowChats = showChatsScreen;
+        showChatsScreen = function() {
+            JumpLock.stop();
+            return _origShowChats.apply(this, arguments);
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API ДЛЯ ОТЛАДКИ
+    // ═══════════════════════════════════════════════════════════
+    window.MegaFix = {
+        // JumpLock
+        jumpLock: {
+            isActive: () => JumpLock.isActive(),
+            target: () => JumpLock.targetMsgId,
+            forceStop: () => JumpLock.stop(),
+        },
+
+        // Blob Registry
+        blobs: {
+            count: () => BlobRegistry.size,
+            totalBytes: () => {
+                let t = 0;
+                BlobRegistry.forEach(info => t += info.size || 0);
+                return t;
+            },
+            list: () => {
+                const arr = [];
+                BlobRegistry.forEach((info, url) => {
+                    arr.push({
+                        url: url.slice(0, 50) + '…',
+                        size: info.size,
+                        sizeStr: (info.size / 1024).toFixed(1) + ' КБ',
+                        age: Math.round((Date.now() - info.createdAt) / 1000) + 's',
+                        type: info.type,
+                    });
+                });
+                return arr.sort((a, b) => b.size - a.size);
+            },
+            cleanup: () => cleanupOrphanedBlobs(),
+            emergency: () => emergencyCleanup(),
+        },
+
+        // Полный статус
+        status: () => ({
+            jumpLockActive: JumpLock.isActive(),
+            jumpLockTarget: JumpLock.targetMsgId,
+            blobCount: BlobRegistry.size,
+            blobTotalBytes: (() => {
+                let t = 0;
+                BlobRegistry.forEach(info => t += info.size || 0);
+                return t;
+            })(),
+            attachmentCacheCount: (typeof _attachmentCache !== 'undefined')
+                ? _attachmentCache.size
+                : 0,
+        }),
+    };
+
+    console.log('🩹 [MegaFix] Патч установлен:');
+    console.log('   • JumpLock — фикс двойного-тройного тапа по треку');
+    console.log('   • BlobRegistry — централизованный трекер blob:URL');
+    console.log('   • cleanupOrphanedBlobs — автоочистка утечек');
+    console.log('   • thoroughClearAttachmentCache — гарантированный revoke');
+    console.log('');
+    console.log('   API для отладки:');
+    console.log('     MegaFix.status()              — общий статус');
+    console.log('     MegaFix.blobs.list()          — список живых blob:URL');
+    console.log('     MegaFix.blobs.totalBytes()    — общий размер в байтах');
+    console.log('     MegaFix.blobs.cleanup()       — принудительная очистка');
+    console.log('     MegaFix.jumpLock.isActive()   — идёт ли прыжок к треку');
+})();
+</script>
 </body>
 </html>
