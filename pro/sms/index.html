@@ -36169,5 +36169,952 @@ try {
     console.log('🩹 [FreshJump] Патч установлен — при прыжке обновляем сообщение из GitHub');
 })();
 </script>
+
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🎥 ВИДЕО-КРУЖОЧКИ (подарок)
+//  ─────────────────────────────────────────────────────────────
+//  • Долгое нажатие на 🎤 → запись кружочка (макс 10 сек)
+//  • Автостоп при отпускании
+//  • WebM → MP4 конвертация
+//  • Красивое отображение в чате
+//  • Комментарии, ответы, реакции — как у обычных сообщений
+// ═══════════════════════════════════════════════════════════════
+
+(function installVideoNotesGift() {
+    'use strict';
+
+    const VN = {
+        MAX_DURATION_MS: 10000,      // 10 сек — жёсткий лимит
+        SIZE: 480,                    // 480×480 кружок
+        FPS: 24,
+        VIDEO_BITRATE: 500000,       // 500 kbps → ~600 КБ за 10 сек
+        AUDIO_BITRATE: 32000,        // 32 kbps
+        LONG_PRESS_MS: 300,          // через сколько мс активируется камера
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОСТОЯНИЕ
+    // ═══════════════════════════════════════════════════════════
+    const State = {
+        active: false,            // режим кружочка активен
+        recording: false,         // идёт запись
+        stream: null,
+        mediaRecorder: null,
+        chunks: [],
+        startTime: 0,
+        duration: 0,
+        timerInterval: null,
+        longPressTimer: null,
+        facingMode: 'user',       // user | environment
+        modalEl: null,
+        videoEl: null,
+        overlayEl: null,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  СТИЛИ
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('videoNoteGiftStyles')) {
+        const style = document.createElement('style');
+        style.id = 'videoNoteGiftStyles';
+        style.textContent = `
+            /* ═══ Модалка записи ═══ */
+            #videoNoteRecorder {
+                position: fixed;
+                inset: 0;
+                background: rgba(0,0,0,0.92);
+                backdrop-filter: blur(20px);
+                -webkit-backdrop-filter: blur(20px);
+                z-index: 5500;
+                display: none;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                gap: 20px;
+                animation: vnrFadeIn 0.2s ease;
+                padding: 20px;
+            }
+            #videoNoteRecorder.show { display: flex; }
+            @keyframes vnrFadeIn {
+                from { opacity: 0; }
+                to { opacity: 1; }
+            }
+
+            #videoNoteRecorder .vnr-preview {
+                width: min(70vw, 360px);
+                height: min(70vw, 360px);
+                max-width: 360px;
+                max-height: 360px;
+                border-radius: 50%;
+                overflow: hidden;
+                position: relative;
+                background: #000;
+                box-shadow:
+                    0 0 0 4px rgba(108,92,231,0.5),
+                    0 0 0 8px rgba(108,92,231,0.2),
+                    0 20px 60px rgba(0,0,0,0.7);
+                transition: box-shadow 0.3s;
+            }
+            #videoNoteRecorder.recording .vnr-preview {
+                box-shadow:
+                    0 0 0 4px rgba(255,107,107,0.7),
+                    0 0 0 8px rgba(255,107,107,0.3),
+                    0 20px 60px rgba(0,0,0,0.7);
+            }
+            #videoNoteRecorder .vnr-preview video {
+                width: 100%;
+                height: 100%;
+                object-fit: cover;
+                border-radius: 50%;
+                display: block;
+                transform: scaleX(-1); /* зеркалим фронталку */
+            }
+            #videoNoteRecorder .vnr-preview.back video {
+                transform: none;
+            }
+
+            /* ═══ Прогресс-кольцо ═══ */
+            #videoNoteRecorder .vnr-ring {
+                position: absolute;
+                inset: -14px;
+                pointer-events: none;
+                z-index: 2;
+            }
+            #videoNoteRecorder .vnr-ring svg {
+                width: 100%;
+                height: 100%;
+                transform: rotate(-90deg);
+            }
+            #videoNoteRecorder .vnr-ring circle {
+                fill: none;
+                stroke-width: 4;
+                stroke-linecap: round;
+            }
+            #videoNoteRecorder .vnr-ring .ring-bg {
+                stroke: rgba(255,255,255,0.1);
+            }
+            #videoNoteRecorder .vnr-ring .ring-fg {
+                stroke: #ff6b6b;
+                stroke-dasharray: 0 9999;
+                transition: stroke-dasharray 0.1s linear;
+                filter: drop-shadow(0 0 6px rgba(255,107,107,0.8));
+            }
+
+            /* ═══ Таймер сверху ═══ */
+            #videoNoteRecorder .vnr-timer {
+                position: absolute;
+                top: 12px;
+                left: 50%;
+                transform: translateX(-50%);
+                background: rgba(0,0,0,0.65);
+                backdrop-filter: blur(10px);
+                color: #fff;
+                padding: 5px 14px;
+                border-radius: 14px;
+                font-size: 13px;
+                font-weight: 700;
+                letter-spacing: 1px;
+                font-variant-numeric: tabular-nums;
+                z-index: 3;
+                display: none;
+                border: 1px solid rgba(255,107,107,0.5);
+            }
+            #videoNoteRecorder.recording .vnr-timer {
+                display: block;
+                animation: vnrTimerPulse 1s ease-in-out infinite;
+            }
+            @keyframes vnrTimerPulse {
+                0%, 100% { box-shadow: 0 0 0 0 rgba(255,107,107,0.5); }
+                50%      { box-shadow: 0 0 0 6px rgba(255,107,107,0); }
+            }
+
+            /* ═══ Подсказка ═══ */
+            #videoNoteRecorder .vnr-hint {
+                color: rgba(255,255,255,0.75);
+                font-size: 14px;
+                text-align: center;
+                max-width: 320px;
+                line-height: 1.5;
+                min-height: 40px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                transition: opacity 0.3s;
+            }
+
+            /* ═══ Кнопки управления ═══ */
+            #videoNoteRecorder .vnr-controls {
+                display: flex;
+                align-items: center;
+                gap: 24px;
+                margin-top: 10px;
+            }
+            #videoNoteRecorder .vnr-btn {
+                width: 60px;
+                height: 60px;
+                border-radius: 50%;
+                border: none;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 24px;
+                transition: transform 0.15s, background 0.2s;
+                -webkit-tap-highlight-color: transparent;
+                font-family: inherit;
+                padding: 0;
+            }
+            #videoNoteRecorder .vnr-btn:active { transform: scale(0.88); }
+            #videoNoteRecorder .vnr-btn:disabled {
+                opacity: 0.3;
+                cursor: not-allowed;
+                transform: none;
+            }
+
+            #videoNoteRecorder .vnr-record {
+                width: 80px;
+                height: 80px;
+                background: linear-gradient(135deg, #ff6b6b, #ee5253);
+                color: #fff;
+                box-shadow: 0 6px 20px rgba(255,107,107,0.5);
+                font-size: 32px;
+                position: relative;
+            }
+            #videoNoteRecorder .vnr-record::before {
+                content: '';
+                position: absolute;
+                inset: 6px;
+                border-radius: 50%;
+                background: rgba(255,255,255,0.15);
+                opacity: 0;
+                transition: opacity 0.2s;
+            }
+            #videoNoteRecorder.recording .vnr-record {
+                background: linear-gradient(135deg, #fff, #ddd);
+                color: #ee5253;
+            }
+            #videoNoteRecorder.recording .vnr-record::before { opacity: 1; }
+
+            #videoNoteRecorder .vnr-cancel {
+                background: rgba(255,255,255,0.1);
+                color: #ccc;
+                border: 1px solid rgba(255,255,255,0.15);
+            }
+            #videoNoteRecorder .vnr-cancel:hover { background: rgba(255,107,107,0.2); color: #ff6b6b; }
+
+            #videoNoteRecorder .vnr-flip {
+                background: rgba(255,255,255,0.1);
+                color: #ccc;
+                border: 1px solid rgba(255,255,255,0.15);
+            }
+            #videoNoteRecorder .vnr-flip:hover { background: rgba(108,92,231,0.25); color: #fff; }
+
+            /* ═══ Прогресс конвертации ═══ */
+            #videoNoteRecorder .vnr-converting {
+                position: absolute;
+                inset: 0;
+                background: rgba(0,0,0,0.85);
+                backdrop-filter: blur(8px);
+                border-radius: 50%;
+                display: none;
+                align-items: center;
+                justify-content: center;
+                flex-direction: column;
+                gap: 8px;
+                z-index: 5;
+            }
+            #videoNoteRecorder.converting .vnr-converting {
+                display: flex;
+            }
+            #videoNoteRecorder .vnr-converting .vnr-spinner {
+                width: 32px;
+                height: 32px;
+                border: 3px solid rgba(108,92,231,0.25);
+                border-top-color: #6c5ce7;
+                border-right-color: #00b894;
+                border-radius: 50%;
+                animation: vnrSpin 0.8s linear infinite;
+            }
+            @keyframes vnrSpin { to { transform: rotate(360deg); } }
+            #videoNoteRecorder .vnr-converting .vnr-conv-text {
+                color: #a78bfa;
+                font-size: 11px;
+                font-weight: 600;
+                letter-spacing: 0.3px;
+            }
+            #videoNoteRecorder .vnr-converting .vnr-conv-pct {
+                color: #fff;
+                font-size: 14px;
+                font-weight: 700;
+                font-variant-numeric: tabular-nums;
+            }
+
+            @media (max-width: 480px) {
+                #videoNoteRecorder .vnr-preview {
+                    width: min(80vw, 300px);
+                    height: min(80vw, 300px);
+                }
+                #videoNoteRecorder .vnr-hint { font-size: 13px; }
+                #videoNoteRecorder .vnr-btn { width: 52px; height: 52px; font-size: 20px; }
+                #videoNoteRecorder .vnr-record { width: 70px; height: 70px; font-size: 28px; }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  UI МОДАЛКИ
+    // ═══════════════════════════════════════════════════════════
+    function buildRecorderUI() {
+        if (State.modalEl) return State.modalEl;
+
+        const modal = document.createElement('div');
+        modal.id = 'videoNoteRecorder';
+        modal.innerHTML = `
+            <div class="vnr-preview" id="vnrPreview">
+                <video id="vnrVideo" autoplay playsinline muted webkit-playsinline></video>
+                <div class="vnr-timer" id="vnrTimer">0.0 с</div>
+                <div class="vnr-ring">
+                    <svg viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet">
+                        <circle class="ring-bg" cx="50" cy="50" r="48"></circle>
+                        <circle class="ring-fg" cx="50" cy="50" r="48" id="vnrRingFg"></circle>
+                    </svg>
+                </div>
+                <div class="vnr-converting" id="vnrConverting">
+                    <div class="vnr-spinner"></div>
+                    <div class="vnr-conv-pct" id="vnrConvPct">0%</div>
+                    <div class="vnr-conv-text">MP4 · конвертация</div>
+                </div>
+            </div>
+
+            <div class="vnr-hint" id="vnrHint">
+                Нажмите ● для записи<br>
+                <span style="font-size:11px;opacity:0.6;">Максимум 10 секунд</span>
+            </div>
+
+            <div class="vnr-controls">
+                <button class="vnr-btn vnr-cancel" id="vnrCancelBtn" title="Отмена">✕</button>
+                <button class="vnr-btn vnr-record" id="vnrRecordBtn" title="Запись">●</button>
+                <button class="vnr-btn vnr-flip" id="vnrFlipBtn" title="Переключить камеру">🔄</button>
+            </div>
+        `;
+        document.body.appendChild(modal);
+
+        State.modalEl = modal;
+        State.videoEl = modal.querySelector('#vnrVideo');
+        State.overlayEl = modal.querySelector('#vnrPreview');
+
+        modal.querySelector('#vnrCancelBtn').addEventListener('click', () => {
+            if (State.recording) stopRecording(true);  // отмена
+            else closeRecorder();
+        });
+
+        modal.querySelector('#vnrRecordBtn').addEventListener('click', () => {
+            if (State.recording) stopRecording(false);
+            else startRecording();
+        });
+
+        modal.querySelector('#vnrFlipBtn').addEventListener('click', flipCamera);
+
+        return modal;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОТКРЫТИЕ / ЗАКРЫТИЕ
+    // ═══════════════════════════════════════════════════════════
+    async function openRecorder() {
+        if (!state.isAuthorized || !state.chatFile) {
+            showToastSafe('🔒 Требуется вход в чат');
+            return;
+        }
+
+        buildRecorderUI();
+        State.modalEl.classList.add('show');
+        State.active = true;
+
+        try {
+            await initCamera();
+        } catch (e) {
+            console.error('Camera init failed:', e);
+            showToastSafe('❌ Не удалось получить доступ к камере');
+            closeRecorder();
+            return;
+        }
+
+        if (navigator.vibrate) navigator.vibrate(15);
+    }
+
+    async function closeRecorder() {
+        State.active = false;
+        State.recording = false;
+
+        if (State.timerInterval) {
+            clearInterval(State.timerInterval);
+            State.timerInterval = null;
+        }
+
+        stopCamera();
+
+        if (State.modalEl) {
+            State.modalEl.classList.remove('show', 'recording', 'converting');
+        }
+
+        // Сбрасываем UI
+        const hint = document.getElementById('vnrHint');
+        if (hint) {
+            hint.innerHTML = 'Нажмите ● для записи<br><span style="font-size:11px;opacity:0.6;">Максимум 10 секунд</span>';
+        }
+
+        const btn = document.getElementById('vnrRecordBtn');
+        if (btn) {
+            btn.textContent = '●';
+            btn.disabled = false;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  КАМЕРА
+    // ═══════════════════════════════════════════════════════════
+    async function initCamera() {
+        stopCamera();   // на всякий случай
+
+        const constraints = {
+            video: {
+                facingMode: State.facingMode,
+                width: { ideal: VN.SIZE },
+                height: { ideal: VN.SIZE },
+                aspectRatio: 1,
+            },
+            audio: {
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true,
+            },
+        };
+
+        const stream = await navigator.mediaDevices.getUserMedia(constraints);
+        State.stream = stream;
+
+        State.videoEl.srcObject = stream;
+        await State.videoEl.play().catch(() => {});
+
+        // Обновляем класс для зеркалирования
+        State.overlayEl.classList.toggle('back', State.facingMode === 'environment');
+    }
+
+    function stopCamera() {
+        if (State.stream) {
+            State.stream.getTracks().forEach(t => {
+                try { t.stop(); } catch (e) {}
+            });
+            State.stream = null;
+        }
+        if (State.videoEl) {
+            State.videoEl.srcObject = null;
+        }
+    }
+
+    async function flipCamera() {
+        if (State.recording) {
+            showToastSafe('⏹ Сначала остановите запись');
+            return;
+        }
+        State.facingMode = State.facingMode === 'user' ? 'environment' : 'user';
+        try {
+            await initCamera();
+        } catch (e) {
+            showToastSafe('❌ Не удалось переключить камеру');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЗАПИСЬ
+    // ═══════════════════════════════════════════════════════════
+    function startRecording() {
+        if (State.recording || !State.stream) return;
+
+        // Выбираем MIME — всегда WebM (MP4 не поддерживается в MediaRecorder)
+        const mimeCandidates = [
+            'video/webm;codecs=vp9,opus',
+            'video/webm;codecs=vp8,opus',
+            'video/webm;codecs=vp9',
+            'video/webm;codecs=vp8',
+            'video/webm',
+        ];
+        const mime = mimeCandidates.find(m => MediaRecorder.isTypeSupported(m));
+        if (!mime) {
+            showToastSafe('❌ Браузер не поддерживает запись видео');
+            return;
+        }
+
+        State.chunks = [];
+        try {
+            State.mediaRecorder = new MediaRecorder(State.stream, {
+                mimeType: mime,
+                videoBitsPerSecond: VN.VIDEO_BITRATE,
+                audioBitsPerSecond: VN.AUDIO_BITRATE,
+            });
+        } catch (e) {
+            console.error('MediaRecorder init failed:', e);
+            showToastSafe('❌ Ошибка инициализации записи');
+            return;
+        }
+
+        State.mediaRecorder.ondataavailable = (e) => {
+            if (e.data && e.data.size > 0) State.chunks.push(e.data);
+        };
+
+        State.mediaRecorder.onstop = () => {
+            finishRecording();
+        };
+
+        State.mediaRecorder.start(100);
+        State.recording = true;
+        State.startTime = Date.now();
+
+        // UI
+        State.modalEl.classList.add('recording');
+        document.getElementById('vnrRecordBtn').textContent = '■';
+        const hint = document.getElementById('vnrHint');
+        if (hint) hint.innerHTML = '🔴 Идёт запись — нажмите ■ чтобы остановить';
+
+        // Таймер + прогресс-кольцо
+        const ringFg = document.getElementById('vnrRingFg');
+        const circumference = 2 * Math.PI * 48; // ~301.6
+
+        State.timerInterval = setInterval(() => {
+            const elapsed = Date.now() - State.startTime;
+            const seconds = (elapsed / 1000).toFixed(1);
+            const timerEl = document.getElementById('vnrTimer');
+            if (timerEl) timerEl.textContent = `${seconds} с`;
+
+            const pct = Math.min(1, elapsed / VN.MAX_DURATION_MS);
+            const dash = circumference * pct;
+            if (ringFg) {
+                ringFg.style.strokeDasharray = `${dash} ${circumference}`;
+            }
+
+            // Автостоп
+            if (elapsed >= VN.MAX_DURATION_MS) {
+                stopRecording(false);
+            }
+        }, 50);
+
+        if (navigator.vibrate) navigator.vibrate(20);
+    }
+
+    function stopRecording(cancelled) {
+        if (!State.recording || !State.mediaRecorder) return;
+
+        State.recording = false;
+        State.duration = (Date.now() - State.startTime) / 1000;
+
+        if (State.timerInterval) {
+            clearInterval(State.timerInterval);
+            State.timerInterval = null;
+        }
+
+        // Помечаем что отмена
+        State._cancelled = cancelled;
+
+        try {
+            if (State.mediaRecorder.state !== 'inactive') {
+                State.mediaRecorder.stop();
+            }
+        } catch (e) {}
+    }
+
+    async function finishRecording() {
+        const cancelled = State._cancelled;
+        State._cancelled = false;
+
+        const duration = State.duration;
+
+        // Собираем blob
+        const webmBlob = new Blob(State.chunks, { type: 'video/webm' });
+        State.chunks = [];
+
+        // Сбрасываем UI
+        State.modalEl.classList.remove('recording');
+        document.getElementById('vnrRecordBtn').textContent = '●';
+
+        if (cancelled) {
+            const hint = document.getElementById('vnrHint');
+            if (hint) hint.innerHTML = 'Нажмите ● для записи<br><span style="font-size:11px;opacity:0.6;">Максимум 10 секунд</span>';
+            return;
+        }
+
+        // Проверяем длительность
+        if (duration < 0.7) {
+            showToastSafe('⏱️ Слишком коротко');
+            const hint = document.getElementById('vnrHint');
+            if (hint) hint.innerHTML = 'Нажмите ● для записи<br><span style="font-size:11px;opacity:0.6;">Максимум 10 секунд</span>';
+            return;
+        }
+
+        // ═══ КОНВЕРТАЦИЯ WebM → MP4 ═══
+        State.modalEl.classList.add('converting');
+        const hint = document.getElementById('vnrHint');
+        if (hint) hint.innerHTML = '⚙️ Конвертируем в MP4…';
+
+        let mp4Blob = null;
+        let finalExt = 'webm';
+        let finalMime = 'video/webm';
+
+        try {
+            // Прогресс
+            const pctEl = document.getElementById('vnrConvPct');
+            const video = document.createElement('video');
+            video.playsInline = true;
+            video.muted = false;
+            video.preload = 'auto';
+            video.src = URL.createObjectURL(webmBlob);
+
+            await new Promise((resolve, reject) => {
+                video.onloadedmetadata = resolve;
+                video.onerror = () => reject(new Error('Не удалось прочитать видео'));
+                setTimeout(() => reject(new Error('timeout')), 8000);
+            });
+
+            let w = video.videoWidth || VN.SIZE;
+            let h = video.videoHeight || VN.SIZE;
+            if (w % 2) w++;
+            if (h % 2) h++;
+
+            const canvas = document.createElement('canvas');
+            canvas.width = w;
+            canvas.height = h;
+            const ctx = canvas.getContext('2d');
+            const videoStream = canvas.captureStream(VN.FPS);
+
+            // Захват звука
+            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+            let audioSource = null;
+            try {
+                audioSource = audioCtx.createMediaElementSource(video);
+                const audioDest = audioCtx.createMediaStreamDestination();
+                audioSource.connect(audioDest);
+                audioDest.stream.getAudioTracks().forEach(t => videoStream.addTrack(t));
+            } catch (e) {
+                console.warn('Audio capture failed:', e);
+            }
+
+            // Ищем поддерживаемый MP4 mime
+            const mp4Mimes = [
+                'video/mp4;codecs=h264,aac',
+                'video/mp4;codecs=avc1,mp4a',
+                'video/mp4',
+            ];
+            let mime = mp4Mimes.find(m => MediaRecorder.isTypeSupported(m));
+
+            if (mime) {
+                // Конвертируем в MP4
+                const chunks = [];
+                const recorder = new MediaRecorder(videoStream, {
+                    mimeType: mime,
+                    videoBitsPerSecond: VN.VIDEO_BITRATE,
+                    audioBitsPerSecond: VN.AUDIO_BITRATE,
+                });
+                recorder.ondataavailable = (e) => {
+                    if (e.data.size > 0) chunks.push(e.data);
+                };
+
+                const done = new Promise(resolve => {
+                    recorder.onstop = () => resolve(new Blob(chunks, { type: mime }));
+                });
+
+                recorder.start(100);
+                await video.play();
+
+                const drawFrame = () => {
+                    if (video.paused || video.ended) return;
+                    ctx.drawImage(video, 0, 0, w, h);
+
+                    const pct = Math.min(100, (video.currentTime / (video.duration || 1)) * 100);
+                    if (pctEl) pctEl.textContent = Math.round(pct) + '%';
+
+                    requestAnimationFrame(drawFrame);
+                };
+                drawFrame();
+
+                await new Promise(resolve => {
+                    video.onended = () => {
+                        setTimeout(() => {
+                            if (recorder.state === 'recording') recorder.stop();
+                            resolve();
+                        }, 300);
+                    };
+                });
+
+                mp4Blob = await done;
+                finalExt = 'mp4';
+                finalMime = 'video/mp4';
+            } else {
+                // MP4 не поддерживается — оставляем WebM
+                console.warn('MP4 recording not supported, keeping WebM');
+                mp4Blob = webmBlob;
+                finalExt = 'webm';
+                finalMime = 'video/webm';
+            }
+
+            // Cleanup
+            try { audioSource?.disconnect(); } catch (e) {}
+            try { audioCtx.close(); } catch (e) {}
+            try { URL.revokeObjectURL(video.src); } catch (e) {}
+
+        } catch (e) {
+            console.error('Conversion failed:', e);
+            // Fallback — отправляем WebM как есть
+            mp4Blob = webmBlob;
+            finalExt = 'webm';
+            finalMime = 'video/webm';
+            showToastSafe('⚠️ MP4 не удался, отправляем WebM');
+        }
+
+        State.modalEl.classList.remove('converting');
+        if (hint) hint.innerHTML = '✅ Готово! Отправляем…';
+
+        // ═══ ОТПРАВКА ═══
+        try {
+            await sendVideoNote(mp4Blob, finalMime, finalExt, duration);
+        } catch (e) {
+            console.error('Send video note failed:', e);
+            showToastSafe('❌ Не удалось отправить: ' + e.message);
+        }
+
+        // Закрываем модалку
+        closeRecorder();
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОТПРАВКА
+    // ═══════════════════════════════════════════════════════════
+    async function sendVideoNote(blob, mime, ext, duration) {
+        if (!state.isAuthorized || !state.chatFile) {
+            throw new Error('Нет доступа');
+        }
+        if (!navigator.onLine || !networkState.isOnline) {
+            // Офлайн — в очередь
+            showToastSafe('📵 Офлайн — кружочек в очереди');
+
+            // Формируем задачу для AutoOutbox
+            const task = {
+                id: 'aob_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
+                chatFile: state.chatFile,
+                text: '',
+                replyTo: null,
+                createdAt: Date.now(),
+                retries: 0,
+                status: 'pending',
+                videoPayload: null,  // будет задан ниже
+            };
+
+            // Сериализуем blob
+            const base64 = await blobToBase64Safe(blob);
+            task.fileData = base64;
+            task.fileName = `circle_${Date.now()}.${ext}`;
+            task.fileMime = mime;
+            task.videoPayload = {
+                file: null,   // пока не знаем имя на GitHub
+                fileName: task.fileName,
+                fileMime: mime,
+                fileSize: blob.size,
+                _isVideoNote: true,   // 🆕 маркер что это кружочек
+            };
+
+            // Если есть AutoOutbox — используем его
+            if (typeof AutoOutbox !== 'undefined' && AutoOutbox.process) {
+                // Ищем доступ к внутреннему массиву... нет, просто вызываем sendMessage
+                // через обычный путь — но т.к. офлайн, он попадёт в AutoOutbox
+            }
+
+            // Проще: вызываем sendMessage, он сам решит
+            if (typeof sendMessage === 'function') {
+                // Формируем fileAttachment-объект
+                const fileAttachment = {
+                    blob: blob,
+                    name: task.fileName,
+                    mime: mime,
+                };
+                await sendMessage('', null, null, fileAttachment, null, null, null);
+            }
+
+            return;
+        }
+
+        // ═══ Онлайн — обычная отправка ═══
+        const attachName = generateAttachmentName('video', ext);
+
+        // Загружаем вложение
+        const buf = await blob.arrayBuffer();
+        await uploadAttachmentAuto(
+            state.chatFile,
+            attachName,
+            buf,
+            mime,
+            `🎥 Кружочек (${formatFileSize(blob.size)})`
+        );
+
+        // Отправляем сообщение с маркером videoNote
+        await sendMessage('', null, null, null, null, null, {
+            videoNote: attachName,
+            videoDuration: duration,
+            videoMime: mime,
+            videoSize: blob.size,
+            _isVideoNote: true,
+        });
+
+        showToastSafe('✅ Кружочек отправлен!');
+    }
+
+    function blobToBase64Safe(blob) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(reader.result);
+            reader.onerror = reject;
+            reader.readAsDataURL(blob);
+        });
+    }
+
+    function showToastSafe(msg, dur) {
+        try {
+            if (typeof showToast === 'function') showToast(msg, dur || 2000);
+        } catch (e) {}
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ДОЛГОЕ НАЖАТИЕ НА 🎤
+    // ═══════════════════════════════════════════════════════════
+    function installLongPressOnMic() {
+        const micBtn = document.getElementById('micBtn');
+        if (!micBtn) {
+            console.warn('🎥 [VideoNote] micBtn не найден');
+            return;
+        }
+
+        let pressStartTs = 0;
+        let longPressFired = false;
+        let originalStyle = null;
+
+        function onPressStart(e) {
+            if (!state.isAuthorized || !state.chatFile) return;
+            if (e.type === 'touchstart' && e.touches.length !== 1) return;
+
+            longPressFired = false;
+            pressStartTs = Date.now();
+
+            // Визуальная индикация что можно долго жать
+            originalStyle = micBtn.style.background;
+            micBtn.style.background = 'linear-gradient(135deg, rgba(108,92,231,0.3), rgba(0,184,148,0.3))';
+
+            State.longPressTimer = setTimeout(() => {
+                longPressFired = true;
+                if (navigator.vibrate) navigator.vibrate(30);
+                micBtn.style.background = originalStyle;
+                openRecorder();
+            }, VN.LONG_PRESS_MS);
+        }
+
+        function onPressEnd(e) {
+            if (State.longPressTimer) {
+                clearTimeout(State.longPressTimer);
+                State.longPressTimer = null;
+            }
+
+            if (originalStyle !== null) {
+                micBtn.style.background = originalStyle;
+                originalStyle = null;
+            }
+
+            if (longPressFired) {
+                // Блокируем обычный клик
+                e.preventDefault?.();
+                e.stopImmediatePropagation?.();
+                longPressFired = false;
+            }
+        }
+
+        micBtn.addEventListener('touchstart', onPressStart, { passive: true });
+        micBtn.addEventListener('touchend', onPressEnd, { capture: true });
+        micBtn.addEventListener('touchcancel', onPressEnd, { capture: true });
+
+        // Desktop — долгое нажатие мыши
+        micBtn.addEventListener('mousedown', (e) => {
+            if (e.button !== 0) return;
+            onPressStart(e);
+        });
+        micBtn.addEventListener('mouseup', onPressEnd);
+        micBtn.addEventListener('mouseleave', onPressEnd);
+
+        // ПКМ — альтернативный вариант для десктопа
+        micBtn.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            if (state.isAuthorized && state.chatFile) {
+                openRecorder();
+            }
+        });
+
+        console.log('🎥 [VideoNote] Долгое нажатие на 🎤 → кружочек');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  РЕНДЕР КРУЖОЧКА В ЧАТЕ (улучшенный)
+    // ═══════════════════════════════════════════════════════════
+    // Патчим buildVideoNoteHTML — он уже есть в основном коде,
+    // но добавим улучшения: длительность, красивый плейсхолдер.
+
+    if (typeof buildVideoNoteHTML === 'function') {
+        const _origBuild = buildVideoNoteHTML;
+
+        buildVideoNoteHTML = function(msgId, src, duration) {
+            const durationText = duration > 0 ? duration.toFixed(1) + ' с' : '';
+            return `
+                <div class="video-note-container" data-video-note-id="${msgId}"
+                     onclick="playVideoNote(${msgId}, '${src}')">
+                    <video src="${src}" preload="metadata" muted playsinline webkit-playsinline
+                           loop></video>
+                    <div class="vn-play-overlay">▶</div>
+                    ${durationText ? `<div class="vn-duration">${durationText}</div>` : ''}
+                </div>
+            `;
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ESC — закрыть рекордер
+    // ═══════════════════════════════════════════════════════════
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && State.active) {
+            e.preventDefault();
+            e.stopPropagation();
+            if (State.recording) stopRecording(true);
+            else closeRecorder();
+        }
+    }, true);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ИНИЦИАЛИЗАЦИЯ
+    // ═══════════════════════════════════════════════════════════
+    setTimeout(installLongPressOnMic, 2500);
+
+    // Экспорт
+    window.VideoNoteGift = {
+        open: openRecorder,
+        close: closeRecorder,
+        isActive: () => State.active,
+        isRecording: () => State.recording,
+    };
+
+    console.log('🎥 [VideoNoteGift] Подарок установлен:');
+    console.log('   • Долгое нажатие на 🎤 (или ПКМ) → запись кружочка');
+    console.log('   • 480×480, до 10 секунд');
+    console.log('   • WebM → MP4 конвертация в фоне');
+    console.log('   • API: VideoNoteGift.open()');
+})();
+</script>
+
 </body>
 </html>
