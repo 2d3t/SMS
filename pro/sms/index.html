@@ -35072,5 +35072,624 @@ try {
     console.log('   • ::selection принудительно прозрачный в списке чатов');
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  ✨ КАСТОМИЗАЦИЯ ИМЕНИ ПОЛЬЗОВАТЕЛЯ — v2 (компактная сетка)
+//  ─────────────────────────────────────────────────────────────
+//  • Клик по имени в шапке → меню стилей
+//  • Компактные квадратики 6 в ряд
+//  • Сетка прокручивается, видно все стили
+//  • Сохраняется в localStorage
+// ═══════════════════════════════════════════════════════════════
+
+(function installUsernameStyleMenu() {
+    'use strict';
+
+    const STORAGE_KEY = 'smschat_username_styles';
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАЛИТРА СТИЛЕЙ
+    // ═══════════════════════════════════════════════════════════
+    const STYLES = [
+        { id: 'default',   name: 'Классика',    colors: ['#a78bfa', '#00b894'], preview: 'linear-gradient(135deg, #a78bfa, #00b894)' },
+        { id: 'sunset',    name: 'Закат',       colors: ['#FF516A', '#FFA85C'], preview: 'linear-gradient(135deg, #FF516A, #FFA85C)' },
+        { id: 'ocean',     name: 'Океан',       colors: ['#5CA8FF', '#3FC9C1'], preview: 'linear-gradient(135deg, #5CA8FF, #3FC9C1)' },
+        { id: 'forest',    name: 'Лес',         colors: ['#4FD166', '#3FC9C1'], preview: 'linear-gradient(135deg, #4FD166, #3FC9C1)' },
+        { id: 'candy',     name: 'Карамель',    colors: ['#F36BE1', '#FFA85C'], preview: 'linear-gradient(135deg, #F36BE1, #FFA85C)' },
+        { id: 'royal',     name: 'Королевский', colors: ['#7B7FF6', '#B36BFF'], preview: 'linear-gradient(135deg, #7B7FF6, #B36BFF)' },
+        { id: 'fire',      name: 'Огонь',       colors: ['#FFD93B', '#FF516A'], preview: 'linear-gradient(135deg, #FFD93B, #FF516A)' },
+        { id: 'aurora',    name: 'Аврора',      colors: ['#3FC9C1', '#B36BFF'], preview: 'linear-gradient(135deg, #3FC9C1, #B36BFF)' },
+        { id: 'matrix',    name: 'Матрица',     colors: ['#4FD166', '#9ED94C'], preview: 'linear-gradient(135deg, #4FD166, #9ED94C)' },
+        { id: 'gold',      name: 'Золото',      colors: ['#FFD93B', '#FFA85C'], preview: 'linear-gradient(135deg, #FFD93B, #FFA85C)' },
+        { id: 'ice',       name: 'Лёд',         colors: ['#5CA8FF', '#B8E5FF'], preview: 'linear-gradient(135deg, #5CA8FF, #B8E5FF)' },
+        { id: 'crimson',   name: 'Малина',      colors: ['#D64D8E', '#FF516A'], preview: 'linear-gradient(135deg, #D64D8E, #FF516A)' },
+        { id: 'mint',      name: 'Мята',        colors: ['#4FD166', '#B8E876'], preview: 'linear-gradient(135deg, #4FD166, #B8E876)' },
+        { id: 'lavender',  name: 'Лаванда',     colors: ['#B36BFF', '#F36BE1'], preview: 'linear-gradient(135deg, #B36BFF, #F36BE1)' },
+        { id: 'sunrise',   name: 'Рассвет',     colors: ['#FFA85C', '#FFD93B'], preview: 'linear-gradient(135deg, #FFA85C, #FFD93B)' },
+        { id: 'midnight',  name: 'Полночь',     colors: ['#4D5BC4', '#7B7FF6'], preview: 'linear-gradient(135deg, #4D5BC4, #7B7FF6)' },
+        { id: 'rose',      name: 'Роза',        colors: ['#F36BE1', '#FF516A'], preview: 'linear-gradient(135deg, #F36BE1, #FF516A)' },
+        { id: 'toxic',     name: 'Токсик',      colors: ['#9ED94C', '#4FD166'], preview: 'linear-gradient(135deg, #9ED94C, #4FD166)' },
+        { id: 'rainbow',   name: 'Радуга',      colors: ['#FF516A', '#FFD93B', '#4FD166', '#5CA8FF', '#B36BFF'], preview: 'linear-gradient(90deg, #FF516A, #FFD93B, #4FD166, #5CA8FF, #B36BFF)', animated: true },
+        { id: 'solid',     name: 'Простой',     colors: ['#a78bfa'], preview: '#a78bfa', solid: true },
+    ];
+
+    let _userStyles = {};
+
+    function loadStyles() {
+        try {
+            const raw = localStorage.getItem(STORAGE_KEY);
+            _userStyles = raw ? JSON.parse(raw) : {};
+        } catch (e) { _userStyles = {}; }
+    }
+    function saveStyles() {
+        try { localStorage.setItem(STORAGE_KEY, JSON.stringify(_userStyles)); } catch (e) {}
+    }
+    function getStyle(username) {
+        return _userStyles[username] || 'default';
+    }
+    function setStyle(username, styleId) {
+        _userStyles[username] = styleId;
+        saveStyles();
+    }
+
+    loadStyles();
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПОЛУЧИТЬ CSS ДЛЯ СТИЛЯ
+    // ═══════════════════════════════════════════════════════════
+    function getStyleCss(styleId) {
+        const style = STYLES.find(s => s.id === styleId) || STYLES[0];
+        if (style.solid) {
+            return {
+                background: 'none',
+                webkitTextFillColor: style.colors[0],
+                color: style.colors[0],
+            };
+        }
+        const grad = `linear-gradient(135deg, ${style.colors.join(', ')})`;
+        return {
+            background: style.animated
+                ? `linear-gradient(90deg, ${style.colors.join(', ')}, ${style.colors[0]})`
+                : grad,
+            backgroundSize: style.animated ? '300% 100%' : 'auto',
+            animation: style.animated ? 'usernameRainbowShift 4s ease infinite' : 'none',
+            webkitTextFillColor: 'transparent',
+            backgroundClip: 'text',
+            webkitBackgroundClip: 'text',
+        };
+    }
+
+    function applyStyleToElement(el, styleId) {
+        const css = getStyleCss(styleId);
+        el.style.background = css.background;
+        el.style.webkitTextFillColor = css.webkitTextFillColor;
+        el.style.backgroundClip = css.backgroundClip || 'text';
+        el.style.webkitBackgroundClip = css.webkitBackgroundClip || 'text';
+        el.style.color = css.color || '';
+        el.style.backgroundSize = css.backgroundSize || '';
+        el.style.animation = css.animation || '';
+        el.dataset.styleId = styleId;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СТИЛИ
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('usernameStyleStyles')) {
+        const style = document.createElement('style');
+        style.id = 'usernameStyleStyles';
+        style.textContent = `
+            /* ═══ Имя в шапке ═══ */
+            #chatsUserLabel {
+                font-size: 14px;
+                font-weight: 700;
+                letter-spacing: 0.3px;
+                cursor: pointer;
+                padding: 4px 6px;
+                transition: opacity 0.2s ease, transform 0.1s ease;
+                display: inline-block;
+                user-select: none;
+                -webkit-user-select: none;
+                -webkit-tap-highlight-color: transparent;
+                outline: none;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                max-width: 160px;
+                vertical-align: middle;
+            }
+            #chatsUserLabel:hover { opacity: 0.85; }
+            #chatsUserLabel:active { transform: scale(0.95); opacity: 0.7; }
+
+            @media (max-width: 480px) {
+                #chatsUserLabel { font-size: 13px; max-width: 110px; }
+            }
+
+            /* ═══ Анимация радуги ═══ */
+            @keyframes usernameRainbowShift {
+                0%, 100% { background-position: 0% 50%; }
+                50%      { background-position: 100% 50%; }
+            }
+
+            /* ═══ Меню ═══ */
+            #usernameStyleMenu {
+                position: fixed;
+                z-index: 4700;
+                background: #1a1a2e;
+                border: 1px solid rgba(255,255,255,0.12);
+                border-radius: 18px;
+                padding: 8px;
+                display: none;
+                flex-direction: column;
+                gap: 8px;
+                box-shadow: 0 16px 48px rgba(0,0,0,0.7);
+                backdrop-filter: blur(24px);
+                -webkit-backdrop-filter: blur(24px);
+                width: 340px;
+                max-width: calc(100vw - 24px);
+                animation: usernameMenuPop 0.2s cubic-bezier(0.22, 0.61, 0.36, 1);
+            }
+            #usernameStyleMenu.show { display: flex; }
+
+            @keyframes usernameMenuPop {
+                from { opacity: 0; transform: scale(0.94) translateY(-4px); }
+                to   { opacity: 1; transform: scale(1) translateY(0); }
+            }
+
+            /* ─── Заголовок ─── */
+            #usernameStyleMenu .usm-header {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                padding: 6px 10px 6px;
+            }
+            #usernameStyleMenu .usm-title {
+                font-size: 13px;
+                font-weight: 700;
+                color: #fff;
+                letter-spacing: 0.2px;
+            }
+            #usernameStyleMenu .usm-close {
+                width: 26px;
+                height: 26px;
+                border-radius: 50%;
+                border: none;
+                background: rgba(255,255,255,0.06);
+                color: #888;
+                font-size: 12px;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                transition: all 0.15s;
+                padding: 0;
+            }
+            #usernameStyleMenu .usm-close:hover {
+                background: rgba(255,107,107,0.2);
+                color: #ff6b6b;
+            }
+
+            /* ─── Превью ─── */
+            #usernameStyleMenu .usm-preview-box {
+                padding: 10px 12px;
+                background: rgba(0,0,0,0.28);
+                border-radius: 12px;
+                border: 1px solid rgba(255,255,255,0.06);
+                text-align: center;
+            }
+            #usernameStyleMenu .usm-preview-name {
+                font-size: 22px;
+                font-weight: 800;
+                letter-spacing: 0.5px;
+                display: inline-block;
+                max-width: 100%;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                transition: all 0.25s ease;
+            }
+            #usernameStyleMenu .usm-preview-hint {
+                font-size: 10px;
+                color: #666;
+                margin-top: 4px;
+            }
+
+            /* ─── Сетка стилей — компактная, 6 в ряд ─── */
+            #usernameStyleMenu .usm-styles-grid {
+                display: grid;
+                grid-template-columns: repeat(6, 1fr);
+                gap: 5px;
+                padding: 2px;
+                max-height: 180px;
+                overflow-y: auto;
+                overflow-x: hidden;
+                -webkit-overflow-scrolling: touch;
+                scrollbar-width: thin;
+                scrollbar-color: rgba(255,255,255,0.15) transparent;
+            }
+            #usernameStyleMenu .usm-styles-grid::-webkit-scrollbar {
+                width: 3px;
+            }
+            #usernameStyleMenu .usm-styles-grid::-webkit-scrollbar-thumb {
+                background: rgba(255,255,255,0.15);
+                border-radius: 2px;
+            }
+            #usernameStyleMenu .usm-styles-grid::-webkit-scrollbar-track {
+                background: transparent;
+            }
+
+            #usernameStyleMenu .usm-style {
+                aspect-ratio: 1;
+                border-radius: 8px;
+                cursor: pointer;
+                position: relative;
+                overflow: hidden;
+                transition: transform 0.12s ease, box-shadow 0.12s ease;
+                border: 1.5px solid transparent;
+                -webkit-tap-highlight-color: transparent;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                color: #fff;
+                font-size: 11px;
+                font-weight: 800;
+            }
+            #usernameStyleMenu .usm-style .usm-letter {
+                position: relative;
+                z-index: 2;
+                text-shadow: 0 1px 2px rgba(0,0,0,0.45);
+                pointer-events: none;
+            }
+            #usernameStyleMenu .usm-style:hover {
+                transform: scale(1.08);
+                box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+                z-index: 1;
+            }
+            #usernameStyleMenu .usm-style:active {
+                transform: scale(0.92);
+            }
+            #usernameStyleMenu .usm-style.selected {
+                border-color: #fff;
+                box-shadow: 0 0 0 1.5px rgba(255,255,255,0.4),
+                            0 3px 10px rgba(108,92,231,0.45);
+                transform: scale(1.05);
+            }
+            #usernameStyleMenu .usm-style.selected::after {
+                content: '✓';
+                position: absolute;
+                bottom: -1px;
+                right: -1px;
+                font-size: 8px;
+                color: #fff;
+                background: rgba(0,0,0,0.6);
+                border-radius: 4px 0 0 0;
+                width: 12px;
+                height: 12px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                line-height: 1;
+                z-index: 3;
+            }
+
+            /* ─── Разделитель ─── */
+            #usernameStyleMenu .usm-divider {
+                height: 1px;
+                background: linear-gradient(90deg, transparent, rgba(255,255,255,0.08), transparent);
+                margin: 2px 6px;
+            }
+
+            /* ─── Кнопки действий ─── */
+            #usernameStyleMenu .usm-actions {
+                display: flex;
+                gap: 6px;
+                padding: 0 2px 2px;
+            }
+            #usernameStyleMenu .usm-action {
+                flex: 1;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                gap: 5px;
+                padding: 9px 6px;
+                border-radius: 11px;
+                border: 1px solid rgba(255,255,255,0.08);
+                background: rgba(255,255,255,0.04);
+                color: #ddd;
+                font-size: 12px;
+                font-weight: 600;
+                cursor: pointer;
+                transition: all 0.15s;
+                font-family: inherit;
+                -webkit-tap-highlight-color: transparent;
+            }
+            #usernameStyleMenu .usm-action:hover {
+                background: rgba(108,92,231,0.18);
+                border-color: rgba(108,92,231,0.4);
+                color: #fff;
+            }
+            #usernameStyleMenu .usm-action:active {
+                transform: scale(0.96);
+            }
+            #usernameStyleMenu .usm-action.danger {
+                color: #ff6b6b;
+                border-color: rgba(255,107,107,0.25);
+                background: rgba(255,107,107,0.06);
+            }
+            #usernameStyleMenu .usm-action.danger:hover {
+                background: rgba(255,107,107,0.18);
+                border-color: rgba(255,107,107,0.5);
+            }
+
+            /* ─── Backdrop ─── */
+            #usernameStyleBackdrop {
+                position: fixed;
+                inset: 0;
+                background: rgba(0,0,0,0.45);
+                backdrop-filter: blur(4px);
+                -webkit-backdrop-filter: blur(4px);
+                z-index: 4650;
+                display: none;
+                opacity: 0;
+                transition: opacity 0.2s;
+            }
+            #usernameStyleBackdrop.show { display: block; opacity: 1; }
+
+            /* ─── Мобильная адаптация ─── */
+            @media (max-width: 480px) {
+                #usernameStyleMenu {
+                    left: 10px !important;
+                    right: 10px !important;
+                    top: auto !important;
+                    bottom: 10px !important;
+                    width: auto !important;
+                    padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+                }
+                #usernameStyleMenu .usm-preview-name { font-size: 20px; }
+                #usernameStyleMenu .usm-styles-grid {
+                    grid-template-columns: repeat(6, 1fr);
+                    max-height: 160px;
+                }
+                #usernameStyleMenu .usm-style { font-size: 10px; }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПРИМЕНИТЬ К ИМЕНИ
+    // ═══════════════════════════════════════════════════════════
+    function updateChatsUserLabel() {
+        const label = document.getElementById('chatsUserLabel');
+        if (!label) return;
+
+        const username = state.username || '?';
+        label.textContent = username;
+        label.title = 'Нажмите, чтобы изменить имя и аватарку';
+
+        const styleId = getStyle(username);
+        applyStyleToElement(label, styleId);
+    }
+
+    window.updateChatsUserLabel = updateChatsUserLabel;
+
+    const _origShowChatsScreen = showChatsScreen;
+    showChatsScreen = function() {
+        const r = _origShowChatsScreen.apply(this, arguments);
+        updateChatsUserLabel();
+        return r;
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  МЕНЮ
+    // ═══════════════════════════════════════════════════════════
+    let _menuEl = null;
+    let _backdropEl = null;
+
+    function buildMenu() {
+        if (_menuEl) return _menuEl;
+
+        const menu = document.createElement('div');
+        menu.id = 'usernameStyleMenu';
+        menu.innerHTML = `
+            <div class="usm-header">
+                <div class="usm-title">✨ Настройка имени</div>
+                <button class="usm-close" id="usmCloseBtn">✕</button>
+            </div>
+
+            <div class="usm-preview-box">
+                <div class="usm-preview-name" id="usmPreviewName">ВашеИмя</div>
+                <div class="usm-preview-hint">Так ваше имя выглядит</div>
+            </div>
+
+            <div class="usm-styles-grid" id="usmStylesGrid"></div>
+
+            <div class="usm-divider"></div>
+
+            <div class="usm-actions">
+                <button class="usm-action" id="usmAvatarBtn">🖼️ <span>Аватарка</span></button>
+                <button class="usm-action danger" id="usmRemoveAvatarBtn">🗑️ <span>Удалить</span></button>
+            </div>
+        `;
+        document.body.appendChild(menu);
+
+        const backdrop = document.createElement('div');
+        backdrop.id = 'usernameStyleBackdrop';
+        document.body.appendChild(backdrop);
+        backdrop.addEventListener('click', closeMenu);
+
+        menu.querySelector('#usmCloseBtn').addEventListener('click', closeMenu);
+
+        menu.querySelector('#usmAvatarBtn').addEventListener('click', () => {
+            closeMenu();
+            setTimeout(() => {
+                if (typeof pickUserAvatar === 'function') {
+                    pickUserAvatar(state.username);
+                }
+            }, 200);
+        });
+
+        menu.querySelector('#usmRemoveAvatarBtn').addEventListener('click', () => {
+            closeMenu();
+            setTimeout(() => {
+                if (typeof UserAvatars !== 'undefined' && UserAvatars.has(state.username)) {
+                    if (confirm(`Удалить аватарку для «${state.username}»?`)) {
+                        UserAvatars.remove(state.username);
+                        if (typeof refreshAllUserAvatars === 'function') {
+                            refreshAllUserAvatars(state.username);
+                        }
+                        if (typeof showToast === 'function') {
+                            showToast('🗑️ Аватарка удалена', 1500);
+                        }
+                        if (typeof soundManager !== 'undefined') {
+                            soundManager.play('delete');
+                        }
+                    }
+                } else {
+                    if (typeof showToast === 'function') {
+                        showToast('ℹ️ Аватарки нет', 1500);
+                    }
+                }
+            }, 200);
+        });
+
+        document.addEventListener('keydown', onKeyDown);
+
+        _menuEl = menu;
+        _backdropEl = backdrop;
+        return menu;
+    }
+
+    function renderStylesGrid() {
+        const grid = _menuEl.querySelector('#usmStylesGrid');
+        if (!grid) return;
+
+        const username = state.username || '?';
+        const currentStyle = getStyle(username);
+        const letter = username.charAt(0).toUpperCase() || 'A';
+
+        grid.innerHTML = STYLES.map(s => {
+            const isSelected = s.id === currentStyle;
+            return `
+                <div class="usm-style ${isSelected ? 'selected' : ''}"
+                     data-style-id="${s.id}"
+                     title="${escapeHtml(s.name)}"
+                     style="background: ${s.preview};">
+                    <span class="usm-letter">${letter}</span>
+                </div>
+            `;
+        }).join('');
+
+        grid.querySelectorAll('.usm-style').forEach(el => {
+            el.addEventListener('click', (e) => {
+                e.stopPropagation();
+                selectStyle(el.dataset.styleId);
+            });
+        });
+    }
+
+    function selectStyle(styleId) {
+        const username = state.username || '?';
+        setStyle(username, styleId);
+
+        const preview = document.getElementById('usmPreviewName');
+        if (preview) {
+            preview.textContent = username;
+            applyStyleToElement(preview, styleId);
+        }
+
+        _menuEl.querySelectorAll('.usm-style').forEach(el => {
+            el.classList.toggle('selected', el.dataset.styleId === styleId);
+        });
+
+        const label = document.getElementById('chatsUserLabel');
+        if (label) applyStyleToElement(label, styleId);
+
+        if (typeof soundManager !== 'undefined') soundManager.play('click');
+        if (navigator.vibrate) navigator.vibrate(8);
+    }
+
+    function openMenu(anchorEl) {
+        buildMenu();
+
+        const username = state.username || '?';
+        const preview = _menuEl.querySelector('#usmPreviewName');
+        if (preview) {
+            preview.textContent = username;
+            applyStyleToElement(preview, getStyle(username));
+        }
+
+        renderStylesGrid();
+        _backdropEl.classList.add('show');
+        _menuEl.classList.add('show');
+
+        const isMobile = window.innerWidth <= 480;
+        if (!isMobile && anchorEl) {
+            const rect = anchorEl.getBoundingClientRect();
+            const menuRect = _menuEl.getBoundingClientRect();
+            const margin = 10;
+
+            let left = rect.right - menuRect.width;
+            let top = rect.bottom + 8;
+
+            if (left < margin) left = margin;
+            if (left + menuRect.width > window.innerWidth - margin) {
+                left = window.innerWidth - menuRect.width - margin;
+            }
+            if (top + menuRect.height > window.innerHeight - margin) {
+                top = rect.top - menuRect.height - 8;
+            }
+            top = Math.max(margin, top);
+
+            _menuEl.style.left = left + 'px';
+            _menuEl.style.top = top + 'px';
+        }
+
+        if (navigator.vibrate) navigator.vibrate(12);
+    }
+
+    function closeMenu() {
+        if (_menuEl) _menuEl.classList.remove('show');
+        if (_backdropEl) _backdropEl.classList.remove('show');
+    }
+
+    function onKeyDown(e) {
+        if (e.key === 'Escape' && _menuEl && _menuEl.classList.contains('show')) {
+            e.preventDefault();
+            e.stopPropagation();
+            closeMenu();
+        }
+    }
+
+    document.addEventListener('click', (e) => {
+        const label = e.target.closest('#chatsUserLabel');
+        if (!label) return;
+        if (state.currentScreen !== 'chats') return;
+        if (!state.username) return;
+
+        e.stopPropagation();
+        e.preventDefault();
+        openMenu(label);
+    }, true);
+
+    setTimeout(() => {
+        if (state && state.isAuthorized && state.username) {
+            updateChatsUserLabel();
+        }
+    }, 500);
+
+    window.UsernameStyle = {
+        styles: STYLES,
+        get: (username) => getStyle(username || state.username),
+        set: (styleId, username) => {
+            setStyle(username || state.username, styleId);
+            updateChatsUserLabel();
+        },
+        open: () => openMenu(document.getElementById('chatsUserLabel')),
+        close: closeMenu,
+    };
+
+    console.log('✨ [UsernameStyle v2] Меню кастомизации имени — ' + STYLES.length + ' стилей');
+})();
+</script>
 </body>
 </html>
