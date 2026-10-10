@@ -38361,5 +38361,362 @@ try {
     console.log('   • API: PersistentSession.status() / .clear()');
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🩹 ПАТЧ v1: РАЗДЕЛЕНИЕ КНОПОК АУДИО И ВИДЕО-КРУЖОЧКА
+//  ─────────────────────────────────────────────────────────────
+//  Что делает:
+//   1. Добавляет отдельную кнопку  для видеокружочка
+//   2. Убирает долгое нажатие с 🎤 (только аудио)
+//   3. Кнопка видео блокируется в офлайне (как остальные)
+//   4. Убирает тост-подсказку про «нажмите ещё раз»
+//
+//  Что НЕ трогает:
+//   • Существующий handleMicClick (запись аудио)
+//   • openRecorder / closeRecorder (запись видео)
+//   • Очередь отправки (AutoOutbox)
+//   • Стили и логику самого рекордера
+// ═══════════════════════════════════════════════════════════════
+
+(function installVideoNoteButtonPatch() {
+    'use strict';
+
+    console.log('📹 [VideoNoteBtnPatch] Установка патча…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  1. ДОБАВЛЯЕМ КНОПКУ 📹 В ПАНЕЛЬ ВВОДА
+    // ═══════════════════════════════════════════════════════════
+    function injectVideoNoteButton() {
+        const inputBar = document.getElementById('inputBar');
+        if (!inputBar) return false;
+
+        // Уже вставлена?
+        if (document.getElementById('videoNoteBtn')) return true;
+
+        const actionButtons = inputBar.querySelector('.action-buttons');
+        if (!actionButtons) return false;
+
+        const micBtn = actionButtons.querySelector('#micBtn');
+        if (!micBtn) return false;
+
+        // Создаём кнопку
+        const btn = document.createElement('button');
+        btn.className = 'video-note-btn';
+        btn.id = 'videoNoteBtn';
+        btn.type = 'button';
+        btn.title = 'Записать видео-кружочек (до 10 сек)';
+        btn.innerHTML = '📹';
+
+        // Вставляем ПЕРЕД микрофоном
+        actionButtons.insertBefore(btn, micBtn);
+
+        // Обработчик
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (!state.isAuthorized || !state.chatFile) {
+                showToastSafe('🔒 Требуется вход в чат');
+                return;
+            }
+            if (typeof window.openRecorder !== 'function' && typeof VideoNoteGift?.open !== 'function') {
+                showToastSafe('❌ Функция временно недоступна');
+                console.warn('📹 [VideoNoteBtnPatch] openRecorder не найден');
+                return;
+            }
+
+            // Закрываем открытые панели
+            if (typeof _emojiPanelOpen !== 'undefined' && _emojiPanelOpen && typeof toggleEmojiPanel === 'function') {
+                toggleEmojiPanel(false);
+            }
+            if (typeof _attachMenuOpen !== 'undefined' && _attachMenuOpen && typeof toggleAttachMenu === 'function') {
+                toggleAttachMenu(false);
+            }
+
+            // Запускаем рекордер
+            try {
+                if (typeof VideoNoteGift?.open === 'function') {
+                    VideoNoteGift.open();
+                } else if (typeof window.openRecorder === 'function') {
+                    window.openRecorder();
+                }
+                if (navigator.vibrate) navigator.vibrate(12);
+            } catch (err) {
+                console.error('📹 [VideoNoteBtnPatch] openRecorder failed:', err);
+                showToastSafe('❌ Не удалось открыть камеру');
+            }
+        });
+
+        console.log('📹 [VideoNoteBtnPatch] Кнопка 📹 добавлена');
+        return true;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  2. ДОБАВЛЯЕМ CSS ДЛЯ НОВОЙ КНОПКИ
+    // ═══════════════════════════════════════════════════════════
+    function injectStyles() {
+        if (document.getElementById('videoNoteButtonStyles')) return;
+
+        const style = document.createElement('style');
+        style.id = 'videoNoteButtonStyles';
+        style.textContent = `
+            /* ═══ Кнопка 📹 — как mic-btn, но со своим цветом активной ═══ */
+            .input-bar .video-note-btn {
+                width: 48px;
+                height: 48px;
+                border-radius: 50%;
+                border: none;
+                background: rgba(255, 255, 255, 0.06);
+                color: #888;
+                font-size: 22px;
+                cursor: pointer;
+                flex-shrink: 0;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                transition: all 0.3s;
+                padding: 0;
+                line-height: 1;
+                -webkit-tap-highlight-color: transparent;
+                font-family: inherit;
+            }
+            .input-bar .video-note-btn:active {
+                transform: scale(0.9);
+                background: rgba(255, 255, 255, 0.12);
+            }
+            .input-bar .video-note-btn:hover {
+                background: rgba(108, 92, 231, 0.15);
+                color: #a78bfa;
+            }
+            .input-bar .video-note-btn:disabled {
+                opacity: 0.4;
+                cursor: not-allowed;
+                transform: none;
+                background: rgba(255, 255, 255, 0.06);
+                color: #888;
+            }
+
+            /* На мобиле — те же размеры что у mic-btn */
+            @media (max-width: 480px) {
+                .input-bar .video-note-btn {
+                    width: 40px;
+                    height: 40px;
+                    font-size: 18px;
+                }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. УБИРАЕМ ДОЛГОЕ НАЖАТИЕ С 🎤
+    //  Самый чистый способ — заменить installLongPressOnMic
+    //  на пустышку ДО того, как она вызовется (через 2500 мс).
+    // ═══════════════════════════════════════════════════════════
+    function neutralizeOldLongPress() {
+        // Заглушаем глобально — если модуль VideoNoteGift её вызывал
+        // через setTimeout, наш no-op перезапишет.
+        // Функция объявлена внутри IIFE, но если она попала в scope
+        // как window.installLongPressOnMic — перезапишем.
+        // Если нет — защищаемся через удаление ссылок.
+
+        // Дополнительно: убираем возможные обработчики у micBtn.
+        // Т.к. нельзя удалить анонимные listeners, ставим «стоп-слой»
+        // в CAPTURE-фазе: если сработал долгий тап (openRecorder вызвался
+        // в течение ~500 мс после touchstart), мы его «глушим».
+
+        const micBtn = document.getElementById('micBtn');
+        if (!micBtn) return;
+
+        // ─── Слой-предохранитель ───
+        // Перехватываем contextmenu (там вызывался openRecorder)
+        micBtn.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            console.log('📹 [VideoNoteBtnPatch] contextmenu на micBtn заблокирован');
+        }, true);
+
+        // Перехватываем долгий тап: если openRecorder вызывается из
+        // старого обработчика — мы его перехватываем через патч
+        // (см. пункт 4 ниже)
+        console.log('📹 [VideoNoteBtnPatch] Долгое нажатие на 🎤 нейтрализовано');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  4. ПАТЧ openRecorder — блокируем вызов «из mic», разрешаем
+    //  только «из videoNoteBtn»
+    // ═══════════════════════════════════════════════════════════
+    //  Идея: VideoNoteGift.open — публичный метод. Мы его оборачиваем:
+    //   • Если вызов из #videoNoteBtn → пропускаем
+    //   • Если вызов из #micBtn (старый long-press) → блокируем
+    //   • Любой другой источник (API) → пропускаем
+    // ═══════════════════════════════════════════════════════════
+    function patchOpenRecorder() {
+        if (typeof VideoNoteGift === 'undefined' || typeof VideoNoteGift.open !== 'function') {
+            // Модуль ещё не готов — попробуем позже
+            return false;
+        }
+        if (VideoNoteGift._patchedByBtn) return true;
+
+        const _origOpen = VideoNoteGift.open;
+
+        VideoNoteGift.open = function() {
+            // Определяем источник вызова
+            // (Chrome/Firefox поддерживают stack, Safari — частично)
+            let source = 'unknown';
+            try {
+                const stack = new Error().stack || '';
+                if (stack.includes('videoNoteBtn') || stack.includes('installVideoNoteButtonPatch')) {
+                    source = 'videoNoteBtn';
+                } else if (stack.includes('installLongPressOnMic') || stack.includes('onPressStart')) {
+                    source = 'oldLongPress';
+                }
+            } catch (e) {}
+
+            // Блокируем старый источник
+            if (source === 'oldLongPress') {
+                console.log('📹 [VideoNoteBtnPatch] Старый long-press на 🎤 заблокирован');
+                return;
+            }
+
+            // Всё остальное — пропускаем
+            return _origOpen.apply(this, arguments);
+        };
+
+        VideoNoteGift._patchedByBtn = true;
+        console.log('📹 [VideoNoteBtnPatch] VideoNoteGift.open пропатчен');
+        return true;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  5. ОФЛАЙН-БЛОКИРОВКА
+    //  Индикатор сети уже управляет micBtn/sendBtn. Добавим
+    //  для нашей кнопки — через MutationObserver на disabled.
+    // ═══════════════════════════════════════════════════════════
+    function installOfflineBlocking() {
+        const micBtn = document.getElementById('micBtn');
+        const vnBtn = document.getElementById('videoNoteBtn');
+        if (!micBtn || !vnBtn) return;
+
+        // Копируем состояние micBtn на vnBtn
+        const syncDisabled = () => {
+            vnBtn.disabled = micBtn.disabled || !state.isAuthorized;
+        };
+
+        const observer = new MutationObserver(syncDisabled);
+        observer.observe(micBtn, { attributes: true, attributeFilter: ['disabled'] });
+
+        // Изначальная синхронизация
+        syncDisabled();
+
+        console.log('📹 [VideoNoteBtnPatch] Офлайн-блокировка подключена');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  6. ХЕЛПЕР: безопасный тост
+    // ═══════════════════════════════════════════════════════════
+    function showToastSafe(msg, dur = 2000) {
+        try {
+            if (typeof showToast === 'function') showToast(msg, dur);
+        } catch (e) {}
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  7. ИНИЦИАЛИЗАЦИЯ С ОЖИДАНИЕМ ГОТОВНОСТИ
+    // ═══════════════════════════════════════════════════════════
+    let _initAttempts = 0;
+    const MAX_INIT_ATTEMPTS = 40;   // 10 секунд максимум
+
+    function tryInit() {
+        _initAttempts++;
+
+        const readyInputBar = !!document.getElementById('inputBar');
+        const readyMicBtn = !!document.getElementById('micBtn');
+        const readyVideoGift = typeof VideoNoteGift !== 'undefined';
+
+        if (!readyInputBar || !readyMicBtn) {
+            if (_initAttempts < MAX_INIT_ATTEMPTS) {
+                setTimeout(tryInit, 250);
+            }
+            return;
+        }
+
+        // 1. Стили
+        injectStyles();
+
+        // 2. Кнопка
+        const injected = injectVideoNoteButton();
+
+        // 3. Патч openRecorder (когда VideoNoteGift появится)
+        if (readyVideoGift) {
+            patchOpenRecorder();
+        }
+
+        // 4. Нейтрализация старого long-press
+        neutralizeOldLongPress();
+
+        // 5. Офлайн-блокировка
+        installOfflineBlocking();
+
+        if (injected) {
+            console.log('📹 [VideoNoteBtnPatch] ✅ Патч установлен полностью');
+        }
+
+        // Если VideoNoteGift ещё не готов — ждём его и патчим openRecorder
+        if (!readyVideoGift) {
+            let _giftWait = 0;
+            const waitGift = setInterval(() => {
+                _giftWait++;
+                if (typeof VideoNoteGift !== 'undefined') {
+                    clearInterval(waitGift);
+                    patchOpenRecorder();
+                    // Перепроверим в оффлайн-блокировке
+                    installOfflineBlocking();
+                }
+                if (_giftWait > 60) clearInterval(waitGift);
+            }, 250);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  8. РЕАКЦИЯ НА СМЕНУ ЭКРАНОВ
+    //  Если кнопка вдруг пропала (перерисовался inputBar) — вернём
+    // ═══════════════════════════════════════════════════════════
+    const _screenObserver = new MutationObserver(() => {
+        if (!document.getElementById('videoNoteBtn')) {
+            const inputBar = document.getElementById('inputBar');
+            const micBtn = inputBar && inputBar.querySelector('#micBtn');
+            if (inputBar && micBtn) {
+                injectVideoNoteButton();
+                installOfflineBlocking();
+            }
+        }
+    });
+    _screenObserver.observe(document.body, { childList: true, subtree: true });
+
+    // ═══════════════════════════════════════════════════════════
+    //  9. API ДЛЯ ОТЛАДКИ
+    // ═══════════════════════════════════════════════════════════
+    window.VideoNoteButton = {
+        inject: injectVideoNoteButton,
+        status: () => ({
+            buttonExists: !!document.getElementById('videoNoteBtn'),
+            buttonDisabled: document.getElementById('videoNoteBtn')?.disabled ?? null,
+            openRecorderPatched: !!VideoNoteGift?._patchedByBtn,
+            videoNoteGiftReady: typeof VideoNoteGift !== 'undefined',
+        }),
+        test: () => {
+            const btn = document.getElementById('videoNoteBtn');
+            if (btn) btn.click();
+            else console.warn('📹 Кнопка не найдена');
+        },
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЗАПУСК
+    // ═══════════════════════════════════════════════════════════
+    tryInit();
+
+    console.log('📹 [VideoNoteBtnPatch] Запуск — ждём готовности DOM…');
+})();
+</script>
 </body>
 </html>
