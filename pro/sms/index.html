@@ -34462,5 +34462,336 @@ try {
     console.log('     MegaFix.jumpLock.isActive()   — идёт ли прыжок к треку');
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🧘 RATE LIMIT PACIFIER v1 — успокаиваем GitHub API
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: Fl4 стал слишком «болтливым» и выжирает 5000 запросов
+//  в час. Этот патч:
+//   1. Увеличивает интервалы всех фоновых поллингов.
+//   2. Отключает поллинги при document.hidden.
+//   3. Добавляет глобальный счётчик остатка лимита (X-RateLimit).
+//   4. При остатке < 500 — ставит все поллинги на паузу.
+// ═══════════════════════════════════════════════════════════════
+
+(function installRateLimitPacifier() {
+    'use strict';
+
+    console.log('🧘 [Pacifier] Запуск…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  1. ГЛОБАЛЬНЫЙ ТРЕКЕР ЛИМИТА
+    // ═══════════════════════════════════════════════════════════
+    const RATE = {
+        remaining: 5000,
+        limit: 5000,
+        resetAt: 0,           // timestamp
+        lastUpdate: 0,
+        lowMode: false,       // активирован ли режим экономии
+        // Порог, при котором включаем экономию
+        LOW_THRESHOLD: 500,
+        // Порог, при котором выключаем экономию
+        RECOVER_THRESHOLD: 1500,
+    };
+
+    // Перехватываем глобальный fetch и смотрим заголовки X-RateLimit
+    const _origFetch = window.fetch.bind(window);
+    window.fetch = function(url, opts) {
+        const urlStr = typeof url === 'string' ? url : (url && url.url) || '';
+        const isGitHub = urlStr.includes('api.github.com');
+
+        return _origFetch(url, opts).then(res => {
+            if (isGitHub) {
+                const remaining = res.headers.get('X-RateLimit-Remaining');
+                const limit = res.headers.get('X-RateLimit-Limit');
+                const reset = res.headers.get('X-RateLimit-Reset');
+                if (remaining != null) RATE.remaining = parseInt(remaining, 10) || 0;
+                if (limit != null) RATE.limit = parseInt(limit, 10) || 5000;
+                if (reset != null) RATE.resetAt = parseInt(reset, 10) * 1000;
+                RATE.lastUpdate = Date.now();
+
+                // Проверяем — не пора ли включить/выключить экономию
+                if (!RATE.lowMode && RATE.remaining < RATE.LOW_THRESHOLD) {
+                    RATE.lowMode = true;
+                    onLowModeEnter();
+                } else if (RATE.lowMode && RATE.remaining > RATE.RECOVER_THRESHOLD) {
+                    RATE.lowMode = false;
+                    onLowModeExit();
+                }
+            }
+            return res;
+        });
+    };
+
+    function onLowModeEnter() {
+        console.warn(`🧘 [Pacifier] ЭКОНОМНЫЙ РЕЖИМ ВКЛЮЧЁН (остаток: ${RATE.remaining}/${RATE.limit})`);
+        try { showToast(`🐢 Экономный режим (осталось ${RATE.remaining} запросов)`, 3500); } catch (e) {}
+        // Прячем частые поллинги
+        _pauseAllPollings();
+    }
+
+    function onLowModeExit() {
+        console.log(`🧘 [Pacifier] ЭКОНОМНЫЙ РЕЖИМ ВЫКЛЮЧЕН (остаток: ${RATE.remaining}/${RATE.limit})`);
+        _resumeAllPollings();
+    }
+
+    // Флаги для поллингов
+    const _pausedState = {
+        backBadge: false,
+        eventRadar: false,
+        autoOutbox: false,
+        unreadBadges: false,
+    };
+
+    function _pauseAllPollings() {
+        _pausedState.backBadge = true;
+        _pausedState.eventRadar = true;
+        _pausedState.unreadBadges = true;
+        // AutoOutbox оставляем, но с большим интервалом (см. ниже)
+    }
+
+    function _resumeAllPollings() {
+        _pausedState.backBadge = false;
+        _pausedState.eventRadar = false;
+        _pausedState.unreadBadges = false;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  2. ПАТЧ BackButtonBadgeV2 — интервал 5 сек → 60 сек
+    //  + отключение при document.hidden
+    //  + уважение RATE.lowMode
+    // ═══════════════════════════════════════════════════════════
+    // Мы не можем «достучаться» до внутреннего setInterval этого
+    // модуля (он в IIFE). Поэтому делаем «глушилку»: перехватываем
+    // fetch вызовы к /contents/chats/*.meta.json и троттлим их.
+
+    const _metaFetchThrottle = new Map();  // url → lastFetchTs
+    const META_MIN_INTERVAL_MS = 45000;    // минимум 45 секунд между запросами одного meta
+
+    const _origFetchBeforeThrottle = window.fetch;
+    window.fetch = function(url, opts) {
+        const urlStr = typeof url === 'string' ? url : (url && url.url) || '';
+
+        // Троттлим meta.json
+        if (urlStr.includes('/contents/chats/') && urlStr.endsWith('.meta.json')) {
+            // В экономном режиме — вообще не пускаем
+            if (RATE.lowMode && _pausedState.backBadge) {
+                return Promise.reject(new TypeError('RateLimit-LowMode'));
+            }
+            if (document.hidden && _pausedState.backBadge) {
+                return Promise.reject(new TypeError('Document-Hidden'));
+            }
+            const now = Date.now();
+            const last = _metaFetchThrottle.get(urlStr) || 0;
+            if (now - last < META_MIN_INTERVAL_MS) {
+                return Promise.reject(new TypeError('Throttled'));
+            }
+            _metaFetchThrottle.set(urlStr, now);
+        }
+
+        return _origFetchBeforeThrottle.call(this, url, opts);
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. ПАТЧ EventRadar — интервал сканирования
+    //  EventRadar экспортирует объект window.EventRadar, но
+    //  setInterval зашит в IIFE. Троттлим через тот же fetch-фильтр:
+    //  запросы к /contents/chats/*.json (не .meta) в экономном
+    //  режиме пропускаем не чаще 1 раза в 3 минуты на файл.
+    // ═══════════════════════════════════════════════════════════
+    const _chatFetchThrottle = new Map();
+    const CHAT_MIN_INTERVAL_MS = 60000;    // 60 сек между одинаковыми запросами
+
+    window.fetch = function(url, opts) {
+        const urlStr = typeof url === 'string' ? url : (url && url.url) || '';
+
+        // Троттлим большие запросы к чатам (содержимое .json)
+        if (urlStr.includes('/contents/chats/') && urlStr.endsWith('.json') && !urlStr.includes('.meta.json')) {
+            // В экономном режиме — очень редко
+            if (RATE.lowMode) {
+                const now = Date.now();
+                const last = _chatFetchThrottle.get(urlStr) || 0;
+                if (now - last < 180000) {   // 3 минуты
+                    return Promise.reject(new TypeError('RateLimit-LowMode'));
+                }
+                _chatFetchThrottle.set(urlStr, now);
+            }
+            // В обычном режиме — не чаще раза в минуту
+            else {
+                const now = Date.now();
+                const last = _chatFetchThrottle.get(urlStr) || 0;
+                // Разрешаем пропускать, если это срочный запрос (PUT/POST)
+                if (!opts || (opts.method !== 'PUT' && opts.method !== 'POST' && opts.method !== 'DELETE')) {
+                    if (now - last < CHAT_MIN_INTERVAL_MS) {
+                        return Promise.reject(new TypeError('Throttled-Chat'));
+                    }
+                    _chatFetchThrottle.set(urlStr, now);
+                }
+            }
+        }
+
+        return _origFetchBeforeThrottle.call(this, url, opts);
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  4. ПАТЧ refreshUnreadBadges — интервал 3 сек → 20 сек
+    //  Патчим setInterval глобально: если это вызов с интервалом 3000,
+    //  похожий на «непрочитанные» — увеличиваем до 20000.
+    // ═══════════════════════════════════════════════════════════
+    const _origSetInterval = window.setInterval;
+    window.setInterval = function(fn, delay, ...args) {
+        // setInterval для refreshUnreadBadges — 3000 мс
+        if (delay === 3000 && fn.toString().includes('refreshUnreadBadges')) {
+            console.log('🧘 [Pacifier] refreshUnreadBadges: 3с → 20с');
+            return _origSetInterval.call(this, function() {
+                if (document.hidden) return;
+                if (RATE.lowMode) return;
+                if (_pausedState.unreadBadges) return;
+                try { fn(); } catch (e) {}
+            }, 20000, ...args);
+        }
+
+        // BackButtonBadgeV2 — 5000 мс
+        if (delay === 5000 && fn.toString().includes('watchOtherChats')) {
+            console.log('🧘 [Pacifier] BackButtonBadge: 5с → 90с');
+            return _origSetInterval.call(this, function() {
+                if (document.hidden) return;
+                if (RATE.lowMode) return;
+                try { fn(); } catch (e) {}
+            }, 90000, ...args);
+        }
+
+        // AutoRefresh polling — 10000 мс
+        if (delay === 10000 && fn.toString().includes('tryReconnectRecovery')) {
+            console.log('🧘 [Pacifier] AutoRefresh polling: 10с → 90с');
+            return _origSetInterval.call(this, function() {
+                if (document.hidden) return;
+                if (RATE.lowMode) return;
+                try { fn(); } catch (e) {}
+            }, 90000, ...args);
+        }
+
+        // AutoOutbox processQueue — 2000 мс
+        if (delay === 2000 && fn.toString().includes('processQueue')) {
+            console.log('🧘 [Pacifier] AutoOutbox: 2с → 20с');
+            return _origSetInterval.call(this, function() {
+                if (document.hidden) return;
+                try { fn(); } catch (e) {}
+            }, 20000, ...args);
+        }
+
+        return _origSetInterval.call(this, fn, delay, ...args);
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  5. ПАТЧ checkNetwork — не чаще раза в 60 секунд
+    //  Оригинал вызывается из многих мест, но результат важен.
+    //  Просто троттлим сам вызов.
+    // ═══════════════════════════════════════════════════════════
+    if (typeof window.checkNetwork === 'function') {
+        const _origCheckNetwork = window.checkNetwork;
+        let _lastCheckTs = 0;
+        let _lastResult = true;
+
+        window.checkNetwork = async function() {
+            const now = Date.now();
+            // Если проверяли меньше 60 сек назад — возвращаем прошлый результат
+            if (now - _lastCheckTs < 60000) {
+                return _lastResult;
+            }
+            _lastCheckTs = now;
+            try {
+                _lastResult = await _origCheckNetwork.apply(this, arguments);
+                return _lastResult;
+            } catch (e) {
+                _lastResult = false;
+                throw e;
+            }
+        };
+
+        console.log('🧘 [Pacifier] checkNetwork троттлится до 1 раза в 60 сек');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  6. ПАУЗА ВСЕГО ПРИ document.hidden
+    //  Когда вкладка свёрнута — вообще никуда не стучимся.
+    // ═══════════════════════════════════════════════════════════
+    const _origFetchFinal = window.fetch;
+    window.fetch = function(url, opts) {
+        const urlStr = typeof url === 'string' ? url : (url && url.url) || '';
+        const isGitHub = urlStr.includes('api.github.com');
+        const isRead = !opts || (!opts.method || opts.method === 'GET');
+
+        // Если вкладка скрыта и это фоновый GET к GitHub — не пускаем
+        if (document.hidden && isGitHub && isRead) {
+            // Исключения: активная отправка сообщения, загрузка вложения по запросу пользователя
+            const isUserInitiated = opts && (
+                opts._userInitiated === true ||
+                opts.method === 'PUT' ||
+                opts.method === 'POST'
+            );
+            if (!isUserInitiated) {
+                return Promise.reject(new TypeError('Document-Hidden'));
+            }
+        }
+        return _origFetchFinal.call(this, url, opts);
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  7. ПЕРИОДИЧЕСКИЙ ЛОГ
+    // ═══════════════════════════════════════════════════════════
+    setInterval(() => {
+        if (RATE.lastUpdate === 0) return;
+        const ago = Math.round((Date.now() - RATE.lastUpdate) / 1000);
+        if (ago > 60) return;
+        const pct = Math.round((RATE.remaining / RATE.limit) * 100);
+        if (pct < 30) {
+            console.log(`🧘 [Pacifier] Лимит GitHub: ${RATE.remaining}/${RATE.limit} (${pct}%)`);
+        }
+    }, 30000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  8. API ДЛЯ ОТЛАДКИ
+    // ═══════════════════════════════════════════════════════════
+    window.RateLimitPacifier = {
+        status: () => ({
+            remaining: RATE.remaining,
+            limit: RATE.limit,
+            percent: Math.round((RATE.remaining / RATE.limit) * 100) + '%',
+            resetIn: RATE.resetAt ? Math.round((RATE.resetAt - Date.now()) / 1000) + 's' : 'unknown',
+            lowMode: RATE.lowMode,
+            paused: { ..._pausedState },
+            metaThrottleSize: _metaFetchThrottle.size,
+            chatThrottleSize: _chatFetchThrottle.size,
+        }),
+        // Принудительно очистить троттл-кэш (если нужно срочно что-то запросить)
+        clearThrottle: () => {
+            _metaFetchThrottle.clear();
+            _chatFetchThrottle.clear();
+            console.log('🧘 [Pacifier] Троттл-кэш очищен');
+        },
+        // Временно вернуть обычные интервалы (для отладки)
+        disable: () => {
+            RATE.lowMode = false;
+            _resumeAllPollings();
+            console.log('🧘 [Pacifier] Отключено вручную');
+        },
+    };
+
+    console.log('🧘 [Pacifier] Активирован:');
+    console.log('   • BackButtonBadge: 5с → 90с (и пауза при hidden)');
+    console.log('   • refreshUnreadBadges: 3с → 20с');
+    console.log('   • AutoOutbox: 2с → 20с');
+    console.log('   • AutoRefresh polling: 10с → 90с');
+    console.log('   • checkNetwork: не чаще 1 раза в 60с');
+    console.log('   • meta.json: не чаще 1 раза в 45с на файл');
+    console.log('   • chats/*.json: не чаще 1 раза в 60с на файл');
+    console.log('   • При document.hidden — GitHub не дёргается вообще');
+    console.log('   • При остатке < 500 — экономный режим');
+    console.log('');
+    console.log('   Проверка: RateLimitPacifier.status()');
+})();
+</script>
+
 </body>
 </html>
