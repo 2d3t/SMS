@@ -35691,5 +35691,328 @@ try {
     console.log('✨ [UsernameStyle v2] Меню кастомизации имени — ' + STYLES.length + ' стилей');
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🩹 ПАТЧ: EventRadar использует общий scrollToMessage для
+//  подсветки сообщения — так же, как фото и поиск.
+// ═══════════════════════════════════════════════════════════════
+
+(function fixEventRadarHighlight() {
+    'use strict';
+
+    if (typeof window.EventRadar === 'undefined') {
+        console.warn('🩹 [EventRadarFix] EventRadar не найден');
+        return;
+    }
+
+    // Проверяем, что глобальный scrollToMessage есть
+    if (typeof scrollToMessage !== 'function') {
+        console.warn('🩹 [EventRadarFix] scrollToMessage не найден');
+        return;
+    }
+
+    // ─── Патчим handleEventClick внутри EventRadar ───
+    // Но эта функция внутри IIFE, поэтому просто переопределим
+    // публичный open/перерисуем клик через MutationObserver.
+
+    // Более надёжный путь: перехватываем клики на .r2-event
+    // в capture-фазе и делаем свою логику.
+
+    document.addEventListener('click', (e) => {
+        const card = e.target.closest('.r2-event[data-chat-file]');
+        if (!card) return;
+
+        // Проверяем, что мы на оверлее радара
+        const overlay = document.getElementById('radar2Overlay');
+        if (!overlay || !overlay.classList.contains('show')) return;
+
+        e.stopImmediatePropagation();
+        e.preventDefault();
+
+        const chatFile = card.dataset.chatFile;
+        const msgId = parseInt(card.dataset.msgId);
+        const eventIdx = parseInt(card.dataset.eventIdx);
+
+        if (isNaN(msgId) || !chatFile) return;
+
+        // ─── Помечаем как прочитанное ───
+        let ev = null;
+        if (!isNaN(eventIdx)) {
+            const events = window.EventRadar.getEvents();
+            if (events[eventIdx] && events[eventIdx].msgId === msgId
+                && events[eventIdx].chatFile === chatFile) {
+                ev = events[eventIdx];
+            }
+        }
+        if (!ev) {
+            const events = window.EventRadar.getEvents();
+            ev = events.find(x => x.chatFile === chatFile
+                && x.msgId === msgId && !x.seen);
+        }
+        if (ev && !ev.seen && typeof window.EventRadar.markSeen === 'function') {
+            window.EventRadar.markSeen(ev);
+        }
+        card.classList.add('seen');
+
+        // ─── Закрываем оверлей ───
+        if (typeof window.EventRadar.close === 'function') {
+            window.EventRadar.close();
+        }
+
+        // ─── Дальше — как в обычном клике, но через scrollToMessage ───
+        (async () => {
+            await new Promise(r => setTimeout(r, 280));
+
+            // Если мы в этом чате — просто скроллим
+            if (state.chatFile === chatFile) {
+                scrollToMessage(msgId);
+                return;
+            }
+
+            // Иначе — переходим в чат
+            const chat = state.chats.find(c => c.file === chatFile);
+            if (!chat) {
+                if (typeof showToast === 'function') showToast('❌ Чат не найден', 1800);
+                return;
+            }
+            const password = state.savedPasswords[chatFile];
+            if (!password) {
+                if (typeof showToast === 'function') showToast('🔐 Нужен пароль чата', 2000);
+                return;
+            }
+
+            // 🆕 Ключевой момент: ставим флаг для renderHistory,
+            //    чтобы история отрендерилась с нужным диапазоном
+            window._pendingJumpToMsgId = msgId;
+
+            try {
+                if (typeof window.enterChat === 'function') {
+                    await window.enterChat(chatFile, chat.name || chatFile, password);
+                }
+            } catch (err) {
+                console.error('EventRadar jump error:', err);
+                window._pendingJumpToMsgId = null;
+                if (typeof showToast === 'function') {
+                    showToast('❌ Не удалось открыть чат', 2000);
+                }
+                return;
+            }
+
+            // ─── После входа — ждём появления сообщения и подсвечиваем ───
+            // Но scrollToMessage сам это умеет через _pendingJumpToMsgId,
+            // поэтому если сообщение ещё не отрисовано — вызовем ещё раз
+            // через небольшую задержку.
+            setTimeout(() => {
+                const el = document.querySelector(
+                    `.message-wrapper[data-msg-id="${msgId}"]`
+                );
+                if (el) {
+                    // Сообщение уже в DOM — просто скролл + подсветка
+                    scrollToMessage(msgId);
+                } else {
+                    // Ещё не отрисовано — повторим флаг
+                    window._pendingJumpToMsgId = msgId;
+                    if (typeof renderHistory === 'function') renderHistory();
+                }
+            }, 400);
+        })();
+    }, true);   // ⬅️ CAPTURE-фаза — перехватываем раньше встроенного обработчика
+
+    console.log('🩹 [EventRadarFix] Клики по событиям теперь используют общий scrollToMessage');
+})();
+</script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  ✨ ЯРКАЯ ЗЕЛЁНАЯ ПОДСВЕТКА СООБЩЕНИЙ (highlight-flash)
+//  Заменяет слабую анимацию на заметную: толстая рамка,
+//  свечение, лёгкая пульсация — видно даже на бегу.
+// ═══════════════════════════════════════════════════════════════
+
+(function installBrightHighlight() {
+    'use strict';
+
+    // ─── Удаляем старую слабую анимацию ───
+    // (перезапишем её новым правилом с !important)
+    if (!document.getElementById('brightHighlightStyles')) {
+        const style = document.createElement('style');
+        style.id = 'brightHighlightStyles';
+        style.textContent = `
+            /* ═══════════════════════════════════════════════════
+               ЯРКАЯ ЗЕЛЁНАЯ ПОДСВЕТКА — вместо старой flashHighlight
+               ═══════════════════════════════════════════════════ */
+
+            @keyframes brightFlashHighlight {
+                /* Мгновенный всплеск */
+                0% {
+                    box-shadow:
+                        0 0 0 4px rgba(0, 230, 130, 1),
+                        0 0 0 10px rgba(0, 230, 130, 0.55),
+                        0 0 32px 8px rgba(0, 230, 130, 0.65),
+                        0 0 60px 16px rgba(0, 230, 130, 0.35);
+                    background-color: rgba(0, 230, 130, 0.18);
+                    transform: scale(1.015);
+                }
+                /* Плавное угасание */
+                35% {
+                    box-shadow:
+                        0 0 0 3px rgba(0, 210, 120, 0.95),
+                        0 0 0 8px rgba(0, 210, 120, 0.4),
+                        0 0 26px 6px rgba(0, 210, 120, 0.5),
+                        0 0 48px 12px rgba(0, 210, 120, 0.22);
+                    background-color: rgba(0, 210, 120, 0.13);
+                    transform: scale(1.01);
+                }
+                70% {
+                    box-shadow:
+                        0 0 0 2px rgba(0, 200, 110, 0.75),
+                        0 0 0 6px rgba(0, 200, 110, 0.25),
+                        0 0 18px 4px rgba(0, 200, 110, 0.32);
+                    background-color: rgba(0, 200, 110, 0.08);
+                    transform: scale(1.005);
+                }
+                /* Полное затухание */
+                100% {
+                    box-shadow: none;
+                    background-color: transparent;
+                    transform: scale(1);
+                }
+            }
+
+            /* Основное правило — перебивает старое flashHighlight */
+            .message-wrapper.highlight-flash .message {
+                animation: brightFlashHighlight 2s cubic-bezier(0.22, 0.61, 0.36, 1) !important;
+                will-change: box-shadow, background-color, transform;
+            }
+
+            /* Более долгий вариант для случая когда мы пришли из другого чата
+               (там сообщение может появиться чуть позже) */
+            .message-wrapper.highlight-flash.long .message {
+                animation-duration: 2.6s !important;
+            }
+
+            /* 🆕 На мобиле — рамка чуть тоньше, чтобы не съедала экран */
+            @media (max-width: 480px) {
+                @keyframes brightFlashHighlight {
+                    0% {
+                        box-shadow:
+                            0 0 0 3px rgba(0, 230, 130, 1),
+                            0 0 0 7px rgba(0, 230, 130, 0.5),
+                            0 0 24px 6px rgba(0, 230, 130, 0.6);
+                        background-color: rgba(0, 230, 130, 0.18);
+                        transform: scale(1.012);
+                    }
+                    35% {
+                        box-shadow:
+                            0 0 0 2.5px rgba(0, 210, 120, 0.95),
+                            0 0 0 6px rgba(0, 210, 120, 0.38),
+                            0 0 20px 5px rgba(0, 210, 120, 0.45);
+                        background-color: rgba(0, 210, 120, 0.13);
+                        transform: scale(1.008);
+                    }
+                    70% {
+                        box-shadow:
+                            0 0 0 2px rgba(0, 200, 110, 0.7),
+                            0 0 0 4px rgba(0, 200, 110, 0.22),
+                            0 0 14px 3px rgba(0, 200, 110, 0.28);
+                        background-color: rgba(0, 200, 110, 0.08);
+                    }
+                    100% {
+                        box-shadow: none;
+                        background-color: transparent;
+                        transform: scale(1);
+                    }
+                }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ─── Патчим scrollToMessage / doScrollAndFlash — удлиняем подсветку ───
+    // Оригинал: снимает класс через 1300 мс.
+    // Теперь: через 2100 мс (под нашу новую 2-секундную анимацию).
+
+    if (typeof doScrollAndFlash === 'function') {
+        const _origDoScrollAndFlash = doScrollAndFlash;
+
+        doScrollAndFlash = function(el, msgId) {
+            if (!el) return;
+
+            // Снимаем старую подсветку у всех
+            messagesInner.querySelectorAll('.message-wrapper.highlight-flash')
+                .forEach(x => x.classList.remove('highlight-flash', 'long'));
+
+            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+            // 🆕 Добавляем «long» класс если это переход из другого чата
+            const isCrossChat = window._pendingJumpToMsgId && msgId
+                && String(window._pendingJumpToMsgId) === String(msgId);
+
+            setTimeout(() => {
+                el.classList.add('highlight-flash');
+                if (isCrossChat) el.classList.add('long');
+
+                setTimeout(() => {
+                    el.classList.remove('highlight-flash', 'long');
+                }, 2200);
+            }, 200);
+
+            if (navigator.vibrate) navigator.vibrate([15, 30, 15]);
+        };
+
+        console.log('✨ [BrightHighlight] doScrollAndFlash пропатчен');
+    }
+
+    // ─── Патч jumpToMessage внутри EventRadar (его встроенную версию) ───
+    // Т.к. она снимает класс через 1500 мс — анимация обрывается.
+    // Заменяем на глобальный scrollToMessage — он теперь даёт яркую подсветку.
+    // (этот патч уже был в предыдущем сообщении, здесь просто напоминание —
+    //  если ты его ещё не добавил, добавь, иначе вспышка будет слабой)
+
+    // ─── Патч renderHistory — если пришёл _pendingJumpToMsgId, ───
+    //     добавляем класс "long" к подсвечиваемому сообщению
+    if (typeof renderHistory === 'function') {
+        const _origRenderHistory = renderHistory;
+
+        renderHistory = function() {
+            const jumpTarget = window._pendingJumpToMsgId;
+            const result = _origRenderHistory.apply(this, arguments);
+
+            if (jumpTarget) {
+                // Ищем сообщение и подсвечиваем его ярко
+                setTimeout(() => {
+                    const el = messagesInner.querySelector(
+                        `.message-wrapper[data-msg-id="${jumpTarget}"]`
+                    );
+                    if (el) {
+                        messagesInner.querySelectorAll('.message-wrapper.highlight-flash')
+                            .forEach(x => x.classList.remove('highlight-flash', 'long'));
+
+                        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+                        setTimeout(() => {
+                            el.classList.add('highlight-flash', 'long');
+                            setTimeout(() => {
+                                el.classList.remove('highlight-flash', 'long');
+                            }, 2700);
+                        }, 250);
+
+                        if (navigator.vibrate) navigator.vibrate([15, 30, 15]);
+                    }
+                }, 300);
+            }
+
+            return result;
+        };
+
+        console.log('✨ [BrightHighlight] renderHistory пропатчен');
+    }
+
+    console.log('✨ Яркая зелёная подсветка активирована');
+    console.log('   • Толстая рамка (до 4px)');
+    console.log('   • Зелёное свечение вокруг');
+    console.log('   • Лёгкая пульсация масштаба');
+    console.log('   • Длительность: 2 секунды (было 1.2)');
+})();
+</script>
 </body>
 </html>
