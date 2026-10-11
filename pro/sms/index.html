@@ -39685,5 +39685,989 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
 }
 
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🎓 ИНТЕРАКТИВНЫЙ ТУР v2 — ФИКС
+//  ─────────────────────────────────────────────────────────────
+//  Исправления:
+//   • Затемнение через box-shadow "прожектор" — элемент ВИДЕН
+//   • Полная очистка DOM при завершении
+//   • Защита от повторного запуска (нет наложения слоёв)
+//   • Проверка на существующие элементы перед созданием
+// ═══════════════════════════════════════════════════════════════
+
+(function installOnboardingTourV2() {
+    'use strict';
+
+    // ═══════════════════════════════════════════════════════════
+    //  СНАЧАЛА — УДАЛЯЕМ ВСЁ СТАРОЕ (если было)
+    // ═══════════════════════════════════════════════════════════
+    function cleanupOldTour() {
+        ['tourOverlay', 'tourTooltip', 'tourArrow', 'tourPulse', 'tourDarkness', 'tourHighlight']
+            .forEach(id => {
+                const el = document.getElementById(id);
+                if (el) {
+                    el.style.display = 'none';
+                    try { el.remove(); } catch (e) {}
+                }
+            });
+        // Снимаем возможные артефакты с body
+        document.body.style.overflow = '';
+        document.body.style.pointerEvents = '';
+    }
+    cleanupOldTour();
+
+    // Старый API — отключаем, чтобы не мешал
+    if (window.OnboardingTour) {
+        window.OnboardingTour.start = () => console.warn('Старый тур отключён');
+        window.OnboardingTour.stop = () => {};
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОСТОЯНИЕ
+    // ═══════════════════════════════════════════════════════════
+    const Tour = {
+        active: false,
+        currentStep: 0,
+        steps: [],
+        // DOM-элементы
+        spotlightEl: null,      // «прожектор» с box-shadow
+        tooltipEl: null,
+        arrowEl: null,
+        _resizeHandler: null,
+        _keyHandler: null,
+        _stepTimer: null,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ШАГИ
+    // ═══════════════════════════════════════════════════════════
+    function buildSteps() {
+        return [
+            {
+                id: 'welcome',
+                target: null,
+                title: '👋 Добро пожаловать!',
+                text: 'Давайте познакомимся с приложением. Я покажу вам основные функции — это займёт меньше минуты.',
+                icon: '🎓',
+                position: 'center',
+                action: null,
+            },
+            {
+                id: 'chats-list',
+                target: '#chatsList',
+                title: '💬 Ваши чаты',
+                text: 'Здесь отображаются все ваши чаты. Нажмите на любой, чтобы открыть. Бейджи показывают непрочитанные сообщения.',
+                icon: '💬',
+                position: 'bottom',
+                action: 'chats',
+            },
+            {
+                id: 'actions-menu',
+                target: '#chatsActionsBtn',
+                title: '⋯ Меню действий',
+                text: 'Главное меню! Здесь можно создать чат, присоединиться, экспортировать профиль, очистить кеш и запустить этот тур снова.',
+                icon: '⋯',
+                position: 'bottom-left',
+                action: 'chats',
+            },
+            {
+                id: 'radar-btn',
+                target: '#radar2Btn',
+                title: '🔔 Центр событий',
+                text: 'Здесь собираются все реакции и комментарии к вашим сообщениям. Нажмите на событие, чтобы перейти к нему.',
+                icon: '🔔',
+                position: 'bottom-left',
+                action: 'chats',
+                optional: true,
+            },
+            {
+                id: 'username',
+                target: '#chatsUserLabel',
+                title: '✨ Ваше имя',
+                text: 'Нажмите на своё имя, чтобы настроить его стиль — градиент, аватарку, цвет. Всё сохраняется локально.',
+                icon: '✨',
+                position: 'bottom-left',
+                action: 'chats',
+            },
+            {
+                id: 'create-chat',
+                target: null,
+                title: '➕ Создание чата',
+                text: 'В меню "⋯" → "Создать чат". Придумайте название, пароль сгенерируется автоматически. Сохраните его — без него сообщения не расшифруются!',
+                icon: '➕',
+                position: 'center',
+                action: 'chats',
+            },
+            {
+                id: 'join-chat',
+                target: null,
+                title: '🔗 Присоединение',
+                text: 'Чтобы войти в чужой чат, нужен его ID и пароль. Или получите файл-приглашение .smschat — просто нажмите на него.',
+                icon: '🔗',
+                position: 'center',
+                action: 'chats',
+            },
+            {
+                id: 'open-chat',
+                target: null,
+                title: '📱 Внутри чата',
+                text: 'Давайте заглянем в чат! Если у вас есть хотя бы один чат — сейчас открою его. Если нет — создайте его позже.',
+                icon: '📱',
+                position: 'center',
+                action: 'try-open-chat',
+            },
+            {
+                id: 'input-bar',
+                target: '#messageInput',
+                title: '⌨️ Поле ввода',
+                text: 'Пишите сообщения здесь. Enter — перенос строки, Ctrl+Enter — отправить. Текст шифруется перед отправкой.',
+                icon: '⌨️',
+                position: 'top',
+                action: 'chat',
+            },
+            {
+                id: 'action-buttons',
+                target: '.input-bar .action-buttons',
+                title: '🎛️ Кнопки действий',
+                text: '😊 — эмодзи, 📎 — вложения (фото, видео, аудио, файлы), 🎤 — голосовое (долгое нажатие — кружочек), 📹 — видео-кружочек, ➤ — отправить.',
+                icon: '🎛️',
+                position: 'top',
+                action: 'chat',
+                optional: true,
+            },
+            {
+                id: 'gallery',
+                target: null,
+                title: '🖼️ Просмотр фото',
+                text: 'Нажмите на фото — откроется галерея. Можно листать, зумить, скачивать. Долгое нажатие покажет информацию.',
+                icon: '🖼️',
+                position: 'center',
+                action: 'chat',
+            },
+            {
+                id: 'audio',
+                target: null,
+                title: '🎵 Аудио и голосовые',
+                text: 'Голосовые и музыку можно слушать прямо в чате. Плеер продолжает играть при переходе между чатами.',
+                icon: '🎵',
+                position: 'center',
+                action: 'chat',
+            },
+            {
+                id: 'reactions',
+                target: null,
+                title: '❤️ Реакции и ответы',
+                text: 'Долгое нажатие на сообщение — меню: ответить, копировать, редактировать (свои), удалить. Свайп вправо — быстрый ответ.',
+                icon: '❤️',
+                position: 'center',
+                action: 'chat',
+            },
+            {
+                id: 'offline',
+                target: null,
+                title: '📴 Работает офлайн',
+                text: 'Сообщения кэшируются. Без интернета можно читать историю, а отправленные сообщения встанут в очередь и уйдут при появлении сети.',
+                icon: '📴',
+                position: 'center',
+                action: 'chat',
+            },
+            {
+                id: 'security',
+                target: null,
+                title: '🔐 Шифрование',
+                text: 'Все сообщения шифруются AES-256-GCM. Ключ выводится из пароля чата через PBKDF2 (200 000 итераций). Без пароля прочитать нельзя.',
+                icon: '🔐',
+                position: 'center',
+                action: 'chat',
+            },
+            {
+                id: 'finish',
+                target: null,
+                title: '🎉 Готово!',
+                text: 'Вот и всё! Теперь вы знаете основные функции. Исследуйте приложение и удачного общения!',
+                icon: '🎉',
+                position: 'center',
+                action: 'finish',
+            },
+        ];
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СТИЛИ
+    // ═══════════════════════════════════════════════════════════
+    function injectStyles() {
+        const existing = document.getElementById('onboardingTourV2Styles');
+        if (existing) return;
+
+        const style = document.createElement('style');
+        style.id = 'onboardingTourV2Styles';
+        style.textContent = `
+            /* ═══ ПРОЖЕКТОР ═══
+               Используем box-shadow-трюк: сам элемент прозрачный,
+               но огромная тень вокруг затемняет всё остальное.
+               Так элемент ВИДЕН, а не спрятан под оверлеем. */
+            #tourSpotlightV2 {
+                position: fixed;
+                border-radius: 14px;
+                /* Огромная тень = тёмный фон вокруг элемента */
+                box-shadow:
+                    0 0 0 4px rgba(108, 92, 231, 0.9),
+                    0 0 0 8px rgba(108, 92, 231, 0.35),
+                    0 0 0 9999px rgba(0, 0, 0, 0.72);
+                transition:
+                    left 0.4s cubic-bezier(0.22, 0.61, 0.36, 1),
+                    top 0.4s cubic-bezier(0.22, 0.61, 0.36, 1),
+                    width 0.4s cubic-bezier(0.22, 0.61, 0.36, 1),
+                    height 0.4s cubic-bezier(0.22, 0.61, 0.36, 1),
+                    border-radius 0.4s ease;
+                pointer-events: none;
+                z-index: 99999;
+                background: transparent;
+                display: none;
+                /* Лёгкая пульсация */
+                animation: tourSpotlightPulse 2s ease-in-out infinite;
+            }
+            #tourSpotlightV2.show {
+                display: block;
+            }
+            /* Центральный режим — без подсветки, просто затемнение */
+            #tourSpotlightV2.centered {
+                left: 50% !important;
+                top: 50% !important;
+                width: 0 !important;
+                height: 0 !important;
+                border-radius: 50% !important;
+                box-shadow:
+                    0 0 0 0 rgba(108, 92, 231, 0),
+                    0 0 0 0 rgba(108, 92, 231, 0),
+                    0 0 0 9999px rgba(0, 0, 0, 0.72);
+                animation: none;
+            }
+            @keyframes tourSpotlightPulse {
+                0%, 100% {
+                    box-shadow:
+                        0 0 0 4px rgba(108, 92, 231, 0.9),
+                        0 0 0 8px rgba(108, 92, 231, 0.35),
+                        0 0 0 9999px rgba(0, 0, 0, 0.72);
+                }
+                50% {
+                    box-shadow:
+                        0 0 0 4px rgba(108, 92, 231, 1),
+                        0 0 0 12px rgba(108, 92, 231, 0.45),
+                        0 0 0 9999px rgba(0, 0, 0, 0.72);
+                }
+            }
+
+            /* ═══ ТУЛТИП ═══ */
+            #tourTooltipV2 {
+                position: fixed;
+                max-width: 340px;
+                min-width: 280px;
+                background: linear-gradient(135deg, #1a1a2e 0%, #252540 100%);
+                border: 1px solid rgba(108, 92, 231, 0.5);
+                border-radius: 20px;
+                padding: 20px 22px;
+                box-shadow:
+                    0 20px 60px rgba(0, 0, 0, 0.8),
+                    0 0 0 1px rgba(108, 92, 231, 0.3);
+                z-index: 100001;
+                pointer-events: auto;
+                animation: tourTooltipIn 0.3s cubic-bezier(0.22, 0.61, 0.36, 1);
+                display: none;
+            }
+            #tourTooltipV2.show {
+                display: block;
+            }
+            @keyframes tourTooltipIn {
+                from { opacity: 0; transform: scale(0.92); }
+                to   { opacity: 1; transform: scale(1); }
+            }
+
+            #tourTooltipV2 .tour-icon {
+                width: 44px;
+                height: 44px;
+                border-radius: 14px;
+                background: linear-gradient(135deg, rgba(108, 92, 231, 0.35), rgba(0, 184, 148, 0.25));
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 22px;
+                margin-bottom: 12px;
+                border: 1px solid rgba(108, 92, 231, 0.4);
+                box-shadow: 0 4px 12px rgba(108, 92, 231, 0.25);
+            }
+
+            #tourTooltipV2 .tour-title {
+                font-size: 17px;
+                font-weight: 700;
+                color: #fff;
+                margin-bottom: 8px;
+                line-height: 1.3;
+                padding-right: 44px;
+            }
+
+            #tourTooltipV2 .tour-text {
+                font-size: 14px;
+                color: #bbb;
+                line-height: 1.55;
+                margin-bottom: 16px;
+            }
+
+            #tourTooltipV2 .tour-progress {
+                display: flex;
+                gap: 4px;
+                margin-bottom: 16px;
+            }
+            #tourTooltipV2 .tour-progress-dot {
+                flex: 1;
+                height: 3px;
+                background: rgba(255, 255, 255, 0.08);
+                border-radius: 2px;
+                transition: all 0.3s;
+            }
+            #tourTooltipV2 .tour-progress-dot.done {
+                background: rgba(108, 92, 231, 0.5);
+            }
+            #tourTooltipV2 .tour-progress-dot.active {
+                background: linear-gradient(90deg, #6c5ce7, #00b894);
+                box-shadow: 0 0 8px rgba(108, 92, 231, 0.6);
+            }
+
+            #tourTooltipV2 .tour-actions {
+                display: flex;
+                gap: 8px;
+                align-items: center;
+            }
+            #tourTooltipV2 .tour-btn {
+                padding: 11px 16px;
+                border-radius: 12px;
+                border: none;
+                font-size: 14px;
+                font-weight: 600;
+                cursor: pointer;
+                transition: all 0.15s;
+                font-family: inherit;
+                -webkit-tap-highlight-color: transparent;
+            }
+            #tourTooltipV2 .tour-btn:active { transform: scale(0.96); }
+            #tourTooltipV2 .tour-btn-next {
+                flex: 1;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                color: #fff;
+                box-shadow: 0 4px 14px rgba(108, 92, 231, 0.4);
+            }
+            #tourTooltipV2 .tour-btn-prev {
+                flex: 0 0 auto;
+                background: rgba(255, 255, 255, 0.06);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                color: #ccc;
+                padding: 11px 14px;
+            }
+            #tourTooltipV2 .tour-btn-skip {
+                flex: 0 0 auto;
+                background: transparent;
+                color: #666;
+                font-size: 12px;
+                font-weight: 500;
+                padding: 11px 8px;
+                text-decoration: underline;
+                text-underline-offset: 3px;
+            }
+            #tourTooltipV2 .tour-btn-skip:hover { color: #aaa; }
+
+            #tourTooltipV2 .tour-step-counter {
+                position: absolute;
+                top: 18px;
+                right: 20px;
+                font-size: 11px;
+                color: #666;
+                font-weight: 600;
+                font-variant-numeric: tabular-nums;
+            }
+
+            /* ═══ СТРЕЛКА ═══ */
+            #tourArrowV2 {
+                position: fixed;
+                width: 16px;
+                height: 16px;
+                background: #252540;
+                border: 1px solid rgba(108, 92, 231, 0.5);
+                transform: rotate(45deg);
+                z-index: 100000;
+                display: none;
+                pointer-events: none;
+            }
+            #tourArrowV2.show { display: block; }
+            /* Указывает вниз (тултип сверху элемента) */
+            #tourArrowV2.arrow-down {
+                border-top: none;
+                border-left: none;
+            }
+            /* Указывает вверх (тултип снизу элемента) */
+            #tourArrowV2.arrow-up {
+                border-bottom: none;
+                border-right: none;
+            }
+
+            /* ═══ ПУЛЬС для шагов без target ═══ */
+            #tourPulseV2 {
+                position: fixed;
+                width: 90px;
+                height: 90px;
+                border-radius: 50%;
+                background: radial-gradient(circle, rgba(108, 92, 231, 0.5), transparent 70%);
+                display: none;
+                pointer-events: none;
+                z-index: 100000;
+                animation: tourPulseAnimV2 2s ease-in-out infinite;
+                transform: translate(-50%, -50%);
+            }
+            #tourPulseV2.show { display: block; }
+            @keyframes tourPulseAnimV2 {
+                0%, 100% { transform: translate(-50%, -50%) scale(1); opacity: 0.8; }
+                50%      { transform: translate(-50%, -50%) scale(1.4); opacity: 0.3; }
+            }
+
+            @media (max-width: 480px) {
+                #tourTooltipV2 {
+                    max-width: calc(100vw - 24px);
+                    min-width: 0;
+                    padding: 18px;
+                    border-radius: 18px;
+                }
+                #tourTooltipV2 .tour-title { font-size: 16px; padding-right: 40px; }
+                #tourTooltipV2 .tour-text { font-size: 13px; }
+                #tourTooltipV2 .tour-icon { width: 40px; height: 40px; font-size: 20px; }
+                #tourTooltipV2 .tour-btn { padding: 10px 14px; font-size: 13px; }
+                #tourSpotlightV2 { border-radius: 12px; }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОЗДАНИЕ ЭЛЕМЕНТОВ (с проверкой на дубли)
+    // ═══════════════════════════════════════════════════════════
+    function ensureElements() {
+        // Прожектор
+        if (!Tour.spotlightEl || !Tour.spotlightEl.isConnected) {
+            const old = document.getElementById('tourSpotlightV2');
+            if (old) old.remove();
+            const el = document.createElement('div');
+            el.id = 'tourSpotlightV2';
+            document.body.appendChild(el);
+            Tour.spotlightEl = el;
+        }
+
+        // Тултип
+        if (!Tour.tooltipEl || !Tour.tooltipEl.isConnected) {
+            const old = document.getElementById('tourTooltipV2');
+            if (old) old.remove();
+            const el = document.createElement('div');
+            el.id = 'tourTooltipV2';
+            document.body.appendChild(el);
+            Tour.tooltipEl = el;
+        }
+
+        // Стрелка
+        if (!Tour.arrowEl || !Tour.arrowEl.isConnected) {
+            const old = document.getElementById('tourArrowV2');
+            if (old) old.remove();
+            const el = document.createElement('div');
+            el.id = 'tourArrowV2';
+            document.body.appendChild(el);
+            Tour.arrowEl = el;
+        }
+
+        // Пульс
+        if (!Tour.pulseEl || !Tour.pulseEl.isConnected) {
+            const old = document.getElementById('tourPulseV2');
+            if (old) old.remove();
+            const el = document.createElement('div');
+            el.id = 'tourPulseV2';
+            document.body.appendChild(el);
+            Tour.pulseEl = el;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПОЗИЦИОНИРОВАНИЕ
+    // ═══════════════════════════════════════════════════════════
+    function positionForStep(step) {
+        const tooltip = Tour.tooltipEl;
+        const arrow = Tour.arrowEl;
+        const spot = Tour.spotlightEl;
+
+        // Сброс классов и позиций
+        arrow.classList.remove('show', 'arrow-down', 'arrow-up');
+        spot.classList.remove('centered');
+        Tour.pulseEl.classList.remove('show');
+
+        // ─── Шаг без target — центрируем тултип, прожектор = затемнение ───
+        if (!step.target) {
+            spot.classList.add('centered', 'show');
+
+            tooltip.style.left = '50%';
+            tooltip.style.top = '50%';
+            tooltip.style.transform = 'translate(-50%, -50%)';
+            tooltip.style.maxWidth = '380px';
+            return;
+        }
+
+        const target = document.querySelector(step.target);
+        if (!target) {
+            // Не нашли элемент — центрируем тултип как fallback
+            spot.classList.add('centered', 'show');
+            tooltip.style.left = '50%';
+            tooltip.style.top = '50%';
+            tooltip.style.transform = 'translate(-50%, -50%)';
+            return;
+        }
+
+        // Скроллим к элементу, если не виден
+        const targetRect0 = target.getBoundingClientRect();
+        if (targetRect0.top < 0 || targetRect0.bottom > window.innerHeight) {
+            target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+
+        // Даём время на скролл
+        setTimeout(() => {
+            if (!Tour.active || Tour.steps[Tour.currentStep] !== step) return;
+            applyPosition(step, target);
+        }, 200);
+    }
+
+    function applyPosition(step, target) {
+        const tooltip = Tour.tooltipEl;
+        const arrow = Tour.arrowEl;
+        const spot = Tour.spotlightEl;
+
+        const rect = target.getBoundingClientRect();
+        const padding = 8;
+
+        // ─── ПРОЖЕКТОР: точно совпадает с элементом ───
+        spot.style.left = (rect.left - padding) + 'px';
+        spot.style.top = (rect.top - padding) + 'px';
+        spot.style.width = (rect.width + padding * 2) + 'px';
+        spot.style.height = (rect.height + padding * 2) + 'px';
+        spot.style.transform = 'none';
+        spot.classList.add('show');
+
+        // ─── Позиция тултипа ───
+        // Сбрасываем transform, чтобы измерить актуальные размеры
+        tooltip.style.transform = 'none';
+        const tooltipRect = tooltip.getBoundingClientRect();
+        const tw = tooltipRect.width;
+        const th = tooltipRect.height;
+        const margin = 22;
+
+        let left, top;
+        let arrowSide = null;
+
+        switch (step.position) {
+            case 'top':
+                left = rect.left + rect.width / 2 - tw / 2;
+                top = rect.top - th - margin;
+                if (top < 12) {
+                    top = rect.bottom + margin;
+                    arrowSide = 'up';
+                } else {
+                    arrowSide = 'down';
+                }
+                break;
+
+            case 'bottom':
+                left = rect.left + rect.width / 2 - tw / 2;
+                top = rect.bottom + margin;
+                if (top + th > window.innerHeight - 12) {
+                    top = rect.top - th - margin;
+                    arrowSide = 'down';
+                } else {
+                    arrowSide = 'up';
+                }
+                break;
+
+            case 'bottom-left':
+                left = rect.left - 8;
+                top = rect.bottom + margin;
+                if (top + th > window.innerHeight - 12) {
+                    top = rect.top - th - margin;
+                    arrowSide = 'down';
+                } else {
+                    arrowSide = 'up';
+                }
+                break;
+
+            case 'left':
+                left = rect.left - tw - margin;
+                top = rect.top + rect.height / 2 - th / 2;
+                if (left < 12) {
+                    left = rect.right + margin;
+                    arrowSide = 'left';
+                } else {
+                    arrowSide = 'right';
+                }
+                break;
+
+            case 'right':
+                left = rect.right + margin;
+                top = rect.top + rect.height / 2 - th / 2;
+                if (left + tw > window.innerWidth - 12) {
+                    left = rect.left - tw - margin;
+                    arrowSide = 'right';
+                } else {
+                    arrowSide = 'left';
+                }
+                break;
+
+            default:
+                left = rect.left + rect.width / 2 - tw / 2;
+                top = rect.bottom + margin;
+                arrowSide = 'up';
+        }
+
+        // Удержание в пределах экрана
+        left = Math.max(12, Math.min(left, window.innerWidth - tw - 12));
+        top = Math.max(12, Math.min(top, window.innerHeight - th - 12));
+
+        tooltip.style.left = left + 'px';
+        tooltip.style.top = top + 'px';
+        tooltip.style.maxWidth = '340px';
+
+        // ─── Стрелка ───
+        if (arrowSide) {
+            const arrowSize = 16;
+            let arrowLeft = rect.left + rect.width / 2 - arrowSize / 2;
+            // Не выходим за пределы тултипа
+            arrowLeft = Math.max(left + 20, Math.min(arrowLeft, left + tw - arrowSize - 20));
+
+            if (arrowSide === 'down') {
+                // Тултип сверху, стрелка внизу тултипа, указывает вниз
+                arrow.style.left = arrowLeft + 'px';
+                arrow.style.top = (top + th - 9) + 'px';
+                arrow.classList.add('arrow-down');
+                arrow.classList.add('show');
+            } else if (arrowSide === 'up') {
+                // Тултип снизу, стрелка вверху тултипа, указывает вверх
+                arrow.style.left = arrowLeft + 'px';
+                arrow.style.top = (top - 8) + 'px';
+                arrow.classList.add('arrow-up');
+                arrow.classList.add('show');
+            } else if (arrowSide === 'left') {
+                // Стрелка слева тултипа — указывает влево
+                arrow.style.left = (left - 8) + 'px';
+                arrow.style.top = (top + th / 2 - arrowSize / 2) + 'px';
+                arrow.classList.add('arrow-down');
+                arrow.classList.add('show');
+            } else if (arrowSide === 'right') {
+                // Стрелка справа тултипа — указывает вправо
+                arrow.style.left = (left + tw - 8) + 'px';
+                arrow.style.top = (top + th / 2 - arrowSize / 2) + 'px';
+                arrow.classList.add('arrow-up');
+                arrow.classList.add('show');
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  РЕНДЕР ШАГА
+    // ═══════════════════════════════════════════════════════════
+    function renderStep(index) {
+        if (!Tour.active) return;
+
+        const step = Tour.steps[index];
+        if (!step) { endTour(); return; }
+
+        Tour.currentStep = index;
+
+        // Action
+        handleStepAction(step.action);
+
+        // Пауза, если меняли экран
+        const delay = ['try-open-chat', 'chat', 'chats', 'finish'].includes(step.action) ? 500 : 30;
+
+        if (Tour._stepTimer) clearTimeout(Tour._stepTimer);
+        Tour._stepTimer = setTimeout(() => {
+            if (!Tour.active) return;
+
+            const total = Tour.steps.length;
+            const dots = Tour.steps.map((_, i) => {
+                let cls = 'tour-progress-dot';
+                if (i < index) cls += ' done';
+                if (i === index) cls += ' active';
+                return `<div class="${cls}"></div>`;
+            }).join('');
+
+            Tour.tooltipEl.innerHTML = `
+                <div class="tour-step-counter">${index + 1} / ${total}</div>
+                <div class="tour-icon">${step.icon}</div>
+                <div class="tour-title">${step.title}</div>
+                <div class="tour-text">${step.text}</div>
+                <div class="tour-progress">${dots}</div>
+                <div class="tour-actions">
+                    ${index > 0 ? '<button class="tour-btn tour-btn-prev" id="tourPrevBtnV2">←</button>' : ''}
+                    <button class="tour-btn tour-btn-next" id="tourNextBtnV2">
+                        ${index === total - 1 ? '🎉 Завершить' : 'Далее →'}
+                    </button>
+                    <button class="tour-btn tour-btn-skip" id="tourSkipBtnV2">Пропустить</button>
+                </div>
+            `;
+            Tour.tooltipEl.classList.add('show');
+
+            // Обработчики
+            const nextBtn = Tour.tooltipEl.querySelector('#tourNextBtnV2');
+            const prevBtn = Tour.tooltipEl.querySelector('#tourPrevBtnV2');
+            const skipBtn = Tour.tooltipEl.querySelector('#tourSkipBtnV2');
+
+            if (nextBtn) nextBtn.onclick = (e) => { e.stopPropagation(); nextStep(); };
+            if (prevBtn) prevBtn.onclick = (e) => { e.stopPropagation(); prevStep(); };
+            if (skipBtn) skipBtn.onclick = (e) => { e.stopPropagation(); endTour(); };
+
+            // Позиционируем
+            positionForStep(step);
+
+            if (navigator.vibrate) navigator.vibrate(10);
+        }, delay);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ACTIONS
+    // ═══════════════════════════════════════════════════════════
+    function handleStepAction(action) {
+        if (!action) return;
+        try {
+            switch (action) {
+                case 'chats':
+                    if (state.currentScreen !== 'chats' && typeof backToChats === 'function') {
+                        backToChats();
+                    }
+                    break;
+
+                case 'try-open-chat':
+                    if (state.chats && state.chats.length > 0 && state.currentScreen !== 'chat') {
+                        const firstChat = state.chats[0];
+                        const password = state.savedPasswords[firstChat.file];
+                        if (password && typeof enterChat === 'function') {
+                            enterChat(firstChat.file, firstChat.name || firstChat.file, password)
+                                .catch(e => console.warn('Tour: не удалось открыть чат:', e));
+                        }
+                    }
+                    break;
+            }
+        } catch (e) {
+            console.warn('Tour action error:', e);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  НАВИГАЦИЯ
+    // ═══════════════════════════════════════════════════════════
+    function nextStep() {
+        if (Tour.currentStep >= Tour.steps.length - 1) { endTour(); return; }
+        renderStep(Tour.currentStep + 1);
+    }
+
+    function prevStep() {
+        if (Tour.currentStep <= 0) return;
+        renderStep(Tour.currentStep - 1);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СТАРТ
+    // ═══════════════════════════════════════════════════════════
+    function startTour() {
+        // Если уже активен — перезапускаем чисто
+        if (Tour.active) {
+            endTour();
+            setTimeout(() => startTour(), 100);
+            return;
+        }
+
+        console.log('🎓 [Tour v2] Запуск');
+
+        injectStyles();
+        ensureElements();
+
+        // Собираем шаги (убираем опциональные без target)
+        const allSteps = buildSteps();
+        Tour.steps = allSteps.filter(step => {
+            if (!step.optional) return true;
+            if (!step.target) return true;
+            return !!document.querySelector(step.target);
+        });
+
+        Tour.active = true;
+        Tour.currentStep = 0;
+
+        document.body.style.overflow = 'hidden';
+
+        renderStep(0);
+
+        // Ресайз
+        Tour._resizeHandler = () => {
+            if (!Tour.active) return;
+            const step = Tour.steps[Tour.currentStep];
+            if (step && step.target) {
+                const target = document.querySelector(step.target);
+                if (target) applyPosition(step, target);
+            }
+        };
+        window.addEventListener('resize', Tour._resizeHandler);
+        window.addEventListener('scroll', Tour._resizeHandler, { passive: true, capture: true });
+
+        // Escape / стрелки
+        Tour._keyHandler = (e) => {
+            if (!Tour.active) return;
+            if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); endTour(); }
+            else if (e.key === 'ArrowRight') { e.preventDefault(); nextStep(); }
+            else if (e.key === 'ArrowLeft') { e.preventDefault(); prevStep(); }
+        };
+        document.addEventListener('keydown', Tour._keyHandler, true);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  КОНЕЦ — ПОЛНАЯ ОЧИСТКА
+    // ═══════════════════════════════════════════════════════════
+    function endTour() {
+        if (!Tour.active) return;
+        console.log('🎓 [Tour v2] Завершение');
+
+        Tour.active = false;
+
+        if (Tour._stepTimer) {
+            clearTimeout(Tour._stepTimer);
+            Tour._stepTimer = null;
+        }
+
+        // Скрываем и УДАЛЯЕМ все элементы
+        [Tour.spotlightEl, Tour.tooltipEl, Tour.arrowEl, Tour.pulseEl].forEach(el => {
+            if (el && el.parentNode) {
+                el.classList.remove('show');
+                el.style.display = 'none';
+                el.remove();   // ← главное: полностью убираем из DOM
+            }
+        });
+        Tour.spotlightEl = null;
+        Tour.tooltipEl = null;
+        Tour.arrowEl = null;
+        Tour.pulseEl = null;
+
+        // На всякий случай — удаляем всё с нужными ID (если что-то осталось)
+        ['tourSpotlightV2', 'tourTooltipV2', 'tourArrowV2', 'tourPulseV2',
+         'tourOverlay', 'tourTooltip', 'tourArrow', 'tourPulse',
+         'tourDarkness', 'tourHighlight'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.remove();
+        });
+
+        document.body.style.overflow = '';
+
+        if (Tour._resizeHandler) {
+            window.removeEventListener('resize', Tour._resizeHandler);
+            window.removeEventListener('scroll', Tour._resizeHandler, true);
+            Tour._resizeHandler = null;
+        }
+        if (Tour._keyHandler) {
+            document.removeEventListener('keydown', Tour._keyHandler, true);
+            Tour._keyHandler = null;
+        }
+
+        try {
+            if (typeof showToast === 'function') showToast('🎉 Тур завершён!', 2000);
+            if (typeof soundManager !== 'undefined') soundManager.play('notification');
+        } catch (e) {}
+
+        try { localStorage.setItem('smschat_tour_completed', '1'); } catch (e) {}
+
+        // Финальный санитайзер — через 500мс убираем случайные остатки
+        setTimeout(() => {
+            ['tourSpotlightV2', 'tourTooltipV2', 'tourArrowV2', 'tourPulseV2',
+             'tourOverlay', 'tourTooltip', 'tourArrow', 'tourPulse'].forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.remove();
+            });
+            document.body.style.overflow = '';
+        }, 500);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУНКТ В МЕНЮ "⋯"
+    // ═══════════════════════════════════════════════════════════
+    function addTourMenuItem() {
+        const menu = document.getElementById('chatsActionsMenu');
+        if (!menu) return;
+        if (menu.querySelector('[data-action="tour"]')) return;
+
+        const cacheItem = menu.querySelector('[data-action="clear-cache"]');
+        if (!cacheItem) return;
+
+        const divider = cacheItem.previousElementSibling;
+        if (!divider || !divider.classList.contains('ucm-divider')) return;
+
+        const tourItem = document.createElement('div');
+        tourItem.className = 'ucm-item';
+        tourItem.dataset.action = 'tour';
+        tourItem.innerHTML = `
+            <span class="ucm-icon">🎓</span>
+            <span class="ucm-label">Знакомство с программой</span>
+        `;
+
+        divider.parentNode.insertBefore(tourItem, divider);
+
+        const newDivider = document.createElement('div');
+        newDivider.className = 'ucm-divider';
+        divider.parentNode.insertBefore(newDivider, cacheItem);
+
+        // Обработчик — снимаем старый (если был) и вешаем чистый
+        tourItem.onclick = (e) => {
+            e.stopPropagation();
+            const menuEl = document.getElementById('chatsActionsMenu');
+            if (menuEl) menuEl.classList.remove('show');
+
+            // Запускаем только если тур не активен
+            if (!Tour.active) {
+                setTimeout(() => startTour(), 250);
+            }
+        };
+
+        console.log('🎓 [Tour v2] Пункт меню добавлен');
+    }
+
+    const menuObserver = new MutationObserver(() => {
+        if (document.getElementById('chatsActionsMenu')) {
+            addTourMenuItem();
+        }
+    });
+    menuObserver.observe(document.body, { childList: true, subtree: true });
+
+    setTimeout(addTourMenuItem, 2000);
+
+    document.addEventListener('click', (e) => {
+        if (e.target.closest('#chatsActionsBtn')) {
+            setTimeout(addTourMenuItem, 100);
+        }
+    }, true);
+
+    // ═══════════════════════════════════════════════════════════
+    //  API
+    // ═══════════════════════════════════════════════════════════
+    window.OnboardingTour = {
+        start: startTour,
+        stop: endTour,
+        next: nextStep,
+        prev: prevStep,
+        isActive: () => Tour.active,
+        currentStep: () => Tour.currentStep,
+        totalSteps: () => Tour.steps.length,
+        reset: () => {
+            localStorage.removeItem('smschat_tour_completed');
+            console.log('🎓 [Tour v2] Флаг сброшен');
+        },
+    };
+
+    console.log('🎓 [Tour v2] Интерактивный тур (фикс затемнения) установлен');
+})();
+</script>
 </body>
 </html>
