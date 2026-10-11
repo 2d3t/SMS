@@ -10884,8 +10884,55 @@ async function doShareToChat(targetFile, targetPassword, blob, fileName, mime, m
             fileContent.messages = fileContent.messages.slice(-CONFIG.maxMessages);
         }
 
-        const saved = await saveFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path, fileContent, sha);
-        await updateMeta(targetFile, messageId, fileContent.messages.length);
+        const saved = await saveFile(
+    state.token, CONFIG.repoOwner, CONFIG.repoName, path,
+    async ({ attempt }) => {
+        if (attempt === 0) {
+            return { content: fileContent, sha: sha };
+        }
+
+        console.log(`💾 [409-retry] Перечитываем файл (попытка ${attempt + 1})...`);
+
+        const freshResult = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
+        if (!freshResult || !freshResult.exists) {
+            throw new Error('Чат исчез между попытками');
+        }
+
+        const freshContent = freshResult.content;
+        if (freshContent.v !== CRYPTO.VERSION) {
+            throw new Error('Формат изменился');
+        }
+
+        // Проверяем дубликат
+        const alreadySaved = (freshContent.messages || []).some(
+            m => String(m.id) === String(messageId)
+        );
+        if (alreadySaved) {
+            console.log(`💾 [409-retry] Наше сообщение ${messageId} уже в файле`);
+            return { content: freshContent, sha: freshResult.sha };
+        }
+
+        // Применяем наше сообщение
+        const freshMessages = freshContent.messages || [];
+        freshMessages.push(encMsg);
+
+        if (freshMessages.length > CONFIG.maxMessages) {
+            freshContent.messages = freshMessages.slice(-CONFIG.maxMessages);
+        } else {
+            freshContent.messages = freshMessages;
+        }
+
+        return { content: freshContent, sha: freshResult.sha };
+    },
+    sha,
+    {
+        message: `📤 Пересылка`,
+        maxRetries: 6,
+        baseDelay: 1500,
+        maxDelay: 12000,
+    }
+);
+await updateMeta(targetFile, messageId, fileContent.messages.length);
         state._metaEtagsByFile[targetFile] = null;
 
         // ═══ 7. Локальное обновление ═══
@@ -17850,8 +17897,62 @@ sendMessage = async function(text, imageBlob = null, audioData = null, fileAttac
             fileContent.messages = fileContent.messages.slice(-CONFIG.maxMessages);
         }
 
-        const saved = await saveFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path, fileContent, sha);
-        await updateMeta(state.chatFile, messageId, fileContent.messages.length);
+        const saved = await saveFile(
+    state.token, CONFIG.repoOwner, CONFIG.repoName, path,
+    // callback: при retry перечитываем файл и добавляем наше сообщение
+    async ({ attempt }) => {
+        if (attempt === 0) {
+            return { content: fileContent, sha: sha };
+        }
+
+        // ═══ RETRY: перечитываем свежий файл ═══
+        console.log(`💾 [409-retry] Перечитываем файл (попытка ${attempt + 1})...`);
+
+        const freshResult = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
+        if (!freshResult || !freshResult.exists) {
+            throw new Error('Чат исчез между попытками');
+        }
+
+        const freshContent = freshResult.content;
+        if (freshContent.v !== CRYPTO.VERSION) {
+            throw new Error('Формат изменился');
+        }
+
+        if (freshContent.salt !== state.salt) {
+            state.salt = freshContent.salt;
+            CRYPTO._key = await deriveKey(state.chatPassword, state.salt);
+        }
+
+        // ═══ Проверяем: не отправили ли мы уже это сообщение? ═══
+        const alreadySaved = (freshContent.messages || []).some(
+            m => String(m.id) === String(messageId)
+        );
+        if (alreadySaved) {
+            console.log(`💾 [409-retry] Наше сообщение ${messageId} уже в файле`);
+            return { content: freshContent, sha: freshResult.sha };
+        }
+
+        // ═══ Применяем наше сообщение к свежему содержимому ═══
+        const freshMessages = freshContent.messages || [];
+        freshMessages.push(encMsg);
+
+        if (freshMessages.length > CONFIG.maxMessages) {
+            freshContent.messages = freshMessages.slice(-CONFIG.maxMessages);
+        } else {
+            freshContent.messages = freshMessages;
+        }
+
+        return { content: freshContent, sha: freshResult.sha };
+    },
+    sha,
+    {
+        message: `💬 ${state.username}: видео`,
+        maxRetries: 6,
+        baseDelay: 1500,
+        maxDelay: 12000,
+    }
+);
+await updateMeta(state.chatFile, messageId, fileContent.messages.length);
 
         state._lastMetaVersion = messageId;
         state._metaEtag = null;
@@ -39684,601 +39785,6 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
     throw lastError || new Error('Не удалось сохранить файл');
 }
 
-</script>
-<script>
-// ═══════════════════════════════════════════════════════════════
-//  🩹 ФИКС v3: АНТИ-ДУБЛИКАТ ДЛЯ МЕДИА (аудио/видео/файлы)
-//  ─────────────────────────────────────────────────────────────
-//  Проблема: при одновременной отправке медиа с двух устройств
-//  вложение грузится 5-10 сек, потом saveFile → 409 → retry.
-//  Гонка приводит к дубликатам.
-//
-//  Решение (по аналогии с текстом):
-//   1. messageId генерируется В САМОМ НАЧАЛЕ _origSendMessage
-//      (до загрузки вложений).
-//   2. Он передаётся в saveFile как opts.messageId.
-//   3. saveFile при 409 перечитывает файл и проверяет —
-//      нет ли уже нашего messageId. Если есть — выходим с успехом.
-//   4. Для батчей фото (handleMultipleImageUpload) — то же самое,
-//      но проверяем весь набор batchId.
-// ═══════════════════════════════════════════════════════════════
-
-(function installMediaAntiDuplicateV3() {
-    'use strict';
-
-    console.log('🩹 [MediaAntiDup v3] Установка…');
-
-    // ═══════════════════════════════════════════════════════════
-    //  ПАТЧ 1: _origSendMessage — фиксируем messageId в самом начале
-    //  и передаём его в saveFile через opts.messageId
-    // ═══════════════════════════════════════════════════════════
-
-    if (typeof _origSendMessage !== 'function') {
-        console.warn('🩹 [MediaAntiDup v3] _origSendMessage не найдена — патч не установлен');
-        return;
-    }
-
-    const _origSendMessageV3 = _origSendMessage;
-
-    _origSendMessage = async function(text, imageBlob = null, audioData = null, fileAttachment = null, audioFile = null, replyContext = null) {
-        // Базовая проверка (как в оригинале)
-        if (!state.isAuthorized || !state.chatFile) { showToast('❌ Нет доступа', 2000); soundManager.play('error'); return; }
-        if (!navigator.onLine || !networkState.isOnline) { showToast('📵 Нет подключения', 2500); soundManager.play('error'); return; }
-
-        const hasText = text && text.trim();
-        const hasImage = imageBlob instanceof Blob;
-        const hasAudio = audioData !== null;
-        const hasFile = fileAttachment && fileAttachment.blob instanceof Blob;
-        const hasAudioFile = audioFile && audioFile.blob instanceof Blob;
-
-        if ((!hasText && !hasImage && !hasAudio && !hasFile && !hasAudioFile) || state.isSending) return;
-
-        // 🆕 ГЛАВНОЕ: генерируем messageId СЕЙЧАС, до загрузки вложений.
-        // Это "резервирование" — даже если upload займёт 30 секунд,
-        // наш messageId уже уникален и известен.
-        const messageId = Date.now();
-
-        // Сохраняем в state для поллинга
-        state._lastSentMessageId = messageId;
-
-        // Перехватываем saveFile — подменим opts, чтобы добавить messageId
-        const _origSaveFileInScope = window.saveFile;
-        let _saveFileIntercepted = false;
-
-        window.saveFile = function(token, owner, repo, path, content, sha, opts = {}) {
-            // Передаём наш messageId в первый вызов
-            if (!_saveFileIntercepted) {
-                _saveFileIntercepted = true;
-                opts = { ...opts, messageId };
-                console.log(`🩹 [MediaAntiDup v3] saveFile перехвачен, messageId=${messageId}`);
-            }
-            return _origSaveFileInScope.call(this, token, owner, repo, path, content, sha, opts);
-        };
-
-        try {
-            // Вызываем оригинал — он будет использовать наш window.saveFile
-            // (который мы только что подменили)
-            return await _origSendMessageV3.call(
-                this, text, imageBlob, audioData, fileAttachment, audioFile, replyContext
-            );
-        } finally {
-            // Восстанавливаем saveFile
-            window.saveFile = _origSaveFileInScope;
-        }
-    };
-
-    console.log('🩹 [MediaAntiDup v3] patched: _origSendMessage (messageId до upload)');
-
-    // ═══════════════════════════════════════════════════════════
-    //  ПАТЧ 2: handleMultipleImageUpload — то же для батчей
-    //  Здесь нельзя использовать один messageId — их несколько.
-    //  Используем составной идентификатор: batchId + первый index.
-    // ═══════════════════════════════════════════════════════════
-
-    if (typeof handleMultipleImageUpload === 'function') {
-        const _origBatchUpload = handleMultipleImageUpload;
-
-        handleMultipleImageUpload = async function(files) {
-            // Предварительные проверки
-            if (!state.isAuthorized || !state.chatFile) { showToast('❌ Нет доступа', 2000); return; }
-            if (!navigator.onLine || !networkState.isOnline) { showToast('📵 Нет подключения', 2500); return; }
-            if (files.length > CONFIG.maxBatchImages) {
-                showToast(`❌ Максимум ${CONFIG.maxBatchImages} фото за раз`, 3000);
-                return;
-            }
-
-            // 🆕 Генерируем batchId СЕЙЧАС — до загрузки
-            const batchId = 'batch_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
-
-            // 🆕 Первый messageId батча — по нему будем проверять дубликат
-            const firstMessageId = Date.now();
-
-            // Подменяем saveFile на время работы
-            const _origSaveFileInScope = window.saveFile;
-            let _saveFileIntercepted = false;
-
-            window.saveFile = function(token, owner, repo, path, content, sha, opts = {}) {
-                if (!_saveFileIntercepted) {
-                    _saveFileIntercepted = true;
-                    // Передаём firstMessageId — saveFile проверит,
-                    // есть ли уже такое сообщение в файле
-                    opts = { ...opts, messageId: firstMessageId };
-                    console.log(`🩹 [MediaAntiDup v3] Batch saveFile перехвачен, firstMsgId=${firstMessageId}, batchId=${batchId}`);
-                }
-                return _origSaveFileInScope.call(this, token, owner, repo, path, content, sha, opts);
-            };
-
-            // Хак: подменяем Math.random так, чтобы batchId внутри
-            // оригинала совпал с нашим. Но это рискованно —
-            // вместо этого сохраним наш batchId в state и в
-            // оригинале проверим через another hack.
-
-            // Проще: сохраняем наш batchId в глобальную переменную,
-            // которую оригинал прочитает
-            window._forceBatchId = batchId;
-            window._forceFirstMsgId = firstMessageId;
-
-            try {
-                return await _origBatchUpload.call(this, files);
-            } finally {
-                window.saveFile = _origSaveFileInScope;
-                delete window._forceBatchId;
-                delete window._forceFirstMsgId;
-            }
-        };
-
-        console.log('🩹 [MediaAntiDup v3] patched: handleMultipleImageUpload');
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ПАТЧ 3: Сам процесс sendMessage для медиа (внутри
-    //  _origSendMessage и handleMultipleImageUpload) уже вызывает
-    //  saveFile с opts.messageId — но там передаётся объект,
-    //  а не callback. Наш saveFile v2 умеет с этим работать:
-    //  при 409 он перечитает файл и проверит messageId.
-    //
-    //  Дополнительно: ensure передача messageId в контексте
-    //  sendMessage. В существующем коде sendMessage вызывает
-    //  _origSendMessage, а тот уже делает saveFile через callback.
-    // ═══════════════════════════════════════════════════════════
-
-    // ═══════════════════════════════════════════════════════════
-    //  ПАТЧ 4: doShareToChat — пересылка файлов в другой чат
-    //  Здесь тоже нужно передать messageId в saveFile.
-    // ═══════════════════════════════════════════════════════════
-
-    if (typeof doShareToChat === 'function') {
-        const _origDoShare = doShareToChat;
-
-        doShareToChat = async function(targetFile, targetPassword, blob, fileName, mime, meta = {}) {
-            // 🆕 Генерируем messageId заранее
-            const messageId = Date.now();
-            console.log(`🩹 [MediaAntiDup v3] doShareToChat: messageId=${messageId}`);
-
-            // Подмена saveFile на время работы
-            const _origSaveFileInScope = window.saveFile;
-            let _saveFileIntercepted = false;
-
-            window.saveFile = function(token, owner, repo, path, content, sha, opts = {}) {
-                if (!_saveFileIntercepted) {
-                    _saveFileIntercepted = true;
-                    opts = { ...opts, messageId };
-                    console.log(`🩹 [MediaAntiDup v3] doShareToChat saveFile: messageId=${messageId}`);
-                }
-                return _origSaveFileInScope.call(this, token, owner, repo, path, content, sha, opts);
-            };
-
-            try {
-                return await _origDoShare.call(this, targetFile, targetPassword, blob, fileName, mime, meta);
-            } finally {
-                window.saveFile = _origSaveFileInScope;
-            }
-        };
-
-        console.log('🩹 [MediaAntiDup v3] patched: doShareToChat');
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ПАТЧ 5: sendVideoNote — отправка кружочков
-    // ═══════════════════════════════════════════════════════════
-
-    if (typeof sendVideoNote === 'function') {
-        const _origSendVN = sendVideoNote;
-
-        sendVideoNote = async function(blob, mime, ext, duration) {
-            // Генерируем messageId заранее
-            const messageId = Date.now();
-
-            const _origSaveFileInScope = window.saveFile;
-            let _saveFileIntercepted = false;
-
-            window.saveFile = function(token, owner, repo, path, content, sha, opts = {}) {
-                if (!_saveFileIntercepted) {
-                    _saveFileIntercepted = true;
-                    opts = { ...opts, messageId };
-                }
-                return _origSaveFileInScope.call(this, token, owner, repo, path, content, sha, opts);
-            };
-
-            try {
-                return await _origSendVN.call(this, blob, mime, ext, duration);
-            } finally {
-                window.saveFile = _origSaveFileInScope;
-            }
-        };
-
-        console.log('🩹 [MediaAntiDup v3] patched: sendVideoNote');
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ПАТЧ 6: saveFile внутри callback тоже должен знать messageId
-    //  ─────────────────────────────────────────────────────────
-    //  Проблема: в основном коде _origSendMessage вызывает saveFile
-    //  с callback, который перечитывает файл и добавляет сообщение.
-    //  Но наш saveFile v2 при первой попытке НЕ проверяет messageId —
-    //  он проверяет только при 409. А при 409 он перечитывает файл
-    //  и ищет messageId в свежем содержимом.
-    //
-    //  Всё работает корректно, если messageId передан.
-    //  Мы его передаём через подмену window.saveFile.
-    //
-    //  Единственная проблема: если _origSendMessage вызывает
-    //  saveFile не через window.saveFile, а напрямую через функцию
-    //  saveFile (по имени). Т.к. saveFile объявлена как function
-    //  declaration, "по имени" резолвится в window.saveFile — наш
-    //  хак сработает.
-    // ═══════════════════════════════════════════════════════════
-
-    console.log('🩹 [MediaAntiDup v3] Все патчи установлены:');
-    console.log('   • _origSendMessage — messageId до upload');
-    console.log('   • handleMultipleImageUpload — batchId + firstMsgId');
-    console.log('   • doShareToChat — messageId для пересылки');
-    console.log('   • sendVideoNote — messageId для кружочков');
-})();
-</script>
-<script>
-// ═══════════════════════════════════════════════════════════════
-//  🩹 ФИКС v4: AutoOutbox — anti-409 с retry + проверкой messageId
-//  ─────────────────────────────────────────────────────────────
-//  Проблемы, которые решает:
-//   1. saveFileForTask падает на 409 без retry — задача уходит в error,
-//      а вложение остаётся сиротой на GitHub.
-//   2. Нет проверки: может, наше сообщение УЖЕ в файле (гонка).
-//   3. Нет экспоненциальной паузы — при 409 сразу ошибка.
-//   4. Не обновляется UI после успешной отправки из очереди.
-//   5. Не показываются правильные сообщения об ошибках.
-//
-//  Логика:
-//   • messageId генерируется в НАЧАЛЕ задачи (до upload вложений)
-//   • saveFileForTask делает до 6 попыток с экспоненциальной паузой
-//   • При каждой 409 — перечитывает файл и ищет наш messageId
-//   • Если нашёл — выходим с успехом (предыдущая попытка прошла)
-//   • Если нет — переприменяем наше сообщение к свежему контенту
-//   • При полном успехе — обновляем UI чата (если открыт)
-// ═══════════════════════════════════════════════════════════════
-
-(function fixAutoOutbox409() {
-    'use strict';
-
-    if (typeof AutoOutbox === 'undefined') {
-        console.warn('🩹 [AutoOutboxFix] AutoOutbox не найден');
-        return;
-    }
-
-    console.log('🩹 [AutoOutboxFix] Установка патча…');
-
-    // ═══════════════════════════════════════════════════════════
-    //  Заменяем saveFileForTask на версию с retry и проверкой messageId
-    //  ─────────────────────────────────────────────────────────
-    //  ⚠️ saveFileForTask — внутри IIFE AutoOutbox, снаружи недоступна.
-    //  Поэтому используем другой подход: подменяем window.fetch на время
-    //  работы processQueue, перехватываем PUT-запросы к chats/*.json
-    //  и добавляем retry + логику анти-дубликата прямо на уровне fetch.
-    // ═══════════════════════════════════════════════════════════
-
-    // ─── Утилита: получить messageId из тела PUT-запроса ───
-    async function extractMessageIdFromBody(bodyStr) {
-        try {
-            const body = JSON.parse(bodyStr);
-            if (!body || !body.content) return null;
-
-            // Декодируем base64 → JSON → messages
-            const binary = atob(body.content.replace(/\n/g, ''));
-            const bytes = new Uint8Array(binary.length);
-            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-            const decoded = new TextDecoder().decode(bytes);
-            const content = JSON.parse(decoded);
-
-            const msgs = content.messages || [];
-            if (msgs.length === 0) return null;
-
-            // Берём последний messageId
-            const last = msgs[msgs.length - 1];
-            return last.id;
-        } catch (e) {
-            return null;
-        }
-    }
-
-    // ─── Утилита: получить все messageIds из тела ───
-    async function extractAllMessageIdsFromBody(bodyStr) {
-        try {
-            const body = JSON.parse(bodyStr);
-            if (!body || !body.content) return [];
-
-            const binary = atob(body.content.replace(/\n/g, ''));
-            const bytes = new Uint8Array(binary.length);
-            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-            const decoded = new TextDecoder().decode(bytes);
-            const content = JSON.parse(decoded);
-
-            return (content.messages || []).map(m => m.id);
-        } catch (e) {
-            return [];
-        }
-    }
-
-    // ─── Патчим fetch — перехватываем PUT к чатам ───
-    const _origFetch = window.fetch.bind(window);
-
-    // Храним "наши" messageId, чтобы точно знать что мы отправили
-    const _ourMessageIds = new Map();  // path → Set(messageId)
-
-    window.fetch = async function(url, opts = {}) {
-        const urlStr = typeof url === 'string' ? url : (url && url.url) || '';
-
-        // Интересуют только PUT-запросы к файлам чатов
-        const isChatPut = opts.method === 'PUT'
-            && urlStr.includes('/contents/chats/')
-            && urlStr.endsWith('.json')
-            && !urlStr.endsWith('.meta.json');
-
-        if (!isChatPut || !opts.body) {
-            return _origFetch(url, opts);
-        }
-
-        // Парсим messageId'ы из тела
-        const ourIds = await extractAllMessageIdsFromBody(opts.body);
-
-        // ─── Retry-логика ───
-        const MAX_RETRIES = 6;
-        const BASE_DELAY = 1500;
-        const MAX_DELAY = 12000;
-
-        let lastError = null;
-
-        for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-            let response;
-            try {
-                // Отправляем запрос (используем _origFetch напрямую)
-                response = await _origFetch(url, opts);
-            } catch (netErr) {
-                lastError = netErr;
-                console.warn(`🩹 [AutoOutboxFix] Сетевая ошибка (попытка ${attempt + 1}):`, netErr.message);
-                if (attempt < MAX_RETRIES) {
-                    const delay = Math.min(BASE_DELAY * Math.pow(1.7, attempt), MAX_DELAY);
-                    await new Promise(r => setTimeout(r, delay));
-                    continue;
-                }
-                throw netErr;
-            }
-
-            // Успех
-            if (response.ok) {
-                if (attempt > 0) {
-                    console.log(`🩹 [AutoOutboxFix] ✅ Успех с попытки ${attempt + 1}`);
-                }
-                return response;
-            }
-
-            // 409 CONFLICT — самое важное
-            if (response.status === 409) {
-                lastError = new Error('409 CONFLICT');
-
-                if (attempt >= MAX_RETRIES) {
-                    console.error(`🩹 [AutoOutboxFix] ❌ Исчерпаны попытки (409)`);
-                    throw lastError;
-                }
-
-                const jitter = Math.random() * 800;
-                const delay = Math.min(BASE_DELAY * Math.pow(1.7, attempt), MAX_DELAY) + jitter;
-                console.warn(`🩹 [AutoOutboxFix] ⚠️ 409 (попытка ${attempt + 1}/${MAX_RETRIES + 1}). Ждём ${Math.round(delay / 1000)} сек...`);
-
-                // Показываем пользователю мягкое уведомление
-                if (attempt === 0 && typeof showToast === 'function') {
-                    try { showToast('⏳ Кто-то ещё пишет — пробуем снова...', 2000); } catch (e) {}
-                }
-
-                await new Promise(r => setTimeout(r, delay));
-
-                // ─── Ключевое: перечитываем свежий файл ───
-                try {
-                    const freshRes = await _origFetch(url, {
-                        method: 'GET',
-                        headers: opts.headers,
-                        cache: 'no-store',
-                    });
-
-                    if (!freshRes.ok) {
-                        console.warn('🩹 [AutoOutboxFix] Не удалось перечитать файл');
-                        continue;
-                    }
-
-                    const freshData = await freshRes.json();
-                    const freshSha = freshData.sha;
-
-                    // Декодируем свежий контент
-                    const binary = atob((freshData.content || '').replace(/\n/g, ''));
-                    const bytes = new Uint8Array(binary.length);
-                    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-                    const decoded = new TextDecoder().decode(bytes);
-                    const freshContent = JSON.parse(decoded);
-
-                    const freshMessages = freshContent.messages || [];
-                    const freshIds = new Set(freshMessages.map(m => String(m.id)));
-
-                    // 🆕 Проверяем: есть ли УЖЕ наши сообщения в свежем файле?
-                    const alreadySaved = ourIds.filter(id => freshIds.has(String(id)));
-
-                    if (alreadySaved.length === ourIds.length && ourIds.length > 0) {
-                        // ВСЕ наши сообщения уже в файле — значит,
-                        // предыдущая попытка на самом деле прошла, а мы
-                        // получили 409 из-за гонки. Выходим с успехом.
-                        console.log(`🩹 [AutoOutboxFix] ✅ Все наши сообщения (${ourIds.length}) уже в файле — выходим`);
-
-                        // Возвращаем искусственный успешный ответ
-                        return new Response(JSON.stringify({
-                            content: { sha: freshSha },
-                            commit: { sha: freshSha },
-                        }), {
-                            status: 200,
-                            headers: { 'Content-Type': 'application/json' },
-                        });
-                    }
-
-                    // 🆕 Частично наши — переприменяем недостающие
-                    if (alreadySaved.length > 0 && alreadySaved.length < ourIds.length) {
-                        console.log(`🩹 [AutoOutboxFix] Частично наши (${alreadySaved.length}/${ourIds.length}) — переприменяем недостающие`);
-
-                        // Декодируем наше тело, чтобы взять недостающие сообщения
-                        const ourBody = JSON.parse(opts.body);
-                        const ourBinary = atob(ourBody.content.replace(/\n/g, ''));
-                        const ourBytes = new Uint8Array(ourBinary.length);
-                        for (let i = 0; i < ourBinary.length; i++) ourBytes[i] = ourBinary.charCodeAt(i);
-                        const ourContent = JSON.parse(new TextDecoder().decode(ourBytes));
-
-                        const missing = (ourContent.messages || []).filter(
-                            m => !alreadySaved.includes(m.id)
-                        );
-
-                        if (missing.length > 0) {
-                            // Добавляем недостающие в свежий контент
-                            const merged = [...freshMessages, ...missing];
-                            if (merged.length > CONFIG.maxMessages) {
-                                freshContent.messages = merged.slice(-CONFIG.maxMessages);
-                            } else {
-                                freshContent.messages = merged;
-                            }
-                        }
-
-                        // Обновляем opts.body с новым контентом
-                        const newEncoded = utf8ToBase64(JSON.stringify(freshContent));
-                        const newBody = JSON.parse(opts.body);
-                        newBody.content = newEncoded;
-                        newBody.sha = freshSha;
-                        opts = { ...opts, body: JSON.stringify(newBody) };
-
-                        continue;
-                    }
-
-                    // 🆕 Наших нет вообще — переприменяем ВСЁ к свежему контенту
-                    console.log(`🩹 [AutoOutboxFix] Наших нет в свежем файле — переприменяем полностью`);
-
-                    const ourBody = JSON.parse(opts.body);
-                    const ourBinary = atob(ourBody.content.replace(/\n/g, ''));
-                    const ourBytes = new Uint8Array(ourBinary.length);
-                    for (let i = 0; i < ourBinary.length; i++) ourBytes[i] = ourBinary.charCodeAt(i);
-                    const ourContent = JSON.parse(new TextDecoder().decode(ourBytes));
-
-                    // Берём из нашего контента ТОЛЬКО новые сообщения
-                    // (те, которых нет в свежем)
-                    const ourMessages = ourContent.messages || [];
-                    const missing = ourMessages.filter(m => !freshIds.has(String(m.id)));
-
-                    if (missing.length > 0) {
-                        const merged = [...freshMessages, ...missing];
-                        if (merged.length > CONFIG.maxMessages) {
-                            freshContent.messages = merged.slice(-CONFIG.maxMessages);
-                        } else {
-                            freshContent.messages = merged;
-                        }
-
-                        const newEncoded = utf8ToBase64(JSON.stringify(freshContent));
-                        const newBody = JSON.parse(opts.body);
-                        newBody.content = newEncoded;
-                        newBody.sha = freshSha;
-                        opts = { ...opts, body: JSON.stringify(newBody) };
-                    }
-
-                    continue;
-                } catch (e) {
-                    console.warn('🩹 [AutoOutboxFix] Ошибка переприменения:', e.message);
-                    continue;
-                }
-            }
-
-            // 401/403 — сразу пробрасываем
-            if (response.status === 401 || response.status === 403) {
-                return response;
-            }
-
-            // Другие ошибки — возвращаем как есть
-            return response;
-        }
-
-        throw lastError || new Error('Не удалось сохранить после всех попыток');
-    };
-
-    // ═══════════════════════════════════════════════════════════
-    //  Обновление UI: после успешной отправки из очереди
-    //  если мы в этом чате — подгружаем свежие сообщения
-    // ═══════════════════════════════════════════════════════════
-
-    // Слушаем события от AutoOutbox.process через периодический чек
-    let _lastQueueSize = -1;
-
-    setInterval(() => {
-        try {
-            if (typeof AutoOutbox === 'undefined' || !AutoOutbox.status) return;
-            const st = AutoOutbox.status();
-            const currentSize = st.queueSize;
-
-            // Очередь уменьшилась → что-то отправилось успешно
-            if (_lastQueueSize > 0 && currentSize < _lastQueueSize && state.chatFile) {
-                console.log('🩹 [AutoOutboxFix] Очередь уменьшилась — обновляем UI');
-
-                // Если мы в чате, куда отправили — подтянуть свежие сообщения
-                setTimeout(async () => {
-                    try {
-                        if (typeof pollUpdates === 'function') {
-                            await pollUpdates();
-                        }
-                    } catch (e) {
-                        console.warn('🩹 [AutoOutboxFix] pollUpdates failed:', e);
-                    }
-                }, 500);
-            }
-
-            _lastQueueSize = currentSize;
-        } catch (e) {}
-    }, 1500);
-
-    // ═══════════════════════════════════════════════════════════
-    //  Улучшенные сообщения об ошибках для AutoOutbox
-    // ═══════════════════════════════════════════════════════════
-
-    const _origShowToast = window.showToast;
-
-    window.showToast = function(text, duration) {
-        if (typeof text === 'string') {
-            // Понятные сообщения для типичных ошибок
-            if (text.includes('409 CONFLICT')) {
-                return _origShowToast.call(this, '⏳ Конфликт записи — сообщение будет доставлено повторно', 3000);
-            }
-            if (text.includes('NetworkError') || text.includes('Failed to fetch')) {
-                return _origShowToast.call(this, '📵 Нет связи — сообщение осталось в очереди', 3000);
-            }
-        }
-        return _origShowToast.call(this, text, duration);
-    };
-
-    console.log('🩹 [AutoOutboxFix] Патч установлен:');
-    console.log('   • saveFileForTask: 6 попыток с экспоненциальной паузой');
-    console.log('   • При 409 — перечитывает файл и ищет наши messageId');
-    console.log('   • Если нашли — успех (не дублируем)');
-    console.log('   • Если нет — переприменяет наши сообщения к свежему');
-    console.log('   • UI обновляется автоматически после отправки');
-})();
 </script>
 </body>
 </html>
