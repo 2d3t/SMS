@@ -39147,5 +39147,349 @@ try {
     console.log('   • Галерея умеет листать обложки аудио');
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🩹 АВТОДЕДУПЛИКАЦИЯ ПАРНЫХ СООБЩЕНИЙ
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: при одновременной отправке с двух устройств
+//  или при гонке при 409-retry — в чате появляются два
+//  визуально одинаковых сообщения подряд.
+//
+//  Решение:
+//   1. Дедупликация в historyState.allMessages (данные).
+//   2. Дедупликация в DOM (визуально).
+//   3. Работает и при appendMessages, и при renderHistory,
+//      и при поллинге.
+//   4. Запускается периодически как страховка.
+//
+//  Логика:
+//   • Два сообщения от одного автора
+//   • Идентичный текст (или оба без текста)
+//   • Идентичный набор вложений (image/audio/file/video/videoNote)
+//   • ID отличаются не сильно (< 10 сек разница) — временное окно
+//   • Идут подряд (между ними нет других сообщений от того же автора)
+//     — либо стоят с небольшим зазором
+// ═══════════════════════════════════════════════════════════════
+
+(function installMessageDeduplication() {
+    'use strict';
+
+    const CFG = {
+        // Временное окно, в пределах которого считаем сообщения дублями
+        TIME_WINDOW_MS: 15000,
+        // Логировать что удалили
+        LOG: true,
+        // Периодическая страховка — раз в 3 секунды
+        PERIODIC_MS: 3000,
+    };
+
+    const log = (...a) => CFG.LOG && console.log('🩹 [Dedup]', ...a);
+
+    // ═══════════════════════════════════════════════════════════
+    //  Сигнатура сообщения — по ней сравниваем
+    // ═══════════════════════════════════════════════════════════
+    function getMessageSignature(msg) {
+        if (!msg) return null;
+
+        // Собираем "ядро" сообщения без id/time
+        const parts = [
+            msg.username || '',
+            (msg.text || '').trim(),
+            msg.image ? 'IMG:' + msg.image : '',
+            msg.audio ? 'AUD:' + msg.audio : '',
+            msg.file ? 'FILE:' + (msg.fileName || msg.file) : '',
+            msg.video ? 'VID:' + msg.video : '',
+            msg.videoNote ? 'VN:' + msg.videoNote : '',
+        ];
+
+        // Добавляем batch-инфу, чтобы разные части одного batch не считались дублями
+        if (msg.batchId) {
+            parts.push(`B:${msg.batchId}:${msg.batchIndex ?? ''}`);
+        }
+
+        return parts.join('|');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Проверка: два сообщения — дубликаты?
+    // ═══════════════════════════════════════════════════════════
+    function areDuplicates(a, b) {
+        if (!a || !b) return false;
+        if (a === b) return false;
+
+        // Автор должен совпадать
+        if ((a.username || '') !== (b.username || '')) return false;
+
+        // Время — в пределах окна
+        const ta = new Date(a.time).getTime();
+        const tb = new Date(b.time).getTime();
+        if (isNaN(ta) || isNaN(tb)) return false;
+        if (Math.abs(ta - tb) > CFG.TIME_WINDOW_MS) return false;
+
+        // Сигнатуры совпадают
+        if (getMessageSignature(a) !== getMessageSignature(b)) return false;
+
+        // Оба должны иметь "контент" — не удаляем пустые системные
+        const hasContent = (a.text && a.text.trim())
+            || a.image || a.audio || a.file || a.video || a.videoNote;
+        if (!hasContent) return false;
+
+        return true;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Дедупликация массива сообщений (in-place)
+    //  Возвращает количество удалённых
+    // ═══════════════════════════════════════════════════════════
+    function dedupeMessagesArray(arr) {
+        if (!Array.isArray(arr) || arr.length < 2) return 0;
+
+        let removed = 0;
+        const seenKeys = new Set();
+        const result = [];
+
+        for (let i = 0; i < arr.length; i++) {
+            const msg = arr[i];
+            if (!msg) continue;
+
+            // Строим полную сигнатуру с временным бакетом
+            const sig = getMessageSignature(msg);
+            const ta = new Date(msg.time).getTime();
+            const bucket = Math.floor((isNaN(ta) ? 0 : ta) / CFG.TIME_WINDOW_MS);
+            const key = `${bucket}|${sig}`;
+
+            if (seenKeys.has(key)) {
+                removed++;
+                log(`Удалён дубликат: id=${msg.id}, от=${msg.username}, текст="${(msg.text||'').slice(0,30)}"`);
+                continue;
+            }
+
+            seenKeys.add(key);
+            result.push(msg);
+        }
+
+        if (removed > 0) {
+            // Очищаем и перезаполняем исходный массив
+            arr.length = 0;
+            for (const m of result) arr.push(m);
+        }
+
+        return removed;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Дедупликация DOM-узлов
+    // ═══════════════════════════════════════════════════════════
+    function dedupeDom() {
+        if (typeof messagesInner === 'undefined' || !messagesInner) return 0;
+
+        const wrappers = Array.from(
+            messagesInner.querySelectorAll('.message-wrapper[data-msg-id]')
+        );
+        if (wrappers.length < 2) return 0;
+
+        let removed = 0;
+        const seen = new Map();   // key → первый wrapper
+
+        for (const w of wrappers) {
+            const msgId = parseInt(w.dataset.msgId);
+            if (isNaN(msgId)) continue;
+
+            const msg = (typeof historyState !== 'undefined' && historyState.allMessages)
+                ? historyState.allMessages.find(m => String(m.id) === String(msgId))
+                : null;
+
+            // Если сообщение есть в истории — строим сигнатуру
+            let key;
+            if (msg) {
+                const sig = getMessageSignature(msg);
+                const ta = new Date(msg.time).getTime();
+                const bucket = Math.floor((isNaN(ta) ? 0 : ta) / CFG.TIME_WINDOW_MS);
+                key = `${bucket}|${sig}`;
+            } else {
+                // Fallback — по тексту из DOM
+                const text = (w.querySelector('.text')?.textContent || '').trim();
+                const sender = (w.querySelector('.sender')?.textContent || '').trim();
+                if (!text) continue;
+                key = `dom|${sender}|${text}`;
+            }
+
+            if (seen.has(key)) {
+                // Это дубликат — плавно убираем
+                const original = seen.get(key);
+
+                // Оставляем тот, у которого ID больше (он "свежее"),
+                // а старый убираем — либо наоборот. Возьмём: оставляем
+                // с БОЛЬШИМ id (последний по времени), удаляем старый.
+                const origId = parseInt(original.dataset.msgId);
+                const target = msgId > origId ? original : w;
+                const keep = msgId > origId ? w : original;
+
+                // Плавное удаление
+                target.style.transition = 'opacity 0.35s ease, transform 0.35s ease, max-height 0.35s ease';
+                target.style.opacity = '0';
+                target.style.transform = 'scale(0.9)';
+                setTimeout(() => {
+                    try { target.remove(); } catch (e) {}
+                }, 400);
+
+                seen.set(key, keep);
+                removed++;
+                log(`DOM: удалён дубликат msg-id=${target.dataset.msgId}`);
+            } else {
+                seen.set(key, w);
+            }
+        }
+
+        return removed;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Полная дедупликация (данные + DOM)
+    // ═══════════════════════════════════════════════════════════
+    function dedupeAll(reason = '') {
+        let dataRemoved = 0;
+        let domRemoved = 0;
+
+        // 1. Данные
+        try {
+            if (typeof historyState !== 'undefined' && historyState.allMessages) {
+                dataRemoved = dedupeMessagesArray(historyState.allMessages);
+            }
+            if (typeof state !== 'undefined' && state.messages) {
+                // Только переносим — данные в state.messages обычно те же объекты
+                dedupeMessagesArray(state.messages);
+            }
+        } catch (e) {
+            console.warn('🩹 [Dedup] data error:', e);
+        }
+
+        // 2. DOM
+        try {
+            domRemoved = dedupeDom();
+        } catch (e) {
+            console.warn('🩹 [Dedup] dom error:', e);
+        }
+
+        if (dataRemoved > 0 || domRemoved > 0) {
+            log(`Всего: data=${dataRemoved}, dom=${domRemoved} (${reason})`);
+        }
+
+        return dataRemoved + domRemoved;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХУК: appendMessages — дедуплицируем новые перед вставкой
+    // ═══════════════════════════════════════════════════════════
+    if (typeof appendMessages === 'function') {
+        const _origAppendMessages = appendMessages;
+
+        appendMessages = function(newMsgs) {
+            if (!newMsgs || newMsgs.length === 0) {
+                return _origAppendMessages.apply(this, arguments);
+            }
+
+            // Фильтруем новые: если уже есть такое же в истории — не добавляем
+            const filtered = [];
+            const existing = (typeof historyState !== 'undefined' && historyState.allMessages)
+                ? historyState.allMessages
+                : [];
+
+            for (const msg of newMsgs) {
+                const isDup = existing.some(e => areDuplicates(e, msg));
+                if (isDup) {
+                    log(`appendMessages: пропущен дубликат id=${msg.id}`);
+                    continue;
+                }
+                filtered.push(msg);
+            }
+
+            if (filtered.length === 0) return;
+
+            const result = _origAppendMessages.call(this, filtered);
+
+            // После вставки — контрольная проверка DOM
+            setTimeout(() => dedupeDom(), 50);
+
+            return result;
+        };
+
+        log('patched: appendMessages');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХУК: renderHistory — дедуплицируем перед рендером
+    // ═══════════════════════════════════════════════════════════
+    if (typeof renderHistory === 'function') {
+        const _origRenderHistory = renderHistory;
+
+        renderHistory = function() {
+            // Перед рендером — чистим данные
+            try {
+                if (typeof historyState !== 'undefined' && historyState.allMessages) {
+                    dedupeMessagesArray(historyState.allMessages);
+                }
+            } catch (e) {}
+
+            const result = _origRenderHistory.apply(this, arguments);
+
+            // После рендера — контрольная DOM-проверка
+            setTimeout(() => dedupeDom(), 100);
+
+            return result;
+        };
+
+        log('patched: renderHistory');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРИОДИЧЕСКАЯ СТРАХОВКА
+    // ═══════════════════════════════════════════════════════════
+    setInterval(() => {
+        if (document.hidden) return;
+        if (typeof state === 'undefined' || !state.chatFile) return;
+        if (typeof state.currentScreen === 'undefined' || state.currentScreen !== 'chat') return;
+        dedupeAll('periodic');
+    }, CFG.PERIODIC_MS);
+
+    // ═══════════════════════════════════════════════════════════
+    //  РУЧНОЙ ЗАПУСК + API
+    // ═══════════════════════════════════════════════════════════
+    window.MessageDedup = {
+        run: (reason) => dedupeAll(reason || 'manual'),
+        config: CFG,
+        // Проверить два сообщения на дубликат
+        check: (a, b) => areDuplicates(a, b),
+        // Найти все дубликаты в текущей истории
+        find: () => {
+            const all = (typeof historyState !== 'undefined' && historyState.allMessages)
+                ? historyState.allMessages
+                : [];
+            const dups = [];
+            const seen = new Map();
+            for (const m of all) {
+                const sig = getMessageSignature(m);
+                const ta = new Date(m.time).getTime();
+                const bucket = Math.floor((isNaN(ta) ? 0 : ta) / CFG.TIME_WINDOW_MS);
+                const key = `${bucket}|${sig}`;
+                if (seen.has(key)) {
+                    dups.push({ first: seen.get(key), second: m });
+                } else {
+                    seen.set(key, m);
+                }
+            }
+            return dups;
+        },
+    };
+
+    // Первый запуск после инициализации
+    setTimeout(() => dedupeAll('startup'), 3000);
+
+    console.log('🩹 [Dedup] Автодедупликация сообщений активна');
+    console.log(`   • Окно сравнения: ${CFG.TIME_WINDOW_MS / 1000} сек`);
+    console.log(`   • Периодическая проверка: раз в ${CFG.PERIODIC_MS / 1000} сек`);
+    console.log('   • API: MessageDedup.run() / .find() / .check(a, b)');
+})();
+</script>
 </body>
 </html>
