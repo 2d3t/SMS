@@ -10577,7 +10577,6 @@ if (!finalMime.includes('mp4') && finalBlob.size < 5 * 1024 * 1024) {
 
 
 
-
 function openShareToChatModal(blob, fileName, imageUrl, meta = {}) {
     if (!state.chats || state.chats.length === 0) {
         showToast('❌ Нет чатов для отправки', 2500);
@@ -10591,79 +10590,109 @@ function openShareToChatModal(blob, fileName, imageUrl, meta = {}) {
     _shareToChat.selectedFile = null;
     _shareToChat.meta = meta || {};
 
-    const thumb = $('shareToChatThumb');
-if (imageUrl) {
-    // Есть preview (фото) — показываем картинку
-    thumb.innerHTML = `<img src="${imageUrl}" style="width:100%;height:100%;object-fit:cover;">`;
-} else {
-    // 🆕 Определяем иконку по типу файла
-    const name = (_shareToChat.fileName || fileName || '').toLowerCase();
-    const mime = (_shareToChat.mime || blob.type || '').toLowerCase();
-    let icon = '📎';   // дефолт — файл
-
-
-    if (mime.startsWith('audio/') || /\.(mp3|ogg|wav|m4a|aac|flac|opus|webm)$/i.test(name)) {
-        icon = '🎵';   // аудио
-    } else if (mime.startsWith('video/') || /\.(mp4|mov|avi|mkv|webm|m4v|3gp)$/i.test(name)) {
-        icon = '🎬';   // видео
-    } else if (mime.startsWith('image/') || /\.(jpg|jpeg|png|gif|webp|bmp|avif)$/i.test(name)) {
-        icon = '🖼️';   // картинка без preview
-    } else if (/\.(zip|rar|7z|tar|gz)$/i.test(name)) {
-        icon = '🗜️';   // архив
-    } else if (/\.(pdf)$/i.test(name)) {
-        icon = '📕';   // pdf
-    } else if (/\.(doc|docx)$/i.test(name)) {
-        icon = '📘';   // word
-    } else if (/\.(xls|xlsx)$/i.test(name)) {
-        icon = '📊';   // excel
-    } else if (/\.smschat$/i.test(name)) {
-        icon = '💌';   // приглашение в чат
+    // 🆕 ЗАПОМИНАЕМ РЕЖИМ: 'invite' (временная ссылка) или 'file' (обычный share)
+    //    Если явно не передан — определяем по имени файла.
+    if (meta.mode === 'invite') {
+        _shareToChat.mode = 'invite';
+        _shareToChat.inviteChatFile = meta.chatFile || state.chatFile;
+    } else if (meta.mode === 'file') {
+        _shareToChat.mode = 'file';
+        _shareToChat.inviteChatFile = null;
+    } else {
+        // Автоопределение по расширению
+        const isInvite = /\.smschat$/i.test(fileName || '');
+        _shareToChat.mode = isInvite ? 'invite' : 'file';
+        _shareToChat.inviteChatFile = isInvite ? (state.chatFile || null) : null;
     }
 
+    // 🆕 Обновляем подпись на кнопке «Другие приложения…»
+    //    чтобы пользователь понимал, что произойдёт
+    const externalBtn = document.getElementById('shareToExternalBtn');
+    if (externalBtn) {
+        const titleEl = externalBtn.querySelector('div[style*="font-size:14px"]');
+        const subEl = externalBtn.querySelector('div[style*="font-size:11px"]');
+        if (titleEl && subEl) {
+            if (_shareToChat.mode === 'invite') {
+                titleEl.textContent = 'Создать ссылку-приглашение';
+                subEl.textContent = 'Действует 2 минуты';
+            } else {
+                titleEl.textContent = 'Другие приложения…';
+                subEl.textContent = 'Telegram, WhatsApp, почта и др.';
+            }
+        }
+    }
 
-    thumb.innerHTML = icon;
-}
+    const thumb = $('shareToChatThumb');
+    if (imageUrl) {
+        // Есть preview (фото) — показываем картинку
+        thumb.innerHTML = `<img src="${imageUrl}" style="width:100%;height:100%;object-fit:cover;">`;
+    } else {
+        // 🆕 Определяем иконку по типу файла
+        const name = (_shareToChat.fileName || fileName || '').toLowerCase();
+        const mime = (_shareToChat.mime || blob.type || '').toLowerCase();
+        let icon = '📎';   // дефолт — файл
+
+        if (mime.startsWith('audio/') || /\.(mp3|ogg|wav|m4a|aac|flac|opus|webm)$/i.test(name)) {
+            icon = '🎵';   // аудио
+        } else if (mime.startsWith('video/') || /\.(mp4|mov|avi|mkv|webm|m4v|3gp)$/i.test(name)) {
+            icon = '🎬';   // видео
+        } else if (mime.startsWith('image/') || /\.(jpg|jpeg|png|gif|webp|bmp|avif)$/i.test(name)) {
+            icon = '🖼️';   // картинка без preview
+        } else if (/\.(zip|rar|7z|tar|gz)$/i.test(name)) {
+            icon = '🗜️';   // архив
+        } else if (/\.(pdf)$/i.test(name)) {
+            icon = '📕';   // pdf
+        } else if (/\.(doc|docx)$/i.test(name)) {
+            icon = '📘';   // word
+        } else if (/\.(xls|xlsx)$/i.test(name)) {
+            icon = '📊';   // excel
+        } else if (/\.smschat$/i.test(name)) {
+            icon = '💌';   // приглашение в чат
+        }
+
+        thumb.innerHTML = icon;
+    }
     $('shareToChatFileName').textContent = _shareToChat.fileName;
     $('shareToChatFileSize').textContent = formatFileSize(blob.size);
 
     const list = $('shareToChatList');
-list.innerHTML = state.chats.map(c => {
-    const isCurrent = c.file === state.chatFile;
-    const avatarData = getChatAvatar(c.file);
-    const letter = (c.name || c.file).charAt(0).toUpperCase();
-    const avatarHtml = avatarData
-        ? `<img src="${avatarData}" alt="" style="width:100%;height:100%;object-fit:cover;pointer-events:none;">`
-        : letter;
-    return `
-        <div class="share-to-chat-item" data-file="${c.file}" style="
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            padding: 10px 12px;
-            background: rgba(255,255,255,0.05);
-            border: 1px solid rgba(255,255,255,0.08);
-            border-radius: 12px;
-            cursor: pointer;
-            transition: all 0.15s;
-        ">
-            <div style="
-                width: 36px;height:36px;border-radius:50%;
-                background: linear-gradient(135deg, #6c5ce7, #00b894);
-                display:flex;align-items:center;justify-content:center;
-                font-weight:700;color:#fff;flex-shrink:0;font-size:14px;
-                overflow:hidden;position:relative;
-            ">${avatarHtml}</div>
-            <div style="flex:1;min-width:0;">
-                <div style="font-size:14px;font-weight:600;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
-                    ${escapeHtml(c.name || c.file)}
-                </div>
-                <div style="font-size:11px;color:#666;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
-                    ${escapeHtml(c.file)}${isCurrent ? ' · текущий' : ''}
+    list.innerHTML = state.chats.map(c => {
+        const isCurrent = c.file === state.chatFile;
+        const avatarData = getChatAvatar(c.file);
+        const letter = (c.name || c.file).charAt(0).toUpperCase();
+        const avatarHtml = avatarData
+            ? `<img src="${avatarData}" alt="" style="width:100%;height:100%;object-fit:cover;pointer-events:none;">`
+            : letter;
+        return `
+            <div class="share-to-chat-item" data-file="${c.file}" style="
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                padding: 10px 12px;
+                background: rgba(255,255,255,0.05);
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 12px;
+                cursor: pointer;
+                transition: all 0.15s;
+            ">
+                <div style="
+                    width: 36px;height:36px;border-radius:50%;
+                    background: linear-gradient(135deg, #6c5ce7, #00b894);
+                    display:flex;align-items:center;justify-content:center;
+                    font-weight:700;color:#fff;flex-shrink:0;font-size:14px;
+                    overflow:hidden;position:relative;
+                ">${avatarHtml}</div>
+                <div style="flex:1;min-width:0;">
+                    <div style="font-size:14px;font-weight:600;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+                        ${escapeHtml(c.name || c.file)}
+                    </div>
+                    <div style="font-size:11px;color:#666;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+                        ${escapeHtml(c.file)}${isCurrent ? ' · текущий' : ''}
+                    </div>
                 </div>
             </div>
-        </div>
-    `;
-}).join('');
+        `;
+    }).join('');
 
     list.querySelectorAll('.share-to-chat-item').forEach(el => {
         el.addEventListener('click', () => {
@@ -10681,7 +10710,6 @@ list.innerHTML = state.chats.map(c => {
     $('confirmShareToChatBtn').disabled = true;
     $('shareToChatModal').classList.add('active');
 }
-
 
 async function confirmShareToChat() {
     if (!_shareToChat.blob || !_shareToChat.selectedFile) return;
@@ -12225,6 +12253,12 @@ document.addEventListener('keydown', (e) => {
 // ═══════════════════════════════════════════════════════════════
 //  ПОДЕЛИТЬСЯ ВО ВНЕШНИЕ ПРИЛОЖЕНИЯ
 // ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
+//  📤 КНОПКА «ДРУГИЕ ПРИЛОЖЕНИЯ…» — РАЗНОЕ ПОВЕДЕНИЕ
+//  ─────────────────────────────────────────────────────────────
+//  • mode = 'invite' → генерируем временную ссылку (TempInvite)
+//  • mode = 'file'   → обычный navigator.share (Telegram, WhatsApp…)
+// ═══════════════════════════════════════════════════════════════
 (async function initExternalShare() {
     const btn = document.getElementById('shareToExternalBtn');
     if (!btn) return;
@@ -12241,79 +12275,142 @@ document.addEventListener('keydown', (e) => {
     btn.addEventListener('mouseup',   () => btn.style.transform = 'scale(1)');
     btn.addEventListener('touchstart',() => btn.style.transform = 'scale(0.98)', { passive: true });
     btn.addEventListener('touchend',  () => btn.style.transform = 'scale(1)');
-btn.addEventListener('click', async () => {
-    const blob = _shareToChat.blob;
-    let fileName = _shareToChat.fileName || 'file.bin';
-    const originalMime = _shareToChat.mime || blob.type || '';
 
-    if (!blob) {
-        showToast('❌ Нет файла для отправки', 2000);
-        return;
-    }
+    btn.addEventListener('click', async () => {
+        const blob = _shareToChat.blob;
+        const fileName = _shareToChat.fileName || 'file.bin';
 
-    // 🆕 Определяем реальный тип
-    const kind = await detectAttachmentKind(blob, fileName, originalMime);
-    let mime = blob.type || originalMime;
-    if (!mime) {
-        mime = kind === 'video' ? 'video/mp4'
-             : kind === 'audio' ? 'audio/mpeg'
-             : kind === 'image' ? 'image/jpeg'
-             : 'application/octet-stream';
-    }
+        if (!blob) {
+            showToast('❌ Нет файла для отправки', 2000);
+            return;
+        }
 
-    // 🆕 Для видео: Telegram понимает MP4. Если WebM — предупреждаем, но шлём как есть
-    if (kind === 'video') {
-        const isMp4 = mime.includes('mp4') || mime.includes('quicktime');
-        if (!isMp4) {
+        // ═══════════════════════════════════════════════════════
+        //  ВАРИАНТ A: РЕЖИМ 'invite' — генерируем ссылку
+        // ═══════════════════════════════════════════════════════
+        if (_shareToChat.mode === 'invite') {
+            console.log('📤 [ExtShare] Режим invite → TempInvite');
+
+            if (typeof TempInvite === 'undefined' || typeof TempInvite.build !== 'function') {
+                showToast('❌ Генератор ссылок недоступен', 2500);
+                return;
+            }
+
+            const targetFile = _shareToChat.inviteChatFile
+                            || _shareToChat.selectedFile
+                            || state.chatFile;
+
+            if (!targetFile) {
+                showToast('❌ Чат-источник не определён', 2500);
+                return;
+            }
+            if (!state.savedPasswords[targetFile]) {
+                showToast('🔐 Пароль чата не сохранён — ссылку сделать нельзя', 3500);
+                return;
+            }
+
+            const originalHTML = btn.innerHTML;
+            btn.disabled = true;
+            btn.innerHTML = `
+                <div style="width:40px;height:40px;border-radius:12px;background:rgba(108,92,231,0.3);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0;">⏳</div>
+                <div style="flex:1;min-width:0;text-align:left;">
+                    <div style="font-size:14px;font-weight:600;color:#fff;">Создаём ссылку…</div>
+                    <div style="font-size:11px;color:#888;margin-top:2px;">пару секунд</div>
+                </div>
+            `;
+
+            try {
+                const { url, payload } = await TempInvite.build(targetFile);
+
+                // Закрываем модалку
+                document.getElementById('shareToChatModal').classList.remove('active');
+
+                // Показываем ссылку через модалку TempInvite
+                // (экспортируем showInviteModal — см. шаг 4)
+                if (typeof window.showInviteLinkModal === 'function') {
+                    window.showInviteLinkModal(url, payload);
+                } else {
+                    // Fallback — копируем в буфер
+                    try {
+                        await navigator.clipboard.writeText(url);
+                        showToast('📋 Ссылка скопирована в буфер', 3000);
+                    } catch (e) {
+                        showToast('🔗 ' + url, 6000);
+                    }
+                }
+
+                soundManager.play('send');
+            } catch (err) {
+                console.error('Ошибка TempInvite:', err);
+                showToast('❌ ' + err.message, 3500);
+                soundManager.play('error');
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = originalHTML;
+            }
+            return;
+        }
+
+        // ═══════════════════════════════════════════════════════
+        //  ВАРИАНТ B: РЕЖИМ 'file' — обычный share
+        // ═══════════════════════════════════════════════════════
+        console.log('📤 [ExtShare] Режим file → navigator.share');
+
+        const originalMime = _shareToChat.mime || blob.type || '';
+        const kind = await detectAttachmentKind(blob, fileName, originalMime);
+        let mime = blob.type || originalMime;
+        if (!mime) {
+            mime = kind === 'video' ? 'video/mp4'
+                 : kind === 'audio' ? 'audio/mpeg'
+                 : kind === 'image' ? 'image/jpeg'
+                 : 'application/octet-stream';
+        }
+
+        if (kind === 'video' && !mime.includes('mp4') && !mime.includes('quicktime')) {
             const ok = await showConfirmModal(
                 '⚠️ Telegram и WebM',
-                'Telegram не принимает WebM как видео — он может показать его как обычный файл.\n\n' +
-                'Продолжить отправку?',
+                'Telegram не принимает WebM как видео — он может показать его как обычный файл.\n\nПродолжить отправку?',
                 'Отправить',
                 'Отмена'
             );
             if (!ok) return;
-            // Если пользователь хочет MP4 — дадим выбор
-            // (для этого нужно было бы конвертировать, но на мобилке это ненадёжно)
-        }
-    }
-
-    document.getElementById('shareToChatModal').classList.remove('active');
-    if (navigator.vibrate) navigator.vibrate(20);
-
-    try {
-        const file = new File([blob], fileName, { type: mime });
-
-        if (navigator.canShare && navigator.canShare({ files: [file] })) {
-            await navigator.share({ files: [file], title: fileName });
-            showToast('✅ Отправлено', 1500);
-            return;
         }
 
-        if (navigator.share) {
-            await navigator.share({ title: fileName, text: 'Посмотри этот файл' });
-            return;
+        document.getElementById('shareToChatModal').classList.remove('active');
+        if (navigator.vibrate) navigator.vibrate(20);
+
+        try {
+            const file = new File([blob], fileName, { type: mime });
+
+            if (navigator.canShare && navigator.canShare({ files: [file] })) {
+                await navigator.share({ files: [file], title: fileName });
+                showToast('✅ Отправлено', 1500);
+                return;
+            }
+
+            if (navigator.share) {
+                await navigator.share({ title: fileName, text: 'Посмотри этот файл' });
+                return;
+            }
+
+            // Fallback — скачивание
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = fileName;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            setTimeout(() => URL.revokeObjectURL(url), 2000);
+            showToast('💾 Файл скачан', 2500);
+
+        } catch (err) {
+            if (err.name === 'AbortError') return;
+            console.error('Ошибка внешнего share:', err);
+            showToast('❌ Не удалось поделиться', 2000);
         }
-
-        // Fallback — скачивание
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = fileName;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        setTimeout(() => URL.revokeObjectURL(url), 2000);
-        showToast('💾 Файл скачан', 2500);
-
-    } catch (err) {
-        if (err.name === 'AbortError') return;
-        console.error('externalShare error:', err);
-        showToast('❌ Не удалось поделиться', 2000);
-    }
-});
+    });
 })();
-
 
 // ===================================================================
 //  ВОССТАНОВЛЕНИЕ СЕССИИ
@@ -18238,6 +18335,11 @@ console.log('📜 История чата: предзагрузка за 1500px 
 /**
  * Отправляет приглашение в текущий чат через общую модалку шаринга.
  */
+/**
+ * Отправляет приглашение в текущий чат через общую модалку шаринга.
+ * 🆕 Помечает режим как 'invite' — чтобы кнопка «Другие приложения…»
+ *    знала, что нужно генерировать временную ссылку.
+ */
 function inviteToChat() {
     if (!state.chatFile) return;
     const password = state.savedPasswords[state.chatFile];
@@ -18272,8 +18374,8 @@ function inviteToChat() {
     const safeName = chatName.replace(/[^a-zA-Zа-яА-Я0-9_-]/g, '_').slice(0, 30);
     const fileName = `Приглашение в «${safeName}».smschat`;
 
-    // Переиспользуем существующую модалку шаринга
-    openShareToChatModal(blob, fileName, null);
+    // 🆕 Передаём режим 'invite' — это ключевой момент
+    openShareToChatModal(blob, fileName, null, { mode: 'invite', chatFile: state.chatFile });
     soundManager.play('click');
 }
 
@@ -38256,44 +38358,81 @@ try {
     //  ПЕРЕХВАТ КНОПКИ «Другие приложения…»
     // ═══════════════════════════════════════════════════════════
     function interceptExternalShareButton() {
-        const btn = document.getElementById('shareToExternalBtn');
-        if (!btn || btn._tempInviteAttached) return;
-        btn._tempInviteAttached = true;
+    const btn = document.getElementById('shareToExternalBtn');
+    if (!btn || btn._tempInviteAttached) return;
+    btn._tempInviteAttached = true;
 
-        btn.addEventListener('click', async (e) => {
-            e.stopImmediatePropagation();
-            e.preventDefault();
+    btn.addEventListener('click', async (e) => {
+        // ═══════════════════════════════════════════════════════
+        //  🆕 РЕШАЕМ: генерировать ссылку или пропустить клик
+        //  ─────────────────────────────────────────────────────
+        //  Логика:
+        //   • Если _shareToChat.mode === 'invite'  → генерируем ссылку
+        //   • Если _shareToChat.mode === 'file'    → пропускаем клик
+        //     (пусть сработает обычный initExternalShare с navigator.share)
+        //   • Если mode не задан — определяем по имени файла:
+        //     .smschat → invite, всё остальное → file
+        // ═══════════════════════════════════════════════════════
 
-            let targetFile = _shareToChat.selectedFile || state.chatFile;
-            if (!targetFile) {
-                showToast('❌ Сначала выберите чат из списка ниже', 2500);
-                return;
-            }
-            if (!state.savedPasswords[targetFile]) {
-                showToast('🔐 Пароль чата не сохранён — ссылку сделать нельзя', 3500);
-                return;
-            }
+        let mode = _shareToChat.mode;
 
-            btn.disabled = true;
-            const originalHTML = btn.innerHTML;
-            btn.innerHTML = `<div style="width:40px;height:40px;border-radius:12px;background:rgba(108,92,231,0.3);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0;">⏳</div><div style="flex:1;min-width:0;text-align:left;"><div style="font-size:14px;font-weight:600;color:#fff;">Создаём ссылку…</div><div style="font-size:11px;color:#888;margin-top:2px;">пару секунд</div></div>`;
+        // Автоопределение, если режим не задан
+        if (!mode) {
+            const fname = _shareToChat.fileName || '';
+            mode = /\.smschat$/i.test(fname) ? 'invite' : 'file';
+            _shareToChat.mode = mode;
+        }
 
-            try {
-                const { url, payload } = await buildInviteLink(targetFile);
-                document.getElementById('shareToChatModal').classList.remove('active');
-                showInviteModal(url, payload);
-                soundManager.play('send');
-            } catch (err) {
-                console.error('🔗 [Invite v2] Ошибка:', err);
-                showToast('❌ ' + err.message, 3500);
-                soundManager.play('error');
-            } finally {
-                btn.disabled = false;
-                btn.innerHTML = originalHTML;
-            }
-        }, true); // capture
-    }
+        // ─── Если это НЕ приглашение — не перехватываем ───
+        if (mode !== 'invite') {
+            console.log('🔗 [TempInvite] Режим file — пропускаем клик');
+            return;   // ← НЕ вызываем stopImmediatePropagation
+                      //   Пусть событие дойдёт до обычного обработчика
+                      //   из initExternalShare (navigator.share)
+        }
 
+        // ─── Дальше — только для invite-режима ───
+        e.stopImmediatePropagation();
+        e.preventDefault();
+
+        let targetFile = _shareToChat.inviteChatFile
+                      || _shareToChat.selectedFile
+                      || state.chatFile;
+
+        if (!targetFile) {
+            showToast('❌ Сначала выберите чат из списка ниже', 2500);
+            return;
+        }
+        if (!state.savedPasswords[targetFile]) {
+            showToast('🔐 Пароль чата не сохранён — ссылку сделать нельзя', 3500);
+            return;
+        }
+
+        btn.disabled = true;
+        const originalHTML = btn.innerHTML;
+        btn.innerHTML = `
+            <div style="width:40px;height:40px;border-radius:12px;background:rgba(108,92,231,0.3);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0;">⏳</div>
+            <div style="flex:1;min-width:0;text-align:left;">
+                <div style="font-size:14px;font-weight:600;color:#fff;">Создаём ссылку…</div>
+                <div style="font-size:11px;color:#888;margin-top:2px;">пару секунд</div>
+            </div>
+        `;
+
+        try {
+            const { url, payload } = await buildInviteLink(targetFile);
+            document.getElementById('shareToChatModal').classList.remove('active');
+            showInviteModal(url, payload);
+            soundManager.play('send');
+        } catch (err) {
+            console.error('🔗 [Invite v2] Ошибка:', err);
+            showToast('❌ ' + err.message, 3500);
+            soundManager.play('error');
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = originalHTML;
+        }
+    }, true);
+}
     // Наблюдаем за появлением кнопки
     const observer = new MutationObserver(() => {
         if (document.getElementById('shareToExternalBtn')) {
@@ -38332,7 +38471,8 @@ try {
         parse: (raw) => parseAndValidateInvite(raw),
         config: CFG,
     };
-
+// 🆕 Экспортируем функцию показа модалки со ссылкой
+window.showInviteLinkModal = showInviteModal;
     console.log('🔗 [Invite v2] Система активна:');
     console.log('   • Кнопка «Другие приложения…» → создание временной ссылки');
     console.log('   • Новый пользователь вводит имя перед входом');
@@ -41311,6 +41451,320 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
     console.log('   • API: AttachRetry.findAllFailed() / .retryAll()');
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🩹 ФИКС: ОБЛОЖКИ ПЕСЕН НЕ ПОПАДАЮТ В ОБЩУЮ ГАЛЕРЕЮ ФОТО
+//  ─────────────────────────────────────────────────────────────
+//  Проблема (после патча AudioCoverFix v2):
+//   1. Клик по обложке песни → открывается ВСЯ галерея
+//      (со всеми фото + другими обложками) — а нужно только обложку
+//   2. Клик по обычному фото → в галерею попадают ещё и обложки песен
+//      — а нужно только фото
+//
+//  Решение:
+//   • Обложки песен БОЛЬШЕ НЕ участвуют в общем списке галереи
+//   • collectAllImageMsgIds возвращает только реальные фото
+//   • Клик по обложке песни открывает изолированную галерею из 1 элемента
+// ═══════════════════════════════════════════════════════════════
 
+(function fixAlbumCoversIsolation() {
+    'use strict';
+
+    console.log('🖼️ [CoversIsolation] Установка патча…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  1. Перезаписываем collectAllImageMsgIds
+    //     — БОЛЬШЕ НЕ ДОБАВЛЯЕМ обложки аудио
+    // ═══════════════════════════════════════════════════════════
+    collectAllImageMsgIds = function() {
+        const ids = [];
+
+        for (const msg of historyState.allMessages) {
+            if (msg.image && isAttachmentRef(msg.image)) {
+                ids.push({ msgId: msg.id, attachName: msg.image });
+            } else if (msg.image && (msg.image.startsWith('blob:') || msg.image.startsWith('data:'))) {
+                ids.push({ msgId: msg.id, attachName: null, inlineSrc: msg.image });
+            }
+            // ⚠️ Обложки аудио (msg.audioCover) — НЕ добавляем!
+        }
+
+        return ids;
+    };
+
+    console.log('🖼️ [CoversIsolation] collectAllImageMsgIds — только реальные фото');
+
+    // ═══════════════════════════════════════════════════════════
+    //  2. Перезаписываем openGallery
+    //     — Клик по обложке открывает ОДИНОЧНУЮ галерею
+    //     — Клик по фото открывает обычную галерею (только фото)
+    // ═══════════════════════════════════════════════════════════
+    const _origOpenGallery = openGallery;
+
+    openGallery = async function(imageUrl) {
+        // ═══ Определяем: это обложка песни или обычное фото? ═══
+        let isCover = false;
+        let coverOwnerMsg = null;
+
+        // Пробуем найти сообщение, у которого это обложка
+        for (const msg of historyState.allMessages) {
+            if (!msg.audioCover) continue;
+            const cached = _attachmentCache.get(msg.audioCover);
+            if (cached === imageUrl) {
+                isCover = true;
+                coverOwnerMsg = msg;
+                break;
+            }
+        }
+
+        // Также проверим через DOM — может быть в .audio-cover
+        if (!isCover) {
+            const coverImg = document.querySelector(`.audio-cover img[src="${imageUrl}"]`);
+            if (coverImg) {
+                isCover = true;
+                const container = coverImg.closest('.audio-container');
+                if (container) {
+                    const msgId = parseInt(container.dataset.audioId);
+                    if (!isNaN(msgId)) {
+                        coverOwnerMsg = historyState.allMessages.find(m => m.id === msgId);
+                    }
+                }
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════
+        //  СЦЕНАРИЙ A: это обложка песни → изолированная галерея
+        // ═══════════════════════════════════════════════════════
+        if (isCover) {
+            console.log('🖼️ [CoversIsolation] Обложка песни → изолированная галерея из 1 элемента');
+
+            // Готовим галерею из одного элемента
+            const anchorMsgId = coverOwnerMsg ? coverOwnerMsg.id : null;
+
+            galleryState.allImageMsgIds = [{
+                msgId: anchorMsgId,
+                attachName: coverOwnerMsg ? coverOwnerMsg.audioCover : null,
+                inlineSrc: imageUrl,
+                _isCover: true,
+            }];
+            galleryState.loadedSrcs = {};
+            if (anchorMsgId != null) {
+                galleryState.loadedSrcs[anchorMsgId] = imageUrl;
+            }
+
+            buildGalleryWindow(anchorMsgId);
+
+            // Если окно пустое — fallback
+            if (galleryState.images.length === 0) {
+                galleryState.images = [imageUrl];
+                galleryState._windowMsgIds = [anchorMsgId];
+            }
+
+            let idx = anchorMsgId != null ? findGalleryIndexByMsgId(anchorMsgId) : -1;
+            if (idx === -1) idx = 0;
+            galleryState.currentIndex = idx;
+
+            imageModal.classList.add('active');
+            document.body.style.overflow = 'hidden';
+            galleryState.isOpen = true;
+            if (window._updateGallerySizes) window._updateGallerySizes();
+
+            updateGalleryUI();
+            hideGalleryActions();
+
+            const src = galleryState.images[galleryState.currentIndex];
+            const pre = new Image();
+            const init = () => { ImageZoom.open(); };
+            pre.onload = init;
+            pre.onerror = init;
+            pre.src = src;
+            if (pre.complete && pre.naturalWidth) init();
+
+            return;
+        }
+
+        // ═══════════════════════════════════════════════════════
+        //  СЦЕНАРИЙ B: это обычное фото → обычная галерея
+        //  (collectAllImageMsgIds уже возвращает только фото)
+        // ═══════════════════════════════════════════════════════
+        console.log('🖼️ [CoversIsolation] Обычное фото → обычная галерея');
+
+        galleryState.allImageMsgIds = collectAllImageMsgIds();
+
+        let anchorMsgId = null;
+
+        // Ищем фото в DOM
+        const domImg = messagesInner.querySelector(`.image-container img[src="${imageUrl}"]`);
+        if (domImg) {
+            const wrapper = domImg.closest('.message-wrapper');
+            if (wrapper) anchorMsgId = parseInt(wrapper.dataset.msgId);
+        }
+
+        // Ищем по загруженным src
+        if (!anchorMsgId) {
+            for (const [id, src] of Object.entries(galleryState.loadedSrcs)) {
+                if (src === imageUrl) { anchorMsgId = parseInt(id); break; }
+            }
+        }
+
+        if (anchorMsgId) {
+            const item = galleryState.allImageMsgIds.find(x => x.msgId === anchorMsgId);
+            if (item && !galleryState.loadedSrcs[anchorMsgId] && !item.inlineSrc) {
+                galleryState.loadedSrcs[anchorMsgId] = imageUrl;
+            }
+        }
+
+        buildGalleryWindow(anchorMsgId);
+
+        if (galleryState.images.length === 0) {
+            galleryState.images = [imageUrl];
+            galleryState._windowMsgIds = [anchorMsgId];
+        }
+
+        let idx = anchorMsgId ? findGalleryIndexByMsgId(anchorMsgId) : -1;
+        if (idx === -1) idx = galleryState.images.indexOf(imageUrl);
+        if (idx === -1) idx = 0;
+        galleryState.currentIndex = idx;
+
+        imageModal.classList.add('active');
+        document.body.style.overflow = 'hidden';
+        galleryState.isOpen = true;
+        if (window._updateGallerySizes) window._updateGallerySizes();
+
+        updateGalleryUI();
+        hideGalleryActions();
+
+        const src = galleryState.images[galleryState.currentIndex];
+        const pre = new Image();
+        const init = () => { ImageZoom.open(); };
+        pre.onload = init;
+        pre.onerror = init;
+        pre.src = src;
+        if (pre.complete && pre.naturalWidth) init();
+
+        // Фоновая подгрузка более старых фото
+        setTimeout(async () => {
+            if (!galleryState.isOpen) return;
+            const loadedOld = await preloadOlderImages(15);
+            if (loadedOld > 0 && galleryState.isOpen) {
+                rebuildGalleryWindow(anchorMsgId);
+            }
+        }, 200);
+    };
+
+    console.log('🖼️ [CoversIsolation] openGallery — разделены сценарии');
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. Перехватываем клик по обложке напрямую
+    //     (AudioCoverFix v2 тоже перехватывает, но пусть будет
+    //      дублирующая защита в capture-фазе)
+    // ═══════════════════════════════════════════════════════════
+    document.addEventListener('click', (e) => {
+        const cover = e.target.closest('.audio-cover');
+        if (!cover) return;
+
+        // Клик по кнопке play — не трогаем
+        const playBtn = e.target.closest('.audio-cover-play');
+        if (playBtn) return;
+
+        // Клик по самой обложке
+        const img = cover.querySelector('img');
+        if (!img || !img.src) return;
+
+        e.stopImmediatePropagation();
+        e.preventDefault();
+
+        // Открываем именно ЭТУ обложку в изолированной галерее
+        openGallery(img.src);
+    }, true);
+
+    // ═══════════════════════════════════════════════════════════
+    //  4. Патчим превью обложки в мини-плеере (тоже отдельно)
+    // ═══════════════════════════════════════════════════════════
+    // В GlobalPlayer клик по gp-thumb ведёт в jumpToPlayingTrack,
+    // это уже правильно — не трогаем.
+
+    // ═══════════════════════════════════════════════════════════
+    //  5. Патчим renderHistory и appendMessages — чтобы галерея
+    //     пересобиралась без обложек
+    // ═══════════════════════════════════════════════════════════
+    if (typeof window.loadAttachmentsIn === 'function') {
+        const _origLoadAttachments = window.loadAttachmentsIn;
+        window.loadAttachmentsIn = async function(root) {
+            const result = await _origLoadAttachments.call(this, root);
+
+            // Если галерея открыта и это не изолированный режим —
+            // пересобираем окно с новыми blob:URL (без обложек)
+            if (galleryState.isOpen
+                && galleryState.allImageMsgIds.length > 1  // не изолированная
+                && root === messagesInner) {
+                const wrappers = messagesInner.querySelectorAll('.message-wrapper[data-msg-id]');
+                let newFound = 0;
+                wrappers.forEach(w => {
+                    const msgId = parseInt(w.dataset.msgId);
+                    if (!msgId || galleryState.loadedSrcs[msgId]) return;
+                    const img = w.querySelector('.image-container img');
+                    if (img && img.src && img.src.startsWith('blob:')) {
+                        galleryState.loadedSrcs[msgId] = img.src;
+                        newFound++;
+                    }
+                });
+                if (newFound > 0) {
+                    const curMsgId = (galleryState._windowMsgIds || [])[galleryState.currentIndex];
+                    rebuildGalleryWindow(curMsgId);
+                }
+            }
+            return result;
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  6. Публичное API для отладки
+    // ═══════════════════════════════════════════════════════════
+    window.CoversIsolation = {
+        isActive: () => true,
+
+        // Показать, что сейчас в галерее
+        galleryStatus: () => ({
+            isOpen: galleryState.isOpen,
+            imagesCount: galleryState.images.length,
+            currentIndex: galleryState.currentIndex,
+            allImageMsgIds: galleryState.allImageMsgIds.map(x => ({
+                msgId: x.msgId,
+                isCover: !!x._isCover,
+                hasSrc: !!(x.inlineSrc || galleryState.loadedSrcs[x.msgId]),
+            })),
+        }),
+
+        // Проверить обложку
+        testCover: (msgId) => {
+            const msg = historyState.allMessages.find(m => m.id === msgId);
+            if (!msg || !msg.audioCover) {
+                console.log('У сообщения нет обложки');
+                return null;
+            }
+            const cached = _attachmentCache.get(msg.audioCover);
+            console.log('Обложка:', msg.audioCover);
+            console.log('blob:URL:', cached || 'не загружена');
+            return cached;
+        },
+
+        // Открыть обложку конкретного сообщения
+        openCover: (msgId) => {
+            const msg = historyState.allMessages.find(m => m.id === msgId);
+            if (!msg || !msg.audioCover) return;
+            const cached = _attachmentCache.get(msg.audioCover);
+            if (cached) openGallery(cached);
+            else console.warn('Обложка ещё не загружена');
+        },
+    };
+
+    console.log('🖼️ [CoversIsolation] Патч установлен полностью:');
+    console.log('   • Обложки песен БОЛЬШЕ НЕ в общей галерее фото');
+    console.log('   • Клик по обложке → изолированная галерея из 1 элемента');
+    console.log('   • Клик по фото → обычная галерея только из фото');
+    console.log('   • API: CoversIsolation.galleryStatus() / .testCover(msgId)');
+
+})();
+</script>
 </body>
 </html>
