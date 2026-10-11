@@ -42206,5 +42206,266 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
 })();
 
 </script>
+
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  💣 NUKE v3 — финальный фикс скролла
+//  ─────────────────────────────────────────────────────────────
+//  • Скролл вверх руками → ничего не дёргает
+//  • Своё сообщение → скролл вниз
+//  • Чужое в открытом чате, ты у низа → скролл вниз
+//  • Чужое в открытом чате, ты НЕ у низа → не скроллит (бейдж ↓)
+//  • Подгрузка старых → компенсация через anchor
+//  • Нативный overflow-anchor включён
+// ═══════════════════════════════════════════════════════════════
+
+(function nukeAllScrollJumpers() {
+    'use strict';
+
+    console.log('💣 [Nuke v3] Установка…');
+
+    // ─── 1. Флаг для внешних компенсаторов ───
+    window.__DISABLE_SCROLL_FREEZERS = true;
+
+    // ─── 2. Нативный якорь браузера ───
+    const style = document.createElement('style');
+    style.textContent = `
+        .messages-container {
+            overflow-anchor: auto !important;
+            scroll-behavior: auto !important;
+        }
+    `;
+    document.head.appendChild(style);
+
+    // ─── 3. Гасим 17.5-секундный freeze ───
+    window.activateInitialFreeze = () => {};
+    window.isInitialFreezeActive = () => false;
+
+    // ─── 4. Гасим ScrollLock ───
+    if (window.ScrollLock) {
+        window.ScrollLock.lock = () => {};
+        window.ScrollLock.unlock = () => {};
+        window.ScrollLock.isActive = () => false;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  5. СИСТЕМА «РАЗРЕШЕНИЯ» СКРОЛЛА ВНИЗ
+    // ═══════════════════════════════════════════════════════════
+    let _allowScrollUntil = 0;
+    let _guardReason = '';
+
+    /**
+     * Разрешить скролл вниз на N миллисекунд.
+     * @param {number} ms — на сколько
+     * @param {string} reason — для отладки
+     */
+    window.allowScrollToBottom = function(ms, reason) {
+        _allowScrollUntil = Date.now() + (ms || 1000);
+        _guardReason = reason || 'unknown';
+        console.log(`✅ [Nuke] Разрешён скролл вниз на ${ms}мс (${_guardReason})`);
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  6. Следим за жестами юзера
+    // ═══════════════════════════════════════════════════════════
+    let _lastUserScroll = Date.now();
+    ['touchstart', 'touchmove', 'wheel', 'mousedown', 'keydown'].forEach(ev => {
+        document.addEventListener(ev, () => {
+            _lastUserScroll = Date.now();
+        }, { passive: true, capture: true });
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    //  7. Перехват scrollTop-сеттера
+    // ═══════════════════════════════════════════════════════════
+    const desc = Object.getOwnPropertyDescriptor(Element.prototype, 'scrollTop');
+
+    if (desc && desc.set) {
+        Object.defineProperty(Element.prototype, 'scrollTop', {
+            get: desc.get,
+            set: function(value) {
+                if (this === messagesContainer) {
+                    const timeSinceUserAction = Date.now() - _lastUserScroll;
+                    const userIsActive = timeSinceUserAction < 150;
+
+                    const now = Date.now();
+                    const scrollAllowed = now < _allowScrollUntil;
+
+                    const diffNow = this.scrollHeight - this.scrollTop - this.clientHeight;
+                    const userAtBottom = diffNow < 100;
+
+                    // Блокируем только попытки ДЁРНУТЬ ВНИЗ, когда:
+                    //  • юзер НЕ трогает экран
+                    //  • юзер НЕ у низа
+                    //  • нет активного разрешения
+                    if (!userIsActive && !userAtBottom && !scrollAllowed) {
+                        const currentTop = desc.get.call(this);
+                        if (value > currentTop + 2) {
+                            console.log('🛡️ [Nuke] Заблокирован дёрг вниз (нет разрешения)');
+                            return;
+                        }
+                    }
+                }
+                return desc.set.call(this, value);
+            },
+            configurable: true,
+        });
+        console.log('💣 [Nuke v3] scrollTop-сеттер защищён');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  8. Компенсация при подгрузке старых сообщений
+    // ═══════════════════════════════════════════════════════════
+    if (typeof window.loadOlderMessages === 'function') {
+        const _origLoadOlder = window.loadOlderMessages;
+        window.loadOlderMessages = async function() {
+            const contRect = messagesContainer.getBoundingClientRect();
+            const wrappers = messagesInner.querySelectorAll('.message-wrapper[data-msg-id]');
+            let anchorEl = null, anchorTop = 0;
+
+            for (const el of wrappers) {
+                const r = el.getBoundingClientRect();
+                if (r.bottom >= contRect.top) {
+                    anchorEl = el;
+                    anchorTop = r.top - contRect.top;
+                    break;
+                }
+            }
+
+            const result = await _origLoadOlder.apply(this, arguments);
+
+            if (anchorEl && anchorEl.isConnected) {
+                const newRect = anchorEl.getBoundingClientRect();
+                const newContRect = messagesContainer.getBoundingClientRect();
+                const delta = (newRect.top - newContRect.top) - anchorTop;
+                if (Math.abs(delta) > 1) {
+                    window.allowScrollToBottom(500, 'loadOlder-compensate');
+                    messagesContainer.scrollTop += delta;
+                }
+            }
+            return result;
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  9. АВТО-РАЗРЕШЕНИЯ В КЛЮЧЕВЫХ МОМЕНТАХ
+    // ═══════════════════════════════════════════════════════════
+
+    // ─── a) Отправка через sendMessage ───
+    if (typeof window.sendMessage === 'function') {
+        const _origSend = window.sendMessage;
+        window.sendMessage = async function(...args) {
+            window.allowScrollToBottom(3000, 'sendMessage');
+            return _origSend.apply(this, args);
+        };
+    }
+
+    // ─── b) Приход новых сообщений (appendMessages) ───
+    if (typeof window.appendMessages === 'function') {
+        const _origAppend = window.appendMessages;
+        window.appendMessages = function(newMsgs) {
+            if (!newMsgs || !newMsgs.length) {
+                return _origAppend.apply(this, arguments);
+            }
+
+            const inChat = (typeof state !== 'undefined')
+                && state.currentScreen === 'chat'
+                && state.chatFile;
+
+            // Используем флаг scrollState.isAtBottom (тот же, что у поллинга)
+            const wasAtBottom = (typeof scrollState !== 'undefined')
+                ? scrollState.isAtBottom
+                : false;
+
+            const hasOwnMessages = newMsgs.some(m =>
+                m.username === state.username && m.id === state._lastSentMessageId
+            );
+
+            const hasForeignMessages = newMsgs.some(m =>
+                m.username !== state.username
+            );
+
+            // Разрешаем если:
+            //   • наши собственные отправленные — всегда
+            //   • чужие И мы в чате И мы были у низа
+            const shouldAllow =
+                hasOwnMessages ||
+                (inChat && hasForeignMessages && wasAtBottom);
+
+            if (shouldAllow) {
+                const reason = hasOwnMessages
+                    ? 'appendMessages-own'
+                    : 'appendMessages-foreign-atBottom';
+                window.allowScrollToBottom(3000, reason);
+            } else if (inChat && hasForeignMessages) {
+                console.log('📥 [Nuke] Чужое, но юзер не у низа — не скроллим');
+            }
+
+            return _origAppend.apply(this, arguments);
+        };
+        console.log('💣 [Nuke v3] appendMessages пропатчен');
+    }
+
+    // ─── c) Пакетная отправка фото ───
+    if (typeof window.handleMultipleImageUpload === 'function') {
+        const _origMulti = window.handleMultipleImageUpload;
+        window.handleMultipleImageUpload = async function(...args) {
+            window.allowScrollToBottom(5000, 'multiImageUpload');
+            return _origMulti.apply(this, args);
+        };
+    }
+
+    // ─── d) Поделиться в чат ───
+    if (typeof window.doShareToChat === 'function') {
+        const _origShare = window.doShareToChat;
+        window.doShareToChat = async function(...args) {
+            window.allowScrollToBottom(5000, 'doShareToChat');
+            return _origShare.apply(this, args);
+        };
+    }
+
+    // ─── e) Вход в чат ───
+    if (typeof window.enterChat === 'function') {
+        const _origEnter = window.enterChat;
+        window.enterChat = async function(...args) {
+            window.allowScrollToBottom(4000, 'enterChat');
+            return _origEnter.apply(this, args);
+        };
+    }
+
+    // ─── f) Прыжок к сообщению (поиск, ответ, событие) ───
+    if (typeof window.scrollToMessage === 'function') {
+        const _origScrollTo = window.scrollToMessage;
+        window.scrollToMessage = function(...args) {
+            window.allowScrollToBottom(3000, 'scrollToMessage');
+            return _origScrollTo.apply(this, args);
+        };
+    }
+
+    // ─── g) Кнопка «вниз» ───
+    if (typeof window.scrollToBottomNow === 'function') {
+        const _origScrollNow = window.scrollToBottomNow;
+        window.scrollToBottomNow = function(...args) {
+            window.allowScrollToBottom(2000, 'scrollToBottomNow');
+            return _origScrollNow.apply(this, args);
+        };
+    }
+
+    // ─── h) Обработчик клика по кнопке «вниз» напрямую ───
+    const scrollDownBtn = document.getElementById('scrollDownBtn');
+    if (scrollDownBtn) {
+        scrollDownBtn.addEventListener('click', () => {
+            window.allowScrollToBottom(2000, 'scrollDownBtn-click');
+        }, true);
+    }
+
+    console.log('💣 [Nuke v3] Готово:');
+    console.log('   • Скролл вверх руками — свободный');
+    console.log('   • Своё сообщение → вниз');
+    console.log('   • Чужое в чате + ты у низа → вниз');
+    console.log('   • Чужое в чате + ты не у низа → не скроллит');
+    console.log('   • API: allowScrollToBottom(ms, reason)');
+})();
+</script>
 </body>
 </html>
