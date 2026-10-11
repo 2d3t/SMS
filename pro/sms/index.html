@@ -38781,41 +38781,36 @@ try {
 })();
 </script>
 
+
+
 <script>
 // ═══════════════════════════════════════════════════════════════
-//  🛡️ RETRY-ПРИ-409 + АНТИ-ДУБЛИКАТ v2
+//  🛡️ RETRY-ПРИ-409 CONFLICT
 //  ─────────────────────────────────────────────────────────────
-//  Проблема v1: при retry сообщение могло записаться дважды, если
-//  между попытками кто-то перечитал файл. Плюс _origSendMessage мог
-//  вызваться параллельно (SendQueue + AutoOutbox).
-//
-//  Решение v2:
-//   1. Каждое сообщение имеет УНИКАЛЬНЫЙ ID (не Date.now()).
-//   2. Перед добавлением в файл — ЖЁСТКАЯ проверка по id.
-//   3. Дедупликация на этапе загрузки истории — если в файле
-//      каким-то образом оказались две копии, показываем одну.
-//   4. Мьютекс на отправку — второй вызов _origSendMessage
-//      с тем же messageId не проходит.
+//  Решает проблему одновременной отправки сообщений двумя
+//  пользователями. Когда GitHub возвращает 409 (sha устарел) —
+//  скрипт перечитывает файл и повторяет PUT со свежим sha,
+//  сохраняя при этом ОБА сообщения.
 // ═══════════════════════════════════════════════════════════════
 
-(function installConflictRetryV2() {
+(function installConflictRetryPatch() {
     'use strict';
 
-    console.log('🛡️ [409-Retry v2] Установка патча…');
+    console.log('🛡️ [409-Retry] Установка патча…');
 
     // ═══════════════════════════════════════════════════════════
     //  КОНФИГ
     // ═══════════════════════════════════════════════════════════
     const CFG = {
-        MAX_RETRIES: 5,
-        BASE_DELAY_MS: 250,
-        MAX_DELAY_MS: 4000,
-        JITTER_MS: 100,
+        MAX_RETRIES: 5,              // сколько попыток при 409
+        BASE_DELAY_MS: 250,          // базовая задержка перед повтором
+        MAX_DELAY_MS: 4000,          // максимальная задержка
+        JITTER_MS: 100,              // случайная добавка (антиколлизия)
         DEBUG: true,
     };
 
-    const log = (...a) => CFG.DEBUG && console.log('🛡️ [409-Retry v2]', ...a);
-    const warn = (...a) => console.warn('🛡️ [409-Retry v2]', ...a);
+    const log = (...a) => CFG.DEBUG && console.log('🛡️ [409-Retry]', ...a);
+    const warn = (...a) => console.warn('🛡️ [409-Retry]', ...a);
 
     // ═══════════════════════════════════════════════════════════
     //  УТИЛИТЫ
@@ -38829,9 +38824,17 @@ try {
         const msg = (err.message || '').toLowerCase();
         return msg.includes('409') ||
                msg.includes('conflict') ||
-               (msg.includes('sha') && msg.includes('not match'));
+               msg.includes('sha') && msg.includes('not match');
     }
 
+    /**
+     * Экспоненциальная задержка со случайным джиттером.
+     * Попытка 1: ~250-350мс
+     * Попытка 2: ~500-600мс
+     * Попытка 3: ~1000-1100мс
+     * Попытка 4: ~2000-2100мс
+     * Попытка 5: ~4000-4100мс
+     */
     function getRetryDelay(attempt) {
         const exp = Math.min(
             CFG.BASE_DELAY_MS * Math.pow(2, attempt),
@@ -38842,76 +38845,24 @@ try {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  🆕 УНИКАЛЬНЫЙ ID СООБЩЕНИЯ
+    //  УНИВЕРСАЛЬНАЯ ОБЁРТКА saveFile С RETRY
     //  ─────────────────────────────────────────────────────────
-    //  Вместо Date.now() — монотонный счётчик + случайный суффикс.
-    //  Гарантирует уникальность даже при отправке двумя устройствами
-    //  в одну миллисекунду.
-    //
-    //  Формат: <timestamp><counter><random>
-    //  Всегда положительное число, всегда растущее,
-    //  работает с сортировкой по возрастанию.
+    //  Используется для файла чата (chats/xxx.json) и meta.json.
+    //  Для атакующего файла чата — также обрабатывает случай,
+    //  когда другой пользователь дописал сообщения между нашими
+    //  попытками (нужно смёрджить).
     // ═══════════════════════════════════════════════════════════
-    let _msgCounter = 0;
 
-    function generateMessageId() {
-        const ts = Date.now();
-        // Инкрементируем счётчик (0-999), обнуляется при 1000
-        _msgCounter = (_msgCounter + 1) % 1000;
-        // Случайный суффикс 0-99 для избежания коллизий между устройствами
-        const rand = Math.floor(Math.random() * 100);
-
-        // Итог: timestamp * 100000 + counter * 100 + rand
-        // Всегда положительное число ~1.7 * 10^17 (влезает в double)
-        return ts * 100000 + _msgCounter * 100 + rand;
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  🆕 ДЕДУПЛИКАЦИЯ ID
-    //  ─────────────────────────────────────────────────────────
-    //  Если в файле чата оказались два сообщения с одинаковым id
-    //  (что может быть из-за бага или retry), показываем только одно.
-    //  При этом в файле тоже почистим при следующей записи.
-    // ═══════════════════════════════════════════════════════════
-    function dedupeMessages(messages) {
-        if (!Array.isArray(messages) || messages.length < 2) return messages;
-
-        const seen = new Set();
-        const result = [];
-        let duplicates = 0;
-
-        for (const msg of messages) {
-            if (!msg || msg.id == null) {
-                result.push(msg);
-                continue;
-            }
-            if (seen.has(msg.id)) {
-                duplicates++;
-                continue;
-            }
-            seen.add(msg.id);
-            result.push(msg);
-        }
-
-        if (duplicates > 0) {
-            warn(`⚠️ Найдено дубликатов: ${duplicates} — отфильтровано`);
-        }
-
-        return result;
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  🆕 МЬЮТЕКС НА ОТПРАВКУ
-    //  ─────────────────────────────────────────────────────────
-    //  Защита от параллельного вызова _origSendMessage.
-    //  Ключ — уникальный ID сообщения. Пока предыдущий вызов
-    //  не завершился, второй с тем же ID игнорируется.
-    // ═══════════════════════════════════════════════════════════
-    const _sendingMutex = new Set();
-
-    // ═══════════════════════════════════════════════════════════
-    //  putWithRetry — универсальная обёртка для PUT
-    // ═══════════════════════════════════════════════════════════
+    /**
+     * Универсальный retry для PUT-запросов к GitHub Contents API.
+     *
+     * @param {object} opts
+     * @param {string} opts.path — путь к файлу
+     * @param {function} opts.buildContent — функция, возвращающая {content, sha}
+     *        Вызывается КАЖДЫЙ раз перед PUT — чтобы получить свежий sha.
+     * @param {string} opts.message — commit message
+     * @returns {Promise<{blobSha, commitSha}>}
+     */
     async function putWithRetry(opts) {
         const { path, buildContent, message } = opts;
 
@@ -38919,8 +38870,10 @@ try {
 
         for (let attempt = 0; attempt < CFG.MAX_RETRIES; attempt++) {
             try {
+                // 1. Получаем СВЕЖИЙ контент и sha (важно — каждый раз заново!)
                 const { content, sha } = await buildContent();
 
+                // 2. Формируем PUT
                 const jsonString = JSON.stringify(content);
                 const encoded = utf8ToBase64(jsonString);
 
@@ -38938,32 +38891,43 @@ try {
                     cache: 'no-store',
                 });
 
+                // ─── Успех ───
                 if (response.ok) {
                     const data = await response.json();
-                    if (attempt > 0) log(`✅ Успех с попытки ${attempt + 1}`);
+                    if (attempt > 0) {
+                        log(`✅ Успех с попытки ${attempt + 1}`);
+                    }
                     return {
                         blobSha: data.content.sha,
                         commitSha: data.commit.sha,
                     };
                 }
 
+                // ─── 409 CONFLICT — повторяем ───
                 if (response.status === 409) {
                     lastError = new Error('409 CONFLICT');
                     const delay = getRetryDelay(attempt);
-                    log(`⚠️ 409 (попытка ${attempt + 1}/${CFG.MAX_RETRIES}), повтор через ${Math.round(delay)}мс`);
+                    log(`⚠️ 409 CONFLICT (попытка ${attempt + 1}/${CFG.MAX_RETRIES}), повтор через ${Math.round(delay)}мс`);
                     await sleep(delay);
                     continue;
                 }
 
-                if (response.status === 401) throw new Error('401');
-                if (response.status === 403) throw new Error('403');
+                // ─── 401/403 — не повторяем ───
+                if (response.status === 401) {
+                    throw new Error('401');
+                }
+                if (response.status === 403) {
+                    throw new Error('403');
+                }
 
+                // ─── Другие ошибки — одна попытка ───
                 let errMsg = `save: ${response.status}`;
                 try {
                     const errData = await response.json();
                     errMsg = errData.message || errMsg;
                 } catch (e) {}
 
+                // 5xx — стоит повторить
                 if (response.status >= 500) {
                     lastError = new Error(errMsg);
                     const delay = getRetryDelay(attempt);
@@ -38975,13 +38939,18 @@ try {
                 throw new Error(errMsg);
 
             } catch (err) {
+                // Сетевые ошибки — не повторяем (это работа AutoOutbox)
                 if (err.name === 'TypeError' || err.name === 'AbortError') {
                     throw err;
                 }
 
                 lastError = err;
-                if (err.message === '401' || err.message === '403') throw err;
+                // Если это 401/403 — сразу выходим
+                if (err.message === '401' || err.message === '403') {
+                    throw err;
+                }
 
+                // Прочие — повторяем
                 if (attempt < CFG.MAX_RETRIES - 1) {
                     const delay = getRetryDelay(attempt);
                     warn(`⚠️ Ошибка: ${err.message}, повтор через ${Math.round(delay)}мс`);
@@ -38995,20 +38964,31 @@ try {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ГЛАВНЫЙ ПАТЧ: _origSendMessage
+    //  ОСНОВНОЙ ПАТЧ: _origSendMessage
+    //  ─────────────────────────────────────────────────────────
+    //  Заменяем логику сохранения: вместо
+    //    fetchFile → saveFile(sha)
+    //  делаем
+    //    putWithRetry(buildContent = () => fetchFile + merge)
+    //
+    //  Merge нужен, потому что при 409 свежий файл содержит
+    //  сообщения ДРУГОГО пользователя. Мы не должны их потерять.
     // ═══════════════════════════════════════════════════════════
+
     if (typeof _origSendMessage !== 'function') {
-        warn('❌ _origSendMessage не найдена');
+        warn('❌ _origSendMessage не найдена — патч не работает');
         return;
     }
 
-    const _origSendMessage_RetryV2 = _origSendMessage;
+    const _origSendMessage_RetryPatch = _origSendMessage;
 
     _origSendMessage = async function(text, imageBlob = null, audioData = null, fileAttachment = null, audioFile = null, replyContext = null) {
+        // Если нет доступа — падаем на оригинал (он сам обработает)
         if (!state.isAuthorized || !state.chatFile) {
-            return _origSendMessage_RetryV2.apply(this, arguments);
+            return _origSendMessage_RetryPatch.apply(this, arguments);
         }
 
+        // Проверяем, есть ли что отправлять
         const hasText = text && text.trim();
         const hasImage = imageBlob instanceof Blob;
         const hasAudio = audioData !== null;
@@ -39016,21 +38996,12 @@ try {
         const hasAudioFile = audioFile && audioFile.blob instanceof Blob;
 
         if (!hasText && !hasImage && !hasAudio && !hasFile && !hasAudioFile) {
-            return _origSendMessage_RetryV2.apply(this, arguments);
+            return _origSendMessage_RetryPatch.apply(this, arguments);
         }
 
         if (state.isSending) return;
 
-        // ═══ 🆕 Генерируем УНИКАЛЬНЫЙ ID ═══
-        const messageId = generateMessageId();
-
-        // ═══ 🆕 МЬЮТЕКС: если уже отправляем с этим ID — игнор ═══
-        if (_sendingMutex.has(messageId)) {
-            warn(`⚠️ Дубликат отправки заблокирован (id=${messageId})`);
-            return;
-        }
-        _sendingMutex.add(messageId);
-
+        // Закрываем панели
         if (_emojiPanelOpen) toggleEmojiPanel(false);
         if (_attachMenuOpen) toggleAttachMenu(false);
 
@@ -39041,7 +39012,8 @@ try {
         try {
             const path = getChatPath(state.chatFile);
 
-            // ═══ 1. Готовим сообщение ═══
+            // ═══ 1. Готовим сообщение (без сохранения) ═══
+            const messageId = Date.now();
             const plainMsg = {
                 id: messageId,
                 username: state.username,
@@ -39049,6 +39021,7 @@ try {
                 time: new Date().toISOString(),
             };
 
+            // Reply контекст
             if (replyContext) {
                 const replied = historyState.allMessages.find(m => m.id === replyContext.id)
                     || state.messages.find(m => m.id === replyContext.id);
@@ -39067,7 +39040,10 @@ try {
                 };
             }
 
-            // ═══ 2. Вложения ═══
+            // ═══ 2. Загружаем вложения (это тоже файлы на GitHub!) ═══
+            // Вложения имеют уникальные имена — коллизий быть не может,
+            // поэтому 409 при их загрузке маловероятен.
+
             if (hasImage) {
                 const attachName = generateAttachmentName('img', 'jpg');
                 const buf = await imageBlob.arrayBuffer();
@@ -39134,8 +39110,20 @@ try {
 
             state._lastSentMessageId = messageId;
 
-            // ═══ 3. Шифруем ОДИН раз ═══
+            // ═══ 3. Шифруем сообщение ═══
+            // ВАЖНО: шифруем ОДИН РАЗ. При retry sha меняется,
+            // но encrypted payload остаётся тем же — он не зависит от sha.
+
+            // ── Нюанс: encryptMessage использует CRYPTO._key ──
+            // Ключ зависит от salt чата. Если за время retry
+            // другой пользователь поменяет salt (что невозможно
+            // в нормальной работе) — ключ не совпадёт.
+            // Но при обычной работе salt чата НЕ меняется никогда.
+            // Так что можно шифровать один раз.
+
+            // Убедимся, что ключ есть
             if (!CRYPTO._key) {
+                // Попробуем загрузить salt из свежего файла
                 const initial = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
                 if (!initial.exists) {
                     const saltBytes = generateSalt();
@@ -39149,14 +39137,16 @@ try {
 
             const encMsg = await encryptMessage(plainMsg);
 
-            // ═══ 4. PUT с retry + дедупликация ═══
+            // ═══ 4. 🔥 ГЛАВНОЕ: putWithRetry с merge при 409 ═══
             let savedResult = null;
+            let finalSha = null;
             let finalSalt = null;
 
             savedResult = await putWithRetry({
                 path,
                 message: '💬 Обновление чата',
                 buildContent: async () => {
+                    // ─── Перечитываем файл КАЖДЫЙ раз ───
                     const fresh = await fetchFile(
                         state.token, CONFIG.repoOwner, CONFIG.repoName, path
                     );
@@ -39164,6 +39154,7 @@ try {
                     let freshContent, sha;
 
                     if (!fresh.exists) {
+                        // Файла ещё нет — создаём
                         if (!state.salt) {
                             const saltBytes = generateSalt();
                             state.salt = arrayBufferToBase64(saltBytes);
@@ -39182,57 +39173,55 @@ try {
                             throw new Error('Формат файла не поддерживается');
                         }
 
-                        // Salt изменился — передеривируем ключ
+                        // ─── Salt изменился? Передеривим ключ ───
                         if (freshContent.salt !== state.salt) {
                             log('⚠️ Salt изменился, передеривирую ключ');
                             state.salt = freshContent.salt;
                             CRYPTO._key = await deriveKey(state.chatPassword, state.salt);
 
+                            // ⚠️ ВАЖНО: перешифровываем сообщение,
+                            // потому что ключ изменился
                             const reEncMsg = await encryptMessage(plainMsg);
+                            // Заменяем "encMsg" на "reEncMsg" через замыкание
+                            // (используем переменную снаружи)
                             encMsg.iv = reEncMsg.iv;
                             encMsg.data = reEncMsg.data;
                         }
                     }
 
-                    // ═══ 🆕 ГЛАВНОЕ: ЖЁСТКАЯ ПРОВЕРКА НА ДУБЛИКАТ ═══
-                    // Ищем наше сообщение по ТОЧНОМУ ID
-                    const existingIdx = (freshContent.messages || [])
-                        .findIndex(m => m.id === messageId);
+                    // ═══ MERGE: проверяем, не добавил ли кто-то сообщений ═══
+                    // (при retry после 409 файл мог обновиться)
+                    const existingIds = new Set(
+                        (freshContent.messages || []).map(m => m.id)
+                    );
 
-                    if (existingIdx >= 0) {
-                        // 🚫 Наше сообщение уже в файле — НЕ добавляем!
-                        log(`ℹ️ Сообщение id=${messageId} уже в файле — пропускаем`);
-                    } else {
-                        // ✅ Добавляем новое
+                    if (!existingIds.has(messageId)) {
+                        // Нашего сообщения ещё нет — добавляем
                         freshContent.messages.push(encMsg);
 
-                        // Обрезаем
+                        // Обрезаем если слишком много
                         if (freshContent.messages.length > CONFIG.maxMessages) {
                             freshContent.messages = freshContent.messages.slice(-CONFIG.maxMessages);
                         }
+                    } else {
+                        log('ℹ️ Сообщение уже в файле (было добавлено ранее)');
                     }
 
-                    // ═══ 🆕 Дедупликация всего списка ═══
-                    // Если в файле каким-то образом оказались дубликаты —
-                    // вычищаем их при следующей записи
-                    const beforeLen = freshContent.messages.length;
-                    freshContent.messages = dedupeMessages(freshContent.messages);
-                    const afterLen = freshContent.messages.length;
-                    if (afterLen < beforeLen) {
-                        log(`🧹 Дедупликация: ${beforeLen} → ${afterLen}`);
-                    }
-
+                    finalSha = sha;
                     finalSalt = freshContent.salt;
 
                     return { content: freshContent, sha };
                 },
             });
 
-            // ═══ 5. Meta ═══
+            // ═══ 5. Обновляем meta.json ═══
+            // Meta может тоже конфликтовать — используем retry
             try {
-                await updateMetaWithRetry(state.chatFile, messageId, 0);
+                await updateMetaWithRetry(state.chatFile, messageId,
+                    /* count неизвестен точно, но это не критично */ 0);
             } catch (e) {
                 warn('Meta update failed:', e.message);
+                // Не критично — meta обновится позже
             }
 
             state._lastMetaVersion = messageId;
@@ -39240,12 +39229,7 @@ try {
             state._metaEtagsByFile[state.chatFile] = null;
 
             // ═══ 6. Локальное состояние ═══
-            // 🆕 Проверяем, не добавлено ли уже локально
-            const alreadyInState = state.messages.some(m => m.id === messageId);
-            if (!alreadyInState) {
-                state.messages.push(plainMsg);
-            }
-
+            state.messages.push(plainMsg);
             state.sha = savedResult.blobSha;
             state._lastCommitSha = savedResult.commitSha;
 
@@ -39255,13 +39239,7 @@ try {
             messageInput.style.height = 'auto';
             scrollState.isAtBottom = true;
 
-            // 🆕 Проверяем, не отрисовано ли уже
-            const alreadyInDom = messagesInner.querySelector(
-                `.message-wrapper[data-msg-id="${messageId}"]`
-            );
-            if (!alreadyInDom) {
-                appendMessages([plainMsg]);
-            }
+            appendMessages([plainMsg]);
 
             requestAnimationFrame(() => {
                 requestAnimationFrame(() => {
@@ -39287,13 +39265,13 @@ try {
             showToast('✅ Отправлено!', 1000);
 
         } catch (error) {
-            console.error('🛡️ [409-Retry v2] Ошибка:', error);
+            console.error('🛡️ [409-Retry] Ошибка:', error);
 
             if (error.message === 'ABORTED') {
                 showToast('⏹️ Загрузка отменена', 1800);
             } else if (isConflictError(error)) {
                 soundManager.play('error');
-                showToast('⚠️ Конфликт. Попробуйте ещё раз', 3000);
+                showToast('⚠️ Не удалось отправить: конфликт. Попробуйте ещё раз', 3000);
             } else {
                 soundManager.play('error');
                 const isNetworkError = !navigator.onLine
@@ -39317,9 +39295,6 @@ try {
             }
             state._lastSentMessageId = null;
         } finally {
-            // 🆕 Освобождаем мьютекс
-            _sendingMutex.delete(messageId);
-
             if (!SendQueue.isBusy()) {
                 state.isSending = false;
                 sendBtn.disabled = !state.isAuthorized;
@@ -39330,7 +39305,7 @@ try {
     };
 
     // ═══════════════════════════════════════════════════════════
-    //  updateMetaWithRetry
+    //  updateMetaWithRetry — обёртка для meta.json
     // ═══════════════════════════════════════════════════════════
     async function updateMetaWithRetry(file, version, count) {
         const path = getMetaPath(file);
@@ -39345,149 +39320,50 @@ try {
             path,
             message: `📌 meta ${file}`,
             buildContent: async () => {
+                // Перечитываем meta каждый раз
                 let sha = null;
                 try {
                     const res = await fetch(
                         `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${path}`,
-                        { headers: getHeaders(state.token), cache: 'no-store' }
+                        {
+                            headers: getHeaders(state.token),
+                            cache: 'no-store',
+                        }
                     );
                     if (res.ok) {
                         const data = await res.json();
                         sha = data.sha;
                     }
                 } catch (e) {}
+
                 return { content: meta, sha };
             },
         });
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  🆕 ПАТЧ: loadAndDecrypt — дедупликация при загрузке истории
-    //  ─────────────────────────────────────────────────────────
-    //  На случай, если в файле чата уже лежат дубликаты
-    //  (например, от предыдущих отправок до патча) — чистим их
-    //  при чтении.
+    //  ПАТЧ 2: sendTaskAutonomous (AutoOutbox)
+    //  Тоже должна использовать retry при 409
     // ═══════════════════════════════════════════════════════════
-    if (typeof loadAndDecrypt === 'function') {
-        const _origLoadAndDecrypt = loadAndDecrypt;
-
-        loadAndDecrypt = async function(saltBase64, encMessages) {
-            const result = await _origLoadAndDecrypt.call(this, saltBase64, encMessages);
-
-            if (Array.isArray(result)) {
-                // 🆕 Дедупликация по id
-                const seen = new Set();
-                const deduped = [];
-                let removed = 0;
-
-                for (const msg of result) {
-                    if (!msg || msg.id == null) {
-                        deduped.push(msg);
-                        continue;
-                    }
-                    if (seen.has(msg.id)) {
-                        removed++;
-                        continue;
-                    }
-                    seen.add(msg.id);
-                    deduped.push(msg);
-                }
-
-                if (removed > 0) {
-                    warn(`🧹 При загрузке убрано дубликатов: ${removed}`);
-                }
-
-                return deduped;
-            }
-
-            return result;
-        };
-
-        log('✅ loadAndDecrypt обёрнут (дедупликация при загрузке)');
-    }
+    // AutoOutbox вызывает saveFileForTask — тоже может упасть на 409.
+    // Но у неё уже есть своя retry-логика: она перечитывает файл
+    // при каждой попытке. Так что если что — она сама разберётся.
 
     // ═══════════════════════════════════════════════════════════
-    //  🆕 ПАТЧ: decryptMessage — тоже защита
-    //  ─────────────────────────────────────────────────────────
-    //  Если один и тот же encMsg случайно расшифруется дважды —
-    //  второй раз игнорируем.
-    // ═══════════════════════════════════════════════════════════
-    // (уже покрыто выше через loadAndDecrypt)
-
-    // ═══════════════════════════════════════════════════════════
-    //  🆕 ПАТЧ: renderMessages — дедупликация в UI
-    //  ─────────────────────────────────────────────────────────
-    //  Гарантирует, что в DOM не окажется два одинаковых сообщения.
-    // ═══════════════════════════════════════════════════════════
-    if (typeof renderMessages === 'function') {
-        const _origRenderMessages = renderMessages;
-
-        renderMessages = function(messages) {
-            if (Array.isArray(messages)) {
-                const seen = new Set();
-                const deduped = [];
-                for (const m of messages) {
-                    if (!m || m.id == null) {
-                        deduped.push(m);
-                        continue;
-                    }
-                    if (seen.has(m.id)) continue;
-                    seen.add(m.id);
-                    deduped.push(m);
-                }
-                return _origRenderMessages.call(this, deduped);
-            }
-            return _origRenderMessages.apply(this, arguments);
-        };
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  🆕 ПАТЧ: appendMessages — не вставляем дубликат в DOM
-    // ═══════════════════════════════════════════════════════════
-    if (typeof appendMessages === 'function') {
-        const _origAppendMessages = appendMessages;
-
-        appendMessages = function(newMsgs) {
-            if (!newMsgs || newMsgs.length === 0) {
-                return _origAppendMessages.apply(this, arguments);
-            }
-
-            // Фильтруем: не добавляем те, что уже есть в DOM
-            const filtered = newMsgs.filter(msg => {
-                if (!msg || msg.id == null) return true;
-                const existing = messagesInner.querySelector(
-                    `.message-wrapper[data-msg-id="${msg.id}"]`
-                );
-                if (existing) {
-                    log(`⚠️ Сообщение id=${msg.id} уже в DOM — пропускаем`);
-                    return false;
-                }
-                return true;
-            });
-
-            if (filtered.length === 0) return;
-            if (filtered.length < newMsgs.length) {
-                warn(`🧹 appendMessages: отфильтровано ${newMsgs.length - filtered.length}`);
-            }
-
-            return _origAppendMessages.call(this, filtered);
-        };
-
-        log('✅ appendMessages обёрнут (защита от дублирования в DOM)');
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  🆕 ПАТЧ: updateMeta — обёртка для retry
+    //  ПАТЧ 3: updateMeta (глобальная) — обернём через retry
     // ═══════════════════════════════════════════════════════════
     if (typeof updateMeta === 'function') {
         const _origUpdateMeta = updateMeta;
 
         updateMeta = async function(file, version, count) {
+            // Пытаемся сначала обычным способом
             try {
                 return await _origUpdateMeta.call(this, file, version, count);
             } catch (e) {
-                if (isConflictError(e) || (e.message && e.message.includes('409'))) {
-                    log('meta update 409 → retry');
+                // При 409 или ошибке — используем retry
+                if (isConflictError(e) ||
+                    (e.message && e.message.includes('409'))) {
+                    log('meta update 409 → используем retry');
                     try {
                         return await updateMetaWithRetry(file, version, count);
                     } catch (e2) {
@@ -39498,6 +39374,50 @@ try {
                 throw e;
             }
         };
+
+        log('✅ updateMeta обёрнут');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧ 4: загрузка вложений — тоже обернуть на случай 409
+    //  ─────────────────────────────────────────────────────────
+    //  При загрузке вложения используется уникальное имя
+    //  (attachName генерируется через crypto.getRandomValues),
+    //  поэтому 409 практически невозможен. Но на всякий случай —
+    //  если такой случай произойдёт, просто перегенерируем имя.
+    // ═══════════════════════════════════════════════════════════
+
+    if (typeof uploadAttachment === 'function') {
+        const _origUploadAttachment = uploadAttachment;
+
+        uploadAttachment = async function(chatFile, attachName, cipherArrayBuffer, ivBase64, opts) {
+            try {
+                return await _origUploadAttachment.call(
+                    this, chatFile, attachName, cipherArrayBuffer, ivBase64, opts
+                );
+            } catch (e) {
+                // 409 при загрузке вложения — генерируем новое имя
+                if (isConflictError(e) || e.message.includes('409')) {
+                    warn('409 при загрузке вложения — пробуем с новым именем');
+
+                    // Ищем точку перед расширением
+                    const dotIdx = attachName.lastIndexOf('.');
+                    const base = dotIdx > 0 ? attachName.slice(0, dotIdx) : attachName;
+                    const ext = dotIdx > 0 ? attachName.slice(dotIdx + 1) : 'bin';
+
+                    // Генерируем новое имя
+                    const prefix = base.split('_')[0] || 'file';
+                    const newName = generateAttachmentName(prefix, ext);
+
+                    return await _origUploadAttachment.call(
+                        this, chatFile, newName, cipherArrayBuffer, ivBase64, opts
+                    );
+                }
+                throw e;
+            }
+        };
+
+        log('✅ uploadAttachment обёрнут');
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -39506,1115 +39426,37 @@ try {
     window.ConflictRetry = {
         config: CFG,
 
-        generateId: () => generateMessageId(),
-
+        // Тест: симулировать 409 для следующего PUT
+        // (для отладки — не трогает реальный файл)
         testDelay(attempt) {
             return getRetryDelay(attempt);
         },
 
+        // Показать текущие настройки
         status: () => ({
             maxRetries: CFG.MAX_RETRIES,
             baseDelayMs: CFG.BASE_DELAY_MS,
             maxDelayMs: CFG.MAX_DELAY_MS,
             jitterMs: CFG.JITTER_MS,
-            sendingMutexSize: _sendingMutex.size,
-            msgCounter: _msgCounter,
+            debug: CFG.DEBUG,
         }),
 
+        // Изменить настройки на лету
         setMaxRetries(n) {
             CFG.MAX_RETRIES = Math.max(1, Math.min(10, n));
             log('maxRetries =', CFG.MAX_RETRIES);
         },
-
-        // 🆕 Ручная дедупликация истории
-        dedupeHistory: () => {
-            const before = historyState.allMessages.length;
-            historyState.allMessages = dedupeMessages(historyState.allMessages);
-            const after = historyState.allMessages.length;
-            if (after < before) {
-                state.messages = dedupeMessages(state.messages);
-                if (typeof renderHistory === 'function') renderHistory();
-                showToast(`🧹 Убрано дубликатов: ${before - after}`, 2000);
-            } else {
-                showToast('✅ Дубликатов не найдено', 1500);
-            }
-            return { before, after };
-        },
     };
 
-    console.log('🛡️ [409-Retry v2] Патч установлен:');
-    console.log('   ✅ Retry при 409 (до 5 попыток)');
-    console.log('   ✅ Уникальные ID (не Date.now)');
-    console.log('   ✅ Мьютекс — защита от параллельного вызова');
-    console.log('   ✅ Жёсткая проверка ID перед добавлением в файл');
-    console.log('   ✅ Дедупликация при загрузке/рендере/append');
+    console.log('🛡️ [409-Retry] Патч установлен');
+    console.log('   • При 409 CONFLICT — до 5 попыток с задержкой 250мс → 4с');
+    console.log('   • Экспоненциальная задержка + случайный джиттер');
+    console.log('   • Сообщение шифруется ОДИН раз, retry — только PUT');
+    console.log('   • Merge: чужие сообщения НЕ теряются');
+    console.log('   • Работает и для meta.json');
     console.log('');
-    console.log('   API:');
-    console.log('     ConflictRetry.status()         — состояние');
-    console.log('     ConflictRetry.generateId()     — посмотреть новый ID');
-    console.log('     ConflictRetry.dedupeHistory()  — почистить историю');
+    console.log('   API: ConflictRetry.status()');
 })();
 </script>
-
-<script>
-// ═══════════════════════════════════════════════════════════════
-//  🛡️ ANTI-DUPLICATE v3 — фикс гонки при поллинге
-//  ─────────────────────────────────────────────────────────────
-//  Решает проблему: когда после ответа собеседника у тебя
-//  всплывает твоё же ранее отправленное сообщение.
-//
-//  Причина: state.lastMessageCount не синхронизировался с
-//  локальным state.messages после отправки, поэтому поллинг
-//  считал "новыми" ВСЕ сообщения, включая твои.
-// ═══════════════════════════════════════════════════════════════
-
-(function installAntiDuplicateV3() {
-    'use strict';
-
-    console.log('🛡️ [AntiDup v3] Установка…');
-
-    const log = (...a) => console.log('🛡️ [AntiDup v3]', ...a);
-    const warn = (...a) => console.warn('🛡️ [AntiDup v3]', ...a);
-
-    // ═══════════════════════════════════════════════════════════
-    //  ФИКС №1: синхронизация lastMessageCount при отправке
-    //  ─────────────────────────────────────────────────────────
-    //  Оборачиваем _origSendMessage — наш патч v2 уже вставил
-    //  своё туда, теперь мы гарантируем что после его выполнения
-    //  счётчик обновлён корректно.
-    // ═══════════════════════════════════════════════════════════
-    const _prevOrigSend = _origSendMessage;
-
-    _origSendMessage = async function(...args) {
-        const beforeCount = state.messages.length;
-        const result = await _prevOrigSend.apply(this, args);
-
-        // 🆕 После отправки — синхронизируем счётчик
-        // (даже если патч v2 уже это сделал — здесь гарантированно)
-        if (state.messages.length !== beforeCount) {
-            const newCount = state.messages.length;
-
-            // Если счётчик сильно отстаёт — догоняем
-            if (state.lastMessageCount < newCount) {
-                log(`🔧 Синхронизация счётчика: ${state.lastMessageCount} → ${newCount}`);
-                state.lastMessageCount = newCount;
-            }
-        }
-
-        return result;
-    };
-
-    // ═══════════════════════════════════════════════════════════
-    //  ФИКС №2: фильтрация в pollUpdates (главный фикс!)
-    //  ─────────────────────────────────────────────────────────
-    //  Перехватываем pollUpdates и правим его логику через
-    //  глобальный хук "фильтр новых сообщений".
-    //
-    //  Но проще: полностью заменяем pollUpdates своей реализацией,
-    //  которая делает то же самое, но с защитой от дубликатов.
-    // ═══════════════════════════════════════════════════════════
-
-    // Устанавливаем флаг, что патч активен
-    window._antiDupV3Active = true;
-
-    // Прячем в глобальный скоуп — renderHistory использует это
-    if (typeof renderMessages === 'function') {
-        const _origRenderMessages = renderMessages;
-
-        renderMessages = function(messages) {
-            if (Array.isArray(messages)) {
-                // 🆕 Финальная дедупликация перед рендером
-                const seen = new Set();
-                const clean = [];
-                let removed = 0;
-                for (const m of messages) {
-                    if (!m || m.id == null) { clean.push(m); continue; }
-                    if (seen.has(m.id)) { removed++; continue; }
-                    seen.add(m.id);
-                    clean.push(m);
-                }
-                if (removed > 0) {
-                    warn(`🧹 renderMessages: убрано ${removed} дубликатов`);
-                }
-                return _origRenderMessages.call(this, clean);
-            }
-            return _origRenderMessages.apply(this, arguments);
-        };
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ФИКС №3: appendMessages с проверкой historyState
-    // ═══════════════════════════════════════════════════════════
-    const _prevAppendMessages = appendMessages;
-
-    appendMessages = function(newMsgs) {
-        if (!newMsgs || newMsgs.length === 0) {
-            return _prevAppendMessages.apply(this, arguments);
-        }
-
-        // 🆕 Проверка по глобальной истории
-        const knownIds = new Set(historyState.allMessages.map(m => m.id));
-
-        const filtered = newMsgs.filter(msg => {
-            if (!msg || msg.id == null) return true;
-
-            // Уже в historyState?
-            if (knownIds.has(msg.id)) {
-                log(`⚠️ id=${msg.id} уже в historyState — фильтруем`);
-                return false;
-            }
-
-            // Уже в DOM?
-            const existing = messagesInner.querySelector(
-                `.message-wrapper[data-msg-id="${msg.id}"]`
-            );
-            if (existing) {
-                log(`⚠️ id=${msg.id} уже в DOM — фильтруем`);
-                return false;
-            }
-
-            knownIds.add(msg.id);
-            return true;
-        });
-
-        if (filtered.length === 0) {
-            log('ℹ️ Все сообщения уже известны — пропускаем appendMessages');
-            return;
-        }
-
-        if (filtered.length < newMsgs.length) {
-            warn(`🧹 appendMessages: отфильтровано ${newMsgs.length - filtered.length}`);
-        }
-
-        return _prevAppendMessages.call(this, filtered);
-    };
-
-    // ═══════════════════════════════════════════════════════════
-    //  ФИКС №4: Перехват pollUpdates (КЛЮЧЕВОЙ!)
-    //  ─────────────────────────────────────────────────────────
-    //  Переписываем pollUpdates целиком с защитой от дубликатов.
-    //  Основная логика та же, но с фильтрацией.
-    // ═══════════════════════════════════════════════════════════
-    pollUpdates = async function() {
-        if (state.isPolling || !state.token || !state.isAuthorized || !CRYPTO._key || !state.chatFile) return;
-        state.isPolling = true;
-
-        try {
-            const chatPath = getChatPath(state.chatFile);
-
-            let metaRes = null;
-            try {
-                metaRes = await fetchMetaFast(state.chatFile, state._metaEtag);
-            } catch (e) {
-                console.warn('Meta fetch failed:', e.message);
-                if (e.message.includes('401') || e.message.includes('403')) throw e;
-                return;
-            }
-
-            if (metaRes.notModified) {
-                if (!networkState.isOnline) {
-                    networkState.isOnline = true;
-                    showToast('🌐 Соединение восстановлено', 2000);
-                }
-                return;
-            }
-            if (!metaRes.exists) return;
-
-            state._metaEtag = metaRes.etag || null;
-            const metaVersion = metaRes.content && metaRes.content.version;
-            if (!metaVersion) return;
-
-            if (metaVersion === state._lastMetaVersion) {
-                if (!networkState.isOnline) {
-                    networkState.isOnline = true;
-                    showToast('🌐 Соединение восстановлено', 2000);
-                }
-                return;
-            }
-
-            state._lastMetaVersion = metaVersion;
-            state._lastActivityAt = Date.now();
-
-            const commitSha = await getLatestCommitSha(state.token, CONFIG.repoOwner, CONFIG.repoName, chatPath);
-            if (!networkState.isOnline) {
-                networkState.isOnline = true;
-                showToast('🌐 Соединение восстановлено', 2000);
-            }
-            if (!commitSha) return;
-            if (commitSha === state._lastCommitSha) return;
-
-            let blobSha = null;
-            let content = null;
-
-            const tryBlobSha = await tryGetFileBlobSha(state.token, CONFIG.repoOwner, CONFIG.repoName, commitSha, chatPath);
-            if (tryBlobSha) {
-                const tryContent = await tryGetBlobContent(state.token, CONFIG.repoOwner, CONFIG.repoName, tryBlobSha);
-                if (tryContent) { blobSha = tryBlobSha; content = tryContent; }
-            }
-            if (!content) {
-                const fallback = await fetchViaContentsRef(state.token, CONFIG.repoOwner, CONFIG.repoName, chatPath, commitSha);
-                if (!fallback) { state._lastCommitSha = commitSha; return; }
-                blobSha = fallback.sha;
-                content = fallback.content;
-            }
-            if (blobSha === state.sha) { state._lastCommitSha = commitSha; return; }
-
-            state._lastCommitSha = commitSha;
-            state.sha = blobSha;
-
-            if (!content || content.v !== CRYPTO.VERSION) return;
-            if (content.salt !== state.salt) {
-                state.salt = content.salt;
-                CRYPTO._key = await deriveKey(state.chatPassword, state.salt);
-            }
-
-            const encMessages = content.messages || [];
-
-            // ═══════════════════════════════════════════════════════
-            //  🆕 СЛУЧАЙ 1: сообщений стало МЕНЬШЕ (удаление)
-            // ═══════════════════════════════════════════════════════
-            if (encMessages.length < state.lastMessageCount) {
-                const decrypted = [];
-                for (const enc of encMessages) {
-                    const m = await decryptMessage(enc);
-                    if (m) decrypted.push(m);
-                }
-
-                // 🆕 Дедупликация
-                const seen = new Set();
-                const clean = [];
-                for (const m of decrypted) {
-                    if (!m || m.id == null) { clean.push(m); continue; }
-                    if (seen.has(m.id)) continue;
-                    seen.add(m.id);
-                    clean.push(m);
-                }
-
-                state.messages = clean;
-                state.lastMessageCount = clean.length;
-
-                if (state.currentScreen === 'chat') {
-                    renderMessages(state.messages);
-                } else {
-                    refreshUnreadBadges();
-                }
-                return;
-            }
-
-            if (encMessages.length === state.lastMessageCount) return;
-
-            // ═══════════════════════════════════════════════════════
-            //  🆕 СЛУЧАЙ 2: пришли новые сообщения
-            // ═══════════════════════════════════════════════════════
-
-            // 🆕 КЛЮЧЕВОЙ ФИКС: вместо slice(lastMessageCount) —
-            //    берём сообщения по id, которых у нас ЕЩЁ НЕТ.
-            //    Это защищает от случая, когда счётчик отстал.
-            const knownIds = new Set(historyState.allMessages.map(m => m.id));
-
-            const trulyNewEnc = [];
-            for (const enc of encMessages) {
-                if (!knownIds.has(enc.id)) {
-                    trulyNewEnc.push(enc);
-                }
-            }
-
-            if (trulyNewEnc.length === 0) {
-                // Всё, что "новое" по счётчику — уже есть локально.
-                // Просто синхронизируем счётчик и выходим.
-                log(`ℹ️ Счётчик отставал (${state.lastMessageCount} vs ${encMessages.length}), но новых нет`);
-                state.lastMessageCount = encMessages.length;
-                return;
-            }
-
-            log(`📥 Найдено новых: ${trulyNewEnc.length} (было ${new Set(encMessages.map(m => m.id)).size - knownIds.size + trulyNewEnc.length} в файле)`);
-
-            // Дешифруем только новые
-            const newPlainMessages = [];
-            for (const enc of trulyNewEnc) {
-                const m = await decryptMessage(enc);
-                if (m) newPlainMessages.push(m);
-            }
-
-            if (newPlainMessages.length === 0) {
-                state.lastMessageCount = encMessages.length;
-                return;
-            }
-
-            // 🆕 Ещё раз фильтруем — вдруг что-то уже успело попасть
-            const finalNew = newPlainMessages.filter(m => {
-                if (!m || m.id == null) return true;
-                return !historyState.allMessages.some(x => x.id === m.id);
-            });
-
-            if (finalNew.length === 0) {
-                state.lastMessageCount = encMessages.length;
-                return;
-            }
-
-            const hasOwnMessage = finalNew.some(
-                m => m.username === state.username && m.id === state._lastSentMessageId
-            );
-            const wasAtBottom = scrollState.isAtBottom;
-            const addedCount = finalNew.length;
-
-            // 🆕 Обновляем state синхронно
-            state.messages = state.messages.concat(finalNew);
-            state.lastMessageCount = encMessages.length;
-
-            if (state.currentScreen !== 'chat') {
-                const chat = state.chats.find(c => c.file === state.chatFile);
-                if (chat) {
-                    chat.hasUnread = true;
-                    chat.unreadCount = (chat.unreadCount || 0) + addedCount;
-                    saveChatsList();
-                    if (state.currentScreen === 'chats') renderChatsList();
-                }
-                if (!hasOwnMessage) soundManager.play('receive');
-                return;
-            }
-
-            scrollState.isAtBottom = wasAtBottom;
-            appendMessages(finalNew);
-
-            const stillAtBottom = (() => {
-                const diff = messagesContainer.scrollHeight
-                    - messagesContainer.scrollTop
-                    - messagesContainer.clientHeight;
-                return diff < 120;
-            })();
-
-            if (wasAtBottom && stillAtBottom) {
-                scrollToBottom(true);
-                markChatAsRead();
-            } else {
-                scrollState.unreadCount += addedCount;
-                updateScrollBadge();
-                updateScrollButton();
-            }
-            if (!hasOwnMessage) soundManager.play('receive');
-            else state._lastSentMessageId = null;
-
-        } catch (error) {
-            console.error('Polling error:', error);
-            const isNetworkError = !navigator.onLine || error.name === 'AbortError'
-                || error.name === 'TypeError' || error.message.includes('Failed to fetch');
-            if (isNetworkError) {
-                if (networkState.isOnline) {
-                    networkState.isOnline = false;
-                    showToast('📵 Соединение потеряно', 2500);
-                }
-                return;
-            }
-            if (error.message.includes('403') || error.message.includes('401')) lockChatUI('Сессия истекла');
-        } finally {
-            state.isPolling = false;
-        }
-    };
-
-    log('✅ pollUpdates заменён (фильтрация по id)');
-
-    // ═══════════════════════════════════════════════════════════
-    //  ФИКС №5: гарантированная синхронизация счётчика после
-    //  любых мутаций state.messages
-    // ═══════════════════════════════════════════════════════════
-    // Периодически (раз в 3 секунды) проверяем, что счётчик
-    // соответствует реальному количеству сообщений.
-    setInterval(() => {
-        if (!state.isAuthorized || !state.chatFile) return;
-        if (state.currentScreen !== 'chat') return;
-
-        const realCount = state.messages.length;
-        if (state.lastMessageCount !== realCount) {
-            // Только если счётчик ОТСТАЁТ — догоняем
-            // (если опережает — значит есть удаления в поллинге)
-            if (state.lastMessageCount < realCount) {
-                log(`🔧 Автокоррекция счётчика: ${state.lastMessageCount} → ${realCount}`);
-                state.lastMessageCount = realCount;
-            }
-        }
-    }, 3000);
-
-    // ═══════════════════════════════════════════════════════════
-    //  API ДЛЯ ОТЛАДКИ
-    // ═══════════════════════════════════════════════════════════
-    window.AntiDuplicate = {
-        status: () => ({
-            lastMessageCount: state.lastMessageCount,
-            messagesInState: state.messages.length,
-            messagesInHistory: historyState.allMessages.length,
-            domWrappers: messagesInner.querySelectorAll('.message-wrapper[data-msg-id]').length,
-            inSync: state.lastMessageCount === state.messages.length,
-            lastSentId: state._lastSentMessageId,
-        }),
-
-        // Принудительно синхронизировать счётчик
-        syncCount: () => {
-            const before = state.lastMessageCount;
-            state.lastMessageCount = state.messages.length;
-            log(`🔧 Ручная синхронизация: ${before} → ${state.lastMessageCount}`);
-            return { before, after: state.lastMessageCount };
-        },
-
-        // Найти все дубликаты в текущем DOM
-        findDuplicates: () => {
-            const wrappers = messagesInner.querySelectorAll('.message-wrapper[data-msg-id]');
-            const ids = new Map();
-            wrappers.forEach(w => {
-                const id = w.dataset.msgId;
-                ids.set(id, (ids.get(id) || 0) + 1);
-            });
-            const dups = [];
-            ids.forEach((count, id) => {
-                if (count > 1) dups.push({ id, count });
-            });
-            return dups;
-        },
-
-        // Почистить дубликаты в DOM
-        cleanDom: () => {
-            const wrappers = messagesInner.querySelectorAll('.message-wrapper[data-msg-id]');
-            const seen = new Set();
-            let removed = 0;
-            wrappers.forEach(w => {
-                const id = w.dataset.msgId;
-                if (seen.has(id)) {
-                    w.remove();
-                    removed++;
-                } else {
-                    seen.add(id);
-                }
-            });
-            log(`🧹 Убрано из DOM: ${removed}`);
-            return removed;
-        },
-    };
-
-    console.log('🛡️ [AntiDup v3] Патч установлен');
-    console.log('   ✅ lastMessageCount синхронизируется при отправке');
-    console.log('   ✅ pollUpdates фильтрует по id, а не по счётчику');
-    console.log('   ✅ appendMessages проверяет и historyState, и DOM');
-    console.log('   ✅ renderMessages дедуплицирует на финальном этапе');
-    console.log('   ✅ Автокоррекция счётчика каждые 3 сек');
-    console.log('');
-    console.log('   API: AntiDuplicate.status()');
-    console.log('        AntiDuplicate.findDuplicates() — найти дубли в DOM');
-    console.log('        AntiDuplicate.cleanDom() — почистить дубли');
-    console.log('        AntiDuplicate.syncCount() — синхронизировать счётчик');
-})();
-</script>
-<script>
-// ═══════════════════════════════════════════════════════════════
-//  🛡️ OUTGOING SYNC v4
-//  ─────────────────────────────────────────────────────────────
-//  Проблема: при неудачной отправке (409×5) сообщение остаётся
-//  локально в state.messages, но на сервере его нет. При поллинге
-//  это приводит к рассинхрону: "мои" vs "чужие".
-//
-//  Решение: вводим понятие "outgoing" — исходящие сообщения,
-//  которые ещё НЕ подтверждены сервером.
-//   1. Пишем сообщение → отправляем → добавляем в outgoing
-//   2. Сервер подтвердил → убираем из outgoing
-//   3. Поллинг видит сообщение на сервере → считает подтверждённым
-// ═══════════════════════════════════════════════════════════════
-
-(function installOutgoingSyncV4() {
-    'use strict';
-
-    console.log('🛡️ [Outgoing v4] Установка…');
-
-    const log = (...a) => console.log('🛡️ [Outgoing v4]', ...a);
-    const warn = (...a) => console.warn('🛡️ [Outgoing v4]', ...a);
-
-    // ═══════════════════════════════════════════════════════════
-    //  СОСТОЯНИЕ: исходящие сообщения по чатам
-    //  { [chatFile]: Map<msgId, {plainMsg, status, errorMessage}> }
-    // ═══════════════════════════════════════════════════════════
-    const Outgoing = new Map();
-
-    function getOutgoing(chatFile) {
-        if (!Outgoing.has(chatFile)) Outgoing.set(chatFile, new Map());
-        return Outgoing.get(chatFile);
-    }
-
-    function addOutgoing(chatFile, msgId, plainMsg) {
-        const map = getOutgoing(chatFile);
-        map.set(msgId, {
-            plainMsg,
-            status: 'pending',
-            addedAt: Date.now(),
-            errorMessage: null,
-        });
-    }
-
-    function confirmOutgoing(chatFile, msgId) {
-        const map = getOutgoing(chatFile);
-        return map.delete(msgId);
-    }
-
-    function failOutgoing(chatFile, msgId, errorMessage) {
-        const map = getOutgoing(chatFile);
-        const item = map.get(msgId);
-        if (item) {
-            item.status = 'error';
-            item.errorMessage = errorMessage || 'Ошибка';
-        }
-    }
-
-    function hasOutgoing(chatFile, msgId) {
-        return getOutgoing(chatFile).has(msgId);
-    }
-
-    function listOutgoing(chatFile) {
-        return Array.from(getOutgoing(chatFile).values());
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ОБЁРТКА _origSendMessage
-    //  ─────────────────────────────────────────────────────────
-    //  Логика:
-    //   1. Генерим messageId
-    //   2. Сразу добавляем в outgoing (статус 'pending')
-    //   3. Отправляем через putWithRetry
-    //   4. Если успех → confirmOutgoing + push в state.messages
-    //   5. Если провал → failOutgoing, сообщение остаётся в UI
-    //      с кнопкой "Повторить"
-    // ═══════════════════════════════════════════════════════════
-    const _prevSend = _origSendMessage;
-
-    _origSendMessage = async function(text, imageBlob = null, audioData = null, fileAttachment = null, audioFile = null, replyContext = null) {
-        if (!state.isAuthorized || !state.chatFile) {
-            return _prevSend.apply(this, arguments);
-        }
-
-        const hasText = text && text.trim();
-        const hasImage = imageBlob instanceof Blob;
-        const hasAudio = audioData !== null;
-        const hasFile = fileAttachment && fileAttachment.blob instanceof Blob;
-        const hasAudioFile = audioFile && audioFile.blob instanceof Blob;
-
-        if (!hasText && !hasImage && !hasAudio && !hasFile && !hasAudioFile) {
-            return _prevSend.apply(this, arguments);
-        }
-
-        if (state.isSending) return;
-
-        // ═══ Генерим ID и сразу регистрируем в outgoing ═══
-        const messageId = typeof ConflictRetry !== 'undefined'
-            && ConflictRetry.generateId
-            ? ConflictRetry.generateId()
-            : Date.now() * 1000 + Math.floor(Math.random() * 1000);
-
-        const chatFileAtStart = state.chatFile;
-
-        // Формируем "предварительное" plainMsg для UI
-        const previewMsg = {
-            id: messageId,
-            username: state.username,
-            text: hasText ? text.trim() : '',
-            time: new Date().toISOString(),
-        };
-
-        // Регистрируем в outgoing
-        addOutgoing(chatFileAtStart, messageId, previewMsg);
-
-        // Отправляем через обычный путь
-        const result = await _prevSend.apply(this, arguments);
-
-        // _prevSend при ошибке уже уведомил пользователя
-        // Проверяем, что стало с сообщением
-        if (state.messages.some(m => m.id === messageId)) {
-            // Сообщение попало в state.messages — значит успешно
-            confirmOutgoing(chatFileAtStart, messageId);
-            log(`✅ id=${messageId} подтверждён сервером`);
-        } else {
-            // Сообщение не попало в state.messages — что-то пошло не так
-            // (это может быть при ошибке отправки)
-            failOutgoing(chatFileAtStart, messageId, 'Не отправлено');
-            warn(`❌ id=${messageId} НЕ подтверждён — статус: error`);
-        }
-
-        return result;
-    };
-
-    // ═══════════════════════════════════════════════════════════
-    //  🆕 ГЛАВНЫЙ ФИКС: pollUpdates с учётом outgoing
-    //  ─────────────────────────────────────────────────────────
-    //  Логика:
-    //   1. Смотрим новые сообщения из файла (по id)
-    //   2. Из них убираем те, что уже в historyState
-    //   3. Дополнительно проверяем: если сообщение наше и оно
-    //      подтверждено сервером — убираем из outgoing
-    //   4. Применяем: state.messages = серверные + свои pending
-    // ═══════════════════════════════════════════════════════════
-    pollUpdates = async function() {
-        if (state.isPolling || !state.token || !state.isAuthorized || !CRYPTO._key || !state.chatFile) return;
-        state.isPolling = true;
-
-        try {
-            const chatPath = getChatPath(state.chatFile);
-
-            let metaRes = null;
-            try {
-                metaRes = await fetchMetaFast(state.chatFile, state._metaEtag);
-            } catch (e) {
-                console.warn('Meta fetch failed:', e.message);
-                if (e.message.includes('401') || e.message.includes('403')) throw e;
-                return;
-            }
-
-            if (metaRes.notModified) {
-                if (!networkState.isOnline) {
-                    networkState.isOnline = true;
-                    showToast('🌐 Соединение восстановлено', 2000);
-                }
-                return;
-            }
-            if (!metaRes.exists) return;
-
-            state._metaEtag = metaRes.etag || null;
-            const metaVersion = metaRes.content && metaRes.content.version;
-            if (!metaVersion) return;
-
-            if (metaVersion === state._lastMetaVersion) {
-                if (!networkState.isOnline) {
-                    networkState.isOnline = true;
-                    showToast('🌐 Соединение восстановлено', 2000);
-                }
-                return;
-            }
-
-            state._lastMetaVersion = metaVersion;
-            state._lastActivityAt = Date.now();
-
-            const commitSha = await getLatestCommitSha(state.token, CONFIG.repoOwner, CONFIG.repoName, chatPath);
-            if (!networkState.isOnline) {
-                networkState.isOnline = true;
-                showToast('🌐 Соединение восстановлено', 2000);
-            }
-            if (!commitSha) return;
-            if (commitSha === state._lastCommitSha) return;
-
-            let blobSha = null;
-            let content = null;
-
-            const tryBlobSha = await tryGetFileBlobSha(state.token, CONFIG.repoOwner, CONFIG.repoName, commitSha, chatPath);
-            if (tryBlobSha) {
-                const tryContent = await tryGetBlobContent(state.token, CONFIG.repoOwner, CONFIG.repoName, tryBlobSha);
-                if (tryContent) { blobSha = tryBlobSha; content = tryContent; }
-            }
-            if (!content) {
-                const fallback = await fetchViaContentsRef(state.token, CONFIG.repoOwner, CONFIG.repoName, chatPath, commitSha);
-                if (!fallback) { state._lastCommitSha = commitSha; return; }
-                blobSha = fallback.sha;
-                content = fallback.content;
-            }
-            if (blobSha === state.sha) { state._lastCommitSha = commitSha; return; }
-
-            state._lastCommitSha = commitSha;
-            state.sha = blobSha;
-
-            if (!content || content.v !== CRYPTO.VERSION) return;
-            if (content.salt !== state.salt) {
-                state.salt = content.salt;
-                CRYPTO._key = await deriveKey(state.chatPassword, state.salt);
-            }
-
-            const encMessages = content.messages || [];
-
-            // ═══════════════════════════════════════════════════════
-            //  🆕 Проверяем подтверждённые outgoing
-            //  ─────────────────────────────────────────────────────────
-            //  Если наш outgoing-id есть в серверных — удаляем из outgoing,
-            //  значит сервер принял наше сообщение.
-            // ═══════════════════════════════════════════════════════
-            const serverIds = new Set(encMessages.map(m => m.id));
-            const outgoingMap = getOutgoing(state.chatFile);
-
-            for (const [outId, item] of outgoingMap.entries()) {
-                if (serverIds.has(outId)) {
-                    log(`✅ Outgoing ${outId} подтверждён поллингом`);
-                    outgoingMap.delete(outId);
-                }
-            }
-
-            // ═══════════════════════════════════════════════════════
-            //  Случай A: сообщений стало меньше (удаление)
-            // ═══════════════════════════════════════════════════════
-            if (encMessages.length < state.lastMessageCount) {
-                const decrypted = [];
-                for (const enc of encMessages) {
-                    const m = await decryptMessage(enc);
-                    if (m) decrypted.push(m);
-                }
-
-                // Дедупликация
-                const seen = new Set();
-                const clean = [];
-                for (const m of decrypted) {
-                    if (!m || m.id == null) { clean.push(m); continue; }
-                    if (seen.has(m.id)) continue;
-                    seen.add(m.id);
-                    clean.push(m);
-                }
-
-                // 🆕 Добавляем свои outgoing (если есть)
-                const outgoing = listOutgoing(state.chatFile).map(x => x.plainMsg);
-                for (const out of outgoing) {
-                    if (!seen.has(out.id)) {
-                        clean.push(out);
-                        seen.add(out.id);
-                    }
-                }
-
-                state.messages = clean;
-                state.lastMessageCount = clean.length;
-
-                if (state.currentScreen === 'chat') {
-                    renderMessages(state.messages);
-                } else {
-                    refreshUnreadBadges();
-                }
-                return;
-            }
-
-            if (encMessages.length === state.lastMessageCount && outgoingMap.size === 0) return;
-
-            // ═══════════════════════════════════════════════════════
-            //  Случай B: пришли новые сообщения
-            // ═══════════════════════════════════════════════════════
-
-            // 🆕 Фильтруем по id, а не по счётчику
-            const knownIds = new Set(historyState.allMessages.map(m => m.id));
-
-            const trulyNewEnc = [];
-            for (const enc of encMessages) {
-                if (!knownIds.has(enc.id)) {
-                    trulyNewEnc.push(enc);
-                }
-            }
-
-            if (trulyNewEnc.length === 0) {
-                // Счётчик мог отстать, но реально новых нет
-                // Только синхронизируем счётчик
-                const realCount = encMessages.length;
-                if (state.lastMessageCount !== realCount) {
-                    log(`🔧 Счётчик: ${state.lastMessageCount} → ${realCount}`);
-                    state.lastMessageCount = realCount;
-                }
-                return;
-            }
-
-            log(`📥 Новых с сервера: ${trulyNewEnc.length}`);
-
-            // Дешифруем
-            const newPlainMessages = [];
-            for (const enc of trulyNewEnc) {
-                const m = await decryptMessage(enc);
-                if (m) newPlainMessages.push(m);
-            }
-
-            if (newPlainMessages.length === 0) {
-                state.lastMessageCount = encMessages.length;
-                return;
-            }
-
-            // Ещё раз фильтруем
-            const finalNew = newPlainMessages.filter(m => {
-                if (!m || m.id == null) return true;
-                return !historyState.allMessages.some(x => x.id === m.id);
-            });
-
-            if (finalNew.length === 0) {
-                state.lastMessageCount = encMessages.length;
-                return;
-            }
-
-            const hasOwnMessage = finalNew.some(
-                m => m.username === state.username && m.id === state._lastSentMessageId
-            );
-            const wasAtBottom = scrollState.isAtBottom;
-            const addedCount = finalNew.length;
-
-            // 🆕 ВАЖНО: корректная синхронизация
-            // state.messages = серверные (в порядке) + outgoing (в конце)
-            const outgoingList = listOutgoing(state.chatFile).map(x => x.plainMsg);
-
-            // Собираем итоговый список
-            const finalState = [];
-
-            // Серверные (уже включая наши подтверждённые)
-            const serverMsgMap = new Map();
-            for (const m of state.messages) {
-                serverMsgMap.set(m.id, m);
-            }
-
-            // Добавляем новые
-            for (const m of finalNew) {
-                serverMsgMap.set(m.id, m);
-            }
-
-            // Составляем итог в порядке сервера + outgoing в конце
-            for (const enc of encMessages) {
-                const m = serverMsgMap.get(enc.id);
-                if (m) finalState.push(m);
-            }
-
-            // Добавляем outgoing (те, которых нет на сервере)
-            for (const out of outgoingList) {
-                if (!serverMsgMap.has(out.id)) {
-                    finalState.push(out);
-                }
-            }
-
-            state.messages = finalState;
-            state.lastMessageCount = encMessages.length;
-
-            if (state.currentScreen !== 'chat') {
-                const chat = state.chats.find(c => c.file === state.chatFile);
-                if (chat) {
-                    chat.hasUnread = true;
-                    chat.unreadCount = (chat.unreadCount || 0) + addedCount;
-                    saveChatsList();
-                    if (state.currentScreen === 'chats') renderChatsList();
-                }
-                if (!hasOwnMessage) soundManager.play('receive');
-                return;
-            }
-
-            scrollState.isAtBottom = wasAtBottom;
-
-            // 🆕 Перерисовываем ВСЁ, чтобы гарантировать порядок
-            // (это надёжнее, чем добавлять в конец)
-            renderMessages(finalState);
-
-            const stillAtBottom = (() => {
-                const diff = messagesContainer.scrollHeight
-                    - messagesContainer.scrollTop
-                    - messagesContainer.clientHeight;
-                return diff < 120;
-            })();
-
-            if (wasAtBottom && stillAtBottom) {
-                scrollToBottom(true);
-                markChatAsRead();
-            } else {
-                scrollState.unreadCount += addedCount;
-                updateScrollBadge();
-                updateScrollButton();
-            }
-            if (!hasOwnMessage) soundManager.play('receive');
-            else state._lastSentMessageId = null;
-
-        } catch (error) {
-            console.error('Polling error:', error);
-            const isNetworkError = !navigator.onLine || error.name === 'AbortError'
-                || error.name === 'TypeError' || error.message.includes('Failed to fetch');
-            if (isNetworkError) {
-                if (networkState.isOnline) {
-                    networkState.isOnline = false;
-                    showToast('📵 Соединение потеряно', 2500);
-                }
-                return;
-            }
-            if (error.message.includes('403') || error.message.includes('401')) lockChatUI('Сессия истекла');
-        } finally {
-            state.isPolling = false;
-        }
-    };
-
-    log('✅ pollUpdates заменён (учитывает outgoing)');
-
-    // ═══════════════════════════════════════════════════════════
-    //  🆕 ФИКС: при смене чата — не терять outgoing
-    // ═══════════════════════════════════════════════════════════
-    const _prevEnterChat = enterChat;
-    enterChat = async function(file, name, password) {
-        const result = await _prevEnterChat.call(this, file, name, password);
-
-        // После входа — если есть outgoing для этого чата,
-        // добавляем их в конец state.messages (они не на сервере)
-        if (state.chatFile === file) {
-            const outgoing = listOutgoing(file);
-            if (outgoing.length > 0) {
-                log(`📤 Восстанавливаем ${outgoing.length} outgoing для ${file}`);
-                for (const item of outgoing) {
-                    if (!state.messages.some(m => m.id === item.plainMsg.id)) {
-                        state.messages.push(item.plainMsg);
-                    }
-                }
-                // Перерисовываем
-                if (state.currentScreen === 'chat') {
-                    appendMessages(outgoing.map(x => x.plainMsg));
-                }
-            }
-        }
-
-        return result;
-    };
-
-    // ═══════════════════════════════════════════════════════════
-    //  🆕 ФИКС: при загрузке истории — фильтруем outgoing
-    //  ─────────────────────────────────────────────────────────
-    //  Если в локальной истории есть сообщения, которых нет
-    //  на сервере, но которые "висят" в outgoing — оставляем их.
-    //  Все остальные "фантомные" (были добавлены ошибочно) — убираем.
-    // ═══════════════════════════════════════════════════════════
-    const _prevLoadAndDecrypt = loadAndDecrypt;
-    loadAndDecrypt = async function(saltBase64, encMessages) {
-        const result = await _prevLoadAndDecrypt.call(this, saltBase64, encMessages);
-
-        if (!Array.isArray(result)) return result;
-
-        // Собираем id с сервера
-        const serverIds = new Set(encMessages.map(m => m.id));
-
-        // Фильтруем: оставляем только те, что есть на сервере
-        const clean = [];
-        const seen = new Set();
-
-        for (const msg of result) {
-            if (!msg || msg.id == null) { clean.push(msg); continue; }
-            if (seen.has(msg.id)) continue;
-            seen.add(msg.id);
-            clean.push(msg);
-        }
-
-        return clean;
-    };
-
-    // ═══════════════════════════════════════════════════════════
-    //  🆕 ХУК: подтверждение outgoing при успешной отправке
-    //  ─────────────────────────────────────────────────────────
-    //  Патчим appendMessages: если пришло сообщение с нашим
-    //  messageId и оно есть в outgoing — подтверждаем.
-    // ═══════════════════════════════════════════════════════════
-    const _prevAppendMessages = appendMessages;
-    appendMessages = function(newMsgs) {
-        if (!newMsgs || newMsgs.length === 0) {
-            return _prevAppendMessages.apply(this, arguments);
-        }
-
-        // Проверяем: не подтвердилось ли что-то из outgoing
-        if (state.chatFile) {
-            for (const msg of newMsgs) {
-                if (msg && msg.id != null && hasOutgoing(state.chatFile, msg.id)) {
-                    log(`✅ Outgoing ${msg.id} подтверждён через appendMessages`);
-                    confirmOutgoing(state.chatFile, msg.id);
-                }
-            }
-        }
-
-        return _prevAppendMessages.apply(this, arguments);
-    };
-
-    // ═══════════════════════════════════════════════════════════
-    //  API ДЛЯ ОТЛАДКИ
-    // ═══════════════════════════════════════════════════════════
-    window.OutgoingSync = {
-        list: (chatFile) => {
-            const file = chatFile || state.chatFile;
-            if (!file) return [];
-            return listOutgoing(file).map(x => ({
-                id: x.plainMsg.id,
-                text: (x.plainMsg.text || '').slice(0, 30),
-                status: x.status,
-                ageMs: Date.now() - x.addedAt,
-                errorMessage: x.errorMessage,
-            }));
-        },
-
-        count: (chatFile) => {
-            const file = chatFile || state.chatFile;
-            if (!file) return 0;
-            return getOutgoing(file).size;
-        },
-
-        status: () => ({
-            currentChat: state.chatFile,
-            outgoingCount: state.chatFile ? getOutgoing(state.chatFile).size : 0,
-            outgoing: state.chatFile ? listOutgoing(state.chatFile).map(x => ({
-                id: x.plainMsg.id,
-                text: (x.plainMsg.text || '').slice(0, 30),
-                status: x.status,
-            })) : [],
-            messagesInState: state.messages.length,
-            messagesOnServer: state.lastMessageCount,
-            inHistory: historyState.allMessages.length,
-        }),
-
-        // Принудительно очистить outgoing (если знаешь что все ушли)
-        clear: (chatFile) => {
-            const file = chatFile || state.chatFile;
-            if (!file) return 0;
-            const map = getOutgoing(file);
-            const count = map.size;
-            map.clear();
-            log(`🧹 Outgoing очищено: ${count}`);
-            return count;
-        },
-
-        // Дозагрузить историю с сервера (если что-то подозрительно)
-        resync: async () => {
-            if (!state.chatFile) return;
-            const path = getChatPath(state.chatFile);
-            const result = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
-            if (!result.exists) return;
-
-            const content = result.content;
-            if (!content || content.v !== CRYPTO.VERSION) return;
-
-            const decrypted = [];
-            for (const enc of (content.messages || [])) {
-                const m = await decryptMessage(enc);
-                if (m) decrypted.push(m);
-            }
-
-            // Дедупликация
-            const seen = new Set();
-            const clean = [];
-            for (const m of decrypted) {
-                if (!m || m.id == null) continue;
-                if (seen.has(m.id)) continue;
-                seen.add(m.id);
-                clean.push(m);
-            }
-
-            // 🆕 Свои outgoing подтверждаем: если они на сервере — убираем из outgoing
-            const outgoingMap = getOutgoing(state.chatFile);
-            for (const [outId] of outgoingMap.entries()) {
-                if (seen.has(outId)) {
-                    outgoingMap.delete(outId);
-                }
-            }
-
-            // 🆕 Оставляем только те, что подтверждены сервером
-            state.messages = clean;
-            state.lastMessageCount = clean.length;
-
-            // Перерисовываем
-            if (state.currentScreen === 'chat') {
-                renderMessages(clean);
-            }
-
-            log(`🔄 Resync: ${clean.length} сообщений загружено`);
-            return clean.length;
-        },
-    };
-
-    console.log('🛡️ [Outgoing v4] Патч установлен:');
-    console.log('   ✅ Outgoing-очередь на каждый чат');
-    console.log('   ✅ При 409×5 — сообщение помечается как failed');
-    console.log('   ✅ Поллинг не путает свои vs чужие');
-    console.log('   ✅ При смене чата outgoing восстанавливаются');
-    console.log('');
-    console.log('   API: OutgoingSync.status()');
-    console.log('        OutgoingSync.list() — все pending');
-    console.log('        OutgoingSync.resync() — принудительно перекачать');
-    console.log('        OutgoingSync.clear() — очистить очередь');
-})();
-</script>
-
-
 </body>
 </html>
