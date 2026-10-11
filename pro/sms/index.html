@@ -40669,5 +40669,648 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
     console.log('🎓 [Tour v2] Интерактивный тур (фикс затемнения) установлен');
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🔄 RETRY ATTACHMENT v1 — кнопка "Перезагрузить" для вложений
+//  ─────────────────────────────────────────────────────────────
+//  Если вложение не загрузилось — вместо "⚠️ не загрузилось"
+//  показываем кнопку 🔄. По клику:
+//   1. Очищаем кэш для этого вложения
+//   2. Удаляем placeholder из DOM
+//   3. Заново запускаем loadAttachmentsIn для родителя
+// ═══════════════════════════════════════════════════════════════
+
+(function installAttachmentRetry() {
+    'use strict';
+
+    // ═══════════════════════════════════════════════════════════
+    //  СТИЛИ
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('attachRetryStyles')) {
+        const style = document.createElement('style');
+        style.id = 'attachRetryStyles';
+        style.textContent = `
+            /* ═══ Placeholder с ошибкой ═══ */
+            .attach-error-retry {
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                gap: 8px;
+                padding: 14px 16px;
+                background: rgba(255, 107, 107, 0.08);
+                border: 1px solid rgba(255, 107, 107, 0.25);
+                border-radius: 12px;
+                color: #ff8a8a;
+                font-size: 12px;
+                text-align: center;
+                min-height: 60px;
+                user-select: none;
+                -webkit-user-select: none;
+            }
+            .attach-error-retry .aer-icon {
+                font-size: 20px;
+                line-height: 1;
+            }
+            .attach-error-retry .aer-text {
+                font-size: 11px;
+                color: #ff8a8a;
+                opacity: 0.85;
+                max-width: 220px;
+                line-height: 1.3;
+            }
+            .attach-error-retry .aer-btn {
+                display: inline-flex;
+                align-items: center;
+                gap: 6px;
+                padding: 7px 16px;
+                border-radius: 20px;
+                border: 1px solid rgba(108, 92, 231, 0.5);
+                background: linear-gradient(135deg,
+                    rgba(108, 92, 231, 0.25),
+                    rgba(0, 184, 148, 0.2));
+                color: #fff;
+                font-size: 12px;
+                font-weight: 600;
+                cursor: pointer;
+                font-family: inherit;
+                transition: all 0.15s ease;
+                -webkit-tap-highlight-color: transparent;
+                margin-top: 2px;
+            }
+            .attach-error-retry .aer-btn:hover {
+                background: linear-gradient(135deg,
+                    rgba(108, 92, 231, 0.4),
+                    rgba(0, 184, 148, 0.3));
+                border-color: rgba(108, 92, 231, 0.8);
+                transform: translateY(-1px);
+            }
+            .attach-error-retry .aer-btn:active {
+                transform: scale(0.94);
+            }
+            .attach-error-retry .aer-btn:disabled {
+                opacity: 0.5;
+                cursor: wait;
+                transform: none;
+            }
+            .attach-error-retry .aer-btn .aer-spin {
+                display: inline-block;
+                transition: transform 0.3s;
+            }
+            .attach-error-retry .aer-btn.loading .aer-spin {
+                animation: aerSpin 0.8s linear infinite;
+            }
+            @keyframes aerSpin {
+                to { transform: rotate(360deg); }
+            }
+
+            /* Компактная версия — для мелких вложений */
+            .attach-error-retry.compact {
+                flex-direction: row;
+                padding: 8px 12px;
+                min-height: 44px;
+                gap: 10px;
+            }
+            .attach-error-retry.compact .aer-text {
+                text-align: left;
+                flex: 1;
+            }
+            .attach-error-retry.compact .aer-btn {
+                margin-top: 0;
+                flex-shrink: 0;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ГЛАВНАЯ ФУНКЦИЯ: ПОКАЗАТЬ ПЛЕЙСХОЛДЕР С ОШИБКОЙ
+    // ═══════════════════════════════════════════════════════════
+    /**
+     * Заменяет содержимое элемента на кнопку "Перезагрузить".
+     * @param {HTMLElement} el — контейнер вложения
+     * @param {string} attachName — имя вложения
+     * @param {string} errorMsg — сообщение об ошибке
+     * @param {boolean} compact — компактный режим (для аудио/файлов)
+     */
+    function showRetryButton(el, attachName, errorMsg, compact) {
+        if (!el || !attachName) return;
+
+        // Не перерисовываем, если уже есть кнопка для этого вложения
+        if (el.querySelector('.attach-error-retry')) return;
+
+        // Запоминаем контекст (какой элемент, какое вложение)
+        el.dataset.attach = attachName;
+        el.dataset.retryAvailable = '1';
+
+        const safeError = (errorMsg || 'Не удалось загрузить')
+            .slice(0, 100)
+            .replace(/[<>]/g, '');
+
+        el.innerHTML = `
+            <div class="attach-error-retry ${compact ? 'compact' : ''}">
+                <div class="aer-icon">⚠️</div>
+                <div class="aer-text">${safeError}</div>
+                <button class="aer-btn" data-retry-attach="${attachName}">
+                    <span class="aer-spin">🔄</span>
+                    <span>Перезагрузить</span>
+                </button>
+            </div>
+        `;
+
+        // Обработчик кнопки
+        const btn = el.querySelector('.aer-btn');
+        if (btn) {
+            btn.addEventListener('click', async (e) => {
+                e.stopPropagation();
+                e.preventDefault();
+                await retryAttachmentLoad(el, attachName, btn);
+            });
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕЗАГРУЗКА ВЛОЖЕНИЯ
+    // ═══════════════════════════════════════════════════════════
+    async function retryAttachmentLoad(el, attachName, btn) {
+        if (!el || !attachName) return;
+
+        // Блокируем кнопку
+        if (btn) {
+            btn.disabled = true;
+            btn.classList.add('loading');
+            const label = btn.querySelector('span:last-child');
+            if (label) label.textContent = 'Загрузка…';
+        }
+
+        console.log(`🔄 [RetryAttach] Перезагрузка: ${attachName}`);
+
+        try {
+            // ═══ 1. Чистим кэш для этого вложения ═══
+
+            // Память
+            if (typeof _attachmentCache !== 'undefined' && _attachmentCache.has(attachName)) {
+                const oldUrl = _attachmentCache.get(attachName);
+                try { URL.revokeObjectURL(oldUrl); } catch (e) {}
+                _attachmentCache.delete(attachName);
+            }
+
+            // Pending
+            if (typeof _pendingAttachmentLoads !== 'undefined') {
+                _pendingAttachmentLoads.delete(attachName);
+            }
+
+            // IndexedDB (постоянный кэш)
+            try {
+                if (typeof AttachPersistCache !== 'undefined'
+                    && typeof AttachPersistCache.clearChat === 'function') {
+                    // Не удаляем весь чат — только это вложение
+                    // (AttachPersistCache не имеет метода удалить одно вложение,
+                    //  но у нас есть прямой доступ к IndexedDB через хак)
+                    await clearSinglePersistCache(attachName);
+                }
+            } catch (e) {
+                console.warn('🔄 [RetryAttach] persist clear failed:', e);
+            }
+
+            // ═══ 2. Сбрасываем флаг «уже загружено» ═══
+            delete el.dataset.loaded;
+
+            // ═══ 3. Ставим «часики» на место кнопки ═══
+            el.innerHTML = '<div style="text-align:center;padding:14px;color:#888;font-size:12px;">⏳ Загрузка…</div>';
+
+            // ═══ 4. Заново грузим ═══
+            // Определяем тип вложения и вызываем нужный путь
+            await reloadSingleAttachment(el, attachName);
+
+            console.log(`🔄 [RetryAttach] ✅ Успешно: ${attachName}`);
+            if (typeof soundManager !== 'undefined') soundManager.play('send');
+
+        } catch (e) {
+            console.error('🔄 [RetryAttach] Ошибка:', e);
+
+            // Возвращаем кнопку с сообщением об ошибке
+            const msg = (e && e.message) ? e.message.slice(0, 80) : 'Всё ещё не удалось';
+            showRetryButton(el, attachName, msg, el.classList.contains('compact'));
+            if (typeof soundManager !== 'undefined') soundManager.play('error');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  УДАЛЕНИЕ ОДНОГО ВЛОЖЕНИЯ ИЗ IndexedDB
+    // ═══════════════════════════════════════════════════════════
+    async function clearSinglePersistCache(attachName) {
+        if (!('indexedDB' in window)) return;
+
+        try {
+            const db = await new Promise((resolve, reject) => {
+                const req = indexedDB.open('smschat_attachments', 1);
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => reject(req.error);
+                setTimeout(() => reject(new Error('timeout')), 3000);
+            });
+
+            return new Promise((resolve) => {
+                const t = db.transaction('blobs', 'readwrite');
+                t.objectStore('blobs').delete(attachName);
+                t.oncomplete = () => {
+                    console.log(`🔄 [RetryAttach] IndexedDB: удалено ${attachName}`);
+                    resolve(true);
+                };
+                t.onerror = () => resolve(false);
+            });
+        } catch (e) {
+            return false;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЗАГРУЗКА ОДНОГО ВЛОЖЕНИЯ (с определением типа)
+    // ═══════════════════════════════════════════════════════════
+    async function reloadSingleAttachment(el, attachName) {
+        if (!state.chatFile) throw new Error('Нет активного чата');
+
+        const isImage = /\.(jpg|jpeg|png|gif|webp|bmp|avif)$/i.test(attachName);
+        const isAudio = /\.(webm|mp3|ogg|wav|m4a|aac|flac|opus)$/i.test(attachName);
+        const isVideo = /\.(mp4|mov|webm|mkv|avi|m4v|3gp|ogv)$/i.test(attachName);
+
+        // Проверяем, не плейсхолдер ли это видео-кружочка
+        const isVideoNote = el.dataset.videoNote === '1';
+        const isVideoFile = el.dataset.videoAttach !== undefined;
+
+        // 🆕 Загружаем blob
+        const url = await loadAttachment(state.chatFile, attachName);
+
+        // ═══ Определяем, куда вставлять ═══
+        // Нам нужно заменить текущий `el` на новый контент.
+        // Родительский wrapper будет содержать новые данные.
+
+        // Убираем флаг retryAvailable
+        delete el.dataset.retryAvailable;
+
+        // ═══ Обработка по типам ═══
+
+        // 1. Видео-кружочек
+        if (isVideoNote && el.dataset.videoMsgid) {
+            const msgId = el.dataset.videoMsgid;
+            const duration = parseFloat(el.dataset.videoDuration) || 0;
+            const wrapper = document.createElement('div');
+            wrapper.innerHTML = buildVideoNoteHTML(msgId, url, duration);
+            const frag = document.createDocumentFragment();
+            while (wrapper.firstChild) frag.appendChild(wrapper.firstChild);
+            el.replaceWith(frag);
+            return;
+        }
+
+        // 2. Видеофайл
+        if (isVideoFile && el.dataset.videoMsgid) {
+            const msgId = el.dataset.videoMsgid;
+            const duration = parseFloat(el.dataset.videoDuration) || 0;
+            const name = el.dataset.videoName || 'video';
+            const size = parseInt(el.dataset.videoSize) || 0;
+            const wrapper = document.createElement('div');
+            wrapper.innerHTML = buildVideoFileHTML(msgId, url, duration, name, size);
+            const frag = document.createDocumentFragment();
+            while (wrapper.firstChild) frag.appendChild(wrapper.firstChild);
+            el.replaceWith(frag);
+            return;
+        }
+
+        // 3. Обычный файл
+        if (el.classList.contains('file-attach-placeholder')) {
+            const fileName = el.dataset.filename || 'file';
+            const fileSize = parseInt(el.dataset.filesize) || 0;
+
+            if (fileName.toLowerCase().endsWith('.smschat')) {
+                el.outerHTML = createInviteCardHTML(attachName, url, fileName, fileSize);
+            } else {
+                el.outerHTML = createFileCardHTML(attachName, url, fileName, fileSize);
+            }
+            return;
+        }
+
+        // 4. Аудио
+        if (el.classList.contains('audio-container') || isAudio) {
+            const msgId = el.dataset.msgid || '';
+            const duration = parseFloat(el.dataset.duration) || 0;
+            const mime = el.dataset.audiomime || '';
+            const trackName = el.dataset.audioname || '';
+            const coverName = el.dataset.audiocover || '';
+
+            let coverSrc = null;
+            if (coverName && isAttachmentRef(coverName)) {
+                try {
+                    coverSrc = await loadAttachment(state.chatFile, coverName);
+                } catch (e) {}
+            }
+
+            const wrapper = document.createElement('div');
+            wrapper.innerHTML = createAudioPlayerHTML(msgId, url, duration, mime, trackName, coverSrc);
+            const newNode = wrapper.firstElementChild;
+            el.replaceWith(newNode);
+
+            // Инициализируем плеер
+            setTimeout(() => {
+                if (typeof initAudioPlayers === 'function') initAudioPlayers();
+            }, 50);
+            return;
+        }
+
+        // 5. Изображение
+        if (el.classList.contains('image-container') || isImage) {
+            el.innerHTML = `<img src="${url}" alt="Изображение" onclick="openImageModal('${url}')">`;
+            return;
+        }
+
+        // 6. Fallback — просто вставляем ссылку
+        el.innerHTML = `<div class="attach-error" style="padding:10px;text-align:center;">⚠️ Неизвестный тип вложения</div>`;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧИМ loadAttachmentsIn — заменяем текст ошибки
+    // ═══════════════════════════════════════════════════════════
+    const _origLoadAttachmentsIn = loadAttachmentsIn;
+
+    loadAttachmentsIn = async function(root) {
+        const placeholders = root.querySelectorAll('[data-attach]:not([data-loaded])');
+        if (placeholders.length === 0) return;
+
+        const tasks = [];
+
+        placeholders.forEach(el => {
+            el.dataset.loaded = '1';
+            const name = el.dataset.attach;
+            const isImage = /\.(jpg|jpeg|png|gif|webp|bmp|avif)$/i.test(name);
+            const isAudio = /\.(webm|mp3|ogg|wav|m4a|aac|flac|opus)$/i.test(name);
+            const isFile = el.classList.contains('file-attach-placeholder');
+
+            tasks.push((async () => {
+                try {
+                    const url = await loadAttachment(state.chatFile, name);
+
+                    if (isImage) {
+                        el.innerHTML = `<img src="${url}" alt="Изображение" onclick="openImageModal('${url}')">`;
+                    } else if (isAudio) {
+                        const msgId = el.dataset.msgid || '';
+                        const duration = parseFloat(el.dataset.duration) || 0;
+                        const mime = el.dataset.audiomime || '';
+                        const trackName = el.dataset.audioname || '';
+                        const coverName = el.dataset.audiocover || '';
+
+                        let coverSrc = null;
+                        if (coverName && isAttachmentRef(coverName)) {
+                            try {
+                                coverSrc = await loadAttachment(state.chatFile, coverName);
+                            } catch (e) {}
+                        }
+
+                        const wrapper = document.createElement('div');
+                        wrapper.innerHTML = createAudioPlayerHTML(msgId, url, duration, mime, trackName, coverSrc);
+                        el.replaceWith(wrapper.firstElementChild);
+                    } else if (isFile) {
+                        const fileName = el.dataset.filename || 'file';
+                        const fileSize = parseInt(el.dataset.filesize) || 0;
+
+                        if (fileName.toLowerCase().endsWith('.smschat')) {
+                            el.outerHTML = createInviteCardHTML(name, url, fileName, fileSize);
+                        } else {
+                            el.outerHTML = createFileCardHTML(name, url, fileName, fileSize);
+                        }
+                    }
+                } catch (e) {
+                    console.error('attach load error', name, e);
+
+                    // 🆕 ПОКАЗЫВАЕМ КНОПКУ ПЕРЕЗАГРУЗКИ
+                    const isCompact = isAudio || isFile;
+
+                    // Сообщение об ошибке — коротко
+                    let errMsg = 'Не загрузилось';
+                    if (e && e.message) {
+                        if (e.message.includes('attachment not found')) {
+                            errMsg = 'Файл не найден на сервере';
+                        } else if (e.message.includes('401') || e.message.includes('403')) {
+                            errMsg = 'Нет доступа';
+                        } else if (e.message.includes('Network')) {
+                            errMsg = 'Нет соединения';
+                        } else if (e.message.includes('decrypt')) {
+                            errMsg = 'Ошибка расшифровки';
+                        } else {
+                            errMsg = 'Не загрузилось';
+                        }
+                    }
+
+                    showRetryButton(el, name, errMsg, isCompact);
+                }
+            })());
+        });
+
+        await Promise.allSettled(tasks);
+
+        // Пост-обработка (сохранена из оригинала)
+        setTimeout(initAudioPlayers, 0);
+        [0, 150, 400, 800].forEach(delay => {
+            setTimeout(() => {
+                if (typeof syncInlineWithGlobal === 'function') syncInlineWithGlobal();
+            }, delay);
+        });
+
+        if (scrollState.isAtBottom && !_isUserScrolling
+            && !(_scrollPreserver && _scrollPreserver.active)) {
+            requestAnimationFrame(() => {
+                const diff = messagesContainer.scrollHeight
+                    - messagesContainer.scrollTop
+                    - messagesContainer.clientHeight;
+                if (diff > 30) {
+                    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                }
+            });
+        }
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧИМ loadReplyThumbnails — та же логика для миниатюр
+    // ═══════════════════════════════════════════════════════════
+    const _origLoadReplyThumbnails = loadReplyThumbnails;
+
+    loadReplyThumbnails = async function(root) {
+        const placeholders = root.querySelectorAll('.rq-thumb-placeholder[data-rq-thumb-attach]:not([data-loaded])');
+        if (placeholders.length === 0) return;
+
+        const tasks = [];
+        placeholders.forEach(el => {
+            el.dataset.loaded = '1';
+            const attachName = el.dataset.rqThumbAttach;
+
+            tasks.push((async () => {
+                try {
+                    if (!/\.(jpg|jpeg|png|gif|webp|bmp|avif)$/i.test(attachName)) {
+                        el.textContent = '📎';
+                        el.classList.remove('rq-thumb-placeholder');
+                        el.classList.add('rq-thumb-icon');
+                        return;
+                    }
+
+                    const cached = _attachmentCache.get(attachName);
+                    if (cached) {
+                        const img = document.createElement('img');
+                        img.src = cached;
+                        img.alt = '';
+                        img.className = 'rq-thumb';
+                        el.replaceWith(img);
+                        return;
+                    }
+
+                    const url = await loadAttachment(state.chatFile, attachName);
+                    const img = document.createElement('img');
+                    img.src = url;
+                    img.alt = '';
+                    img.className = 'rq-thumb';
+                    el.replaceWith(img);
+                } catch (e) {
+                    console.warn('reply thumb load error:', e);
+                    // Для миниатюр не показываем кнопку — слишком мелко
+                    el.textContent = '⚠️';
+                    el.classList.remove('rq-thumb-placeholder');
+                    el.classList.add('rq-thumb-icon');
+                }
+            })());
+        });
+
+        await Promise.allSettled(tasks);
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧИМ loadAttachmentsIn для ВИДЕО (там своя логика была)
+    // ═══════════════════════════════════════════════════════════
+    const _origLoadVideoAttachments = (() => {
+        // Мы уже переопределили loadAttachmentsIn, но в основном коде
+        // видео-обработка была внутри loadAttachmentsIn через
+        // отдельный querySelector('[data-video-attach]').
+        // Наш новый loadAttachmentsIn не обрабатывает видео — вернём эту часть.
+
+        // Возвращаем патч, который добавляет обработку видео
+        // ПОСЛЕ основного loadAttachmentsIn.
+        return null;
+    })();
+
+    // 🆕 Отдельная функция для видео-плейсхолдеров
+    async function loadVideoAttachments(root) {
+        const placeholders = root.querySelectorAll('[data-video-attach]:not([data-loaded])');
+        if (placeholders.length === 0) return;
+
+        const tasks = [];
+        placeholders.forEach(el => {
+            el.dataset.loaded = '1';
+            const attachName = el.dataset.videoAttach;
+            const msgId = el.dataset.videoMsgid;
+            const isNote = el.dataset.videoNote === '1';
+            const duration = parseFloat(el.dataset.videoDuration) || 0;
+
+            tasks.push((async () => {
+                try {
+                    const url = await loadAttachment(state.chatFile, attachName);
+                    if (isNote) {
+                        const wrapper = document.createElement('div');
+                        wrapper.innerHTML = buildVideoNoteHTML(msgId, url, duration);
+                        const frag = document.createDocumentFragment();
+                        while (wrapper.firstChild) frag.appendChild(wrapper.firstChild);
+                        el.replaceWith(frag);
+                    } else {
+                        const name = el.dataset.videoName || 'video';
+                        const size = parseInt(el.dataset.videoSize) || 0;
+                        const wrapper = document.createElement('div');
+                        wrapper.innerHTML = buildVideoFileHTML(msgId, url, duration, name, size);
+                        const frag = document.createDocumentFragment();
+                        while (wrapper.firstChild) frag.appendChild(wrapper.firstChild);
+                        el.replaceWith(frag);
+                    }
+                } catch (e) {
+                    console.error('video load error', attachName, e);
+
+                    // 🆕 Показываем кнопку перезагрузки для видео
+                    let errMsg = 'Видео не загрузилось';
+                    if (e.message && e.message.includes('Network')) errMsg = 'Нет соединения';
+                    else if (e.message && e.message.includes('not found')) errMsg = 'Файл не найден';
+
+                    showRetryButton(el, attachName, errMsg, false);
+                }
+            })());
+        });
+        await Promise.allSettled(tasks);
+    }
+
+    // Патчим loadAttachmentsIn окончательно — чтобы вызывать и видео
+    const _finalLoadAttachmentsIn = loadAttachmentsIn;
+    loadAttachmentsIn = async function(root) {
+        await _finalLoadAttachmentsIn.call(this, root);
+        // После основного — грузим видео
+        await loadVideoAttachments(root);
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API
+    // ═══════════════════════════════════════════════════════════
+    window.AttachRetry = {
+        // Перезагрузить конкретное вложение вручную
+        retry: async (attachName, chatFile) => {
+            if (!attachName) throw new Error('attachName required');
+            if (!chatFile && !state.chatFile) throw new Error('chatFile required');
+
+            const file = chatFile || state.chatFile;
+
+            // Чистим кэш
+            if (_attachmentCache.has(attachName)) {
+                const url = _attachmentCache.get(attachName);
+                try { URL.revokeObjectURL(url); } catch (e) {}
+                _attachmentCache.delete(attachName);
+            }
+            _pendingAttachmentLoads.delete(attachName);
+            await clearSinglePersistCache(attachName);
+
+            // Грузим заново
+            const url = await loadAttachment(file, attachName);
+            console.log(`🔄 [RetryAttach] ${attachName} → ${url}`);
+            return url;
+        },
+
+        // Найти все неудачные вложения на странице
+        findAllFailed: () => {
+            const failed = [];
+            document.querySelectorAll('[data-retry-available]').forEach(el => {
+                failed.push({
+                    attachName: el.dataset.attach,
+                    type: el.classList.contains('audio-container') ? 'audio'
+                        : el.classList.contains('file-attach-placeholder') ? 'file'
+                        : el.classList.contains('image-container') ? 'image'
+                        : 'unknown',
+                });
+            });
+            return failed;
+        },
+
+        // Перезагрузить все неудачные
+        retryAll: async () => {
+            const failed = window.AttachRetry.findAllFailed();
+            console.log(`🔄 [RetryAttach] Перезагрузка ${failed.length} вложений`);
+            let ok = 0, fail = 0;
+            for (const item of failed) {
+                try {
+                    await window.AttachRetry.retry(item.attachName);
+                    ok++;
+                } catch (e) {
+                    fail++;
+                }
+            }
+            return { ok, fail, total: failed.length };
+        },
+    };
+
+    console.log('🔄 [RetryAttach] Кнопка "Перезагрузить" для вложений активна');
+    console.log('   • Неудачные вложения показывают кнопку 🔄');
+    console.log('   • API: AttachRetry.retry("img_xxx.jpg")');
+    console.log('   • API: AttachRetry.findAllFailed() / .retryAll()');
+})();
+</script>
+
 </body>
 </html>
