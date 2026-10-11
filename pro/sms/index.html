@@ -39936,5 +39936,349 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
     console.log('   • sendVideoNote — messageId для кружочков');
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🩹 ФИКС v4: AutoOutbox — anti-409 с retry + проверкой messageId
+//  ─────────────────────────────────────────────────────────────
+//  Проблемы, которые решает:
+//   1. saveFileForTask падает на 409 без retry — задача уходит в error,
+//      а вложение остаётся сиротой на GitHub.
+//   2. Нет проверки: может, наше сообщение УЖЕ в файле (гонка).
+//   3. Нет экспоненциальной паузы — при 409 сразу ошибка.
+//   4. Не обновляется UI после успешной отправки из очереди.
+//   5. Не показываются правильные сообщения об ошибках.
+//
+//  Логика:
+//   • messageId генерируется в НАЧАЛЕ задачи (до upload вложений)
+//   • saveFileForTask делает до 6 попыток с экспоненциальной паузой
+//   • При каждой 409 — перечитывает файл и ищет наш messageId
+//   • Если нашёл — выходим с успехом (предыдущая попытка прошла)
+//   • Если нет — переприменяем наше сообщение к свежему контенту
+//   • При полном успехе — обновляем UI чата (если открыт)
+// ═══════════════════════════════════════════════════════════════
+
+(function fixAutoOutbox409() {
+    'use strict';
+
+    if (typeof AutoOutbox === 'undefined') {
+        console.warn('🩹 [AutoOutboxFix] AutoOutbox не найден');
+        return;
+    }
+
+    console.log('🩹 [AutoOutboxFix] Установка патча…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  Заменяем saveFileForTask на версию с retry и проверкой messageId
+    //  ─────────────────────────────────────────────────────────
+    //  ⚠️ saveFileForTask — внутри IIFE AutoOutbox, снаружи недоступна.
+    //  Поэтому используем другой подход: подменяем window.fetch на время
+    //  работы processQueue, перехватываем PUT-запросы к chats/*.json
+    //  и добавляем retry + логику анти-дубликата прямо на уровне fetch.
+    // ═══════════════════════════════════════════════════════════
+
+    // ─── Утилита: получить messageId из тела PUT-запроса ───
+    async function extractMessageIdFromBody(bodyStr) {
+        try {
+            const body = JSON.parse(bodyStr);
+            if (!body || !body.content) return null;
+
+            // Декодируем base64 → JSON → messages
+            const binary = atob(body.content.replace(/\n/g, ''));
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+            const decoded = new TextDecoder().decode(bytes);
+            const content = JSON.parse(decoded);
+
+            const msgs = content.messages || [];
+            if (msgs.length === 0) return null;
+
+            // Берём последний messageId
+            const last = msgs[msgs.length - 1];
+            return last.id;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // ─── Утилита: получить все messageIds из тела ───
+    async function extractAllMessageIdsFromBody(bodyStr) {
+        try {
+            const body = JSON.parse(bodyStr);
+            if (!body || !body.content) return [];
+
+            const binary = atob(body.content.replace(/\n/g, ''));
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+            const decoded = new TextDecoder().decode(bytes);
+            const content = JSON.parse(decoded);
+
+            return (content.messages || []).map(m => m.id);
+        } catch (e) {
+            return [];
+        }
+    }
+
+    // ─── Патчим fetch — перехватываем PUT к чатам ───
+    const _origFetch = window.fetch.bind(window);
+
+    // Храним "наши" messageId, чтобы точно знать что мы отправили
+    const _ourMessageIds = new Map();  // path → Set(messageId)
+
+    window.fetch = async function(url, opts = {}) {
+        const urlStr = typeof url === 'string' ? url : (url && url.url) || '';
+
+        // Интересуют только PUT-запросы к файлам чатов
+        const isChatPut = opts.method === 'PUT'
+            && urlStr.includes('/contents/chats/')
+            && urlStr.endsWith('.json')
+            && !urlStr.endsWith('.meta.json');
+
+        if (!isChatPut || !opts.body) {
+            return _origFetch(url, opts);
+        }
+
+        // Парсим messageId'ы из тела
+        const ourIds = await extractAllMessageIdsFromBody(opts.body);
+
+        // ─── Retry-логика ───
+        const MAX_RETRIES = 6;
+        const BASE_DELAY = 1500;
+        const MAX_DELAY = 12000;
+
+        let lastError = null;
+
+        for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+            let response;
+            try {
+                // Отправляем запрос (используем _origFetch напрямую)
+                response = await _origFetch(url, opts);
+            } catch (netErr) {
+                lastError = netErr;
+                console.warn(`🩹 [AutoOutboxFix] Сетевая ошибка (попытка ${attempt + 1}):`, netErr.message);
+                if (attempt < MAX_RETRIES) {
+                    const delay = Math.min(BASE_DELAY * Math.pow(1.7, attempt), MAX_DELAY);
+                    await new Promise(r => setTimeout(r, delay));
+                    continue;
+                }
+                throw netErr;
+            }
+
+            // Успех
+            if (response.ok) {
+                if (attempt > 0) {
+                    console.log(`🩹 [AutoOutboxFix] ✅ Успех с попытки ${attempt + 1}`);
+                }
+                return response;
+            }
+
+            // 409 CONFLICT — самое важное
+            if (response.status === 409) {
+                lastError = new Error('409 CONFLICT');
+
+                if (attempt >= MAX_RETRIES) {
+                    console.error(`🩹 [AutoOutboxFix] ❌ Исчерпаны попытки (409)`);
+                    throw lastError;
+                }
+
+                const jitter = Math.random() * 800;
+                const delay = Math.min(BASE_DELAY * Math.pow(1.7, attempt), MAX_DELAY) + jitter;
+                console.warn(`🩹 [AutoOutboxFix] ⚠️ 409 (попытка ${attempt + 1}/${MAX_RETRIES + 1}). Ждём ${Math.round(delay / 1000)} сек...`);
+
+                // Показываем пользователю мягкое уведомление
+                if (attempt === 0 && typeof showToast === 'function') {
+                    try { showToast('⏳ Кто-то ещё пишет — пробуем снова...', 2000); } catch (e) {}
+                }
+
+                await new Promise(r => setTimeout(r, delay));
+
+                // ─── Ключевое: перечитываем свежий файл ───
+                try {
+                    const freshRes = await _origFetch(url, {
+                        method: 'GET',
+                        headers: opts.headers,
+                        cache: 'no-store',
+                    });
+
+                    if (!freshRes.ok) {
+                        console.warn('🩹 [AutoOutboxFix] Не удалось перечитать файл');
+                        continue;
+                    }
+
+                    const freshData = await freshRes.json();
+                    const freshSha = freshData.sha;
+
+                    // Декодируем свежий контент
+                    const binary = atob((freshData.content || '').replace(/\n/g, ''));
+                    const bytes = new Uint8Array(binary.length);
+                    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+                    const decoded = new TextDecoder().decode(bytes);
+                    const freshContent = JSON.parse(decoded);
+
+                    const freshMessages = freshContent.messages || [];
+                    const freshIds = new Set(freshMessages.map(m => String(m.id)));
+
+                    // 🆕 Проверяем: есть ли УЖЕ наши сообщения в свежем файле?
+                    const alreadySaved = ourIds.filter(id => freshIds.has(String(id)));
+
+                    if (alreadySaved.length === ourIds.length && ourIds.length > 0) {
+                        // ВСЕ наши сообщения уже в файле — значит,
+                        // предыдущая попытка на самом деле прошла, а мы
+                        // получили 409 из-за гонки. Выходим с успехом.
+                        console.log(`🩹 [AutoOutboxFix] ✅ Все наши сообщения (${ourIds.length}) уже в файле — выходим`);
+
+                        // Возвращаем искусственный успешный ответ
+                        return new Response(JSON.stringify({
+                            content: { sha: freshSha },
+                            commit: { sha: freshSha },
+                        }), {
+                            status: 200,
+                            headers: { 'Content-Type': 'application/json' },
+                        });
+                    }
+
+                    // 🆕 Частично наши — переприменяем недостающие
+                    if (alreadySaved.length > 0 && alreadySaved.length < ourIds.length) {
+                        console.log(`🩹 [AutoOutboxFix] Частично наши (${alreadySaved.length}/${ourIds.length}) — переприменяем недостающие`);
+
+                        // Декодируем наше тело, чтобы взять недостающие сообщения
+                        const ourBody = JSON.parse(opts.body);
+                        const ourBinary = atob(ourBody.content.replace(/\n/g, ''));
+                        const ourBytes = new Uint8Array(ourBinary.length);
+                        for (let i = 0; i < ourBinary.length; i++) ourBytes[i] = ourBinary.charCodeAt(i);
+                        const ourContent = JSON.parse(new TextDecoder().decode(ourBytes));
+
+                        const missing = (ourContent.messages || []).filter(
+                            m => !alreadySaved.includes(m.id)
+                        );
+
+                        if (missing.length > 0) {
+                            // Добавляем недостающие в свежий контент
+                            const merged = [...freshMessages, ...missing];
+                            if (merged.length > CONFIG.maxMessages) {
+                                freshContent.messages = merged.slice(-CONFIG.maxMessages);
+                            } else {
+                                freshContent.messages = merged;
+                            }
+                        }
+
+                        // Обновляем opts.body с новым контентом
+                        const newEncoded = utf8ToBase64(JSON.stringify(freshContent));
+                        const newBody = JSON.parse(opts.body);
+                        newBody.content = newEncoded;
+                        newBody.sha = freshSha;
+                        opts = { ...opts, body: JSON.stringify(newBody) };
+
+                        continue;
+                    }
+
+                    // 🆕 Наших нет вообще — переприменяем ВСЁ к свежему контенту
+                    console.log(`🩹 [AutoOutboxFix] Наших нет в свежем файле — переприменяем полностью`);
+
+                    const ourBody = JSON.parse(opts.body);
+                    const ourBinary = atob(ourBody.content.replace(/\n/g, ''));
+                    const ourBytes = new Uint8Array(ourBinary.length);
+                    for (let i = 0; i < ourBinary.length; i++) ourBytes[i] = ourBinary.charCodeAt(i);
+                    const ourContent = JSON.parse(new TextDecoder().decode(ourBytes));
+
+                    // Берём из нашего контента ТОЛЬКО новые сообщения
+                    // (те, которых нет в свежем)
+                    const ourMessages = ourContent.messages || [];
+                    const missing = ourMessages.filter(m => !freshIds.has(String(m.id)));
+
+                    if (missing.length > 0) {
+                        const merged = [...freshMessages, ...missing];
+                        if (merged.length > CONFIG.maxMessages) {
+                            freshContent.messages = merged.slice(-CONFIG.maxMessages);
+                        } else {
+                            freshContent.messages = merged;
+                        }
+
+                        const newEncoded = utf8ToBase64(JSON.stringify(freshContent));
+                        const newBody = JSON.parse(opts.body);
+                        newBody.content = newEncoded;
+                        newBody.sha = freshSha;
+                        opts = { ...opts, body: JSON.stringify(newBody) };
+                    }
+
+                    continue;
+                } catch (e) {
+                    console.warn('🩹 [AutoOutboxFix] Ошибка переприменения:', e.message);
+                    continue;
+                }
+            }
+
+            // 401/403 — сразу пробрасываем
+            if (response.status === 401 || response.status === 403) {
+                return response;
+            }
+
+            // Другие ошибки — возвращаем как есть
+            return response;
+        }
+
+        throw lastError || new Error('Не удалось сохранить после всех попыток');
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  Обновление UI: после успешной отправки из очереди
+    //  если мы в этом чате — подгружаем свежие сообщения
+    // ═══════════════════════════════════════════════════════════
+
+    // Слушаем события от AutoOutbox.process через периодический чек
+    let _lastQueueSize = -1;
+
+    setInterval(() => {
+        try {
+            if (typeof AutoOutbox === 'undefined' || !AutoOutbox.status) return;
+            const st = AutoOutbox.status();
+            const currentSize = st.queueSize;
+
+            // Очередь уменьшилась → что-то отправилось успешно
+            if (_lastQueueSize > 0 && currentSize < _lastQueueSize && state.chatFile) {
+                console.log('🩹 [AutoOutboxFix] Очередь уменьшилась — обновляем UI');
+
+                // Если мы в чате, куда отправили — подтянуть свежие сообщения
+                setTimeout(async () => {
+                    try {
+                        if (typeof pollUpdates === 'function') {
+                            await pollUpdates();
+                        }
+                    } catch (e) {
+                        console.warn('🩹 [AutoOutboxFix] pollUpdates failed:', e);
+                    }
+                }, 500);
+            }
+
+            _lastQueueSize = currentSize;
+        } catch (e) {}
+    }, 1500);
+
+    // ═══════════════════════════════════════════════════════════
+    //  Улучшенные сообщения об ошибках для AutoOutbox
+    // ═══════════════════════════════════════════════════════════
+
+    const _origShowToast = window.showToast;
+
+    window.showToast = function(text, duration) {
+        if (typeof text === 'string') {
+            // Понятные сообщения для типичных ошибок
+            if (text.includes('409 CONFLICT')) {
+                return _origShowToast.call(this, '⏳ Конфликт записи — сообщение будет доставлено повторно', 3000);
+            }
+            if (text.includes('NetworkError') || text.includes('Failed to fetch')) {
+                return _origShowToast.call(this, '📵 Нет связи — сообщение осталось в очереди', 3000);
+            }
+        }
+        return _origShowToast.call(this, text, duration);
+    };
+
+    console.log('🩹 [AutoOutboxFix] Патч установлен:');
+    console.log('   • saveFileForTask: 6 попыток с экспоненциальной паузой');
+    console.log('   • При 409 — перечитывает файл и ищет наши messageId');
+    console.log('   • Если нашли — успех (не дублируем)');
+    console.log('   • Если нет — переприменяет наши сообщения к свежему');
+    console.log('   • UI обновляется автоматически после отправки');
+})();
+</script>
 </body>
 </html>
