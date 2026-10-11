@@ -38619,6 +38619,166 @@ try {
     };
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🖼️ ФИКС v2: клик по обложке аудио открывает именно её,
+//  а кнопка ▶/⏸ работает как надо
+// ═══════════════════════════════════════════════════════════════
 
+(function fixAudioCoverClickV2() {
+    'use strict';
+
+    console.log('🖼️ [AudioCoverFix v2] Установка…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  1. Перехват кликов на .audio-cover
+    //     ─────────────────────────────────────────────────────
+    //  Если клик был по кнопке play — НЕ открываем галерею,
+    //  и НЕ гасим событие (пусть дойдёт до кнопки).
+    //  Если клик был по самой обложке (img) — открываем галерею.
+    // ═══════════════════════════════════════════════════════════
+
+    // Гасим всплытие onclick на .audio-cover, только когда клик
+    // по кнопке play. Сам inline onclick="openImageModal(...)"
+    // стоит на .audio-cover — нам надо его "перебить".
+    //
+    // Делаем через редирект: при клике по .audio-cover без кнопки —
+    // открываем обложку в галерее вручную.
+
+    document.addEventListener('click', (e) => {
+        const cover = e.target.closest('.audio-cover');
+        if (!cover) return;
+
+        // ─── Клик по кнопке play — пропускаем событие дальше ───
+        const playBtn = e.target.closest('.audio-cover-play');
+        if (playBtn) {
+            // НЕ вызываем stopPropagation — пусть inline onclick на
+            // кнопке сработает. Но нужно погасить всплытие ДО .audio-cover,
+            // чтобы не открылась галерея.
+            // Решение: сами вызываем toggleAudioPlayback и гасим всё.
+            e.stopImmediatePropagation();
+            e.preventDefault();
+
+            // Достаём msgId из контейнера
+            const container = cover.closest('.audio-container');
+            const msgId = container && container.dataset.audioId;
+            if (msgId && typeof toggleAudioPlayback === 'function') {
+                toggleAudioPlayback(parseInt(msgId, 10));
+            }
+            return;
+        }
+
+        // ─── Клик по самой обложке — открываем галерею ───
+        const img = cover.querySelector('img');
+        if (img && img.src) {
+            e.stopImmediatePropagation();
+            e.preventDefault();
+            if (typeof openImageModal === 'function') {
+                openImageModal(img.src);
+            }
+        }
+    }, true);   // capture-фаза — раньше inline onclick
+
+    console.log('🖼️ [AudioCoverFix v2] Перехват кликов установлен');
+
+    // ═══════════════════════════════════════════════════════════
+    //  2. openGallery ищет img в любом контейнере (обложка в т.ч.)
+    // ═══════════════════════════════════════════════════════════
+    const _origOpenGallery = openGallery;
+
+    openGallery = async function(imageUrl) {
+        galleryState.allImageMsgIds = collectAllImageMsgIds();
+
+        let anchorMsgId = null;
+        const domImg = messagesInner.querySelector(`img[src="${imageUrl}"]`);
+        if (domImg) {
+            const wrapper = domImg.closest('.message-wrapper');
+            if (wrapper) {
+                anchorMsgId = parseInt(wrapper.dataset.msgId);
+            }
+        }
+
+        if (!anchorMsgId) {
+            for (const [id, src] of Object.entries(galleryState.loadedSrcs)) {
+                if (src === imageUrl) {
+                    anchorMsgId = parseInt(id);
+                    break;
+                }
+            }
+        }
+
+        if (anchorMsgId) {
+            const item = galleryState.allImageMsgIds.find(x => x.msgId === anchorMsgId);
+            if (item && !galleryState.loadedSrcs[anchorMsgId] && !item.inlineSrc) {
+                galleryState.loadedSrcs[anchorMsgId] = imageUrl;
+            }
+        }
+
+        buildGalleryWindow(anchorMsgId);
+
+        if (galleryState.images.length === 0) {
+            galleryState.images = [imageUrl];
+            galleryState._windowMsgIds = [anchorMsgId];
+        }
+
+        let idx = anchorMsgId ? findGalleryIndexByMsgId(anchorMsgId) : -1;
+        if (idx === -1) idx = galleryState.images.indexOf(imageUrl);
+        if (idx === -1) idx = 0;
+        galleryState.currentIndex = idx;
+
+        imageModal.classList.add('active');
+        document.body.style.overflow = 'hidden';
+        galleryState.isOpen = true;
+        if (window._updateGallerySizes) window._updateGallerySizes();
+
+        updateGalleryUI();
+        hideGalleryActions();
+
+        const src = galleryState.images[galleryState.currentIndex];
+        const pre = new Image();
+        const init = () => { ImageZoom.open(); };
+        pre.onload = init;
+        pre.onerror = init;
+        pre.src = src;
+        if (pre.complete && pre.naturalWidth) init();
+
+        setTimeout(async () => {
+            if (!galleryState.isOpen) return;
+            const loadedOld = await preloadOlderImages(15);
+            if (loadedOld > 0 && galleryState.isOpen) {
+                rebuildGalleryWindow(anchorMsgId);
+            }
+        }, 200);
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. collectAllImageMsgIds — включаем обложки аудио
+    // ═══════════════════════════════════════════════════════════
+    collectAllImageMsgIds = function() {
+        const ids = [];
+
+        for (const msg of historyState.allMessages) {
+            if (msg.image && isAttachmentRef(msg.image)) {
+                ids.push({ msgId: msg.id, attachName: msg.image });
+            } else if (msg.image && (msg.image.startsWith('blob:') || msg.image.startsWith('data:'))) {
+                ids.push({ msgId: msg.id, attachName: null, inlineSrc: msg.image });
+            }
+
+            // Обложки аудио — только если у сообщения нет фото
+            // (иначе коллизия по msgId)
+            if (!msg.image && msg.audioCover && isAttachmentRef(msg.audioCover)) {
+                ids.push({ msgId: msg.id, attachName: msg.audioCover, _isCover: true });
+            }
+        }
+
+        return ids;
+    };
+
+    console.log('🖼️ [AudioCoverFix v2] Патч установлен полностью:');
+    console.log('   • Кнопка ▶/⏸ работает');
+    console.log('   • Клик по обложке открывает её в галерее');
+    console.log('   • Галерея умеет листать обложки аудио');
+})();
+</script>
 </body>
 </html>
