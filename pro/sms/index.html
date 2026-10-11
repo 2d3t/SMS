@@ -6846,28 +6846,175 @@ async function fetchFile(token, owner, repo, path) {
     if (!fallback) return { exists: false };
     return { exists: true, sha: fallback.sha, content: fallback.content, commitSha, blobSha: fallback.sha };
 }
+// ═══════════════════════════════════════════════════════════════
+//  💾 SAVE FILE WITH RETRY (защита от 409 CONFLICT)
+// ═══════════════════════════════════════════════════════════════
 
-async function saveFile(token, owner, repo, path, content, sha) {
+/**
+ * Сохранение файла чата с автоматическим retry при 409.
+ *
+ * @param {string} token - GitHub токен
+ * @param {string} owner - владелец репо
+ * @param {string} repo - репозиторий
+ * @param {string} path - путь к файлу
+ * @param {object|function} content - содержимое. Если функция — вызывается
+ *                                     заново при retry (чтобы переприменить
+ *                                     изменения к свежему содержимому)
+ * @param {string|null} sha - текущий SHA файла
+ * @param {object} opts - опции
+ * @returns {Promise<{blobSha, commitSha, content?}>}
+ */
+async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
+    const maxRetries = opts.maxRetries ?? 6;        // до 6 попыток
+    const baseDelay = opts.baseDelay ?? 1500;       // база задержки 1.5 сек
+    const maxDelay = opts.maxDelay ?? 12000;        // максимум 12 сек
+    const logPrefix = opts.logPrefix || '💾';
+
     const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
-    const jsonString = JSON.stringify(content);
-    const encoded = utf8ToBase64(jsonString);
-    const body = { message: `💬 Обновление чата`, content: encoded };
-    if (sha) body.sha = sha;
-    const response = await fetch(url, {
-        method: 'PUT',
-        headers: getHeaders(token),
-        body: JSON.stringify(body),
-        cache: 'no-store',
-    });
-    if (response.status === 409) throw new Error('409 CONFLICT');
-    if (!response.ok) {
+
+    let currentSha = sha;
+    let currentContent = content;
+    let lastError = null;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        // ═══ Определяем содержимое для этой попытки ═══
+        // Если передан callback — вызываем его с актуальным контентом
+        // из GitHub (для retry после 409)
+        let contentToSave;
+        if (typeof currentContent === 'function') {
+            // callback должен вернуть { content, sha }
+            const r = await currentContent({ attempt, lastError });
+            contentToSave = r.content;
+            currentSha = r.sha;
+        } else {
+            contentToSave = currentContent;
+        }
+
+        if (!contentToSave) {
+            throw new Error('Нет содержимого для сохранения');
+        }
+
+        // ═══ Формируем тело запроса ═══
+        const jsonString = JSON.stringify(contentToSave);
+        const encoded = utf8ToBase64(jsonString);
+        const body = {
+            message: opts.message || `💬 Обновление чата`,
+            content: encoded,
+        };
+        if (currentSha) body.sha = currentSha;
+
+        // ═══ Отправляем ═══
+        let response;
+        try {
+            response = await fetch(url, {
+                method: 'PUT',
+                headers: getHeaders(token),
+                body: JSON.stringify(body),
+                cache: 'no-store',
+            });
+        } catch (netErr) {
+            // Сетевая ошибка — тоже retry
+            lastError = netErr;
+            console.warn(`${logPrefix} [saveFile] Сетевая ошибка (попытка ${attempt + 1}):`, netErr.message);
+            if (attempt < maxRetries) {
+                const delay = Math.min(baseDelay * Math.pow(1.6, attempt), maxDelay);
+                console.log(`${logPrefix} [saveFile] Повтор через ${Math.round(delay / 1000)} сек...`);
+                await new Promise(r => setTimeout(r, delay));
+                continue;
+            }
+            throw netErr;
+        }
+
+        // ═══ Успех ═══
+        if (response.ok) {
+            const data = await response.json();
+            if (attempt > 0) {
+                console.log(`${logPrefix} [saveFile] ✅ Успех с попытки ${attempt + 1}`);
+            }
+            return {
+                blobSha: data.content.sha,
+                commitSha: data.commit.sha,
+                content: contentToSave,
+            };
+        }
+
+        // ═══ 409 CONFLICT — кто-то успел раньше нас ═══
+        if (response.status === 409) {
+            lastError = new Error('409 CONFLICT');
+
+            if (attempt >= maxRetries) {
+                console.error(`${logPrefix} [saveFile] ❌ Исчерпаны попытки (409)`);
+                throw new Error('409 CONFLICT: не удалось сохранить после ' + maxRetries + ' попыток');
+            }
+
+            // Задержка перед retry — экспоненциальная с «джиттером»
+            // (чтобы при одновременном retry двух клиентов они не столкнулись снова)
+            const jitter = Math.random() * 500;                    // 0-500 мс
+            const delay = Math.min(baseDelay * Math.pow(1.6, attempt), maxDelay) + jitter;
+
+            console.warn(`${logPrefix} [saveFile] ⚠️ 409 CONFLICT (попытка ${attempt + 1}/${maxRetries + 1}). Повтор через ${Math.round(delay / 1000)} сек...`);
+
+            // Показываем пользователю мягкий индикатор
+            if (attempt === 0 && !opts.silent) {
+                try {
+                    if (typeof showToast === 'function') {
+                        showToast('⏳ Кто-то ещё пишет в чат — пробуем снова...', 2000);
+                    }
+                } catch (e) {}
+            }
+
+            await new Promise(r => setTimeout(r, delay));
+
+            // При следующей попытке нужно перечитать актуальный файл из GitHub
+            // Если content — callback, он сделает это сам.
+            // Если это объект — перечитаем файл здесь.
+            if (typeof currentContent !== 'function') {
+                try {
+                    const fresh = await fetchFile(token, owner, repo, path);
+                    if (fresh && fresh.exists) {
+                        currentSha = fresh.sha;
+
+                        // ⚠️ КЛЮЧЕВОЙ МОМЕНТ:
+                        // Мы не можем «слить» изменения в общий объект content
+                        // автоматически — это должен сделать вызывающий код
+                        // через callback. Здесь просто предупреждаем.
+                        if (attempt === 0) {
+                            console.warn(
+                                `${logPrefix} [saveFile] ⚠️ Для надёжного retry используйте callback вместо объекта!`
+                            );
+                        }
+                        // Перезаписываем content на свежий — но это потеряет наши изменения!
+                        // Поэтому лучше использовать callback. Но если его нет —
+                        // используем содержимое с актуальным sha (перезапишет чужое).
+                        // Это «жёсткий» режим: last-writer-wins.
+                        // currentContent = fresh.content; // ❌ НЕ ДЕЛАЕМ ЭТО — потеряем своё сообщение
+                    }
+                } catch (e) {
+                    console.warn(`${logPrefix} [saveFile] Не удалось перечитать файл:`, e.message);
+                }
+            }
+            // Продолжаем цикл — следующая попытка
+            continue;
+        }
+
+        // ═══ Другие ошибки ═══
+        if (response.status === 401) throw new Error('401');
+        if (response.status === 403) throw new Error('403');
+
+        // 422 Unprocessable Entity — например, слишком большой файл
+        if (response.status === 422) {
+            const err = await response.json().catch(() => ({}));
+            throw new Error(err.message || '422: файл слишком большой или невалидный');
+        }
+
+        // Прочие ошибки — читаем сообщение
         const error = await response.json().catch(() => ({}));
         throw new Error(error.message || `HTTP ${response.status}`);
     }
-    const data = await response.json();
-    return { blobSha: data.content.sha, commitSha: data.commit.sha };
-}
 
+    // Если дошли сюда — не должны
+    throw lastError || new Error('Не удалось сохранить файл');
+}
 async function updateMeta(file, version, count) {
     const path = getMetaPath(file);
     const meta = { v: 1, version, count, updatedAt: new Date().toISOString() };
@@ -7515,7 +7662,75 @@ if (hasFile) {
             fileContent.messages = fileContent.messages.slice(-CONFIG.maxMessages);
         }
 
-        const saved = await saveFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path, fileContent, sha);
+        // ═══ Сохраняем через callback — защита от 409 ═══
+const saved = await saveFile(
+    state.token, CONFIG.repoOwner, CONFIG.repoName, path,
+    // callback: при каждой попытке перечитываем актуальный файл
+    // и применяем к нему НАШЕ сообщение
+    async ({ attempt, lastError }) => {
+        // При первой попытке — используем уже прочитанное содержимое
+        if (attempt === 0) {
+            // Проверяем актуальность sha — если кто-то уже вклинился
+            // пока мы готовили вложения, sha устарел. Но при первой
+            // попытке мы всё равно используем fileContent — если будет
+            // 409, то на второй попытке перечитаем.
+            return { content: fileContent, sha: sha };
+        }
+
+        // ═══ RETRY: перечитываем свежий файл и добавляем наше сообщение ═══
+        console.log(`💾 [409-retry] Перечитываем файл (попытка ${attempt + 1})...`);
+
+        const freshResult = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
+        if (!freshResult || !freshResult.exists) {
+            throw new Error('Чат исчез между попытками');
+        }
+
+        const freshContent = freshResult.content;
+        if (freshContent.v !== CRYPTO.VERSION) {
+            throw new Error('Формат изменился');
+        }
+
+        // Соль могла измениться (маловероятно, но проверим)
+        if (freshContent.salt !== state.salt) {
+            state.salt = freshContent.salt;
+            CRYPTO._key = await deriveKey(state.chatPassword, state.salt);
+        }
+
+        // ═══ Проверяем: не отправили ли мы уже это сообщение? ═══
+        // (на случай, если предыдущая попытка на самом деле дошла,
+        // а мы получили 409 по какой-то другой причине)
+        const alreadySaved = (freshContent.messages || []).some(
+            m => String(m.id) === String(messageId)
+        );
+
+        if (alreadySaved) {
+            console.log(`💾 [409-retry] Наше сообщение ${messageId} уже в файле — не дублируем`);
+            return { content: freshContent, sha: freshResult.sha };
+        }
+
+        // ═══ Применяем наше сообщение к свежему содержимому ═══
+        const freshMessages = freshContent.messages || [];
+        freshMessages.push(encMsg);
+
+        if (freshMessages.length > CONFIG.maxMessages) {
+            freshContent.messages = freshMessages.slice(-CONFIG.maxMessages);
+        } else {
+            freshContent.messages = freshMessages;
+        }
+
+        return { content: freshContent, sha: freshResult.sha };
+    },
+    sha,
+    {
+        message: `💬 ${state.username}: ${hasText ? text.trim().slice(0, 40) : 'вложение'}`,
+        maxRetries: 6,
+        baseDelay: 1500,
+        maxDelay: 12000,
+    }
+);
+
+// 🆕 Обновляем sha на случай, если была retry и sha изменился
+sha = saved.blobSha;
 
         await updateMeta(state.chatFile, messageId, fileContent.messages.length);
         state._lastMetaVersion = messageId;
@@ -7768,7 +7983,75 @@ async function handleMultipleImageUpload(files) {
             fileContent.messages = fileContent.messages.slice(-CONFIG.maxMessages);
         }
 
-        const saved = await saveFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path, fileContent, sha);
+        // ═══ Сохраняем через callback — защита от 409 ═══
+const saved = await saveFile(
+    state.token, CONFIG.repoOwner, CONFIG.repoName, path,
+    // callback: при каждой попытке перечитываем актуальный файл
+    // и применяем к нему НАШЕ сообщение
+    async ({ attempt, lastError }) => {
+        // При первой попытке — используем уже прочитанное содержимое
+        if (attempt === 0) {
+            // Проверяем актуальность sha — если кто-то уже вклинился
+            // пока мы готовили вложения, sha устарел. Но при первой
+            // попытке мы всё равно используем fileContent — если будет
+            // 409, то на второй попытке перечитаем.
+            return { content: fileContent, sha: sha };
+        }
+
+        // ═══ RETRY: перечитываем свежий файл и добавляем наше сообщение ═══
+        console.log(`💾 [409-retry] Перечитываем файл (попытка ${attempt + 1})...`);
+
+        const freshResult = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
+        if (!freshResult || !freshResult.exists) {
+            throw new Error('Чат исчез между попытками');
+        }
+
+        const freshContent = freshResult.content;
+        if (freshContent.v !== CRYPTO.VERSION) {
+            throw new Error('Формат изменился');
+        }
+
+        // Соль могла измениться (маловероятно, но проверим)
+        if (freshContent.salt !== state.salt) {
+            state.salt = freshContent.salt;
+            CRYPTO._key = await deriveKey(state.chatPassword, state.salt);
+        }
+
+        // ═══ Проверяем: не отправили ли мы уже это сообщение? ═══
+        // (на случай, если предыдущая попытка на самом деле дошла,
+        // а мы получили 409 по какой-то другой причине)
+        const alreadySaved = (freshContent.messages || []).some(
+            m => String(m.id) === String(messageId)
+        );
+
+        if (alreadySaved) {
+            console.log(`💾 [409-retry] Наше сообщение ${messageId} уже в файле — не дублируем`);
+            return { content: freshContent, sha: freshResult.sha };
+        }
+
+        // ═══ Применяем наше сообщение к свежему содержимому ═══
+        const freshMessages = freshContent.messages || [];
+        freshMessages.push(encMsg);
+
+        if (freshMessages.length > CONFIG.maxMessages) {
+            freshContent.messages = freshMessages.slice(-CONFIG.maxMessages);
+        } else {
+            freshContent.messages = freshMessages;
+        }
+
+        return { content: freshContent, sha: freshResult.sha };
+    },
+    sha,
+    {
+        message: `💬 ${state.username}: ${hasText ? text.trim().slice(0, 40) : 'вложение'}`,
+        maxRetries: 6,
+        baseDelay: 1500,
+        maxDelay: 12000,
+    }
+);
+
+// 🆕 Обновляем sha на случай, если была retry и sha изменился
+sha = saved.blobSha;
 
         const lastId = newPlainMessages[newPlainMessages.length - 1].id;
         await updateMeta(state.chatFile, lastId, fileContent.messages.length);
@@ -7905,7 +8188,28 @@ if (attToDelete.length > 0) {
 
         encMessages.splice(idx, 1);
         fileContent.messages = encMessages;
-        const saved = await saveFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path, fileContent, result.sha);
+        const saved = await saveFile(
+    state.token, CONFIG.repoOwner, CONFIG.repoName, path,
+    async ({ attempt }) => {
+        if (attempt === 0) {
+            return { content: fileContent, sha: result.sha };
+        }
+        // На retry — перечитываем и удаляем сообщение заново
+        const fresh = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
+        if (!fresh || !fresh.exists) throw new Error('Чат исчез');
+
+        const freshContent = fresh.content;
+        const freshIdx = (freshContent.messages || []).findIndex(m => m.id === messageId);
+        if (freshIdx === -1) {
+            // Уже удалено кем-то другим
+            return { content: freshContent, sha: fresh.sha };
+        }
+        freshContent.messages.splice(freshIdx, 1);
+        return { content: freshContent, sha: fresh.sha };
+    },
+    result.sha,
+    { message: `🗑️ Удаление сообщения`, maxRetries: 5 }
+);
 
         const newVersion = Date.now();
         await updateMeta(state.chatFile, newVersion, fileContent.messages.length);
@@ -13062,7 +13366,28 @@ async function persistComments(msgId, comments) {
     const reEncrypted = await encryptMessage(plain);
     fileContent.messages[idx] = { ...fileContent.messages[idx], ...reEncrypted };
 
-    const saved = await saveFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path, fileContent, result.sha);
+    const saved = await saveFile(
+    state.token, CONFIG.repoOwner, CONFIG.repoName, path,
+    async ({ attempt }) => {
+        if (attempt === 0) {
+            return { content: fileContent, sha: result.sha };
+        }
+        // На retry — перечитываем и удаляем сообщение заново
+        const fresh = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
+        if (!fresh || !fresh.exists) throw new Error('Чат исчез');
+
+        const freshContent = fresh.content;
+        const freshIdx = (freshContent.messages || []).findIndex(m => m.id === messageId);
+        if (freshIdx === -1) {
+            // Уже удалено кем-то другим
+            return { content: freshContent, sha: fresh.sha };
+        }
+        freshContent.messages.splice(freshIdx, 1);
+        return { content: freshContent, sha: fresh.sha };
+    },
+    result.sha,
+    { message: `🗑️ Удаление сообщения`, maxRetries: 5 }
+);
     state.sha = saved.blobSha;
     state._lastCommitSha = saved.commitSha;
     state.lastMessageCount = fileContent.messages.length;
@@ -14686,7 +15011,28 @@ async function persistReactions(msgId, reactions) {
     // сохраняем исходные id/time/iv/data, но с новым iv/data
     fileContent.messages[idx] = { ...fileContent.messages[idx], ...reEncrypted };
 
-    const saved = await saveFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path, fileContent, result.sha);
+    const saved = await saveFile(
+    state.token, CONFIG.repoOwner, CONFIG.repoName, path,
+    async ({ attempt }) => {
+        if (attempt === 0) {
+            return { content: fileContent, sha: result.sha };
+        }
+        // На retry — перечитываем и удаляем сообщение заново
+        const fresh = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
+        if (!fresh || !fresh.exists) throw new Error('Чат исчез');
+
+        const freshContent = fresh.content;
+        const freshIdx = (freshContent.messages || []).findIndex(m => m.id === messageId);
+        if (freshIdx === -1) {
+            // Уже удалено кем-то другим
+            return { content: freshContent, sha: fresh.sha };
+        }
+        freshContent.messages.splice(freshIdx, 1);
+        return { content: freshContent, sha: fresh.sha };
+    },
+    result.sha,
+    { message: `🗑️ Удаление сообщения`, maxRetries: 5 }
+);
     state.sha = saved.blobSha;
     state._lastCommitSha = saved.commitSha;
 }
@@ -16641,7 +16987,28 @@ async function confirmEditMessage() {
         const reEncrypted = await encryptMessage(plain);
         fileContent.messages[idx] = { ...fileContent.messages[idx], ...reEncrypted };
 
-        const saved = await saveFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path, fileContent, result.sha);
+        const saved = await saveFile(
+    state.token, CONFIG.repoOwner, CONFIG.repoName, path,
+    async ({ attempt }) => {
+        if (attempt === 0) {
+            return { content: fileContent, sha: result.sha };
+        }
+        // На retry — перечитываем и удаляем сообщение заново
+        const fresh = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
+        if (!fresh || !fresh.exists) throw new Error('Чат исчез');
+
+        const freshContent = fresh.content;
+        const freshIdx = (freshContent.messages || []).findIndex(m => m.id === messageId);
+        if (freshIdx === -1) {
+            // Уже удалено кем-то другим
+            return { content: freshContent, sha: fresh.sha };
+        }
+        freshContent.messages.splice(freshIdx, 1);
+        return { content: freshContent, sha: fresh.sha };
+    },
+    result.sha,
+    { message: `🗑️ Удаление сообщения`, maxRetries: 5 }
+);
 
         // Обновляем метаданные
         const newVersion = Date.now();
