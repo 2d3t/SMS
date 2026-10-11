@@ -39556,6 +39556,452 @@ try {
 })();
 </script>
 
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🛡️ ANTI-DUPLICATE v3 — фикс гонки при поллинге
+//  ─────────────────────────────────────────────────────────────
+//  Решает проблему: когда после ответа собеседника у тебя
+//  всплывает твоё же ранее отправленное сообщение.
+//
+//  Причина: state.lastMessageCount не синхронизировался с
+//  локальным state.messages после отправки, поэтому поллинг
+//  считал "новыми" ВСЕ сообщения, включая твои.
+// ═══════════════════════════════════════════════════════════════
 
+(function installAntiDuplicateV3() {
+    'use strict';
+
+    console.log('🛡️ [AntiDup v3] Установка…');
+
+    const log = (...a) => console.log('🛡️ [AntiDup v3]', ...a);
+    const warn = (...a) => console.warn('🛡️ [AntiDup v3]', ...a);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ФИКС №1: синхронизация lastMessageCount при отправке
+    //  ─────────────────────────────────────────────────────────
+    //  Оборачиваем _origSendMessage — наш патч v2 уже вставил
+    //  своё туда, теперь мы гарантируем что после его выполнения
+    //  счётчик обновлён корректно.
+    // ═══════════════════════════════════════════════════════════
+    const _prevOrigSend = _origSendMessage;
+
+    _origSendMessage = async function(...args) {
+        const beforeCount = state.messages.length;
+        const result = await _prevOrigSend.apply(this, args);
+
+        // 🆕 После отправки — синхронизируем счётчик
+        // (даже если патч v2 уже это сделал — здесь гарантированно)
+        if (state.messages.length !== beforeCount) {
+            const newCount = state.messages.length;
+
+            // Если счётчик сильно отстаёт — догоняем
+            if (state.lastMessageCount < newCount) {
+                log(`🔧 Синхронизация счётчика: ${state.lastMessageCount} → ${newCount}`);
+                state.lastMessageCount = newCount;
+            }
+        }
+
+        return result;
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ФИКС №2: фильтрация в pollUpdates (главный фикс!)
+    //  ─────────────────────────────────────────────────────────
+    //  Перехватываем pollUpdates и правим его логику через
+    //  глобальный хук "фильтр новых сообщений".
+    //
+    //  Но проще: полностью заменяем pollUpdates своей реализацией,
+    //  которая делает то же самое, но с защитой от дубликатов.
+    // ═══════════════════════════════════════════════════════════
+
+    // Устанавливаем флаг, что патч активен
+    window._antiDupV3Active = true;
+
+    // Прячем в глобальный скоуп — renderHistory использует это
+    if (typeof renderMessages === 'function') {
+        const _origRenderMessages = renderMessages;
+
+        renderMessages = function(messages) {
+            if (Array.isArray(messages)) {
+                // 🆕 Финальная дедупликация перед рендером
+                const seen = new Set();
+                const clean = [];
+                let removed = 0;
+                for (const m of messages) {
+                    if (!m || m.id == null) { clean.push(m); continue; }
+                    if (seen.has(m.id)) { removed++; continue; }
+                    seen.add(m.id);
+                    clean.push(m);
+                }
+                if (removed > 0) {
+                    warn(`🧹 renderMessages: убрано ${removed} дубликатов`);
+                }
+                return _origRenderMessages.call(this, clean);
+            }
+            return _origRenderMessages.apply(this, arguments);
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ФИКС №3: appendMessages с проверкой historyState
+    // ═══════════════════════════════════════════════════════════
+    const _prevAppendMessages = appendMessages;
+
+    appendMessages = function(newMsgs) {
+        if (!newMsgs || newMsgs.length === 0) {
+            return _prevAppendMessages.apply(this, arguments);
+        }
+
+        // 🆕 Проверка по глобальной истории
+        const knownIds = new Set(historyState.allMessages.map(m => m.id));
+
+        const filtered = newMsgs.filter(msg => {
+            if (!msg || msg.id == null) return true;
+
+            // Уже в historyState?
+            if (knownIds.has(msg.id)) {
+                log(`⚠️ id=${msg.id} уже в historyState — фильтруем`);
+                return false;
+            }
+
+            // Уже в DOM?
+            const existing = messagesInner.querySelector(
+                `.message-wrapper[data-msg-id="${msg.id}"]`
+            );
+            if (existing) {
+                log(`⚠️ id=${msg.id} уже в DOM — фильтруем`);
+                return false;
+            }
+
+            knownIds.add(msg.id);
+            return true;
+        });
+
+        if (filtered.length === 0) {
+            log('ℹ️ Все сообщения уже известны — пропускаем appendMessages');
+            return;
+        }
+
+        if (filtered.length < newMsgs.length) {
+            warn(`🧹 appendMessages: отфильтровано ${newMsgs.length - filtered.length}`);
+        }
+
+        return _prevAppendMessages.call(this, filtered);
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ФИКС №4: Перехват pollUpdates (КЛЮЧЕВОЙ!)
+    //  ─────────────────────────────────────────────────────────
+    //  Переписываем pollUpdates целиком с защитой от дубликатов.
+    //  Основная логика та же, но с фильтрацией.
+    // ═══════════════════════════════════════════════════════════
+    pollUpdates = async function() {
+        if (state.isPolling || !state.token || !state.isAuthorized || !CRYPTO._key || !state.chatFile) return;
+        state.isPolling = true;
+
+        try {
+            const chatPath = getChatPath(state.chatFile);
+
+            let metaRes = null;
+            try {
+                metaRes = await fetchMetaFast(state.chatFile, state._metaEtag);
+            } catch (e) {
+                console.warn('Meta fetch failed:', e.message);
+                if (e.message.includes('401') || e.message.includes('403')) throw e;
+                return;
+            }
+
+            if (metaRes.notModified) {
+                if (!networkState.isOnline) {
+                    networkState.isOnline = true;
+                    showToast('🌐 Соединение восстановлено', 2000);
+                }
+                return;
+            }
+            if (!metaRes.exists) return;
+
+            state._metaEtag = metaRes.etag || null;
+            const metaVersion = metaRes.content && metaRes.content.version;
+            if (!metaVersion) return;
+
+            if (metaVersion === state._lastMetaVersion) {
+                if (!networkState.isOnline) {
+                    networkState.isOnline = true;
+                    showToast('🌐 Соединение восстановлено', 2000);
+                }
+                return;
+            }
+
+            state._lastMetaVersion = metaVersion;
+            state._lastActivityAt = Date.now();
+
+            const commitSha = await getLatestCommitSha(state.token, CONFIG.repoOwner, CONFIG.repoName, chatPath);
+            if (!networkState.isOnline) {
+                networkState.isOnline = true;
+                showToast('🌐 Соединение восстановлено', 2000);
+            }
+            if (!commitSha) return;
+            if (commitSha === state._lastCommitSha) return;
+
+            let blobSha = null;
+            let content = null;
+
+            const tryBlobSha = await tryGetFileBlobSha(state.token, CONFIG.repoOwner, CONFIG.repoName, commitSha, chatPath);
+            if (tryBlobSha) {
+                const tryContent = await tryGetBlobContent(state.token, CONFIG.repoOwner, CONFIG.repoName, tryBlobSha);
+                if (tryContent) { blobSha = tryBlobSha; content = tryContent; }
+            }
+            if (!content) {
+                const fallback = await fetchViaContentsRef(state.token, CONFIG.repoOwner, CONFIG.repoName, chatPath, commitSha);
+                if (!fallback) { state._lastCommitSha = commitSha; return; }
+                blobSha = fallback.sha;
+                content = fallback.content;
+            }
+            if (blobSha === state.sha) { state._lastCommitSha = commitSha; return; }
+
+            state._lastCommitSha = commitSha;
+            state.sha = blobSha;
+
+            if (!content || content.v !== CRYPTO.VERSION) return;
+            if (content.salt !== state.salt) {
+                state.salt = content.salt;
+                CRYPTO._key = await deriveKey(state.chatPassword, state.salt);
+            }
+
+            const encMessages = content.messages || [];
+
+            // ═══════════════════════════════════════════════════════
+            //  🆕 СЛУЧАЙ 1: сообщений стало МЕНЬШЕ (удаление)
+            // ═══════════════════════════════════════════════════════
+            if (encMessages.length < state.lastMessageCount) {
+                const decrypted = [];
+                for (const enc of encMessages) {
+                    const m = await decryptMessage(enc);
+                    if (m) decrypted.push(m);
+                }
+
+                // 🆕 Дедупликация
+                const seen = new Set();
+                const clean = [];
+                for (const m of decrypted) {
+                    if (!m || m.id == null) { clean.push(m); continue; }
+                    if (seen.has(m.id)) continue;
+                    seen.add(m.id);
+                    clean.push(m);
+                }
+
+                state.messages = clean;
+                state.lastMessageCount = clean.length;
+
+                if (state.currentScreen === 'chat') {
+                    renderMessages(state.messages);
+                } else {
+                    refreshUnreadBadges();
+                }
+                return;
+            }
+
+            if (encMessages.length === state.lastMessageCount) return;
+
+            // ═══════════════════════════════════════════════════════
+            //  🆕 СЛУЧАЙ 2: пришли новые сообщения
+            // ═══════════════════════════════════════════════════════
+
+            // 🆕 КЛЮЧЕВОЙ ФИКС: вместо slice(lastMessageCount) —
+            //    берём сообщения по id, которых у нас ЕЩЁ НЕТ.
+            //    Это защищает от случая, когда счётчик отстал.
+            const knownIds = new Set(historyState.allMessages.map(m => m.id));
+
+            const trulyNewEnc = [];
+            for (const enc of encMessages) {
+                if (!knownIds.has(enc.id)) {
+                    trulyNewEnc.push(enc);
+                }
+            }
+
+            if (trulyNewEnc.length === 0) {
+                // Всё, что "новое" по счётчику — уже есть локально.
+                // Просто синхронизируем счётчик и выходим.
+                log(`ℹ️ Счётчик отставал (${state.lastMessageCount} vs ${encMessages.length}), но новых нет`);
+                state.lastMessageCount = encMessages.length;
+                return;
+            }
+
+            log(`📥 Найдено новых: ${trulyNewEnc.length} (было ${new Set(encMessages.map(m => m.id)).size - knownIds.size + trulyNewEnc.length} в файле)`);
+
+            // Дешифруем только новые
+            const newPlainMessages = [];
+            for (const enc of trulyNewEnc) {
+                const m = await decryptMessage(enc);
+                if (m) newPlainMessages.push(m);
+            }
+
+            if (newPlainMessages.length === 0) {
+                state.lastMessageCount = encMessages.length;
+                return;
+            }
+
+            // 🆕 Ещё раз фильтруем — вдруг что-то уже успело попасть
+            const finalNew = newPlainMessages.filter(m => {
+                if (!m || m.id == null) return true;
+                return !historyState.allMessages.some(x => x.id === m.id);
+            });
+
+            if (finalNew.length === 0) {
+                state.lastMessageCount = encMessages.length;
+                return;
+            }
+
+            const hasOwnMessage = finalNew.some(
+                m => m.username === state.username && m.id === state._lastSentMessageId
+            );
+            const wasAtBottom = scrollState.isAtBottom;
+            const addedCount = finalNew.length;
+
+            // 🆕 Обновляем state синхронно
+            state.messages = state.messages.concat(finalNew);
+            state.lastMessageCount = encMessages.length;
+
+            if (state.currentScreen !== 'chat') {
+                const chat = state.chats.find(c => c.file === state.chatFile);
+                if (chat) {
+                    chat.hasUnread = true;
+                    chat.unreadCount = (chat.unreadCount || 0) + addedCount;
+                    saveChatsList();
+                    if (state.currentScreen === 'chats') renderChatsList();
+                }
+                if (!hasOwnMessage) soundManager.play('receive');
+                return;
+            }
+
+            scrollState.isAtBottom = wasAtBottom;
+            appendMessages(finalNew);
+
+            const stillAtBottom = (() => {
+                const diff = messagesContainer.scrollHeight
+                    - messagesContainer.scrollTop
+                    - messagesContainer.clientHeight;
+                return diff < 120;
+            })();
+
+            if (wasAtBottom && stillAtBottom) {
+                scrollToBottom(true);
+                markChatAsRead();
+            } else {
+                scrollState.unreadCount += addedCount;
+                updateScrollBadge();
+                updateScrollButton();
+            }
+            if (!hasOwnMessage) soundManager.play('receive');
+            else state._lastSentMessageId = null;
+
+        } catch (error) {
+            console.error('Polling error:', error);
+            const isNetworkError = !navigator.onLine || error.name === 'AbortError'
+                || error.name === 'TypeError' || error.message.includes('Failed to fetch');
+            if (isNetworkError) {
+                if (networkState.isOnline) {
+                    networkState.isOnline = false;
+                    showToast('📵 Соединение потеряно', 2500);
+                }
+                return;
+            }
+            if (error.message.includes('403') || error.message.includes('401')) lockChatUI('Сессия истекла');
+        } finally {
+            state.isPolling = false;
+        }
+    };
+
+    log('✅ pollUpdates заменён (фильтрация по id)');
+
+    // ═══════════════════════════════════════════════════════════
+    //  ФИКС №5: гарантированная синхронизация счётчика после
+    //  любых мутаций state.messages
+    // ═══════════════════════════════════════════════════════════
+    // Периодически (раз в 3 секунды) проверяем, что счётчик
+    // соответствует реальному количеству сообщений.
+    setInterval(() => {
+        if (!state.isAuthorized || !state.chatFile) return;
+        if (state.currentScreen !== 'chat') return;
+
+        const realCount = state.messages.length;
+        if (state.lastMessageCount !== realCount) {
+            // Только если счётчик ОТСТАЁТ — догоняем
+            // (если опережает — значит есть удаления в поллинге)
+            if (state.lastMessageCount < realCount) {
+                log(`🔧 Автокоррекция счётчика: ${state.lastMessageCount} → ${realCount}`);
+                state.lastMessageCount = realCount;
+            }
+        }
+    }, 3000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  API ДЛЯ ОТЛАДКИ
+    // ═══════════════════════════════════════════════════════════
+    window.AntiDuplicate = {
+        status: () => ({
+            lastMessageCount: state.lastMessageCount,
+            messagesInState: state.messages.length,
+            messagesInHistory: historyState.allMessages.length,
+            domWrappers: messagesInner.querySelectorAll('.message-wrapper[data-msg-id]').length,
+            inSync: state.lastMessageCount === state.messages.length,
+            lastSentId: state._lastSentMessageId,
+        }),
+
+        // Принудительно синхронизировать счётчик
+        syncCount: () => {
+            const before = state.lastMessageCount;
+            state.lastMessageCount = state.messages.length;
+            log(`🔧 Ручная синхронизация: ${before} → ${state.lastMessageCount}`);
+            return { before, after: state.lastMessageCount };
+        },
+
+        // Найти все дубликаты в текущем DOM
+        findDuplicates: () => {
+            const wrappers = messagesInner.querySelectorAll('.message-wrapper[data-msg-id]');
+            const ids = new Map();
+            wrappers.forEach(w => {
+                const id = w.dataset.msgId;
+                ids.set(id, (ids.get(id) || 0) + 1);
+            });
+            const dups = [];
+            ids.forEach((count, id) => {
+                if (count > 1) dups.push({ id, count });
+            });
+            return dups;
+        },
+
+        // Почистить дубликаты в DOM
+        cleanDom: () => {
+            const wrappers = messagesInner.querySelectorAll('.message-wrapper[data-msg-id]');
+            const seen = new Set();
+            let removed = 0;
+            wrappers.forEach(w => {
+                const id = w.dataset.msgId;
+                if (seen.has(id)) {
+                    w.remove();
+                    removed++;
+                } else {
+                    seen.add(id);
+                }
+            });
+            log(`🧹 Убрано из DOM: ${removed}`);
+            return removed;
+        },
+    };
+
+    console.log('🛡️ [AntiDup v3] Патч установлен');
+    console.log('   ✅ lastMessageCount синхронизируется при отправке');
+    console.log('   ✅ pollUpdates фильтрует по id, а не по счётчику');
+    console.log('   ✅ appendMessages проверяет и historyState, и DOM');
+    console.log('   ✅ renderMessages дедуплицирует на финальном этапе');
+    console.log('   ✅ Автокоррекция счётчика каждые 3 сек');
+    console.log('');
+    console.log('   API: AntiDuplicate.status()');
+    console.log('        AntiDuplicate.findDuplicates() — найти дубли в DOM');
+    console.log('        AntiDuplicate.cleanDom() — почистить дубли');
+    console.log('        AntiDuplicate.syncCount() — синхронизировать счётчик');
+})();
+</script>
 </body>
 </html>
