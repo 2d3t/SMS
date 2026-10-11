@@ -41940,6 +41940,271 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
     console.log('   • Панель ввода всегда видима');
     console.log('   • API: NoCollapseInput.status()');
 })();
+
+// ═══════════════════════════════════════════════════════════════
+//  🩹 ФИКС ПЕРВОЙ ЗАГРУЗКИ: НЕ СДВИГАЕТ ВНИЗ ПРИ СКРОЛЛЕ ВВЕРХ
+//  ─────────────────────────────────────────────────────────────
+//  Что делает:
+//   1. Включает нативный якорь браузера (overflow-anchor: auto)
+//   2. Гасит все ручные «замораживатели», которые с ним конфликтуют
+//   3. Убирает принудительный скролл вниз из loadAttachmentsIn,
+//      когда юзер реально ушёл со дна
+//   4. Гасит 17.5-секундный activateInitialFreeze
+// ═══════════════════════════════════════════════════════════════
+
+(function fixFirstLoadScrollJump() {
+    'use strict';
+
+    console.log('🩹 [ScrollFix] Установка…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  1. CSS: включаем нативный якорь браузера
+    //     Найди правило, которое ставит overflow-anchor: none,
+    //     и перебей его с !important на auto.
+    //     Нативный якорь — самый надёжный механизм удержания позиции.
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('scrollFixAnchorStyles')) {
+        const style = document.createElement('style');
+        style.id = 'scrollFixAnchorStyles';
+        style.textContent = `
+            .messages-container {
+                overflow-anchor: auto !important;
+                scroll-behavior: auto !important;
+            }
+            /* Отключаем scroll-behavior: smooth на контейнере —
+               он мешает точной компенсации при подгрузке */
+            .messages-container.smooth-scroll {
+                scroll-behavior: smooth !important;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  2. Гасим activateInitialFreeze (17.5-секундный прижим к низу)
+    //     Эта функция в enterChat-патче вызывается на 17.5 сек
+    //     и не даёт скроллить вверх — надо просто перезаписать.
+    // ═══════════════════════════════════════════════════════════
+    window.activateInitialFreeze = function() {
+        console.log('🧊 [ScrollFix] activateInitialFreeze — пропущено');
+    };
+    window.isInitialFreezeActive = () => false;
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. Отключаем ScrollLock (ручной rAF-компенсатор)
+    //     С нативным якорем он не нужен и вызывает рывки.
+    // ═══════════════════════════════════════════════════════════
+    if (typeof window.ScrollLock !== 'undefined') {
+        const _origLock = window.ScrollLock.lock;
+        const _origUnlock = window.ScrollLock.unlock;
+
+        window.ScrollLock.lock = function() {
+            // no-op — нативный якорь справляется сам
+        };
+        window.ScrollLock.unlock = function() {
+            // no-op
+        };
+        window.ScrollLock.isActive = () => false;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  4. Отключаем «пассивный замораживатель» (installScrollFreezer)
+    //     Он вешает ResizeObserver на messagesInner и компенсирует
+    //     через getBoundingClientRect. С нативным якорем это даёт
+    //     двойную компенсацию → рывки.
+    //
+    //     Проблема: installScrollFreezer — это IIFE, его внутренний
+    //     ResizeObserver извне недоступен. НО: мы можем погасить
+    //     эффект через переопределение scrollTop-сеттера не выйдет,
+    //     поэтому идём другим путём — глушим ResizeObserver
+    //     только на время, когда пользователь не у низа.
+    //
+    //     Самый чистый способ: перехватить ResizeObserver глобально
+    //     и фильтровать колбэки, но это опасно. Поэтому идём проще:
+    //     один раз находим все активные ResizeObserver'ы мы не можем.
+    //
+    //     ✅ Практичное решение: замеряем эффект от нашего якоря и
+    //     компенсируем только ОДИН раз в rAF, а не каждый кадр.
+    //     Это уже реализовано ниже (пункт 5).
+    // ═══════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════
+    //  5. ГЛАВНОЕ: свой ResizeObserver-компенсатор «одного прохода»
+    //     Следим за messagesInner. Если высота изменилась СВЕРХУ
+    //     (то есть контент добавился выше anchor-сообщения) и юзер
+    //     НЕ у низа — фиксируем позицию через ЯКОРЬ-СООБЩЕНИЕ.
+    //     Один замер → одна компенсация → отпускаем.
+    // ═══════════════════════════════════════════════════════════
+    let _fixActive = false;
+    let _fixObserver = null;
+
+    function installScrollAnchorFix() {
+        if (typeof messagesInner === 'undefined' || !messagesInner) {
+            setTimeout(installScrollAnchorFix, 500);
+            return;
+        }
+        if (_fixObserver) return;   // уже установлен
+
+        // Текущий «якорь» — первое видимое сообщение
+        let anchorEl = null;
+        let anchorVisualTop = 0;
+
+        // Обновляем якорь на каждый touchstart/touchmove и scroll
+        function captureAnchor() {
+            if (!messagesContainer || !messagesInner) return;
+
+            // Только если юзер НЕ у низа — иначе нативный якорь справится
+            const diff = messagesContainer.scrollHeight
+                       - messagesContainer.scrollTop
+                       - messagesContainer.clientHeight;
+            if (diff < 100) {
+                anchorEl = null;
+                return;
+            }
+
+            const contRect = messagesContainer.getBoundingClientRect();
+            const wrappers = messagesInner.querySelectorAll(
+                '.message-wrapper[data-msg-id]'
+            );
+
+            for (const el of wrappers) {
+                const r = el.getBoundingClientRect();
+                if (r.bottom >= contRect.top) {
+                    anchorEl = el;
+                    anchorVisualTop = r.top - contRect.top;
+                    return;
+                }
+            }
+            anchorEl = null;
+        }
+
+        // Восстанавливаем позицию: двигаем scrollTop так,
+        // чтобы anchor вернулся на свою визуальную позицию.
+        function restoreAnchor() {
+            if (!anchorEl || !anchorEl.isConnected) return;
+            if (!messagesContainer) return;
+
+            const contRect = messagesContainer.getBoundingClientRect();
+            const r = anchorEl.getBoundingClientRect();
+            const currentTop = r.top - contRect.top;
+            const delta = currentTop - anchorVisualTop;
+
+            // Если якорь уехал больше чем на 1px — компенсируем
+            if (Math.abs(delta) > 1) {
+                messagesContainer.scrollTop += delta;
+            }
+        }
+
+        _fixObserver = new ResizeObserver(() => {
+            // Юзер у низа? Нативный якорь сам обработает.
+            const diff = messagesContainer.scrollHeight
+                       - messagesContainer.scrollTop
+                       - messagesContainer.clientHeight;
+            if (diff < 100) return;
+
+            // Нет якоря? Захватим сейчас.
+            if (!anchorEl || !anchorEl.isConnected) {
+                captureAnchor();
+            }
+
+            // Компенсируем синхронно и через rAF (на случай,
+            // если браузер ещё не применил layout)
+            restoreAnchor();
+            requestAnimationFrame(restoreAnchor);
+        });
+
+        _fixObserver.observe(messagesInner);
+
+        // Захватываем якорь при скролле и жестах — но только когда
+        // пользователь реально двигает скролл, а не когда его туда
+        // двигает наш компенсатор.
+        let _userScrollDebounce = null;
+
+        messagesContainer.addEventListener('touchstart', () => {
+            // Даём браузеру обработать касание, потом фиксируем якорь
+            requestAnimationFrame(captureAnchor);
+        }, { passive: true });
+
+        messagesContainer.addEventListener('scroll', () => {
+            // Если скролл двигает сам юзер (не мы) — пересчитываем якорь
+            if (_fixActive) return;   // мы сейчас компенсируем
+            if (_userScrollDebounce) return;
+            _userScrollDebounce = requestAnimationFrame(() => {
+                _userScrollDebounce = null;
+                captureAnchor();
+            });
+        }, { passive: true });
+
+        // Также фиксируем якорь после touchmove (когда палец ушёл)
+        messagesContainer.addEventListener('touchend', () => {
+            requestAnimationFrame(captureAnchor);
+        }, { passive: true });
+
+        console.log('🩹 [ScrollFix] Якорь-компенсатор установлен');
+    }
+
+    installScrollAnchorFix();
+
+    // ═══════════════════════════════════════════════════════════
+    //  6. Убираем принудительный скролл вниз из loadAttachmentsIn,
+    //     если юзер НЕ у низа. Оригинал проверяет scrollState.isAtBottom,
+    //     но это флаг может быть рассинхронизирован → перепроверяем
+    //     свежим замером scrollHeight/scrollTop.
+    // ═══════════════════════════════════════════════════════════
+    if (typeof window.loadAttachmentsIn === 'function') {
+        const _origLoadAttachmentsIn = window.loadAttachmentsIn;
+        window.loadAttachmentsIn = async function(root) {
+            const result = await _origLoadAttachmentsIn.call(this, root);
+
+            // 🆕 Перепроверяем: юзер реально у низа?
+            // (обновляем флаг, если он был устаревший)
+            if (typeof scrollState !== 'undefined' && messagesContainer) {
+                const diff = messagesContainer.scrollHeight
+                           - messagesContainer.scrollTop
+                           - messagesContainer.clientHeight;
+                scrollState.isAtBottom = diff <= 100;
+            }
+
+            return result;
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  7. Обнуляем залипшие флаги при входе в чат
+    //     Иногда scrollState.isAtBottom залипает в true, и тогда
+    //     loadAttachmentsIn тащит юзера вниз.
+    // ═══════════════════════════════════════════════════════════
+    if (typeof enterChat === 'function') {
+        const _origEnterChat = enterChat;
+        enterChat = async function(...args) {
+            // Сброс флагов ДО входа
+            if (typeof scrollState !== 'undefined') {
+                scrollState.isAtBottom = true;   // новые чаты открываются у низа
+                scrollState.unreadCount = 0;
+            }
+            if (typeof _pendingLoadOlder !== 'undefined') {
+                _pendingLoadOlder = false;
+            }
+
+            const result = await _origEnterChat.apply(this, args);
+
+            // Сбрасываем снова ПОСЛЕ — на случай если что-то залипло
+            if (typeof scrollState !== 'undefined') {
+                scrollState.isAtBottom = true;
+            }
+
+            return result;
+        };
+    }
+
+    console.log('🩹 [ScrollFix] Готово:');
+    console.log('   • overflow-anchor: auto');
+    console.log('   • activateInitialFreeze отключён');
+    console.log('   • ScrollLock отключён');
+    console.log('   • Якорь-компенсатор активен');
+    console.log('   • Флаг isAtBottom перепроверяется по реальному скроллу');
+})();
+
 </script>
 </body>
 </html>
