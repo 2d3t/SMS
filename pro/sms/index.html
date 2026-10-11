@@ -41765,6 +41765,181 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
     console.log('   • API: CoversIsolation.galleryStatus() / .testCover(msgId)');
 
 })();
+
+// ═══════════════════════════════════════════════════════════════
+// 🚫 УБИРАЕМ КНОПКУ СВОРАЧИВАНИЯ СТРОКИ ВВОДА
+// ─────────────────────────────────────────────────────────────
+//   • Полностью скрывает кнопку ✕ закрытия панели ввода
+//   • Блокирует функцию hideInputBar()
+//   • Панель ввода всегда видима, когда открыт чат
+// ═══════════════════════════════════════════════════════════════
+
+(function removeCollapseInputButton() {
+    'use strict';
+
+    console.log('🚫 [NoCollapse] Установка патча…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  1. CSS — принудительно скрываем кнопку
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('noCollapseInputStyles')) {
+        const style = document.createElement('style');
+        style.id = 'noCollapseInputStyles';
+        style.textContent = `
+            /* Полностью скрываем кнопку закрытия панели ввода */
+            #closePanelBtn {
+                display: none !important;
+                visibility: hidden !important;
+                pointer-events: none !important;
+                width: 0 !important;
+                height: 0 !important;
+                opacity: 0 !important;
+            }
+
+            /* Не показываем даже при hover/active */
+            .input-bar:hover .close-panel-btn,
+            .input-bar:active .close-panel-btn,
+            .input-bar .close-panel-btn {
+                display: none !important;
+            }
+
+            /* Также скрываем "плавающую" кнопку клавиатуры, 
+               которая появлялась после сворачивания */
+            #floatingKeyboardBtn {
+                display: none !important;
+                visibility: hidden !important;
+                pointer-events: none !important;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  2. Блокируем функцию hideInputBar
+    // ═══════════════════════════════════════════════════════════
+    if (typeof window.hideInputBar === 'function') {
+        const _origHideInputBar = window.hideInputBar;
+
+        window.hideInputBar = function() {
+            console.log('🚫 [NoCollapse] hideInputBar() заблокирован');
+            // Ничего не делаем — панель остаётся на месте
+            return;
+        };
+
+        console.log('🚫 [NoCollapse] hideInputBar перезаписан как no-op');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. Удаляем обработчик с кнопки, если она есть
+    // ═══════════════════════════════════════════════════════════
+    function removeButtonHandler() {
+        const btn = document.getElementById('closePanelBtn');
+        if (!btn) return false;
+
+        // Клонируем, чтобы убрать все слушатели
+        const newBtn = btn.cloneNode(true);
+        btn.parentNode.replaceChild(newBtn, btn);
+
+        // И полностью скрываем
+        newBtn.style.display = 'none';
+        newBtn.remove();  // ← удаляем вообще из DOM
+
+        return true;
+    }
+
+    // Применяем сразу
+    removeButtonHandler();
+
+    // И следим за пересозданием
+    const observer = new MutationObserver(() => {
+        const btn = document.getElementById('closePanelBtn');
+        if (btn) {
+            btn.remove();
+        }
+        const floatBtn = document.getElementById('floatingKeyboardBtn');
+        if (floatBtn && floatBtn.classList.contains('show')) {
+            floatBtn.classList.remove('show');
+        }
+    });
+
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    // ═══════════════════════════════════════════════════════════
+    //  4. При входе в чат — гарантируем видимость панели
+    // ═══════════════════════════════════════════════════════════
+    if (typeof showInputBar === 'function') {
+        const _origShowInputBar = showInputBar;
+        showInputBar = function() {
+            const result = _origShowInputBar.apply(this, arguments);
+
+            // На всякий случай — снимаем класс hidden
+            const inputBar = document.getElementById('inputBar');
+            if (inputBar) {
+                inputBar.classList.remove('hidden');
+            }
+
+            // И убираем плавающую кнопку
+            const floatBtn = document.getElementById('floatingKeyboardBtn');
+            if (floatBtn) {
+                floatBtn.classList.remove('show');
+            }
+
+            return result;
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  5. Периодическая страховка
+    // ═══════════════════════════════════════════════════════════
+    setInterval(() => {
+        // Если мы в чате — панель должна быть видна
+        if (typeof state !== 'undefined' && state.currentScreen === 'chat' && state.chatFile) {
+            const inputBar = document.getElementById('inputBar');
+            if (inputBar && inputBar.classList.contains('hidden')) {
+                inputBar.classList.remove('hidden');
+                console.log('🚫 [NoCollapse] Восстановлена видимость inputBar');
+            }
+
+            const floatBtn = document.getElementById('floatingKeyboardBtn');
+            if (floatBtn && floatBtn.classList.contains('show')) {
+                floatBtn.classList.remove('show');
+            }
+        }
+
+        // Удаляем кнопку, если она вдруг появилась
+        const btn = document.getElementById('closePanelBtn');
+        if (btn) btn.remove();
+    }, 1000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  6. API
+    // ═══════════════════════════════════════════════════════════
+    window.NoCollapseInput = {
+        isActive: () => true,
+        // Для отладки
+        forceShow: () => {
+            const inputBar = document.getElementById('inputBar');
+            if (inputBar) inputBar.classList.remove('hidden');
+        },
+        status: () => {
+            const inputBar = document.getElementById('inputBar');
+            const closeBtn = document.getElementById('closePanelBtn');
+            const floatBtn = document.getElementById('floatingKeyboardBtn');
+            return {
+                inputBarExists: !!inputBar,
+                inputBarHidden: inputBar ? inputBar.classList.contains('hidden') : null,
+                closeBtnExists: !!closeBtn,
+                floatBtnVisible: floatBtn ? floatBtn.classList.contains('show') : null,
+            };
+        },
+    };
+
+    console.log('🚫 [NoCollapse] Патч установлен:');
+    console.log('   • Кнопка ✕ сворачивания удалена');
+    console.log('   • hideInputBar() отключён');
+    console.log('   • Панель ввода всегда видима');
+    console.log('   • API: NoCollapseInput.status()');
+})();
 </script>
 </body>
 </html>
