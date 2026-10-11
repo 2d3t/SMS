@@ -39490,6 +39490,451 @@ try {
     console.log(`   • Периодическая проверка: раз в ${CFG.PERIODIC_MS / 1000} сек`);
     console.log('   • API: MessageDedup.run() / .find() / .check(a, b)');
 })();
+
+// ═══════════════════════════════════════════════════════════════
+//  💾 SAVE FILE v2 — анти-дубликат через проверку messageId
+//  ─────────────────────────────────────────────────────────────
+//  Ключевое отличие от v1: перед каждой повторной попыткой
+//  (после 409 CONFLICT) перечитываем файл и ПРОВЕРЯЕМ,
+//  нет ли уже нашего messageId. Если есть — выходим с успехом.
+// ═══════════════════════════════════════════════════════════════
+async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
+    const maxRetries = opts.maxRetries ?? 6;
+    const baseDelay = opts.baseDelay ?? 1500;
+    const maxDelay = opts.maxDelay ?? 12000;
+    const logPrefix = opts.logPrefix || '💾';
+
+    // 🆕 Уникальный ID нашего сообщения — для проверки дубликатов
+    const ourMessageId = opts.messageId ?? null;
+
+    const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
+
+    let currentSha = sha;
+    let currentContent = content;
+    let lastError = null;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        // ═══ Определяем содержимое для этой попытки ═══
+        let contentToSave;
+        if (typeof currentContent === 'function') {
+            const r = await currentContent({ attempt, lastError });
+            contentToSave = r.content;
+            currentSha = r.sha;
+        } else {
+            contentToSave = currentContent;
+        }
+
+        if (!contentToSave) {
+            throw new Error('Нет содержимого для сохранения');
+        }
+
+        // ═══ Формируем тело запроса ═══
+        const jsonString = JSON.stringify(contentToSave);
+        const encoded = utf8ToBase64(jsonString);
+        const body = {
+            message: opts.message || `💬 Обновление чата`,
+            content: encoded,
+        };
+        if (currentSha) body.sha = currentSha;
+
+        // ═══ Отправляем ═══
+        let response;
+        try {
+            response = await fetch(url, {
+                method: 'PUT',
+                headers: getHeaders(token),
+                body: JSON.stringify(body),
+                cache: 'no-store',
+            });
+        } catch (netErr) {
+            lastError = netErr;
+            console.warn(`${logPrefix} [saveFile] Сетевая ошибка (попытка ${attempt + 1}):`, netErr.message);
+            if (attempt < maxRetries) {
+                const delay = Math.min(baseDelay * Math.pow(1.6, attempt), maxDelay);
+                console.log(`${logPrefix} [saveFile] Повтор через ${Math.round(delay / 1000)} сек...`);
+                await new Promise(r => setTimeout(r, delay));
+                continue;
+            }
+            throw netErr;
+        }
+
+        // ═══ Успех ═══
+        if (response.ok) {
+            const data = await response.json();
+            if (attempt > 0) {
+                console.log(`${logPrefix} [saveFile] ✅ Успех с попытки ${attempt + 1}`);
+            }
+            return {
+                blobSha: data.content.sha,
+                commitSha: data.commit.sha,
+                content: contentToSave,
+            };
+        }
+
+        // ═══ 409 CONFLICT — кто-то успел раньше нас ═══
+        if (response.status === 409) {
+            lastError = new Error('409 CONFLICT');
+
+            if (attempt >= maxRetries) {
+                console.error(`${logPrefix} [saveFile] ❌ Исчерпаны попытки (409)`);
+                throw new Error('409 CONFLICT: не удалось сохранить после ' + maxRetries + ' попыток');
+            }
+
+            const jitter = Math.random() * 800;
+            const delay = Math.min(baseDelay * Math.pow(1.7, attempt), maxDelay) + jitter;
+
+            console.warn(`${logPrefix} [saveFile] ⚠️ 409 CONFLICT (попытка ${attempt + 1}/${maxRetries + 1}). Повтор через ${Math.round(delay / 1000)} сек...`);
+
+            if (attempt === 0 && !opts.silent) {
+                try {
+                    if (typeof showToast === 'function') {
+                        showToast('⏳ Кто-то ещё пишет в чат — пробуем снова...', 2000);
+                    }
+                } catch (e) {}
+            }
+
+            await new Promise(r => setTimeout(r, delay));
+
+            // 🆕 КЛЮЧЕВОЕ: перечитываем свежий файл и ПРОВЕРЯЕМ,
+            //    нет ли УЖЕ нашего сообщения в нём.
+            try {
+                const fresh = await fetchFile(token, owner, repo, path);
+
+                if (fresh && fresh.exists) {
+                    currentSha = fresh.sha;
+
+                    // 🆕 АНТИ-ДУБЛИКАТ: если наше сообщение уже в файле —
+                    //    значит предыдущая попытка на самом деле прошла,
+                    //    просто мы получили 409 из-за гонки. Выходим.
+                    if (ourMessageId != null && fresh.content) {
+                        const alreadySaved = (fresh.content.messages || []).some(
+                            m => String(m.id) === String(ourMessageId)
+                        );
+
+                        if (alreadySaved) {
+                            console.log(`${logPrefix} [saveFile] ✅ Наше сообщение ${ourMessageId} уже в файле — выходим без повтора`);
+
+                            // Находим blobSha для этого файла
+                            // (используем sha свежего файла как наш blobSha)
+                            return {
+                                blobSha: fresh.sha,
+                                commitSha: fresh.commitSha || fresh.sha,
+                                content: fresh.content,
+                            };
+                        }
+                    }
+
+                    // Если content — объект (не callback), обновляем его
+                    // на свежий + переприменяем наши изменения
+                    if (typeof currentContent !== 'function' && ourMessageId != null) {
+                        // 🆕 Наш новый объект: берём свежий контент
+                        //    и добавляем туда наше сообщение
+                        const freshContent = fresh.content;
+
+                        // Ищем наше сообщение в исходном contentToSave
+                        const ourMsg = (contentToSave.messages || []).find(
+                            m => String(m.id) === String(ourMessageId)
+                        );
+
+                        if (ourMsg) {
+                            // Проверяем — может уже добавлено кем-то ещё
+                            const exists = (freshContent.messages || []).some(
+                                m => String(m.id) === String(ourMessageId)
+                            );
+
+                            if (!exists) {
+                                // Добавляем наше сообщение в свежий контент
+                                const freshMsgs = freshContent.messages || [];
+                                freshMsgs.push(ourMsg);
+
+                                if (freshMsgs.length > CONFIG.maxMessages) {
+                                    freshContent.messages = freshMsgs.slice(-CONFIG.maxMessages);
+                                } else {
+                                    freshContent.messages = freshMsgs;
+                                }
+
+                                console.log(`${logPrefix} [saveFile] Переприменяем наше сообщение к свежему контенту`);
+                            }
+
+                            // Заменяем currentContent на свежий
+                            currentContent = freshContent;
+                        }
+                    }
+                }
+            } catch (e) {
+                console.warn(`${logPrefix} [saveFile] Не удалось перечитать файл:`, e.message);
+            }
+
+            continue;
+        }
+
+        // ═══ Другие ошибки ═══
+        if (response.status === 401) throw new Error('401');
+        if (response.status === 403) throw new Error('403');
+
+        if (response.status === 422) {
+            const err = await response.json().catch(() => ({}));
+            throw new Error(err.message || '422: файл слишком большой или невалидный');
+        }
+
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.message || `HTTP ${response.status}`);
+    }
+
+    throw lastError || new Error('Не удалось сохранить файл');
+}
+
+</script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🩹 ФИКС v3: АНТИ-ДУБЛИКАТ ДЛЯ МЕДИА (аудио/видео/файлы)
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: при одновременной отправке медиа с двух устройств
+//  вложение грузится 5-10 сек, потом saveFile → 409 → retry.
+//  Гонка приводит к дубликатам.
+//
+//  Решение (по аналогии с текстом):
+//   1. messageId генерируется В САМОМ НАЧАЛЕ _origSendMessage
+//      (до загрузки вложений).
+//   2. Он передаётся в saveFile как opts.messageId.
+//   3. saveFile при 409 перечитывает файл и проверяет —
+//      нет ли уже нашего messageId. Если есть — выходим с успехом.
+//   4. Для батчей фото (handleMultipleImageUpload) — то же самое,
+//      но проверяем весь набор batchId.
+// ═══════════════════════════════════════════════════════════════
+
+(function installMediaAntiDuplicateV3() {
+    'use strict';
+
+    console.log('🩹 [MediaAntiDup v3] Установка…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧ 1: _origSendMessage — фиксируем messageId в самом начале
+    //  и передаём его в saveFile через opts.messageId
+    // ═══════════════════════════════════════════════════════════
+
+    if (typeof _origSendMessage !== 'function') {
+        console.warn('🩹 [MediaAntiDup v3] _origSendMessage не найдена — патч не установлен');
+        return;
+    }
+
+    const _origSendMessageV3 = _origSendMessage;
+
+    _origSendMessage = async function(text, imageBlob = null, audioData = null, fileAttachment = null, audioFile = null, replyContext = null) {
+        // Базовая проверка (как в оригинале)
+        if (!state.isAuthorized || !state.chatFile) { showToast('❌ Нет доступа', 2000); soundManager.play('error'); return; }
+        if (!navigator.onLine || !networkState.isOnline) { showToast('📵 Нет подключения', 2500); soundManager.play('error'); return; }
+
+        const hasText = text && text.trim();
+        const hasImage = imageBlob instanceof Blob;
+        const hasAudio = audioData !== null;
+        const hasFile = fileAttachment && fileAttachment.blob instanceof Blob;
+        const hasAudioFile = audioFile && audioFile.blob instanceof Blob;
+
+        if ((!hasText && !hasImage && !hasAudio && !hasFile && !hasAudioFile) || state.isSending) return;
+
+        // 🆕 ГЛАВНОЕ: генерируем messageId СЕЙЧАС, до загрузки вложений.
+        // Это "резервирование" — даже если upload займёт 30 секунд,
+        // наш messageId уже уникален и известен.
+        const messageId = Date.now();
+
+        // Сохраняем в state для поллинга
+        state._lastSentMessageId = messageId;
+
+        // Перехватываем saveFile — подменим opts, чтобы добавить messageId
+        const _origSaveFileInScope = window.saveFile;
+        let _saveFileIntercepted = false;
+
+        window.saveFile = function(token, owner, repo, path, content, sha, opts = {}) {
+            // Передаём наш messageId в первый вызов
+            if (!_saveFileIntercepted) {
+                _saveFileIntercepted = true;
+                opts = { ...opts, messageId };
+                console.log(`🩹 [MediaAntiDup v3] saveFile перехвачен, messageId=${messageId}`);
+            }
+            return _origSaveFileInScope.call(this, token, owner, repo, path, content, sha, opts);
+        };
+
+        try {
+            // Вызываем оригинал — он будет использовать наш window.saveFile
+            // (который мы только что подменили)
+            return await _origSendMessageV3.call(
+                this, text, imageBlob, audioData, fileAttachment, audioFile, replyContext
+            );
+        } finally {
+            // Восстанавливаем saveFile
+            window.saveFile = _origSaveFileInScope;
+        }
+    };
+
+    console.log('🩹 [MediaAntiDup v3] patched: _origSendMessage (messageId до upload)');
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧ 2: handleMultipleImageUpload — то же для батчей
+    //  Здесь нельзя использовать один messageId — их несколько.
+    //  Используем составной идентификатор: batchId + первый index.
+    // ═══════════════════════════════════════════════════════════
+
+    if (typeof handleMultipleImageUpload === 'function') {
+        const _origBatchUpload = handleMultipleImageUpload;
+
+        handleMultipleImageUpload = async function(files) {
+            // Предварительные проверки
+            if (!state.isAuthorized || !state.chatFile) { showToast('❌ Нет доступа', 2000); return; }
+            if (!navigator.onLine || !networkState.isOnline) { showToast('📵 Нет подключения', 2500); return; }
+            if (files.length > CONFIG.maxBatchImages) {
+                showToast(`❌ Максимум ${CONFIG.maxBatchImages} фото за раз`, 3000);
+                return;
+            }
+
+            // 🆕 Генерируем batchId СЕЙЧАС — до загрузки
+            const batchId = 'batch_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+
+            // 🆕 Первый messageId батча — по нему будем проверять дубликат
+            const firstMessageId = Date.now();
+
+            // Подменяем saveFile на время работы
+            const _origSaveFileInScope = window.saveFile;
+            let _saveFileIntercepted = false;
+
+            window.saveFile = function(token, owner, repo, path, content, sha, opts = {}) {
+                if (!_saveFileIntercepted) {
+                    _saveFileIntercepted = true;
+                    // Передаём firstMessageId — saveFile проверит,
+                    // есть ли уже такое сообщение в файле
+                    opts = { ...opts, messageId: firstMessageId };
+                    console.log(`🩹 [MediaAntiDup v3] Batch saveFile перехвачен, firstMsgId=${firstMessageId}, batchId=${batchId}`);
+                }
+                return _origSaveFileInScope.call(this, token, owner, repo, path, content, sha, opts);
+            };
+
+            // Хак: подменяем Math.random так, чтобы batchId внутри
+            // оригинала совпал с нашим. Но это рискованно —
+            // вместо этого сохраним наш batchId в state и в
+            // оригинале проверим через another hack.
+
+            // Проще: сохраняем наш batchId в глобальную переменную,
+            // которую оригинал прочитает
+            window._forceBatchId = batchId;
+            window._forceFirstMsgId = firstMessageId;
+
+            try {
+                return await _origBatchUpload.call(this, files);
+            } finally {
+                window.saveFile = _origSaveFileInScope;
+                delete window._forceBatchId;
+                delete window._forceFirstMsgId;
+            }
+        };
+
+        console.log('🩹 [MediaAntiDup v3] patched: handleMultipleImageUpload');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧ 3: Сам процесс sendMessage для медиа (внутри
+    //  _origSendMessage и handleMultipleImageUpload) уже вызывает
+    //  saveFile с opts.messageId — но там передаётся объект,
+    //  а не callback. Наш saveFile v2 умеет с этим работать:
+    //  при 409 он перечитает файл и проверит messageId.
+    //
+    //  Дополнительно: ensure передача messageId в контексте
+    //  sendMessage. В существующем коде sendMessage вызывает
+    //  _origSendMessage, а тот уже делает saveFile через callback.
+    // ═══════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧ 4: doShareToChat — пересылка файлов в другой чат
+    //  Здесь тоже нужно передать messageId в saveFile.
+    // ═══════════════════════════════════════════════════════════
+
+    if (typeof doShareToChat === 'function') {
+        const _origDoShare = doShareToChat;
+
+        doShareToChat = async function(targetFile, targetPassword, blob, fileName, mime, meta = {}) {
+            // 🆕 Генерируем messageId заранее
+            const messageId = Date.now();
+            console.log(`🩹 [MediaAntiDup v3] doShareToChat: messageId=${messageId}`);
+
+            // Подмена saveFile на время работы
+            const _origSaveFileInScope = window.saveFile;
+            let _saveFileIntercepted = false;
+
+            window.saveFile = function(token, owner, repo, path, content, sha, opts = {}) {
+                if (!_saveFileIntercepted) {
+                    _saveFileIntercepted = true;
+                    opts = { ...opts, messageId };
+                    console.log(`🩹 [MediaAntiDup v3] doShareToChat saveFile: messageId=${messageId}`);
+                }
+                return _origSaveFileInScope.call(this, token, owner, repo, path, content, sha, opts);
+            };
+
+            try {
+                return await _origDoShare.call(this, targetFile, targetPassword, blob, fileName, mime, meta);
+            } finally {
+                window.saveFile = _origSaveFileInScope;
+            }
+        };
+
+        console.log('🩹 [MediaAntiDup v3] patched: doShareToChat');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧ 5: sendVideoNote — отправка кружочков
+    // ═══════════════════════════════════════════════════════════
+
+    if (typeof sendVideoNote === 'function') {
+        const _origSendVN = sendVideoNote;
+
+        sendVideoNote = async function(blob, mime, ext, duration) {
+            // Генерируем messageId заранее
+            const messageId = Date.now();
+
+            const _origSaveFileInScope = window.saveFile;
+            let _saveFileIntercepted = false;
+
+            window.saveFile = function(token, owner, repo, path, content, sha, opts = {}) {
+                if (!_saveFileIntercepted) {
+                    _saveFileIntercepted = true;
+                    opts = { ...opts, messageId };
+                }
+                return _origSaveFileInScope.call(this, token, owner, repo, path, content, sha, opts);
+            };
+
+            try {
+                return await _origSendVN.call(this, blob, mime, ext, duration);
+            } finally {
+                window.saveFile = _origSaveFileInScope;
+            }
+        };
+
+        console.log('🩹 [MediaAntiDup v3] patched: sendVideoNote');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧ 6: saveFile внутри callback тоже должен знать messageId
+    //  ─────────────────────────────────────────────────────────
+    //  Проблема: в основном коде _origSendMessage вызывает saveFile
+    //  с callback, который перечитывает файл и добавляет сообщение.
+    //  Но наш saveFile v2 при первой попытке НЕ проверяет messageId —
+    //  он проверяет только при 409. А при 409 он перечитывает файл
+    //  и ищет messageId в свежем содержимом.
+    //
+    //  Всё работает корректно, если messageId передан.
+    //  Мы его передаём через подмену window.saveFile.
+    //
+    //  Единственная проблема: если _origSendMessage вызывает
+    //  saveFile не через window.saveFile, а напрямую через функцию
+    //  saveFile (по имени). Т.к. saveFile объявлена как function
+    //  declaration, "по имени" резолвится в window.saveFile — наш
+    //  хак сработает.
+    // ═══════════════════════════════════════════════════════════
+
+    console.log('🩹 [MediaAntiDup v3] Все патчи установлены:');
+    console.log('   • _origSendMessage — messageId до upload');
+    console.log('   • handleMultipleImageUpload — batchId + firstMsgId');
+    console.log('   • doShareToChat — messageId для пересылки');
+    console.log('   • sendVideoNote — messageId для кружочков');
+})();
 </script>
 </body>
 </html>
