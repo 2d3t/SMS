@@ -49070,6 +49070,216 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
     console.log('   • API: FreshJump.refresh(msgId) / .refreshCurrent()');
 })();
 </script>
+// ═══════════════════════════════════════════════════════════════
+//  🛡️ DEVICE FINGERPRINT FINAL v3 — ПРИНУДИТЕЛЬНАЯ ИНЪЕКЦИЯ
+//  Этот патч должен быть ПОСЛЕДНИМ среди патчей fingerprint,
+//  чтобы гарантированно перехватить encrypt/decrypt.
+// ═══════════════════════════════════════════════════════════════
 
+(function forceDeviceFingerprintV3() {
+    'use strict';
+
+    console.log('🛡️ [DevFP v3] Принудительная инъекция...');
+
+    // ═══════════════════════════════════════════════════════════
+    //  1. ПРОВЕРЯЕМ DEVICEGUARD
+    // ═══════════════════════════════════════════════════════════
+    if (typeof DeviceGuard === 'undefined') {
+        console.error('❌ [DevFP v3] DeviceGuard не найден! Проверьте, что модуль DeviceGuard v2 загружен.');
+        return;
+    }
+
+    const myShort = DeviceGuard.myId();
+    const myFull  = DeviceGuard.myFullId();
+
+    if (!myShort || !myFull) {
+        console.error('❌ [DevFP v3] DeviceGuard не инициализирован (нет myId/myFullId)');
+        return;
+    }
+
+    console.log(`✅ [DevFP v3] Моё устройство: ${myShort} (${myFull.slice(0, 16)}...)`);
+
+    // ═══════════════════════════════════════════════════════════
+    //  2. ПРИНУДИТЕЛЬНЫЙ ПЕРЕХВАТ encryptMessage
+    //  ─────────────────────────────────────────────────────────
+    //  ВАЖНО: этот патч применяется ПОСЛЕДНИМ, поэтому
+    //  мы "оборачиваем" ту версию encryptMessage, которая
+    //  накопилась в результате предыдущих патчей.
+    // ═══════════════════════════════════════════════════════════
+    const _prevEncrypt = window.encryptMessage || encryptMessage;
+
+    window.encryptMessage = async function(msg) {
+        // 🆕 ГАРАНТИРОВАННАЯ ИНЪЕКЦИЯ — перезаписываем поля
+        //    на каждом вызове, независимо от того, что сделали
+        //    предыдущие патчи.
+        if (msg) {
+            msg._deviceId = myFull;
+            msg._deviceShort = myShort;
+
+            // 🆕 ОТЛАДКА: логируем факт инъекции
+            console.log(`🛡️ [DevFP v3] Инъекция в encryptMessage: id=${msg.id}, short=${myShort}`);
+        }
+
+        return _prevEncrypt.call(this, msg);
+    };
+
+    console.log('✅ [DevFP v3] encryptMessage перехвачен (принудительно)');
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. ПРИНУДИТЕЛЬНЫЙ ПЕРЕХВАТ decryptMessage
+    //  ─────────────────────────────────────────────────────────
+    //  Проблема: если в зашифрованном payload НЕТ полей
+    //  _deviceId/_deviceShort (например, старые сообщения),
+    //  то decryptMessage их не вернёт. Это нормально.
+    //
+    //  Но если есть — вернёт. Наш патч только страхует, что
+    //  previous decryptMessage их не потеряет.
+    // ═══════════════════════════════════════════════════════════
+    const _prevDecrypt = window.decryptMessage || decryptMessage;
+
+    window.decryptMessage = async function(encMsg) {
+        const msg = await _prevDecrypt.call(this, encMsg);
+
+        if (!msg) return msg;
+
+        // 🆕 Восстанавливаем _deviceShort, если есть _deviceId
+        if (msg._deviceId && !msg._deviceShort) {
+            msg._deviceShort = msg._deviceId.slice(0, 8).toUpperCase();
+        }
+
+        return msg;
+    };
+
+    console.log('✅ [DevFP v3] decryptMessage перехвачен (принудительно)');
+
+    // ═══════════════════════════════════════════════════════════
+    //  4. ДИАГНОСТИКА: проверка, что данные ДОХОДЯТ до сервера
+    //  ─────────────────────────────────────────────────────────
+    //  Этот блок можно удалить после проверки.
+    // ═══════════════════════════════════════════════════════════
+
+    // Патчим sendFile/saveFile для перехвата payload перед отправкой
+    // Это самый глубокий уровень — здесь видно, что реально уходит.
+    if (typeof saveFile === 'function') {
+        const _prevSave = saveFile;
+        window.saveFile = async function(token, owner, repo, path, content, sha, opts) {
+            // 🆕 Логируем содержимое первого сообщения (для отладки)
+            try {
+                if (path.endsWith('.json') && !path.endsWith('.meta.json')) {
+                    const messages = Array.isArray(content?.messages) ? content.messages : [];
+                    if (messages.length > 0) {
+                        const lastEnc = messages[messages.length - 1];
+                        console.log(`🛡️ [DevFP v3] saveFile → ${path}, последнее сообщение ID: ${lastEnc.id}`);
+
+                        // Расшифруем последнее сообщение для проверки
+                        // (используя текущий CRYPTO._key)
+                        if (CRYPTO._key) {
+                            try {
+                                const iv = new Uint8Array(base64ToArrayBuffer(lastEnc.iv));
+                                const ciphertext = base64ToArrayBuffer(lastEnc.data);
+                                const plaintext = await crypto.subtle.decrypt(
+                                    { name: 'AES-GCM', iv },
+                                    CRYPTO._key,
+                                    ciphertext
+                                );
+                                const payload = JSON.parse(new TextDecoder().decode(plaintext));
+                                console.log(`🛡️ [DevFP v3] Расшифрован payload:`, {
+                                    username: payload.username,
+                                    has_deviceId: !!payload._deviceId,
+                                    has_deviceShort: !!payload._deviceShort,
+                                    deviceShort: payload._deviceShort || 'НЕТ',
+                                });
+
+                                if (!payload._deviceId || !payload._deviceShort) {
+                                    console.error('🚨 [DevFP v3] ОТПЕЧАТОК НЕ ПОПАЛ В PAYLOAD!');
+                                }
+                            } catch (e) {
+                                console.warn('🛡️ [DevFP v3] Не удалось расшифровать для проверки:', e.message);
+                            }
+                        }
+                    }
+                }
+            } catch (e) {
+                console.warn('🛡️ [DevFP v3] diag error:', e);
+            }
+
+            return _prevSave.apply(this, arguments);
+        };
+
+        console.log('✅ [DevFP v3] saveFile перехвачен (диагностика)');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  5. РУЧНОЙ ТЕСТ
+    //  ─────────────────────────────────────────────────────────
+    //  Отправьте любое сообщение и смотрите консоль:
+    //  должна быть строка "Инъекция в encryptMessage: id=..."
+    //  и "Расшифрован payload: { ..., deviceShort: 'X1Y2Z3' }"
+    //
+    //  Затем на ДРУГОМ устройстве зайдите с тем же именем —
+    //  должна появиться плавающая кнопка "🛡️ Смена устройства".
+    // ═══════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════
+    //  6. ПРОВЕРКА СУЩЕСТВУЮЩИХ СООБЩЕНИЙ В ТЕКУЩЕМ ЧАТЕ
+    //  ─────────────────────────────────────────────────────────
+    //  Смотрим, есть ли в historyState сообщения с _deviceShort.
+    //  Если их нет — значит патч не работал до этого момента.
+    // ═══════════════════════════════════════════════════════════
+    setTimeout(() => {
+        if (typeof historyState === 'undefined' || !Array.isArray(historyState.allMessages)) {
+            return;
+        }
+
+        const withDevice = historyState.allMessages.filter(m => m._deviceShort);
+        const withoutDevice = historyState.allMessages.filter(m => !m._deviceShort);
+
+        console.log(`🛡️ [DevFP v3] В текущем чате:`);
+        console.log(`   • сообщений с отпечатком: ${withDevice.length}`);
+        console.log(`   • сообщений без отпечатка: ${withoutDevice.length}`);
+
+        if (withDevice.length > 0) {
+            const devices = new Set(withDevice.map(m => m._deviceShort));
+            console.log(`🛡️ [DevFP v3] Найдены устройства:`, Array.from(devices));
+        }
+
+        if (withoutDevice.length === historyState.allMessages.length && historyState.allMessages.length > 0) {
+            console.warn('🚨 [DevFP v3] НИ ОДНО сообщение не имеет отпечатка!');
+            console.warn('   Значит, encryptMessage НЕ вызывался с нашим патчем.');
+            console.warn('   Возможно, проблема в более раннем перехвате.');
+        }
+    }, 5000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  7. РЕ-СКАН ТЕКУЩИХ СООБЩЕНИЙ
+    //  ─────────────────────────────────────────────────────────
+    //  Принудительно прогоняем все сообщения через processMessage,
+    //  чтобы "поймать" уже существующие.
+    // ═══════════════════════════════════════════════════════════
+    setTimeout(() => {
+        if (typeof historyState === 'undefined' || !historyState.allMessages) return;
+        if (typeof DeviceGuard._processMessage !== 'function') return;
+
+        console.log('🛡️ [DevFP v3] Ре-скан существующих сообщений...');
+        let processed = 0;
+
+        for (const msg of historyState.allMessages) {
+            try {
+                DeviceGuard._processMessage(msg);
+                processed++;
+            } catch (e) {}
+        }
+
+        console.log(`🛡️ [DevFP v3] Обработано: ${processed}`);
+
+        const status = DeviceGuard.status();
+        console.log('🛡️ [DevFP v3] Статус:', status);
+
+        if (status.pendingAlerts > 0) {
+            console.log('✅ [DevFP v3] Обнаружены события смены устройств!');
+        }
+    }, 6000);
+
+})();
 </body>
 </html>
