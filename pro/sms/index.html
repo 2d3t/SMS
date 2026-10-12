@@ -44157,5 +44157,767 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
     console.log('   • Задачи-дубликаты чистятся при старте');
 })();
 </script>
+
+
+
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🎯 OFFLINE ACTIONS QUEUE — офлайн-очередь для действий
+//  ─────────────────────────────────────────────────────────────
+//  Поддерживает офлайн-очередь для:
+//   • Реакций (toggleReaction)
+//   • Комментариев (submitComment, deleteComment)
+//   • Редактирования (confirmEditMessage)
+//   • Удаления (deleteMessage)
+//   • Ответов (reply) — маркер, что сообщение должно лечь с replyTo
+//
+//  Каждое действие = отдельная задача в localStorage.
+//  При появлении сети — выполняются последовательно.
+// ═══════════════════════════════════════════════════════════════
+
+(function installOfflineActionsQueue() {
+    'use strict';
+
+    // ═══════════════════════════════════════════════════════════
+    //  КОНФИГ
+    // ═══════════════════════════════════════════════════════════
+    const CFG = {
+        storageKey: 'smschat_actions_queue_v1',
+        maxRetries: 5,
+        retryDelayMs: 4000,
+        processIntervalMs: 2500,
+        logPrefix: '🎯 [ActionsQueue]',
+    };
+
+    const log = (...a) => console.log(CFG.logPrefix, ...a);
+    const warn = (...a) => console.warn(CFG.logPrefix, ...a);
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОСТОЯНИЕ
+    // ═══════════════════════════════════════════════════════════
+    const AQ = {
+        queue: [],           // массив задач
+        processing: false,
+        _timer: null,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  УТИЛИТЫ
+    // ═══════════════════════════════════════════════════════════
+    function genId() {
+        return 'aq_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+    }
+
+    function isOnline() {
+        return navigator.onLine === true;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЗАГРУЗКА / СОХРАНЕНИЕ
+    // ═══════════════════════════════════════════════════════════
+    function loadQueue() {
+        try {
+            const raw = localStorage.getItem(CFG.storageKey);
+            if (!raw) return [];
+            const data = JSON.parse(raw);
+            return Array.isArray(data) ? data : [];
+        } catch (e) {
+            warn('loadQueue error:', e);
+            return [];
+        }
+    }
+
+    function saveQueue() {
+        try {
+            localStorage.setItem(CFG.storageKey, JSON.stringify(AQ.queue));
+        } catch (e) {
+            warn('saveQueue error:', e);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ФОРМАТ ЗАДАЧИ
+    //  {
+    //    id: string,
+    //    type: 'reaction' | 'comment' | 'deleteComment' | 'edit' | 'delete',
+    //    chatFile: string,
+    //    msgId: number,
+    //    // Полезная нагрузка зависит от type:
+    //    payload: {...},
+    //    createdAt: number,
+    //    retries: number,
+    //    status: 'pending' | 'sending' | 'error',
+    //    errorMessage: string | null,
+    //  }
+    // ═══════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════
+    //  ДОБАВЛЕНИЕ ЗАДАЧИ
+    // ═══════════════════════════════════════════════════════════
+    function enqueue(type, chatFile, msgId, payload) {
+        const task = {
+            id: genId(),
+            type: type,
+            chatFile: chatFile,
+            msgId: msgId,
+            payload: payload || {},
+            createdAt: Date.now(),
+            retries: 0,
+            status: 'pending',
+            errorMessage: null,
+        };
+
+        AQ.queue.push(task);
+        saveQueue();
+
+        log(`➕ Задача добавлена: ${type} (msg=${msgId})`);
+
+        // Обновляем бейджи
+        updateBadges();
+
+        // Если онлайн — сразу пробуем
+        if (isOnline() && typeof state !== 'undefined' && state.isAuthorized) {
+            setTimeout(() => processQueue(), 100);
+        }
+
+        return task.id;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОБНОВЛЕНИЕ БЕЙДЖЕЙ
+    // ═══════════════════════════════════════════════════════════
+    function updateBadges() {
+        // Считаем общее число задач вместе с сообщениями из AutoOutbox
+        let msgCount = 0;
+        try {
+            if (window.AutoOutbox && AutoOutbox.status) {
+                msgCount = AutoOutbox.status().queueSize || 0;
+            }
+        } catch (e) {}
+
+        const actionCount = AQ.queue.length;
+        const total = msgCount + actionCount;
+        const errors = AQ.queue.filter(t => t.status === 'error').length;
+
+        // Бейдж на кнопке «Назад»
+        try {
+            const backBtn = document.getElementById('backToChatsBtn');
+            if (backBtn) {
+                let badge = backBtn.querySelector('.auto-outbox-badge');
+                if (total > 0) {
+                    backBtn.style.position = 'relative';
+                    if (!badge) {
+                        badge = document.createElement('span');
+                        badge.className = 'auto-outbox-badge';
+                        backBtn.appendChild(badge);
+                    }
+                    badge.textContent = total > 99 ? '99+' : String(total);
+                    badge.classList.toggle('has-errors', errors > 0);
+                } else if (badge) {
+                    badge.remove();
+                }
+            }
+        } catch (e) {}
+
+        // Счётчик в шапке чата
+        try {
+            const chatHeader = document.querySelector('#chatScreen .chat-header');
+            if (chatHeader && state && state.currentScreen === 'chat') {
+                let counter = chatHeader.querySelector('.auto-outbox-counter');
+                if (total > 0) {
+                    if (!counter) {
+                        counter = document.createElement('div');
+                        counter.className = 'auto-outbox-counter';
+                        chatHeader.appendChild(counter);
+                    }
+                    counter.innerHTML = `
+                        <span>${errors > 0 ? '⚠️' : '⏳'}</span>
+                        <span>${total}</span>
+                    `;
+                    counter.classList.toggle('has-errors', errors > 0);
+                } else if (counter) {
+                    counter.remove();
+                }
+            }
+        } catch (e) {}
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ВЫПОЛНЕНИЕ ЗАДАЧИ
+    // ═══════════════════════════════════════════════════════════
+    async function executeTask(task) {
+        if (!task || !task.type || !task.chatFile) {
+            throw new Error('Некорректная задача');
+        }
+        if (!state || !state.isAuthorized || !state.token) {
+            throw new Error('Нет авторизации');
+        }
+
+        const password = state.savedPasswords[task.chatFile];
+        if (!password) {
+            throw new Error(`Нет пароля для чата ${task.chatFile}`);
+        }
+
+        log(`▶️ Выполняю: ${task.type} (msg=${task.msgId})`);
+
+        // Загружаем файл чата
+        const path = getChatPath(task.chatFile);
+        const result = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
+        if (!result.exists) throw new Error('Чат не найден');
+
+        const fileContent = result.content;
+        if (fileContent.v !== CRYPTO.VERSION) throw new Error('Формат не поддерживается');
+
+        // Деривим ключ для целевого чата
+        const targetKey = await deriveKey(password, fileContent.salt);
+
+        // Находим сообщение
+        const idx = (fileContent.messages || []).findIndex(
+            m => String(m.id) === String(task.msgId)
+        );
+        if (idx === -1) throw new Error('Сообщение не найдено');
+
+        // Расшифровываем
+        const enc = fileContent.messages[idx];
+        const iv = new Uint8Array(base64ToArrayBuffer(enc.iv));
+        const ciphertext = base64ToArrayBuffer(enc.data);
+        const plaintext = await crypto.subtle.decrypt(
+            { name: 'AES-GCM', iv },
+            targetKey,
+            ciphertext
+        );
+        const payload = JSON.parse(new TextDecoder().decode(plaintext));
+
+        // ═══ Применяем действие ═══
+        switch (task.type) {
+            case 'reaction': {
+                const emoji = task.payload.emoji;
+                const username = state.username;
+                if (!emoji) throw new Error('Нет emoji');
+
+                if (!payload.reactions) payload.reactions = {};
+                const list = payload.reactions[emoji] || [];
+                const userIdx = list.indexOf(username);
+
+                if (task.payload.action === 'remove') {
+                    // Убрать
+                    if (userIdx >= 0) list.splice(userIdx, 1);
+                    if (list.length === 0) delete payload.reactions[emoji];
+                    else payload.reactions[emoji] = list;
+                } else {
+                    // Добавить
+                    if (userIdx === -1) {
+                        list.push(username);
+                        payload.reactions[emoji] = list;
+                    }
+                }
+                break;
+            }
+
+            case 'comment': {
+                const comment = task.payload.comment;
+                if (!comment) throw new Error('Нет комментария');
+
+                if (!Array.isArray(payload.comments)) payload.comments = [];
+
+                // Проверяем, не добавлен ли уже
+                const exists = payload.comments.some(c =>
+                    String(c.id) === String(comment.id)
+                );
+                if (!exists) {
+                    payload.comments.push(comment);
+                }
+                break;
+            }
+
+            case 'deleteComment': {
+                const commentId = task.payload.commentId;
+                if (!commentId) throw new Error('Нет commentId');
+
+                if (Array.isArray(payload.comments)) {
+                    payload.comments = payload.comments.filter(
+                        c => String(c.id) !== String(commentId)
+                    );
+                }
+                break;
+            }
+
+            case 'edit': {
+                const newText = task.payload.text;
+                if (typeof newText !== 'string') throw new Error('Нет текста');
+
+                // Проверяем, что сообщение наше
+                if (payload.username !== state.username) {
+                    throw new Error('Не ваше сообщение');
+                }
+                payload.text = newText;
+                payload.edited = true;
+                payload.editedAt = task.payload.editedAt || new Date().toISOString();
+                break;
+            }
+
+            case 'delete': {
+                // Удаление самого сообщения — не через payload, а через splice
+                break;
+            }
+
+            default:
+                throw new Error('Неизвестный тип: ' + task.type);
+        }
+
+        // ═══ Шифруем обратно ═══
+        if (task.type === 'delete') {
+            // Удаление — просто вырезаем сообщение
+            fileContent.messages.splice(idx, 1);
+        } else {
+            // Обновляем — шифруем заново
+            const newIv = generateIV();
+            const newPlain = new TextEncoder().encode(JSON.stringify(payload));
+            const newCipher = await crypto.subtle.encrypt(
+                { name: 'AES-GCM', iv: newIv },
+                targetKey,
+                newPlain
+            );
+
+            fileContent.messages[idx] = {
+                id: enc.id,
+                time: enc.time,
+                iv: arrayBufferToBase64(newIv),
+                data: arrayBufferToBase64(newCipher),
+            };
+        }
+
+        // ═══ Сохраняем файл ═══
+        const saveResult = await saveFile(
+            state.token, CONFIG.repoOwner, CONFIG.repoName,
+            path, fileContent, result.sha,
+            {
+                message: getActionCommitMessage(task),
+                maxRetries: 6,
+                silent: true,
+            }
+        );
+
+        // ═══ Обновляем meta ═══
+        try {
+            const newVersion = Date.now();
+            await updateMeta(task.chatFile, newVersion, fileContent.messages.length);
+        } catch (e) {
+            warn('meta update failed:', e.message);
+        }
+
+        // ═══ Обновляем локальное состояние (если открыт этот чат) ═══
+        if (state.chatFile === task.chatFile) {
+            try {
+                // Обновляем sha
+                state.sha = saveResult.blobSha;
+                state._lastCommitSha = saveResult.commitSha;
+                state.lastMessageCount = fileContent.messages.length;
+
+                // Инвалидируем мета-кэш
+                if (state._metaEtagsByFile) {
+                    state._metaEtagsByFile[task.chatFile] = null;
+                }
+                state._metaEtag = null;
+            } catch (e) {}
+        }
+
+        log(`✅ Выполнено: ${task.type} (msg=${task.msgId})`);
+        return true;
+    }
+
+    function getActionCommitMessage(task) {
+        switch (task.type) {
+            case 'reaction': return `❤️ Реакция ${task.payload.emoji || ''}`;
+            case 'comment': return `💬 Комментарий`;
+            case 'deleteComment': return `🗑️ Удаление комментария`;
+            case 'edit': return `✏️ Редактирование сообщения`;
+            case 'delete': return `🗑️ Удаление сообщения`;
+            default: return `💬 Действие`;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОБРАБОТКА ОЧЕРЕДИ
+    // ═══════════════════════════════════════════════════════════
+    async function processQueue() {
+        if (AQ.processing) return;
+        if (AQ.queue.length === 0) return;
+        if (!isOnline()) return;
+        if (!state || !state.isAuthorized || !state.token) return;
+
+        AQ.processing = true;
+
+        try {
+            while (AQ.queue.length > 0) {
+                const task = AQ.queue[0];
+
+                // Ошибка — ждём ручного retry (не мешаем другим)
+                if (task.status === 'error') {
+                    // Пропускаем error-задачи, идём дальше
+                    // (или останавливаемся? лучше пропустить)
+                    log(`⏭ Задача ${task.id} в error, пропускаю`);
+                    // Перемещаем в конец, чтобы не зациклиться
+                    const failed = AQ.queue.shift();
+                    AQ.queue.push(failed);
+                    // Если все задачи в error — выходим
+                    if (AQ.queue.every(t => t.status === 'error')) {
+                        log('Все задачи в error — выход');
+                        break;
+                    }
+                    continue;
+                }
+
+                if (!isOnline()) {
+                    log('Связь пропала — пауза');
+                    break;
+                }
+
+                task.status = 'sending';
+                saveQueue();
+
+                try {
+                    await executeTask(task);
+
+                    // Успех — удаляем
+                    AQ.queue.shift();
+                    saveQueue();
+                    updateBadges();
+
+                    // Звук (тихий)
+                    try {
+                        if (soundManager) soundManager.play('click');
+                    } catch (e) {}
+
+                } catch (err) {
+                    warn(`Ошибка задачи ${task.id} (${task.type}):`, err.message);
+                    task.retries = (task.retries || 0) + 1;
+
+                    const isNetError = isNetworkError(err);
+
+                    if (isNetError && task.retries < CFG.maxRetries) {
+                        task.status = 'pending';
+                        saveQueue();
+                        log(`Сетевая ошибка, повтор позже (${task.retries}/${CFG.maxRetries})`);
+                        await new Promise(r => setTimeout(r, CFG.retryDelayMs));
+                        continue;
+                    }
+
+                    task.status = 'error';
+                    task.errorMessage = err.message || 'Ошибка';
+                    saveQueue();
+                    updateBadges();
+                    break;
+                }
+            }
+        } finally {
+            AQ.processing = false;
+            updateBadges();
+        }
+    }
+
+    function isNetworkError(err) {
+        if (!err) return false;
+        if (!navigator.onLine) return true;
+        const msg = (err.message || '').toLowerCase();
+        if (msg.includes('failed to fetch')) return true;
+        if (msg.includes('networkerror')) return true;
+        if (msg.includes('network error')) return true;
+        if (err.name === 'TypeError') return true;
+        if (err.name === 'AbortError') return true;
+        return false;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ toggleReaction
+    // ═══════════════════════════════════════════════════════════
+    if (typeof window.toggleReaction === 'function') {
+        const _origToggleReaction = window.toggleReaction;
+
+        window.toggleReaction = async function(msgId, emoji) {
+            // Офлайн — в очередь
+            if (!isOnline() && state.isAuthorized && state.chatFile) {
+                log(`📵 Офлайн-реакция: ${emoji} на msg=${msgId}`);
+
+                // Локально применяем сразу (оптимистично)
+                const msg = historyState.allMessages.find(m => m.id === msgId);
+                if (msg) {
+                    if (!msg.reactions) msg.reactions = {};
+                    const list = msg.reactions[emoji] || [];
+                    const userIdx = list.indexOf(state.username);
+                    const isRemoving = userIdx >= 0;
+
+                    if (isRemoving) {
+                        list.splice(userIdx, 1);
+                        if (list.length === 0) delete msg.reactions[emoji];
+                    } else {
+                        list.push(state.username);
+                        msg.reactions[emoji] = list;
+                    }
+
+                    if (typeof updateReactionsInDOM === 'function') {
+                        updateReactionsInDOM(msgId);
+                    }
+
+                    // В очередь
+                    enqueue('reaction', state.chatFile, msgId, {
+                        emoji: emoji,
+                        action: isRemoving ? 'remove' : 'add',
+                    });
+
+                    if (typeof showToast === 'function') {
+                        showToast('📵 Реакция в очереди', 1500);
+                    }
+                    try { soundManager.play('click'); } catch (e) {}
+                }
+                return;
+            }
+
+            // Онлайн — как обычно
+            return _origToggleReaction.call(this, msgId, emoji);
+        };
+        log('patched: toggleReaction');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ submitComment
+    // ═══════════════════════════════════════════════════════════
+    if (typeof window.submitComment === 'function') {
+        const _origSubmitComment = window.submitComment;
+
+        window.submitComment = async function(msgId, text) {
+            if (!text || !text.trim()) return;
+            if (!state.isAuthorized || !state.chatFile) return;
+
+            // Офлайн — в очередь
+            if (!isOnline()) {
+                log(`📵 Офлайн-комментарий на msg=${msgId}: "${text.slice(0, 40)}"`);
+
+                const msg = historyState.allMessages.find(m => m.id === msgId);
+                if (!msg) {
+                    if (typeof showToast === 'function') showToast('❌ Сообщение не найдено');
+                    return;
+                }
+
+                const newComment = {
+                    id: Date.now(),
+                    username: state.username,
+                    text: text.trim().slice(0, 2000),
+                    time: new Date().toISOString(),
+                };
+
+                // Локально применяем
+                if (!msg.comments) msg.comments = [];
+                msg.comments.push(newComment);
+
+                if (typeof updateCommentsInDOM === 'function') {
+                    updateCommentsInDOM(msgId);
+                }
+
+                // В очередь
+                enqueue('comment', state.chatFile, msgId, {
+                    comment: newComment,
+                });
+
+                if (typeof showToast === 'function') {
+                    showToast('💬 Комментарий в очереди', 1500);
+                }
+                try { soundManager.play('send'); } catch (e) {}
+                return;
+            }
+
+            // Онлайн — как обычно
+            return _origSubmitComment.call(this, msgId, text);
+        };
+        log('patched: submitComment');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ deleteComment
+    // ═══════════════════════════════════════════════════════════
+    if (typeof window.deleteComment === 'function') {
+        const _origDeleteComment = window.deleteComment;
+
+        window.deleteComment = async function(msgId, commentId) {
+            if (!state.isAuthorized || !state.chatFile) return;
+
+            const msg = historyState.allMessages.find(m => m.id === msgId);
+            if (!msg || !msg.comments) return;
+
+            const comment = msg.comments.find(c => c.id === commentId);
+            if (!comment) return;
+            if (comment.username !== state.username) {
+                if (typeof showToast === 'function') showToast('❌ Только свои комментарии');
+                return;
+            }
+
+            // Офлайн — в очередь
+            if (!isOnline()) {
+                log(`📵 Офлайн-удаление комментария ${commentId}`);
+
+                const backup = msg.comments.slice();
+                msg.comments = msg.comments.filter(c => c.id !== commentId);
+                if (typeof updateCommentsInDOM === 'function') {
+                    updateCommentsInDOM(msgId);
+                }
+
+                enqueue('deleteComment', state.chatFile, msgId, {
+                    commentId: commentId,
+                });
+
+                if (typeof showToast === 'function') {
+                    showToast('🗑️ Удаление в очереди', 1500);
+                }
+                try { soundManager.play('delete'); } catch (e) {}
+                return;
+            }
+
+            // Онлайн — как обычно
+            return _origDeleteComment.call(this, msgId, commentId);
+        };
+        log('patched: deleteComment');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ confirmEditMessage
+    // ═══════════════════════════════════════════════════════════
+    if (typeof window.confirmEditMessage === 'function') {
+        const _origEditMessage = window.confirmEditMessage;
+
+        window.confirmEditMessage = async function() {
+            if (typeof _editingMessageId === 'undefined' || !_editingMessageId) return;
+            if (!state.isAuthorized || !state.chatFile) return;
+
+            const msgId = _editingMessageId;
+            const newText = document.getElementById('editMessageInput')?.value.trim() || '';
+
+            const msg = historyState.allMessages.find(m => m.id === msgId);
+            if (!msg) return;
+            if (msg.username !== state.username) return;
+
+            const oldText = (msg.text || '').trim();
+            if (newText === oldText) return;
+
+            // Офлайн — в очередь
+            if (!isOnline()) {
+                log(`📵 Офлайн-редактирование msg=${msgId}`);
+
+                msg.text = newText;
+                msg.edited = true;
+                msg.editedAt = new Date().toISOString();
+
+                if (typeof updateMessageInDOM === 'function') {
+                    updateMessageInDOM(msgId, msg);
+                }
+
+                enqueue('edit', state.chatFile, msgId, {
+                    text: newText,
+                    editedAt: msg.editedAt,
+                });
+
+                if (typeof closeEditMessageModal === 'function') {
+                    closeEditMessageModal();
+                }
+                if (typeof showToast === 'function') {
+                    showToast('✏️ Изменение в очереди', 1500);
+                }
+                try { soundManager.play('send'); } catch (e) {}
+                return;
+            }
+
+            // Онлайн — как обычно
+            return _origEditMessage.call(this);
+        };
+        log('patched: confirmEditMessage');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ТАЙМЕРЫ И СОБЫТИЯ
+    // ═══════════════════════════════════════════════════════════
+    AQ._timer = setInterval(() => {
+        if (document.hidden) return;
+        if (AQ.queue.length === 0) return;
+        if (!isOnline()) return;
+        processQueue();
+    }, CFG.processIntervalMs);
+
+    window.addEventListener('online', () => {
+        log('online → process');
+        setTimeout(processQueue, 600);
+    });
+
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) return;
+        if (AQ.queue.length > 0 && isOnline()) {
+            setTimeout(processQueue, 400);
+        }
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    //  ВОССТАНОВЛЕНИЕ ПРИ СТАРТЕ
+    // ═══════════════════════════════════════════════════════════
+    function initFromStorage() {
+        const saved = loadQueue();
+        if (saved.length === 0) return;
+
+        log(`📥 Восстановлено задач: ${saved.length}`);
+        AQ.queue = saved;
+        updateBadges();
+
+        setTimeout(() => {
+            if (isOnline()) {
+                setTimeout(processQueue, 3000);
+            }
+        }, 5000);
+    }
+
+    setTimeout(initFromStorage, 4500);
+
+    // ═══════════════════════════════════════════════════════════
+    //  API
+    // ═══════════════════════════════════════════════════════════
+    window.OfflineActionsQueue = {
+        status: () => ({
+            queueSize: AQ.queue.length,
+            errorCount: AQ.queue.filter(t => t.status === 'error').length,
+            processing: AQ.processing,
+            online: isOnline(),
+            queue: AQ.queue.map(t => ({
+                id: t.id,
+                type: t.type,
+                chat: t.chatFile,
+                msgId: t.msgId,
+                status: t.status,
+                retries: t.retries,
+                createdAt: new Date(t.createdAt).toLocaleTimeString('ru-RU'),
+            })),
+        }),
+        process: () => processQueue(),
+        clearAll: () => {
+            AQ.queue = [];
+            saveQueue();
+            updateBadges();
+            log('🗑️ Очередь действий очищена');
+        },
+        retryAll: () => {
+            AQ.queue.forEach(t => {
+                if (t.status === 'error') {
+                    t.status = 'pending';
+                    t.retries = 0;
+                    t.errorMessage = null;
+                }
+            });
+            saveQueue();
+            updateBadges();
+            processQueue();
+        },
+    };
+
+    log('🚀 Очередь действий готова');
+    log('   API: OfflineActionsQueue.status() / .process() / .clearAll()');
+})();
+</script>
+
+
 </body>
 </html>
