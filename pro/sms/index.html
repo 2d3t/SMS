@@ -7722,7 +7722,7 @@ const saved = await saveFile(
     },
     sha,
     {
-        message: `💬 ${state.username}: ${hasText ? text.trim().slice(0, 40) : 'вложение'}`,
+        message: `📷 ${state.username}: пакет фото (${newPlainMessages.length} шт.)`,
         maxRetries: 6,
         baseDelay: 1500,
         maxDelay: 12000,
@@ -7897,19 +7897,18 @@ async function handleMultipleImageUpload(files) {
             const file = valid[i];
             updateBatchUploadIndicator(i, valid.length, `Обработка ${i + 1} из ${valid.length}…`);
             try {
-                const { blob: compressed } = await compressImageToTarget(file);
-                const attachName = generateAttachmentName('img', 'jpg');
-                const buf = await compressed.arrayBuffer();
-                prepared.push({
-                    attachName,
-                    buf,                        // 🆕 сырой буфер — шифруем внутри uploadAttachmentAuto
-                    size: compressed.size,
-                    mime: 'image/jpeg',
-                });
-            } catch (e) {
-                console.warn('Ошибка обработки', file.name, e);
-                skipped++;
-            }
+    const { blob: compressedBlob } = await compressImageToTarget(file);
+    const attachName = generateAttachmentName('img', 'jpg');
+    prepared.push({
+        attachName,
+        blob: compressedBlob,       // ✅ передаём Blob напрямую
+        size: compressedBlob.size,
+        mime: 'image/jpeg',
+    });
+} catch (e) {
+    console.warn('Ошибка обработки', file.name, e);
+    skipped++;
+}
         }
 
         if (prepared.length === 0) {
@@ -7920,20 +7919,24 @@ async function handleMultipleImageUpload(files) {
         }
 
         // ═══ 3. Загрузка (авто: сжатие или чанки) ═══
-        for (let i = 0; i < prepared.length; i++) {
-            if (BatchUploadIndicator.isCancelled()) throw new Error('ABORTED');
-            const item = prepared[i];
-            updateBatchUploadIndicator(i, prepared.length,
-                `Загрузка ${i + 1} из ${prepared.length}…`);
+for (let i = 0; i < prepared.length; i++) {
+    if (BatchUploadIndicator.isCancelled()) throw new Error('ABORTED');
+    const item = prepared[i];
+    updateBatchUploadIndicator(i, prepared.length,
+        `Загрузка ${i + 1} из ${prepared.length}…`);
 
-            await uploadAttachmentAuto(
-                state.chatFile,
-                item.attachName,
-                item.buf,
-                item.mime,
-                `📷 Фото ${i + 1}/${prepared.length} (${formatFileSize(item.size)})`
-            );
-        }
+    // uploadAttachmentAuto принимает ArrayBuffer, поэтому
+    // преобразуем Blob в буфер здесь (один раз, локально)
+    const buf = await item.blob.arrayBuffer();
+
+    await uploadAttachmentAuto(
+        state.chatFile,
+        item.attachName,
+        buf,                        // ✅ ArrayBuffer из Blob
+        item.mime,
+        `📷 Фото ${i + 1}/${prepared.length} (${formatFileSize(item.size)})`
+    );
+}
 
         // ═══ 4. Читаем файл чата ═══
         const path = getChatPath(state.chatFile);
@@ -8043,7 +8046,7 @@ const saved = await saveFile(
     },
     sha,
     {
-        message: `💬 ${state.username}: ${hasText ? text.trim().slice(0, 40) : 'вложение'}`,
+        message: `📷 ${state.username}: пакет фото`,
         maxRetries: 6,
         baseDelay: 1500,
         maxDelay: 12000,
@@ -11054,12 +11057,9 @@ function openFilePicker(mode) {
         if (files.length === 0) return;
 
         if (mode === 'image') {
-            if (files.length === 1) {
-                handleFileUpload(files[0]);
-            } else {
-                handleMultipleImageUpload(files);
-            }
-        } else if (mode === 'audio') {
+    // Универсальный вызов: работает и для одного, и для нескольких файлов
+    handleMultipleImageUpload(files);
+} else if (mode === 'audio') {
             // 🆕 Отправка аудиофайла
             handleAudioFileUpload(files[0]);
         } else {
