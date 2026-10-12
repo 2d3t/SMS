@@ -49072,261 +49072,353 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
 </script>
 <script>
 // ═══════════════════════════════════════════════════════════════
-//  🩹 ПАТЧ: FRESH MESSAGE ON EVENT AUTOPLAY (колокольчик)
+//  🔔 КОЛОКОЛЬЧИК → АВТОКЛИК ПО КАРТОЧКАМ В ОВЕРЛЕЕ
 //  ─────────────────────────────────────────────────────────────
-//  Проблема: при клике по колокольчику EventAutoPlay переходит
-//  к сообщению, но данные (реакции, комментарии) ещё старые.
+//  Идея: не дублировать логику прыжка. Вместо этого открываем
+//  оверлей EventRadar и программно кликаем по первой непрочитанной
+//  карточке. Обработчик EventRadar делает всё остальное —
+//  правильно прыгает, подсвечивает, обновляет данные.
 //
-//  Решение: перед прыжком форсим обновление сообщения из GitHub
-//  (как это делает FreshJump v3), а затем уже скроллим.
+//  После обработки — можно открыть оверлей снова и кликнуть
+//  по следующей непрочитанной (режим «показать все по очереди»).
 // ═══════════════════════════════════════════════════════════════
 
-(function installFreshMessageOnAutoPlay() {
+(function installBellAutoClickCards() {
     'use strict';
 
-    if (typeof EventAutoPlay === 'undefined') {
-        console.warn('🩹 [AutoPlayFresh] EventAutoPlay не найден — патч не установлен');
-        return;
-    }
+    console.log('🔔 [BellAutoClick] Установка…');
 
-    console.log('🩹 [AutoPlayFresh] Установка…');
-
-    // ─── Спиннер (визуальная обратная связь) ───
-    function showLoadingSpinner(text) {
-        let el = document.getElementById('autoplayLoadingSpinner');
-        if (el) return;
-
-        if (!document.getElementById('autoplayLoadingStyles')) {
-            const style = document.createElement('style');
-            style.id = 'autoplayLoadingStyles';
-            style.textContent = `
-                #autoplayLoadingSpinner {
-                    position: fixed;
-                    top: 50%;
-                    left: 50%;
-                    transform: translate(-50%, -50%);
-                    background: rgba(26, 26, 46, 0.95);
-                    backdrop-filter: blur(16px);
-                    -webkit-backdrop-filter: blur(16px);
-                    border: 1px solid rgba(108, 92, 231, 0.5);
-                    border-radius: 18px;
-                    padding: 16px 22px;
-                    display: flex;
-                    align-items: center;
-                    gap: 12px;
-                    z-index: 8500;
-                    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.7);
-                    animation: apSpinIn 0.2s ease;
-                    pointer-events: none;
-                }
-                @keyframes apSpinIn {
-                    from { opacity: 0; transform: translate(-50%, -50%) scale(0.9); }
-                    to   { opacity: 1; transform: translate(-50%, -50%) scale(1); }
-                }
-                #autoplayLoadingSpinner .ap-spin {
-                    width: 22px;
-                    height: 22px;
-                    border: 3px solid rgba(108, 92, 231, 0.25);
-                    border-top-color: #6c5ce7;
-                    border-right-color: #00b894;
-                    border-radius: 50%;
-                    animation: apSpin 0.8s linear infinite;
-                    flex-shrink: 0;
-                }
-                @keyframes apSpin { to { transform: rotate(360deg); } }
-                #autoplayLoadingSpinner .ap-text {
-                    font-size: 13px;
-                    font-weight: 600;
-                    color: #fff;
-                    white-space: nowrap;
-                }
-                #autoplayLoadingSpinner .ap-sub {
-                    font-size: 11px;
-                    color: #a78bfa;
-                    margin-top: 2px;
-                }
-            `;
-            document.head.appendChild(style);
-        }
-
-        el = document.createElement('div');
-        el.id = 'autoplayLoadingSpinner';
-        el.innerHTML = `
-            <div class="ap-spin"></div>
-            <div>
-                <div class="ap-text">Загружаем сообщение</div>
-                <div class="ap-sub">${text || 'Обновляем данные…'}</div>
-            </div>
-        `;
-        document.body.appendChild(el);
-    }
-
-    function hideLoadingSpinner() {
-        const el = document.getElementById('autoplayLoadingSpinner');
-        if (!el) return;
-        el.style.transition = 'opacity 0.2s';
-        el.style.opacity = '0';
-        setTimeout(() => el.remove(), 200);
-    }
-
-    // ─── Хелпер: свежая загрузка сообщения ───
-    // Используем публичный API FreshJump, если он есть
-    async function refreshMessage(msgId, chatFile) {
-        try {
-            if (window.FreshJump && typeof window.FreshJump.refresh === 'function') {
-                await window.FreshJump.refresh(msgId, chatFile);
-                return true;
-            }
-        } catch (e) {
-            console.warn('🩹 [AutoPlayFresh] FreshJump.refresh failed:', e);
-        }
-        return false;
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ПЕРЕХВАТ startAutoPlay (клик по колокольчику)
-    // ═══════════════════════════════════════════════════════════
-    //  Логика:
-    //   1. Запускаем автоплей (как обычно)
-    //   2. Но ПЕРЕД первым прыжком — обновляем первое событие
-    //   3. Затем переходим к нему
-    // ═══════════════════════════════════════════════════════════
-
-    const _origStart = EventAutoPlay.start;
-
-    EventAutoPlay.start = async function() {
-        const unseen = window.EventRadar && typeof window.EventRadar.getEvents === 'function'
-            ? window.EventRadar.getEvents().filter(e => !e.seen)
-            : [];
-
-        if (unseen.length === 0) {
-            return _origStart.apply(this, arguments);
-        }
-
-        // Показываем спиннер ДО первого прыжка
-        showLoadingSpinner(`Событие 1 из ${unseen.length}`);
-
-        // Запускаем автоплей
-        const result = _origStart.apply(this, arguments);
-
-        // После запуска — скрываем спиннер
-        // (первый прыжок уже начнётся внутри _origStart)
-        setTimeout(() => hideLoadingSpinner(), 500);
-
-        return result;
+    // ─── Состояние ───
+    const BAC = {
+        // Мы в режиме последовательного просмотра?
+        chainActive: false,
+        // Сколько сообщений уже показали в этой серии
+        shownCount: 0,
+        // Максимум за один заход
+        maxChain: 30,
+        // Пауза между прыжками (мс)
+        stepDelay: 900,
+        // Предохранитель от бесконечного цикла
+        chainStartTs: 0,
+        // Таймауты для отмены
+        _timers: [],
+        // Что именно мы уже обработали (чтобы не зацикливаться,
+        // если event.seen почему-то не выставится)
+        _processedKeys: new Set(),
     };
 
-    // ═══════════════════════════════════════════════════════════
-    //  ПЕРЕХВАТ goNext — основная точка, где происходит прыжок
-    // ═══════════════════════════════════════════════════════════
-    //  Но goNext — внутренняя функция. Мы можем перехватить
-    //  её эффект через scrollToMessage (который уже патчен FreshJump v3).
-    //
-    //  Однако! EventAutoPlay вызывает свою внутреннюю jumpToMessage,
-    //  а НЕ глобальную scrollToMessage.
-    //
-    //  Поэтому мы делаем проще: перехватываем клики по кнопкам
-    //  ‹ / › в плашке автоплея и обновляем сообщение ПЕРЕД кликом.
-    // ═══════════════════════════════════════════════════════════
+    function clearTimers() {
+        BAC._timers.forEach(t => clearTimeout(t));
+        BAC._timers = [];
+    }
 
-    function installButtonInterceptors() {
-        const bar = document.getElementById('eventAutoPlayBar');
-        if (!bar || bar._freshJumpAttached) return false;
-        bar._freshJumpAttached = true;
+    function later(fn, ms) {
+        const t = setTimeout(fn, ms);
+        BAC._timers.push(t);
+        return t;
+    }
 
-        // Перехватываем кнопку "Следующее" (›)
-        const nextBtn = bar.querySelector('#apNextBtn');
-        if (nextBtn) {
-            nextBtn.addEventListener('click', async (e) => {
-                // Показываем спиннер
-                const queue = (window.EventRadar && typeof window.EventRadar.getEvents === 'function')
-                    ? window.EventRadar.getEvents().filter(x => !x.seen)
-                    : [];
+    // ─── Получить непрочитанные события ───
+    function getUnseen() {
+        if (typeof EventRadar === 'undefined') return [];
+        if (typeof EventRadar.getEvents !== 'function') return [];
+        return EventRadar.getEvents()
+            .filter(e => !e.seen && !BAC._processedKeys.has(e.key));
+    }
 
-                if (queue.length > 0) {
-                    showLoadingSpinner(`Осталось: ${queue.length}`);
+    // ─── Обработка одной итерации ───
+    //  1. Открыть оверлей (невидимо или с показом)
+    //  2. Найти первую непрочитанную карточку
+    //  3. Программно кликнуть по ней
+    //  4. Дождаться закрытия оверлея и прыжка
+    //  5. Повторить
+    function processNext() {
+        if (!BAC.chainActive) return;
+
+        // Предохранитель
+        if (Date.now() - BAC.chainStartTs > 60000) {
+            console.warn('🔔 [BellAutoClick] Цепочка слишком длинная — стоп');
+            stopChain();
+            return;
+        }
+        if (BAC.shownCount >= BAC.maxChain) {
+            console.log('🔔 [BellAutoClick] Достигнут лимит в серии');
+            stopChain();
+            return;
+        }
+
+        const unseen = getUnseen();
+        if (unseen.length === 0) {
+            console.log('🔔 [BellAutoClick] Больше нет непрочитанных — стоп');
+            stopChain();
+            return;
+        }
+
+        console.log(`🔔 [BellAutoClick] Осталось: ${unseen.length}, показано: ${BAC.shownCount}`);
+
+        // ─── 1. Открываем оверлей ───
+        try {
+            if (typeof EventRadar.open === 'function') {
+                EventRadar.open();
+            } else {
+                console.warn('🔔 [BellAutoClick] EventRadar.open недоступен');
+                stopChain();
+                return;
+            }
+        } catch (e) {
+            console.warn('🔔 [BellAutoClick] Ошибка открытия оверлея:', e);
+            stopChain();
+            return;
+        }
+
+        // ─── 2. Ждём, пока карточки отрисуются, и кликаем ───
+        later(() => {
+            if (!BAC.chainActive) return;
+
+            const overlay = document.getElementById('radar2Overlay');
+            if (!overlay || !overlay.classList.contains('show')) {
+                // Оверлей не открылся — что-то не так
+                console.warn('🔔 [BellAutoClick] Оверлей не открылся');
+                stopChain();
+                return;
+            }
+
+            // Ищем первую непрочитанную карточку
+            // (EventRadar рендерит свежие сверху, поэтому первая
+            //  карточка без .seen — то что нужно)
+            const cards = overlay.querySelectorAll('.r2-event[data-chat-file][data-msg-id]');
+            let targetCard = null;
+
+            for (const card of cards) {
+                if (!card.classList.contains('seen')) {
+                    targetCard = card;
+                    break;
                 }
-            }, true);  // capture
+            }
+
+            if (!targetCard) {
+                console.log('🔔 [BellAutoClick] Все карточки уже помечены seen');
+                stopChain();
+                return;
+            }
+
+            const chatFile = targetCard.dataset.chatFile;
+            const msgId = parseInt(targetCard.dataset.msgId);
+            const cardEventIdx = targetCard.dataset.eventIdx;
+
+            console.log(`🔔 [BellAutoClick] Кликаем: chat=${chatFile} msg=${msgId}`);
+
+            // Помечаем в нашем внутреннем «уже обработано»,
+            // чтобы не зациклиться, если event.seen не выставится
+            try {
+                const evs = EventRadar.getEvents();
+                if (!isNaN(parseInt(cardEventIdx))) {
+                    const ev = evs[parseInt(cardEventIdx)];
+                    if (ev && ev.key) BAC._processedKeys.add(ev.key);
+                }
+            } catch (e) {}
+
+            BAC.shownCount++;
+
+            // ─── 3. Программный клик ───
+            // Это запускает штатный handleEventClick,
+            // который правильно прыгает + помечает seen + закрывает оверлей.
+            try {
+                targetCard.click();
+            } catch (e) {
+                console.warn('🔔 [BellAutoClick] Ошибка клика:', e);
+            }
+
+            // ─── 4. Ждём завершения прыжка и запускаем следующую итерацию ───
+            later(() => {
+                if (!BAC.chainActive) return;
+
+                // Проверяем: оверлей закрылся? (handleEventClick делает closeOverlay)
+                const ov = document.getElementById('radar2Overlay');
+                const stillOpen = ov && ov.classList.contains('show');
+
+                if (stillOpen) {
+                    // Если по какой-то причине оверлей не закрылся — закроем сами
+                    try {
+                        if (typeof EventRadar.close === 'function') EventRadar.close();
+                    } catch (e) {}
+                }
+
+                // Запускаем следующую итерацию
+                later(() => processNext(), BAC.stepDelay);
+            }, 1200);   // ждём завершения прыжка + подсветки + возможной подгрузки свежих данных
+        }, 250);   // ждём, пока EventRadar отрендерит список
+    }
+
+    // ─── Запуск / остановка ───
+    function startChain() {
+        if (BAC.chainActive) {
+            console.log('🔔 [BellAutoClick] Уже запущено');
+            return;
         }
 
-        // Перехватываем кнопку "Предыдущее" (‹)
-        const prevBtn = bar.querySelector('#apPrevBtn');
-        if (prevBtn) {
-            prevBtn.addEventListener('click', () => {
-                // Тут просто визуальный отклик
-            }, true);
+        const unseen = getUnseen();
+        if (unseen.length === 0) {
+            // Нечего показывать — открываем оверлей как обычно
+            try {
+                if (typeof EventRadar !== 'undefined'
+                    && typeof EventRadar.open === 'function') {
+                    EventRadar.open();
+                }
+            } catch (e) {}
+            return;
         }
 
+        console.log(`🔔 [BellAutoClick] Старт серии: ${unseen.length} событий`);
+
+        BAC.chainActive = true;
+        BAC.shownCount = 0;
+        BAC.chainStartTs = Date.now();
+        BAC._processedKeys.clear();
+
+        // Даём индикатор старта
+        if (typeof showToast === 'function') {
+            showToast(`🔔 Показываю ${unseen.length} ${pluralize(unseen.length)}`, 1800);
+        }
+
+        processNext();
+    }
+
+    function stopChain() {
+        if (!BAC.chainActive) return;
+        BAC.chainActive = false;
+        clearTimers();
+
+        // Закрываем оверлей, если он остался открытым
+        try {
+            const ov = document.getElementById('radar2Overlay');
+            if (ov && ov.classList.contains('show')) {
+                if (typeof EventRadar !== 'undefined'
+                    && typeof EventRadar.close === 'function') {
+                    EventRadar.close();
+                }
+            }
+        } catch (e) {}
+
+        if (BAC.shownCount > 0 && typeof showToast === 'function') {
+            showToast(`✅ Показано: ${BAC.shownCount} ${pluralize(BAC.shownCount)}`, 2000);
+        }
+
+        console.log(`🔔 [BellAutoClick] Серия завершена (показано: ${BAC.shownCount})`);
+    }
+
+    function pluralize(n) {
+        const m10 = n % 10, m100 = n % 100;
+        if (m10 === 1 && m100 !== 11) return 'событие';
+        if (m10 >= 2 && m10 <= 4 && (m100 < 10 || m100 >= 20)) return 'события';
+        return 'событий';
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ КЛИКОВ ПО КОЛОКОЛЬЧИКАМ
+    //  ─────────────────────────────────────────────────────────
+    //  Ставим в CAPTURE-фазе, чтобы сработать ДО других обработчиков.
+    //  Если есть непрочитанные — запускаем цепочку.
+    //  Если нет — пропускаем клик дальше (пусть открывается оверлей).
+    // ═══════════════════════════════════════════════════════════
+
+    function interceptBell(btnId) {
+        const btn = document.getElementById(btnId);
+        if (!btn || btn._bellAutoClickAttached) return false;
+        btn._bellAutoClickAttached = true;
+
+        btn.addEventListener('click', (e) => {
+            // Защита от повторного нажатия во время серии
+            if (BAC.chainActive) {
+                e.stopImmediatePropagation();
+                e.preventDefault();
+                console.log('🔔 [BellAutoClick] Серия уже идёт — игнор');
+                return;
+            }
+
+            const unseen = getUnseen();
+
+            // Если нечего показывать — не мешаем обычному клику
+            if (unseen.length === 0) {
+                console.log('🔔 [BellAutoClick] Нет непрочитанных — обычное поведение');
+                return;
+            }
+
+            // Перехватываем
+            e.stopImmediatePropagation();
+            e.preventDefault();
+
+            // Стартуем цепочку
+            startChain();
+        }, true);   // ⬅️ CAPTURE
+
+        console.log(`🔔 [BellAutoClick] Перехват на ${btnId}`);
         return true;
     }
 
-    // ═══════════════════════════════════════════════════════════
-    //  ГЛАВНОЕ: слушаем scrollToMessage — когда EventAutoPlay
-    //  вызывает прыжок, наш scrollToMessage уже патчен FreshJump v3
-    //  и гарантирует свежесть.
-    //
-    //  Но проблема в том, что EventAutoPlay использует свою
-    //  внутреннюю jumpToMessage, а не глобальную scrollToMessage.
-    //
-    //  Решение: перехватываем момент, когда DOM-элемент сообщения
-    //  появляется с подсветкой — и обновляем его.
-    // ═══════════════════════════════════════════════════════════
+    // Устанавливаем перехваты с ретраями (кнопки могут появляться позже)
+    let attempts = 0;
+    function tryInstall() {
+        attempts++;
+        const a = interceptBell('radar2Btn');
+        const b = interceptBell('radar2BtnChat');
 
-    const highlightObserver = new MutationObserver((mutations) => {
-        for (const mut of mutations) {
-            if (mut.type !== 'attributes' || mut.attributeName !== 'class') continue;
-            const el = mut.target;
-            if (!el.classList || !el.classList.contains('message-wrapper')) continue;
-
-            // Появилась подсветка highlight-flash?
-            if (el.classList.contains('highlight-flash')) {
-                const msgId = parseInt(el.dataset.msgId);
-                if (isNaN(msgId)) continue;
-
-                // Форсим обновление
-                refreshMessage(msgId, state.chatFile).then(ok => {
-                    if (ok) {
-                        console.log(`🩹 [AutoPlayFresh] Автообновление msg ${msgId}`);
-                    }
-                });
-            }
+        if (!a || !b) {
+            if (attempts < 40) setTimeout(tryInstall, 300);
         }
-    });
-
-    // Наблюдаем за сообщениями
-    function startObserver() {
-        if (typeof messagesInner === 'undefined' || !messagesInner) {
-            setTimeout(startObserver, 500);
-            return;
-        }
-        highlightObserver.observe(messagesInner, {
-            attributes: true,
-            attributeFilter: ['class'],
-            subtree: true,
-        });
-        console.log('🩹 [AutoPlayFresh] Observer запущен');
     }
+    tryInstall();
 
-    startObserver();
+    // Также — через MutationObserver, на случай перерисовки кнопок
+    const btnObserver = new MutationObserver(() => {
+        interceptBell('radar2Btn');
+        interceptBell('radar2BtnChat');
+    });
+    btnObserver.observe(document.body, { childList: true, subtree: true });
 
     // ═══════════════════════════════════════════════════════════
-    //  ДОПОЛНИТЕЛЬНО: перехват handleEventClick (клик по событию
-    //  в списке radar) — уже сделан FreshJump v3, но проверим
+    //  РУЧНОЙ СТОП
+    //  ─────────────────────────────────────────────────────────
+    //  Если пользователь тапнул по экрану во время серии — стоп.
+    //  Это защищает от зацикливания, если что-то пойдёт не так.
     // ═══════════════════════════════════════════════════════════
-    //  Тут ничего не делаем — FreshJump v3 уже обрабатывает
+    document.addEventListener('touchstart', () => {
+        if (BAC.chainActive) {
+            console.log('🔔 [BellAutoClick] Пользователь коснулся экрана — стоп серии');
+            stopChain();
+        }
+    }, { passive: true, capture: true });
+
+    // Escape — тоже стоп
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && BAC.chainActive) {
+            e.preventDefault();
+            e.stopPropagation();
+            stopChain();
+        }
+    }, true);
 
     // ═══════════════════════════════════════════════════════════
     //  ПУБЛИЧНОЕ API
     // ═══════════════════════════════════════════════════════════
-    window.AutoPlayFresh = {
-        isActive: () => EventAutoPlay.isActive ? EventAutoPlay.isActive() : false,
-        refresh: refreshMessage,
+    window.BellAutoClick = {
+        start: startChain,
+        stop: stopChain,
+        isActive: () => BAC.chainActive,
+        status: () => ({
+            active: BAC.chainActive,
+            shown: BAC.shownCount,
+            unseen: getUnseen().length,
+            processedKeys: BAC._processedKeys.size,
+        }),
+        config: BAC,
     };
 
-    console.log('🩹 [AutoPlayFresh] Готово:');
-    console.log('   • Колокольчик → спиннер → свежие данные → прыжок');
-    console.log('   • Observer следит за highlight-flash и обновляет сообщение');
-    console.log('   • API: AutoPlayFresh.isActive()');
+    console.log('🔔 [BellAutoClick] Готово:');
+    console.log('   • Колокольчик → открывает оверлей → кликает по карточкам');
+    console.log('   • Каждая карточка = правильный прыжок + свежие данные');
+    console.log('   • Тап по экрану = стоп серии');
+    console.log('   • API: BellAutoClick.start() / .stop() / .status()');
 })();
 </script>
 </body>
