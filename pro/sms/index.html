@@ -22621,9 +22621,9 @@ console.log('📱 Кнопка «Назад» Android: чат → список �
     //  КОНФИГ
     // ═══════════════════════════════════════════════════════════
     const CFG = {
-        scanIntervalMs: 45000,               // 45 сек (было 20)
+        scanIntervalMs: 25000,               // 45 сек (было 20)
         scanOnVisibility: true,
-        delayBetweenChatsMs: 250,
+        delayBetweenChatsMs: 300,
         fullScanIntervalMs: 10 * 60 * 1000,  // 🆕 страховочный full-scan раз в 10 мин
         maxEventsKept: 500,
         maxEventsShown: 100,
@@ -48597,5 +48597,479 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
     console.log('   • API: FinalPatch.status()');
 })();
 </script>
+
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🔄 FRESH MESSAGE ON JUMP v3 — гарантированно свежие данные
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: при прыжке к сообщению из Radar, сообщение в
+//  historyState может быть старым (без реакции/комментария).
+//
+//  Решение: перед прыжком ВСЕГДА обновляем конкретное
+//  сообщение из GitHub — синхронно, с ожиданием.
+//  Пока идёт обновление — показываем спиннер в UI.
+// ═══════════════════════════════════════════════════════════════
+
+(function installFreshMessageOnJumpV3() {
+    'use strict';
+
+    console.log('🔄 [FreshJump v3] Установка…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  Флаг: идёт ли уже загрузка свежих данных для чата
+    //  (чтобы параллельные прыжки не грузили один и тот же файл)
+    // ═══════════════════════════════════════════════════════════
+    let _refreshingChatFile = null;
+    let _refreshPromise = null;
+
+    /**
+     * Гарантированно обновляет ОДНО сообщение из GitHub.
+     * Если для этого же чата уже идёт обновление — ждём его.
+     *
+     * @param {number} msgId — ID сообщения
+     * @param {string} chatFile — ID чата (по умолчанию state.chatFile)
+     * @returns {Promise<boolean>} — true если сообщение обновилось
+     */
+    async function ensureFreshMessage(msgId, chatFile) {
+        chatFile = chatFile || state.chatFile;
+        if (!chatFile || !msgId) return false;
+        if (!state.token || !state.isAuthorized) return false;
+
+        // Если для этого чата уже идёт обновление — ждём его
+        if (_refreshingChatFile === chatFile && _refreshPromise) {
+            console.log(`🔄 [FreshJump v3] Ждём уже идущее обновление ${chatFile}`);
+            await _refreshPromise;
+            // После ожидания — проверяем, обновилось ли нужное сообщение
+            return _checkMessageFresh(msgId, chatFile);
+        }
+
+        // Запускаем новое обновление
+        _refreshingChatFile = chatFile;
+        _refreshPromise = (async () => {
+            try {
+                const password = state.savedPasswords[chatFile];
+                if (!password) {
+                    console.warn('🔄 [FreshJump v3] Нет пароля для', chatFile);
+                    return false;
+                }
+
+                console.log(`🔄 [FreshJump v3] Загружаем свежий ${chatFile}…`);
+
+                const path = getChatPath(chatFile);
+                const result = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
+                if (!result.exists || !result.content) return false;
+
+                const content = result.content;
+                if (content.v !== CRYPTO.VERSION || !content.salt) return false;
+
+                // Ключ — если мы не в этом чате, используем временный
+                let key;
+                if (chatFile === state.chatFile && CRYPTO._key) {
+                    key = CRYPTO._key;
+                } else {
+                    // Деривим ключ одноразово, не трогаем state
+                    key = await deriveKey(password, content.salt);
+                }
+
+                // Расшифровываем ТОЛЬКО нужное сообщение
+                const enc = (content.messages || []).find(m => String(m.id) === String(msgId));
+                if (!enc) {
+                    console.warn('🔄 [FreshJump v3] Сообщение не найдено в свежем файле');
+                    return false;
+                }
+
+                // Расшифровка (используем decryptMessage из основного кода —
+                // но он требует CRYPTO._key в state. Поэтому делаем вручную)
+                let freshMsg;
+                try {
+                    const iv = new Uint8Array(base64ToArrayBuffer(enc.iv));
+                    const ciphertext = base64ToArrayBuffer(enc.data);
+                    const plaintext = await crypto.subtle.decrypt(
+                        { name: 'AES-GCM', iv }, key, ciphertext
+                    );
+                    const payload = JSON.parse(new TextDecoder().decode(plaintext));
+
+                    freshMsg = {
+                        id: enc.id,
+                        time: enc.time,
+                        username: payload.username,
+                        text: payload.text || '',
+                    };
+                    if (payload.reactions) freshMsg.reactions = payload.reactions;
+                    if (Array.isArray(payload.comments)) freshMsg.comments = payload.comments;
+                    if (payload.edited) freshMsg.edited = true;
+                    if (payload.image) freshMsg.image = payload.image;
+                    if (payload.audio) {
+                        freshMsg.audio = payload.audio;
+                        freshMsg.audioDuration = payload.audioDuration || 0;
+                        freshMsg.audioMime = payload.audioMime || 'audio/webm';
+                        freshMsg.audioName = payload.audioName || '';
+                        freshMsg.audioCover = payload.audioCover || '';
+                    }
+                    if (payload.file) {
+                        freshMsg.file = payload.file;
+                        freshMsg.fileName = payload.fileName || 'file.bin';
+                        freshMsg.fileMime = payload.fileMime || 'application/octet-stream';
+                        freshMsg.fileSize = payload.fileSize || 0;
+                    }
+                    if (payload.video) {
+                        freshMsg.video = payload.video;
+                        freshMsg.videoDuration = payload.videoDuration || 0;
+                        freshMsg.videoMime = payload.videoMime || 'video/mp4';
+                        freshMsg.videoName = payload.videoName || '';
+                        freshMsg.videoSize = payload.videoSize || 0;
+                    }
+                    if (payload.videoNote) {
+                        freshMsg.videoNote = payload.videoNote;
+                        freshMsg.videoDuration = payload.videoDuration || 0;
+                        freshMsg.videoMime = payload.videoMime || 'video/webm';
+                    }
+                    if (payload.replyTo) freshMsg.replyTo = payload.replyTo;
+                    if (payload.batchId) {
+                        freshMsg.batchId = payload.batchId;
+                        freshMsg.batchIndex = payload.batchIndex;
+                        freshMsg.batchTotal = payload.batchTotal;
+                    }
+                } catch (e) {
+                    console.warn('🔄 [FreshJump v3] Не удалось расшифровать:', e);
+                    return false;
+                }
+
+                // 🎯 Обновляем в памяти
+                _updateMessageInMemory(freshMsg, chatFile);
+
+                // 🎯 Обновляем в DOM (если мы в этом чате)
+                if (state.chatFile === chatFile && state.currentScreen === 'chat') {
+                    _updateMessageInDOM(freshMsg);
+                }
+
+                console.log(`🔄 [FreshJump v3] Сообщение ${msgId} обновлено`);
+                return true;
+            } catch (e) {
+                console.warn('🔄 [FreshJump v3] Ошибка:', e);
+                return false;
+            } finally {
+                _refreshingChatFile = null;
+                _refreshPromise = null;
+            }
+        })();
+
+        return await _refreshPromise;
+    }
+
+    /**
+     * Обновляет сообщение в historyState.allMessages и state.messages
+     */
+    function _updateMessageInMemory(freshMsg, chatFile) {
+        // historyState.allMessages — только если это наш чат
+        if (chatFile === state.chatFile) {
+            const idx = historyState.allMessages.findIndex(
+                m => String(m.id) === String(freshMsg.id)
+            );
+            if (idx >= 0) {
+                historyState.allMessages[idx] = freshMsg;
+            }
+
+            const sIdx = state.messages.findIndex(
+                m => String(m.id) === String(freshMsg.id)
+            );
+            if (sIdx >= 0) {
+                state.messages[sIdx] = freshMsg;
+            }
+        }
+    }
+
+    /**
+     * Перерисовывает конкретное сообщение в DOM с новыми данными.
+     * Сохраняет подсветку если она есть.
+     */
+    function _updateMessageInDOM(freshMsg) {
+        if (!messagesInner) return;
+        const wrapper = messagesInner.querySelector(
+            `.message-wrapper[data-msg-id="${freshMsg.id}"]`
+        );
+        if (!wrapper) return;
+
+        const wasHighlighted = wrapper.classList.contains('highlight-flash');
+        const wasLong = wrapper.classList.contains('long');
+
+        // 🆕 Сохраняем ссылки на активные blob:URL вложений,
+        //     чтобы не перезагружать их при перерисовке
+        const oldAttachCache = {};
+        wrapper.querySelectorAll('[data-attach]').forEach(el => {
+            const name = el.dataset.attach;
+            if (name && _attachmentCache.has(name)) {
+                oldAttachCache[name] = _attachmentCache.get(name);
+            }
+        });
+
+        // Перерисовываем
+        const html = buildMessageHTML(freshMsg, { noFade: true });
+        const temp = document.createElement('div');
+        temp.innerHTML = html;
+        const newWrapper = temp.firstElementChild;
+        if (!newWrapper) return;
+
+        if (wasHighlighted) newWrapper.classList.add('highlight-flash');
+        if (wasLong) newWrapper.classList.add('long');
+
+        wrapper.replaceWith(newWrapper);
+
+        // Прогружаем вложения
+        loadAttachmentsIn(newWrapper);
+        loadReplyThumbnails(newWrapper);
+
+        // 🆕 Восстанавливаем blob:URL из старого кэша
+        //    (если они уже были загружены — не грузим заново)
+        setTimeout(() => {
+            Object.entries(oldAttachCache).forEach(([name, url]) => {
+                if (!_attachmentCache.has(name)) {
+                    _attachmentCache.set(name, url);
+                }
+            });
+            // Триггерим инициализацию плееров
+            if (typeof initAudioPlayers === 'function') initAudioPlayers();
+            // Синхронизируем с глобальным плеером
+            if (typeof syncInlineWithGlobal === 'function') syncInlineWithGlobal();
+        }, 50);
+    }
+
+    /**
+     * Проверяет, обновилось ли уже нужное сообщение.
+     * Используется после ожидания чужого обновления.
+     */
+    function _checkMessageFresh(msgId, chatFile) {
+        if (chatFile !== state.chatFile) return false;
+        const msg = historyState.allMessages.find(m => String(m.id) === String(msgId));
+        if (!msg) return false;
+        // Проверяем: есть ли реакции или комментарии
+        const hasReactions = msg.reactions && Object.keys(msg.reactions).length > 0;
+        const hasComments = Array.isArray(msg.comments) && msg.comments.length > 0;
+        return hasReactions || hasComments || msg.edited;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ scrollToMessage — ждём свежих данных
+    //  ─────────────────────────────────────────────────────────
+    //  Заменяем старую версию scrollToMessage (она синхронная),
+    //  на новую — с асинхронной подгрузкой.
+    // ═══════════════════════════════════════════════════════════
+    if (typeof scrollToMessage === 'function') {
+        const _origScrollToMessage = scrollToMessage;
+
+        scrollToMessage = async function(msgId) {
+            if (!msgId || !state.chatFile) return;
+
+            const targetMsgId = parseInt(msgId);
+            if (isNaN(targetMsgId)) return;
+
+            // 🆕 СНАЧАЛА — показываем спиннер поверх области сообщений,
+            //     чтобы юзер видел, что идёт загрузка
+            showJumpSpinner();
+
+            try {
+                // 🆕 ГАРАНТИРОВАННО подгружаем свежую версию
+                await ensureFreshMessage(targetMsgId, state.chatFile);
+            } catch (e) {
+                console.warn('🔄 [FreshJump v3] ensureFreshMessage fail:', e);
+            } finally {
+                hideJumpSpinner();
+            }
+
+            // Теперь — оригинальный скролл и подсветка
+            return _origScrollToMessage.call(this, msgId);
+        };
+
+        console.log('🔄 [FreshJump v3] scrollToMessage перехвачен');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ handleEventClick (Event Radar)
+    //  ─────────────────────────────────────────────────────────
+    //  Даже если Radar уже обновляет что-то в фоне, мы дополнительно
+    //  убедимся что сообщение свежее — ДО того как начать прыжок.
+    // ═══════════════════════════════════════════════════════════
+    document.addEventListener('click', async (e) => {
+        const card = e.target.closest('.r2-event[data-chat-file]');
+        if (!card) return;
+
+        const overlay = document.getElementById('radar2Overlay');
+        if (!overlay || !overlay.classList.contains('show')) return;
+
+        const chatFile = card.dataset.chatFile;
+        const msgId = parseInt(card.dataset.msgId);
+        if (isNaN(msgId) || !chatFile) return;
+
+        // Если мы УЖЕ в этом чате — гарантируем свежесть
+        // через публичный ensureFresh (без прыжка)
+        if (state.chatFile === chatFile && state.currentScreen === 'chat') {
+            // Не блокируем оригинальный обработчик, он тоже прыгнет.
+            // Но перед этим форсим обновление.
+            try {
+                await ensureFreshMessage(msgId, chatFile);
+            } catch (err) {
+                console.warn('🔄 [FreshJump v3] Pre-fetch для Radar fail:', err);
+            }
+        }
+    }, true);  // capture, срабатывает ДО штатного обработчика EventRadarFix
+
+    // ═══════════════════════════════════════════════════════════
+    //  СПИННЕР ЗАГРУЗКИ
+    // ═══════════════════════════════════════════════════════════
+    function showJumpSpinner() {
+        if (document.getElementById('jumpSpinner')) return;
+
+        if (!document.getElementById('jumpSpinnerStyles')) {
+            const style = document.createElement('style');
+            style.id = 'jumpSpinnerStyles';
+            style.textContent = `
+                #jumpSpinner {
+                    position: fixed;
+                    top: 50%;
+                    left: 50%;
+                    transform: translate(-50%, -50%);
+                    background: rgba(26, 26, 46, 0.95);
+                    backdrop-filter: blur(16px);
+                    -webkit-backdrop-filter: blur(16px);
+                    border: 1px solid rgba(108, 92, 231, 0.5);
+                    border-radius: 18px;
+                    padding: 16px 24px;
+                    display: flex;
+                    align-items: center;
+                    gap: 12px;
+                    z-index: 8500;
+                    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.7);
+                    animation: jumpSpinIn 0.2s ease;
+                    pointer-events: none;
+                }
+                @keyframes jumpSpinIn {
+                    from { opacity: 0; transform: translate(-50%, -50%) scale(0.9); }
+                    to   { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+                }
+                #jumpSpinner .js-spin {
+                    width: 22px;
+                    height: 22px;
+                    border: 3px solid rgba(108, 92, 231, 0.25);
+                    border-top-color: #6c5ce7;
+                    border-right-color: #00b894;
+                    border-radius: 50%;
+                    animation: jsSpin 0.8s linear infinite;
+                    flex-shrink: 0;
+                }
+                @keyframes jsSpin { to { transform: rotate(360deg); } }
+                #jumpSpinner .js-text {
+                    font-size: 13px;
+                    font-weight: 600;
+                    color: #fff;
+                    white-space: nowrap;
+                }
+                #jumpSpinner .js-sub {
+                    font-size: 11px;
+                    color: #a78bfa;
+                    margin-left: 6px;
+                    font-weight: 500;
+                }
+            `;
+            document.head.appendChild(style);
+        }
+
+        const el = document.createElement('div');
+        el.id = 'jumpSpinner';
+        el.innerHTML = `
+            <div class="js-spin"></div>
+            <div>
+                <div class="js-text">Обновляем сообщение</div>
+                <div class="js-sub">Проверяем свежие данные…</div>
+            </div>
+        `;
+        document.body.appendChild(el);
+    }
+
+    function hideJumpSpinner() {
+        const el = document.getElementById('jumpSpinner');
+        if (!el) return;
+        el.style.transition = 'opacity 0.2s';
+        el.style.opacity = '0';
+        setTimeout(() => el.remove(), 200);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  МЕГА-БОНУС: форсируем pollUpdates после получения события
+    //  ─────────────────────────────────────────────────────────
+    //  Даже если кто-то не пользуется Radar — обновление
+    //  реакций/комментариев в текущем чате теперь работает
+    //  быстрее, потому что есть агрессивный поллинг.
+    //
+    //  Тут же — добавим принудительное обновление сразу после
+    //  получения собственной реакции/комментария (мгновенный sync).
+    // ═══════════════════════════════════════════════════════════
+
+    // При отправке реакции на своё или чужое — обновим meta (уже
+    // сделано в другом патче), но также пинём Radar скорее
+    if (typeof toggleReaction === 'function') {
+        const _origToggle = toggleReaction;
+        toggleReaction = async function(msgId, emoji) {
+            const result = await _origToggle.call(this, msgId, emoji);
+
+            // Форсируем soft-скан Radar, чтобы он сразу увидел изменение
+            setTimeout(() => {
+                if (window.EventRadar && typeof window.EventRadar.scanSoft === 'function') {
+                    window.EventRadar.scanSoft().catch(() => {});
+                }
+            }, 800);
+
+            return result;
+        };
+    }
+
+    // То же — при отправке комментария
+    if (typeof submitComment === 'function') {
+        const _origComment = submitComment;
+        submitComment = async function(msgId, text) {
+            const result = await _origComment.call(this, msgId, text);
+
+            setTimeout(() => {
+                if (window.EventRadar && typeof window.EventRadar.scanSoft === 'function') {
+                    window.EventRadar.scanSoft().catch(() => {});
+                }
+            }, 800);
+
+            return result;
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API
+    // ═══════════════════════════════════════════════════════════
+    window.FreshJump = {
+        // Обновить конкретное сообщение вручную
+        refresh: (msgId, chatFile) => ensureFreshMessage(msgId, chatFile || state.chatFile),
+
+        // Обновить весь текущий чат (форс)
+        refreshCurrent: async () => {
+            if (!state.chatFile) return false;
+            try {
+                await pollUpdates();
+                return true;
+            } catch (e) {
+                return false;
+            }
+        },
+
+        // Статус
+        status: () => ({
+            refreshing: _refreshingChatFile,
+            hasPending: !!_refreshPromise,
+        }),
+    };
+
+    console.log('🔄 [FreshJump v3] Готово:');
+    console.log('   • scrollToMessage гарантированно обновляет сообщение');
+    console.log('   • Показывает спиннер во время загрузки');
+    console.log('   • Radar pre-fetch для мгновенной свежести');
+    console.log('   • API: FreshJump.refresh(msgId) / .refreshCurrent()');
+})();
+</script>
+
 </body>
 </html>
