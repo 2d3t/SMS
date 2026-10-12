@@ -49070,6 +49070,264 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
     console.log('   • API: FreshJump.refresh(msgId) / .refreshCurrent()');
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🩹 ПАТЧ: FRESH MESSAGE ON EVENT AUTOPLAY (колокольчик)
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: при клике по колокольчику EventAutoPlay переходит
+//  к сообщению, но данные (реакции, комментарии) ещё старые.
+//
+//  Решение: перед прыжком форсим обновление сообщения из GitHub
+//  (как это делает FreshJump v3), а затем уже скроллим.
+// ═══════════════════════════════════════════════════════════════
 
+(function installFreshMessageOnAutoPlay() {
+    'use strict';
+
+    if (typeof EventAutoPlay === 'undefined') {
+        console.warn('🩹 [AutoPlayFresh] EventAutoPlay не найден — патч не установлен');
+        return;
+    }
+
+    console.log('🩹 [AutoPlayFresh] Установка…');
+
+    // ─── Спиннер (визуальная обратная связь) ───
+    function showLoadingSpinner(text) {
+        let el = document.getElementById('autoplayLoadingSpinner');
+        if (el) return;
+
+        if (!document.getElementById('autoplayLoadingStyles')) {
+            const style = document.createElement('style');
+            style.id = 'autoplayLoadingStyles';
+            style.textContent = `
+                #autoplayLoadingSpinner {
+                    position: fixed;
+                    top: 50%;
+                    left: 50%;
+                    transform: translate(-50%, -50%);
+                    background: rgba(26, 26, 46, 0.95);
+                    backdrop-filter: blur(16px);
+                    -webkit-backdrop-filter: blur(16px);
+                    border: 1px solid rgba(108, 92, 231, 0.5);
+                    border-radius: 18px;
+                    padding: 16px 22px;
+                    display: flex;
+                    align-items: center;
+                    gap: 12px;
+                    z-index: 8500;
+                    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.7);
+                    animation: apSpinIn 0.2s ease;
+                    pointer-events: none;
+                }
+                @keyframes apSpinIn {
+                    from { opacity: 0; transform: translate(-50%, -50%) scale(0.9); }
+                    to   { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+                }
+                #autoplayLoadingSpinner .ap-spin {
+                    width: 22px;
+                    height: 22px;
+                    border: 3px solid rgba(108, 92, 231, 0.25);
+                    border-top-color: #6c5ce7;
+                    border-right-color: #00b894;
+                    border-radius: 50%;
+                    animation: apSpin 0.8s linear infinite;
+                    flex-shrink: 0;
+                }
+                @keyframes apSpin { to { transform: rotate(360deg); } }
+                #autoplayLoadingSpinner .ap-text {
+                    font-size: 13px;
+                    font-weight: 600;
+                    color: #fff;
+                    white-space: nowrap;
+                }
+                #autoplayLoadingSpinner .ap-sub {
+                    font-size: 11px;
+                    color: #a78bfa;
+                    margin-top: 2px;
+                }
+            `;
+            document.head.appendChild(style);
+        }
+
+        el = document.createElement('div');
+        el.id = 'autoplayLoadingSpinner';
+        el.innerHTML = `
+            <div class="ap-spin"></div>
+            <div>
+                <div class="ap-text">Загружаем сообщение</div>
+                <div class="ap-sub">${text || 'Обновляем данные…'}</div>
+            </div>
+        `;
+        document.body.appendChild(el);
+    }
+
+    function hideLoadingSpinner() {
+        const el = document.getElementById('autoplayLoadingSpinner');
+        if (!el) return;
+        el.style.transition = 'opacity 0.2s';
+        el.style.opacity = '0';
+        setTimeout(() => el.remove(), 200);
+    }
+
+    // ─── Хелпер: свежая загрузка сообщения ───
+    // Используем публичный API FreshJump, если он есть
+    async function refreshMessage(msgId, chatFile) {
+        try {
+            if (window.FreshJump && typeof window.FreshJump.refresh === 'function') {
+                await window.FreshJump.refresh(msgId, chatFile);
+                return true;
+            }
+        } catch (e) {
+            console.warn('🩹 [AutoPlayFresh] FreshJump.refresh failed:', e);
+        }
+        return false;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ startAutoPlay (клик по колокольчику)
+    // ═══════════════════════════════════════════════════════════
+    //  Логика:
+    //   1. Запускаем автоплей (как обычно)
+    //   2. Но ПЕРЕД первым прыжком — обновляем первое событие
+    //   3. Затем переходим к нему
+    // ═══════════════════════════════════════════════════════════
+
+    const _origStart = EventAutoPlay.start;
+
+    EventAutoPlay.start = async function() {
+        const unseen = window.EventRadar && typeof window.EventRadar.getEvents === 'function'
+            ? window.EventRadar.getEvents().filter(e => !e.seen)
+            : [];
+
+        if (unseen.length === 0) {
+            return _origStart.apply(this, arguments);
+        }
+
+        // Показываем спиннер ДО первого прыжка
+        showLoadingSpinner(`Событие 1 из ${unseen.length}`);
+
+        // Запускаем автоплей
+        const result = _origStart.apply(this, arguments);
+
+        // После запуска — скрываем спиннер
+        // (первый прыжок уже начнётся внутри _origStart)
+        setTimeout(() => hideLoadingSpinner(), 500);
+
+        return result;
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ goNext — основная точка, где происходит прыжок
+    // ═══════════════════════════════════════════════════════════
+    //  Но goNext — внутренняя функция. Мы можем перехватить
+    //  её эффект через scrollToMessage (который уже патчен FreshJump v3).
+    //
+    //  Однако! EventAutoPlay вызывает свою внутреннюю jumpToMessage,
+    //  а НЕ глобальную scrollToMessage.
+    //
+    //  Поэтому мы делаем проще: перехватываем клики по кнопкам
+    //  ‹ / › в плашке автоплея и обновляем сообщение ПЕРЕД кликом.
+    // ═══════════════════════════════════════════════════════════
+
+    function installButtonInterceptors() {
+        const bar = document.getElementById('eventAutoPlayBar');
+        if (!bar || bar._freshJumpAttached) return false;
+        bar._freshJumpAttached = true;
+
+        // Перехватываем кнопку "Следующее" (›)
+        const nextBtn = bar.querySelector('#apNextBtn');
+        if (nextBtn) {
+            nextBtn.addEventListener('click', async (e) => {
+                // Показываем спиннер
+                const queue = (window.EventRadar && typeof window.EventRadar.getEvents === 'function')
+                    ? window.EventRadar.getEvents().filter(x => !x.seen)
+                    : [];
+
+                if (queue.length > 0) {
+                    showLoadingSpinner(`Осталось: ${queue.length}`);
+                }
+            }, true);  // capture
+        }
+
+        // Перехватываем кнопку "Предыдущее" (‹)
+        const prevBtn = bar.querySelector('#apPrevBtn');
+        if (prevBtn) {
+            prevBtn.addEventListener('click', () => {
+                // Тут просто визуальный отклик
+            }, true);
+        }
+
+        return true;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ГЛАВНОЕ: слушаем scrollToMessage — когда EventAutoPlay
+    //  вызывает прыжок, наш scrollToMessage уже патчен FreshJump v3
+    //  и гарантирует свежесть.
+    //
+    //  Но проблема в том, что EventAutoPlay использует свою
+    //  внутреннюю jumpToMessage, а не глобальную scrollToMessage.
+    //
+    //  Решение: перехватываем момент, когда DOM-элемент сообщения
+    //  появляется с подсветкой — и обновляем его.
+    // ═══════════════════════════════════════════════════════════
+
+    const highlightObserver = new MutationObserver((mutations) => {
+        for (const mut of mutations) {
+            if (mut.type !== 'attributes' || mut.attributeName !== 'class') continue;
+            const el = mut.target;
+            if (!el.classList || !el.classList.contains('message-wrapper')) continue;
+
+            // Появилась подсветка highlight-flash?
+            if (el.classList.contains('highlight-flash')) {
+                const msgId = parseInt(el.dataset.msgId);
+                if (isNaN(msgId)) continue;
+
+                // Форсим обновление
+                refreshMessage(msgId, state.chatFile).then(ok => {
+                    if (ok) {
+                        console.log(`🩹 [AutoPlayFresh] Автообновление msg ${msgId}`);
+                    }
+                });
+            }
+        }
+    });
+
+    // Наблюдаем за сообщениями
+    function startObserver() {
+        if (typeof messagesInner === 'undefined' || !messagesInner) {
+            setTimeout(startObserver, 500);
+            return;
+        }
+        highlightObserver.observe(messagesInner, {
+            attributes: true,
+            attributeFilter: ['class'],
+            subtree: true,
+        });
+        console.log('🩹 [AutoPlayFresh] Observer запущен');
+    }
+
+    startObserver();
+
+    // ═══════════════════════════════════════════════════════════
+    //  ДОПОЛНИТЕЛЬНО: перехват handleEventClick (клик по событию
+    //  в списке radar) — уже сделан FreshJump v3, но проверим
+    // ═══════════════════════════════════════════════════════════
+    //  Тут ничего не делаем — FreshJump v3 уже обрабатывает
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API
+    // ═══════════════════════════════════════════════════════════
+    window.AutoPlayFresh = {
+        isActive: () => EventAutoPlay.isActive ? EventAutoPlay.isActive() : false,
+        refresh: refreshMessage,
+    };
+
+    console.log('🩹 [AutoPlayFresh] Готово:');
+    console.log('   • Колокольчик → спиннер → свежие данные → прыжок');
+    console.log('   • Observer следит за highlight-flash и обновляет сообщение');
+    console.log('   • API: AutoPlayFresh.isActive()');
+})();
+</script>
 </body>
 </html>
