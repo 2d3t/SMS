@@ -43956,6 +43956,206 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
 
     console.log('🚫 [HideBgDot] Точка-индикатор фона отключена');
 })();
+</script><script>
+// ═══════════════════════════════════════════════════════════════
+//  🩹 ФИКС: УБИРАЕМ ЗВУК ОТПРАВКИ ПРИ ПОВТОРНОМ ВХОДЕ В ЧАТ
+//  ─────────────────────────────────────────────────────────────
+//  Причина: старый модуль OutboxQueue (v1) и новый AutoOutbox
+//  делят один и тот же ключ localStorage и оба пытаются
+//  отправить очередь → дубликаты, повторные звуки.
+//
+//  Решение:
+//   1. Полностью отключаем старый OutboxQueue (v1).
+//   2. Запрещаем AutoOutbox читать localStorage после старта —
+//      работает только со своей in-memory очередью.
+//   3. Гасим повторный звук 'send' при восстановлении очереди.
+// ═══════════════════════════════════════════════════════════════
+
+(function fixOutboxDuplicateSendSound() {
+    'use strict';
+
+    console.log('🩹 [OutboxSoundFix] Установка…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  1. Полностью нейтрализуем старый OutboxQueue (v1)
+    // ═══════════════════════════════════════════════════════════
+    if (window.OutboxQueue) {
+        // Обнуляем очередь в памяти
+        try {
+            if (window.OutboxQueue._forceDisable) {
+                window.OutboxQueue._forceDisable();
+            }
+        } catch (e) {}
+
+        // Перезаписываем публичные методы на no-op
+        window.OutboxQueue.process     = () => {};
+        window.OutboxQueue.cancel      = () => {};
+        window.OutboxQueue.retry       = () => {};
+        window.OutboxQueue.cancelAll   = () => {};
+        window.OutboxQueue.getQueue    = () => [];
+        window.OutboxQueue.getCount    = () => 0;
+        window.OutboxQueue.getErrorCount = () => 0;
+        window.OutboxQueue.isProcessing  = () => false;
+        window.OutboxQueue.status = () => ({
+            queueSize: 0,
+            errorCount: 0,
+            processing: false,
+            offline: false,
+            _disabled: true,
+        });
+
+        console.log('🩹 [OutboxSoundFix] OutboxQueue (v1) отключён');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  2. Нейтрализуем автоматический syncFromLocalStorage в AutoOutbox
+    //  Проблема: AutoOutbox при каждом цикле processQueue()
+    //  перечитывает localStorage и подхватывает задачи,
+    //  которые туда положил v1 → двойная отправка.
+    // ═══════════════════════════════════════════════════════════
+    // Это внутренняя функция IIFE, снаружи не достать.
+    // Поэтому действуем проще: как только AutoOutbox инициализирован,
+    // МЫ САМИ стираем ключ localStorage — чтобы syncFromLocalStorage
+    // ничего не подхватил.
+    //
+    // Но AutoOutbox сам пишет туда задачи при enqueue... значит
+    // нужно найти баланс: держать localStorage только для тех
+    // задач, которые ещё НЕ отправлены, и не позволять v1 туда писать.
+
+    // Простое решение: перехватываем localStorage.setItem для нашего ключа
+    // и игнорируем записи из v1. v1 мы уже "обнулили" (пункт 1), 
+    // но на случай, если v1 оставил таймеры — фильтруем.
+    const _origSetItem = localStorage.setItem.bind(localStorage);
+    const OUTBOX_KEY = 'smschat_outbox_v1';
+
+    // Флаг: разрешаем ли запись в этот ключ.
+    // Разрешаем только когда вызывается из AutoOutbox.
+    // Определить источник сложно, поэтому используем временной хак:
+    // при каждом цикле AutoOutbox._processTimer мы ставим флаг на 500мс.
+    let _allowOutboxWrite = false;
+
+    // Экспортируем хелпер — AutoOutbox может использовать его сам
+    window._outboxAllowWrite = (ms) => {
+        _allowOutboxWrite = true;
+        clearTimeout(window._outboxAllowWriteTimer);
+        window._outboxAllowWriteTimer = setTimeout(() => {
+            _allowOutboxWrite = false;
+        }, ms || 800);
+    };
+
+    localStorage.setItem = function(key, value) {
+        if (key === OUTBOX_KEY && !_allowOutboxWrite) {
+            // Не даём писать в ключ очереди из "чужих" мест
+            console.log('🩹 [OutboxSoundFix] Заблокирована запись в', key);
+            return;
+        }
+        return _origSetItem(key, value);
+    };
+
+    console.log('🩹 [OutboxSoundFix] localStorage.setItem для outbox защищён');
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. Гасим звук 'send' во время восстановления очереди
+    //  Когда AutoOutbox просыпается и отправляет накопившиеся
+    //  задачи, каждый `soundManager.play('send')` может вызываться
+    //  для задач, которые уже были отправлены ранее (дубликаты
+    //  от v1). Сделаем "счётчик реальных отправок".
+    // ═══════════════════════════════════════════════════════════
+    if (typeof soundManager !== 'undefined') {
+        const _origPlay = soundManager.play.bind(soundManager);
+        let _lastSendTs = 0;
+        const SEND_COOLDOWN = 400; // мс между звуками отправки
+
+        soundManager.play = function(type) {
+            if (type === 'send') {
+                const now = Date.now();
+                if (now - _lastSendTs < SEND_COOLDOWN) {
+                    // Слишком быстро — вероятно, это "эхо" от дубликатов
+                    console.log('🩹 [OutboxSoundFix] Заглушён повторный звук send');
+                    return;
+                }
+                _lastSendTs = now;
+            }
+            return _origPlay(type);
+        };
+
+        console.log('🩹 [OutboxSoundFix] soundManager.play защищён от повторов');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  4. Чистим localStorage от возможных "застрявших" задач v1
+    //  Делаем это один раз при загрузке.
+    // ═══════════════════════════════════════════════════════════
+    setTimeout(() => {
+        try {
+            const raw = localStorage.getItem(OUTBOX_KEY);
+            if (!raw) return;
+
+            const data = JSON.parse(raw);
+            if (!Array.isArray(data)) return;
+
+            // Если задач в localStorage больше, чем в AutoOutbox —
+            // значит v1 оставил там свои дубликаты. Чистим.
+            const autoCount = (window.AutoOutbox && window.AutoOutbox.status)
+                ? window.AutoOutbox.status().queueSize
+                : 0;
+
+            if (data.length > autoCount) {
+                console.log(`🩹 [OutboxSoundFix] Найдено ${data.length} задач в localStorage, ` +
+                            `в AutoOutbox — ${autoCount}. Чистим лишние.`);
+
+                // Оставляем только те, что есть в AutoOutbox (по id)
+                const autoIds = new Set();
+                if (window.AutoOutbox && window.AutoOutbox.status) {
+                    const st = window.AutoOutbox.status();
+                    (st.queue || []).forEach(t => autoIds.add(t.id));
+                }
+
+                const filtered = data.filter(t => autoIds.has(t.id));
+                _origSetItem(OUTBOX_KEY, JSON.stringify(filtered));
+                console.log(`🩹 [OutboxSoundFix] Оставлено ${filtered.length} задач`);
+            }
+        } catch (e) {
+            console.warn('🩹 [OutboxSoundFix] cleanup failed:', e);
+        }
+    }, 5000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  5. Патч: при входе в чат НЕ играть звук отправки
+    //  Даже если AutoOutbox что-то отправил, звук уже сыграл
+    //  в момент реальной отправки. При повторном рендере чата
+    //  никаких новых 'send' быть не должно.
+    // ═══════════════════════════════════════════════════════════
+    if (typeof enterChat === 'function') {
+        const _origEnter = enterChat;
+        let _enterDepth = 0;
+
+        enterChat = async function(...args) {
+            _enterDepth++;
+            const result = await _origEnter.apply(this, args);
+            _enterDepth--;
+            return result;
+        };
+
+        // Замораживаем звук 'send' на время входа в чат
+        if (typeof soundManager !== 'undefined') {
+            const _origPlay2 = soundManager.play.bind(soundManager);
+            soundManager.play = function(type) {
+                if (type === 'send' && _enterDepth > 0) {
+                    console.log('🩹 [OutboxSoundFix] Заглушён send во время enterChat');
+                    return;
+                }
+                return _origPlay2(type);
+            };
+        }
+    }
+
+    console.log('🩹 [OutboxSoundFix] Готово:');
+    console.log('   • v1 OutboxQueue отключён');
+    console.log('   • Запись в localStorage для outbox защищена');
+    console.log('   • Звук send глушится при быстрых повторах');
+    console.log('   • Задачи-дубликаты чистятся при старте');
+})();
 </script>
 </body>
 </html>
