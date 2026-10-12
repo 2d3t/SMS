@@ -45274,6 +45274,605 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
 
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🖼️ АВТО-АВАТАРКИ ДЛЯ ВСЕХ ЧАТОВ v2
+//  Спрашивает: заменить существующие или оставить?
+// ═══════════════════════════════════════════════════════════════
 
+(function installAutoAvatarsV2() {
+    'use strict';
+
+    const AUTO_AVATAR_KEY = 'chathub_auto_avatars_v1';
+
+    // ═══════════════════════════════════════════════════════════
+    //  БЕСПЛАТНЫЕ ИСТОЧНИКИ
+    // ═══════════════════════════════════════════════════════════
+    const DICEBEAR_STYLES = [
+        'avataaars', 'bottts', 'fun-emoji', 'identicon', 'initials',
+        'micah', 'miniavs', 'personas', 'thumbs', 'adventurer',
+        'big-ears', 'croodles', 'lorelei', 'notionists', 'open-peeps',
+        'pixel-art', 'shapes',
+    ];
+
+    const DICEBEAR_COLORS = [
+        '6c5ce7', '00b894', 'feca57', 'ff6b6b',
+        '5CA8FF', 'F36BE1', '4FD166', 'B36BFF',
+        'FFA85C', '3FC9C1', '7B7FF6', 'FF516A',
+    ];
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХЕШ
+    // ═══════════════════════════════════════════════════════════
+    function hashString(str) {
+        let hash = 0x811c9dc5;
+        for (let i = 0; i < str.length; i++) {
+            hash ^= str.charCodeAt(i);
+            hash = (hash * 0x01000193) >>> 0;
+        }
+        return hash;
+    }
+
+    function generateAvatarUrl(chatFile, chatName) {
+        const seed = chatFile || chatName || 'chat';
+        const hash = hashString(seed);
+        const style = DICEBEAR_STYLES[hash % DICEBEAR_STYLES.length];
+        const bgColor = DICEBEAR_COLORS[(hash >> 8) % DICEBEAR_COLORS.length];
+        return `https://api.dicebear.com/7.x/${style}/svg?seed=${encodeURIComponent(seed)}&backgroundColor=${bgColor}&size=128`;
+    }
+
+    async function fetchAvatarAsDataUrl(url) {
+        const res = await fetch(url, { mode: 'cors', cache: 'force-cache' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const blob = await res.blob();
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(reader.result);
+            reader.onerror = reject;
+            reader.readAsDataURL(blob);
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  🆕 ПРОВЕРКА: какие чаты уже имеют аватарки
+    // ═══════════════════════════════════════════════════════════
+    function analyzeCurrentState() {
+        if (typeof loadAvatars === 'function') loadAvatars();
+
+        const chats = state.chats || [];
+        const withAvatar = [];
+        const withoutAvatar = [];
+
+        for (const chat of chats) {
+            const hasAvatar = typeof getChatAvatar === 'function'
+                ? !!getChatAvatar(chat.file)
+                : false;
+
+            if (hasAvatar) withAvatar.push(chat);
+            else withoutAvatar.push(chat);
+        }
+
+        return {
+            total: chats.length,
+            withAvatar,
+            withoutAvatar,
+            hasAnyExisting: withAvatar.length > 0,
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  🆕 МОДАЛКА-ВЫБОР
+    // ═══════════════════════════════════════════════════════════
+    function showModeChoiceModal(analysis) {
+        return new Promise((resolve) => {
+            const modal = document.createElement('div');
+            modal.id = 'autoAvatarChoiceModal';
+            modal.className = 'image-modal active';
+            modal.innerHTML = `
+                <div class="form-modal-content" style="max-width:460px;" onclick="event.stopPropagation()">
+                    <h2 style="font-size:18px;margin-bottom:12px;">🖼️ Установить аватарки?</h2>
+
+                    <div style="
+                        background: rgba(108,92,231,0.08);
+                        border: 1px solid rgba(108,92,231,0.25);
+                        border-radius: 12px;
+                        padding: 14px 16px;
+                        margin-bottom: 18px;
+                        line-height: 1.7;
+                        font-size: 13px;
+                        color: #ccc;
+                    ">
+                        <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+                            <span>📊 Всего чатов:</span>
+                            <strong style="color:#fff;">${analysis.total}</strong>
+                        </div>
+                        <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+                            <span>✅ Уже с аватарками:</span>
+                            <strong style="color:#00b894;">${analysis.withAvatar.length}</strong>
+                        </div>
+                        <div style="display:flex;justify-content:space-between;">
+                            <span>⚪ Без аватарок:</span>
+                            <strong style="color:#feca57;">${analysis.withoutAvatar.length}</strong>
+                        </div>
+                    </div>
+
+                    <div style="font-size:13px;color:#888;margin-bottom:14px;line-height:1.6;">
+                        Что делать с чатами, у которых <strong style="color:#fff;">уже есть</strong> аватарки?
+                    </div>
+
+                    <div style="display:flex;flex-direction:column;gap:10px;margin-bottom:18px;">
+                        <button class="auto-av-choice-btn" data-mode="keep" style="
+                            text-align:left;
+                            padding:14px 16px;
+                            background:rgba(0,184,148,0.12);
+                            border:1px solid rgba(0,184,148,0.4);
+                            border-radius:12px;
+                            color:#fff;
+                            cursor:pointer;
+                            font-family:inherit;
+                            display:flex;
+                            align-items:center;
+                            gap:12px;
+                            transition:all 0.15s;
+                        ">
+                            <span style="font-size:24px;flex-shrink:0;">🛡️</span>
+                            <span style="flex:1;min-width:0;">
+                                <div style="font-size:14px;font-weight:700;margin-bottom:2px;">Оставить существующие</div>
+                                <div style="font-size:11px;color:#888;">Установлю только там, где их нет (${analysis.withoutAvatar.length} чатов)</div>
+                            </span>
+                        </button>
+
+                        <button class="auto-av-choice-btn" data-mode="replace" style="
+                            text-align:left;
+                            padding:14px 16px;
+                            background:rgba(255,159,67,0.12);
+                            border:1px solid rgba(255,159,67,0.4);
+                            border-radius:12px;
+                            color:#fff;
+                            cursor:pointer;
+                            font-family:inherit;
+                            display:flex;
+                            align-items:center;
+                            gap:12px;
+                            transition:all 0.15s;
+                        ">
+                            <span style="font-size:24px;flex-shrink:0;">🔄</span>
+                            <span style="flex:1;min-width:0;">
+                                <div style="font-size:14px;font-weight:700;margin-bottom:2px;">Заменить все</div>
+                                <div style="font-size:11px;color:#888;">Новые аватарки для всех ${analysis.total} чатов</div>
+                            </span>
+                        </button>
+
+                        <button class="auto-av-choice-btn" data-mode="cancel" style="
+                            text-align:center;
+                            padding:12px 16px;
+                            background:rgba(255,255,255,0.04);
+                            border:1px solid rgba(255,255,255,0.08);
+                            border-radius:12px;
+                            color:#888;
+                            cursor:pointer;
+                            font-family:inherit;
+                            font-size:13px;
+                            font-weight:600;
+                            transition:all 0.15s;
+                        ">
+                            Отмена
+                        </button>
+                    </div>
+                </div>
+            `;
+
+            document.body.appendChild(modal);
+
+            // Стили hover
+            const style = document.createElement('style');
+            style.textContent = `
+                .auto-av-choice-btn:hover {
+                    transform: translateY(-1px);
+                    filter: brightness(1.15);
+                }
+                .auto-av-choice-btn:active {
+                    transform: scale(0.98);
+                }
+            `;
+            modal.appendChild(style);
+
+            // Обработчики
+            modal.querySelectorAll('.auto-av-choice-btn').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const mode = btn.dataset.mode;
+                    modal.remove();
+
+                    if (mode === 'cancel') {
+                        resolve(null);
+                    } else {
+                        resolve(mode); // 'keep' | 'replace'
+                    }
+
+                    if (typeof soundManager !== 'undefined') {
+                        soundManager.play('click');
+                    }
+                });
+            });
+
+            // Клик по фону = отмена
+            modal.addEventListener('click', (e) => {
+                if (e.target === modal) {
+                    modal.remove();
+                    resolve(null);
+                }
+            });
+
+            // Esc = отмена
+            const onEsc = (e) => {
+                if (e.key === 'Escape') {
+                    document.removeEventListener('keydown', onEsc, true);
+                    modal.remove();
+                    resolve(null);
+                }
+            };
+            document.addEventListener('keydown', onEsc, true);
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ГЛАВНАЯ ФУНКЦИЯ
+    // ═══════════════════════════════════════════════════════════
+    async function installAvatarsForAllChats() {
+        if (!state || !state.chats || state.chats.length === 0) {
+            showToastSafe('📭 Нет чатов для установки аватарок', 2000);
+            return;
+        }
+
+        if (typeof loadAvatars === 'function') loadAvatars();
+
+        // 🆕 Анализ текущего состояния
+        const analysis = analyzeCurrentState();
+
+        let mode = 'keep';   // по умолчанию — только для тех, у кого нет
+
+        // 🆕 Если есть хоть одна существующая — спрашиваем
+        if (analysis.hasAnyExisting) {
+            const choice = await showModeChoiceModal(analysis);
+            if (!choice) {
+                console.log('🖼️ [AutoAvatars v2] Отменено пользователем');
+                return;
+            }
+            mode = choice;
+        }
+
+        // Определяем список для обработки
+        let chatsToProcess;
+        if (mode === 'replace') {
+            chatsToProcess = analysis.withAvatar.concat(analysis.withoutAvatar);
+            console.log(`🖼️ [AutoAvatars v2] Режим: ЗАМЕНИТЬ ВСЕ (${chatsToProcess.length} чатов)`);
+        } else {
+            chatsToProcess = analysis.withoutAvatar;
+            console.log(`🖼️ [AutoAvatars v2] Режим: ОСТАВИТЬ СУЩЕСТВУЮЩИЕ (${chatsToProcess.length} из ${analysis.total})`);
+        }
+
+        // Если нечего обрабатывать
+        if (chatsToProcess.length === 0) {
+            showToastSafe('✅ У всех чатов уже есть аватарки', 2500);
+            return;
+        }
+
+        // 🆕 Если режим "оставить", но есть существующие — предупреждаем
+        // что существующие НЕ будут перерисованы
+        if (mode === 'keep' && analysis.withAvatar.length > 0) {
+            showToastSafe(
+                `🛡️ Сохранены существующие: ${analysis.withAvatar.length} · Устанавливаем: ${analysis.withoutAvatar.length}`,
+                3000
+            );
+        }
+
+        // Показываем прогресс
+        showProgressOverlay(chatsToProcess.length);
+
+        let success = 0;
+        let failed = 0;
+        let skipped = 0;
+
+        const BATCH_SIZE = 3;
+
+        for (let i = 0; i < chatsToProcess.length; i += BATCH_SIZE) {
+            const batch = chatsToProcess.slice(i, i + BATCH_SIZE);
+
+            const results = await Promise.allSettled(
+                batch.map(async (chat) => {
+                    const file = chat.file;
+
+                    // 🆕 Проверка: в режиме "keep" — пропускаем, если уже есть
+                    if (mode === 'keep') {
+                        const hasAvatar = typeof getChatAvatar === 'function'
+                            ? !!getChatAvatar(chat.file)
+                            : false;
+                        if (hasAvatar) {
+                            return { status: 'skipped', file };
+                        }
+                    }
+
+                    const url = generateAvatarUrl(file, chat.name);
+                    const dataUrl = await fetchAvatarAsDataUrl(url);
+
+                    // Сохраняем
+                    if (typeof _avatars !== 'undefined' && typeof saveAvatars === 'function') {
+                        _avatars[file] = dataUrl;
+                    } else {
+                        const raw = localStorage.getItem('chathub_avatars');
+                        const avatars = raw ? JSON.parse(raw) : {};
+                        avatars[file] = dataUrl;
+                        localStorage.setItem('chathub_avatars', JSON.stringify(avatars));
+                    }
+
+                    return { status: 'success', file };
+                })
+            );
+
+            for (const r of results) {
+                if (r.status === 'fulfilled') {
+                    if (r.value.status === 'success') success++;
+                    else if (r.value.status === 'skipped') skipped++;
+                } else {
+                    failed++;
+                }
+            }
+
+            updateProgressOverlay(
+                Math.min(i + BATCH_SIZE, chatsToProcess.length),
+                chatsToProcess.length,
+                success,
+                failed,
+                skipped
+            );
+
+            await new Promise(r => setTimeout(r, 100));
+        }
+
+        if (typeof saveAvatars === 'function') saveAvatars();
+
+        hideProgressOverlay();
+
+        // Обновляем все аватарки на странице
+        if (typeof refreshAllAvatarsForChat === 'function') {
+            chatsToProcess.forEach(c => {
+                try { refreshAllAvatarsForChat(c.file); } catch (e) {}
+            });
+        }
+
+        if (typeof renderChatsList === 'function') {
+            renderChatsList();
+        }
+
+        // Результат
+        const modeText = mode === 'replace' ? '🔄 Заменено' : '🛡️ Установлено';
+        const msg = `${modeText}: ${success}` +
+                    (skipped > 0 ? ` · Пропущено: ${skipped}` : '') +
+                    (failed > 0 ? ` · Ошибок: ${failed}` : '');
+        showToastSafe(msg, 3500);
+
+        if (typeof soundManager !== 'undefined') {
+            soundManager.play(success > 0 ? 'send' : 'error');
+        }
+
+        return { success, failed, skipped };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПРОГРЕСС-ОВЕРЛЕЙ
+    // ═══════════════════════════════════════════════════════════
+    function showProgressOverlay(total) {
+        let overlay = document.getElementById('autoAvatarsOverlay');
+        if (overlay) overlay.remove();
+
+        overlay = document.createElement('div');
+        overlay.id = 'autoAvatarsOverlay';
+        overlay.innerHTML = `
+            <div class="auto-av-card">
+                <div class="auto-av-icon">🖼️</div>
+                <div class="auto-av-title">Устанавливаем аватарки</div>
+                <div class="auto-av-sub" id="autoAvSub">0 из ${total}</div>
+                <div class="auto-av-bar">
+                    <div class="auto-av-fill" id="autoAvFill"></div>
+                </div>
+                <div class="auto-av-stats">
+                    <span class="auto-av-stat success">✅ <span id="autoAvSuccess">0</span></span>
+                    <span class="auto-av-stat skipped">⏭ <span id="autoAvSkipped">0</span></span>
+                    <span class="auto-av-stat failed">❌ <span id="autoAvFailed">0</span></span>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(overlay);
+
+        if (!document.getElementById('autoAvatarsStyles')) {
+            const style = document.createElement('style');
+            style.id = 'autoAvatarsStyles';
+            style.textContent = `
+                #autoAvatarsOverlay {
+                    position: fixed; inset: 0;
+                    background: rgba(0, 0, 0, 0.8);
+                    backdrop-filter: blur(10px);
+                    -webkit-backdrop-filter: blur(10px);
+                    z-index: 9000;
+                    display: flex; align-items: center; justify-content: center;
+                    padding: 20px;
+                    animation: autoAvFadeIn 0.25s ease;
+                }
+                @keyframes autoAvFadeIn { from { opacity: 0; } to { opacity: 1; } }
+                .auto-av-card {
+                    background: #1a1a2e;
+                    border: 1px solid rgba(108, 92, 231, 0.4);
+                    border-radius: 22px;
+                    padding: 28px 26px;
+                    max-width: 360px; width: 100%;
+                    text-align: center;
+                    box-shadow: 0 24px 72px rgba(0, 0, 0, 0.7);
+                    animation: autoAvSlideUp 0.3s cubic-bezier(0.22, 0.61, 0.36, 1);
+                }
+                @keyframes autoAvSlideUp {
+                    from { transform: scale(0.94) translateY(20px); opacity: 0; }
+                    to { transform: scale(1) translateY(0); opacity: 1; }
+                }
+                .auto-av-icon {
+                    font-size: 48px; margin-bottom: 12px; line-height: 1;
+                    animation: autoAvIconPulse 2s ease-in-out infinite;
+                }
+                @keyframes autoAvIconPulse {
+                    0%, 100% { transform: scale(1); }
+                    50% { transform: scale(1.1); }
+                }
+                .auto-av-title {
+                    font-size: 18px; font-weight: 700; color: #fff;
+                    margin-bottom: 6px;
+                }
+                .auto-av-sub {
+                    font-size: 13px; color: #888;
+                    margin-bottom: 16px;
+                    font-variant-numeric: tabular-nums;
+                }
+                .auto-av-bar {
+                    height: 8px;
+                    background: rgba(255, 255, 255, 0.08);
+                    border-radius: 4px;
+                    overflow: hidden;
+                    margin-bottom: 14px;
+                }
+                .auto-av-fill {
+                    height: 100%; width: 0%;
+                    background: linear-gradient(90deg, #6c5ce7, #00b894);
+                    border-radius: 4px;
+                    transition: width 0.3s ease;
+                }
+                .auto-av-stats {
+                    display: flex; justify-content: center;
+                    gap: 18px;
+                    font-size: 13px; font-weight: 600;
+                }
+                .auto-av-stat.success { color: #00b894; }
+                .auto-av-stat.skipped { color: #feca57; }
+                .auto-av-stat.failed { color: #ff6b6b; }
+            `;
+            document.head.appendChild(style);
+        }
+    }
+
+    function updateProgressOverlay(current, total, success, failed, skipped) {
+        const sub = document.getElementById('autoAvSub');
+        const fill = document.getElementById('autoAvFill');
+        const successEl = document.getElementById('autoAvSuccess');
+        const skippedEl = document.getElementById('autoAvSkipped');
+        const failedEl = document.getElementById('autoAvFailed');
+
+        if (sub) sub.textContent = `${current} из ${total}`;
+        if (fill) fill.style.width = `${Math.round((current / total) * 100)}%`;
+        if (successEl) successEl.textContent = success;
+        if (skippedEl) skippedEl.textContent = skipped;
+        if (failedEl) failedEl.textContent = failed;
+    }
+
+    function hideProgressOverlay() {
+        const overlay = document.getElementById('autoAvatarsOverlay');
+        if (overlay) {
+            overlay.style.transition = 'opacity 0.3s';
+            overlay.style.opacity = '0';
+            setTimeout(() => overlay.remove(), 300);
+        }
+    }
+
+    function showToastSafe(msg, dur) {
+        if (typeof showToast === 'function') {
+            showToast(msg, dur || 2000);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУНКТ В МЕНЮ "⋯"
+    // ═══════════════════════════════════════════════════════════
+    function injectAutoAvatarMenuItem() {
+        const menu = document.getElementById('chatsActionsMenu');
+        if (!menu) return;
+        if (menu.querySelector('[data-action="auto-avatars"]')) return;
+
+        const cacheItem = menu.querySelector('[data-action="clear-cache"]');
+        if (!cacheItem) return;
+
+        const divider = document.createElement('div');
+        divider.className = 'ucm-divider';
+
+        const item = document.createElement('div');
+        item.className = 'ucm-item';
+        item.dataset.action = 'auto-avatars';
+        item.innerHTML = `
+            <span class="ucm-icon">🖼️</span>
+            <span class="ucm-label">Аватарки всем чатам</span>
+        `;
+
+        if (cacheItem.nextSibling) {
+            cacheItem.parentNode.insertBefore(divider, cacheItem.nextSibling);
+            cacheItem.parentNode.insertBefore(item, divider.nextSibling);
+        } else {
+            cacheItem.parentNode.appendChild(divider);
+            cacheItem.parentNode.appendChild(item);
+        }
+
+        item.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            menu.classList.remove('show');
+            const backdrop = document.getElementById('chatsActionsMenuBackdrop');
+            if (backdrop) backdrop.classList.remove('show');
+
+            await new Promise(r => setTimeout(r, 200));
+            await installAvatarsForAllChats();
+        });
+
+        console.log('🖼️ [AutoAvatars v2] Пункт меню добавлен');
+    }
+
+    const observer = new MutationObserver(() => {
+        if (document.getElementById('chatsActionsMenu')) {
+            injectAutoAvatarMenuItem();
+        }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    document.addEventListener('click', (e) => {
+        if (e.target.closest('#chatsActionsBtn')) {
+            setTimeout(injectAutoAvatarMenuItem, 50);
+            setTimeout(injectAutoAvatarMenuItem, 150);
+        }
+    }, true);
+
+    setTimeout(injectAutoAvatarMenuItem, 2000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  API
+    // ═══════════════════════════════════════════════════════════
+    window.AutoAvatars = {
+        install: installAvatarsForAllChats,
+        analyze: analyzeCurrentState,
+        generateUrl: generateAvatarUrl,
+        styles: DICEBEAR_STYLES,
+        colors: DICEBEAR_COLORS,
+
+        reset: () => {
+            if (confirm('Удалить все аватарки чатов?')) {
+                try {
+                    localStorage.removeItem('chathub_avatars');
+                    if (typeof _avatars !== 'undefined') {
+                        Object.keys(_avatars).forEach(k => delete _avatars[k]);
+                    }
+                    if (typeof renderChatsList === 'function') renderChatsList();
+                    showToastSafe('🗑️ Аватарки удалены', 1500);
+                } catch (e) {}
+            }
+        },
+    };
+
+    console.log('🖼️ [AutoAvatars v2] Модуль загружен');
+    console.log('   • Пункт меню: "🖼️ Аватарки всем чатам"');
+    console.log('   • Спрашивает: заменить или оставить существующие');
+    console.log('   • API: AutoAvatars.install() / .analyze() / .reset()');
+})();
+</script>
 </body>
 </html>
