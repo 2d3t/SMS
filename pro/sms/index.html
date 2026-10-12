@@ -43956,6 +43956,245 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
 
     console.log('🚫 [HideBgDot] Точка-индикатор фона отключена');
 })();
+
+// ═══════════════════════════════════════════════════════════════
+//  🩹 ПАТЧ: УДЕРЖАНИЕ ПОЗИЦИИ ПРИ ДОСТИЖЕНИИ ВЕРХА ЧАТА
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: когда в чате мало сообщений и пользователь
+//  прокручивает вверх до самого начала, срабатывает логика
+//  auto-scroll (из-за загрузки вложений, catchup-таймеров и т.д.)
+//  и пользователя отбрасывает обратно вниз.
+//
+//  Решение: патчим scrollToBottom и связанные функции так, чтобы
+//  они игнорировались, когда пользователь находится у верха чата.
+// ═══════════════════════════════════════════════════════════════
+
+(function installTopScrollFreeze() {
+    'use strict';
+
+    console.log('🩹 [TopFreeze] Установка патча…');
+
+    // ─── Состояние ───
+    const TopFreeze = {
+        active: false,
+        activatedAt: 0,
+        // Сколько миллисекунд держать «заморозку» после касания верха
+        durationMs: 5000,
+        // Если пользователь у верха — считаем что он там
+        _timer: null,
+    };
+
+    // ─── Определяем «у верха» ───
+    function isAtTop() {
+        if (!messagesContainer) return false;
+        return messagesContainer.scrollTop < 10;   // допуск 10px
+    }
+
+    // ─── Активируем заморозку ───
+    function activateTopFreeze(reason) {
+        TopFreeze.active = true;
+        TopFreeze.activatedAt = Date.now();
+
+        if (TopFreeze._timer) clearTimeout(TopFreeze._timer);
+        TopFreeze._timer = setTimeout(() => {
+            TopFreeze.active = false;
+            console.log('🔓 [TopFreeze] Разморожено (таймаут)');
+        }, TopFreeze.durationMs);
+
+        console.log(`🔒 [TopFreeze] Заморозка активирована (${reason})`);
+    }
+
+    // ─── Деактивируем заморозку ───
+    function deactivateTopFreeze() {
+        if (!TopFreeze.active) return;
+        TopFreeze.active = false;
+        if (TopFreeze._timer) {
+            clearTimeout(TopFreeze._timer);
+            TopFreeze._timer = null;
+        }
+        console.log('🔓 [TopFreeze] Разморожено (пользователь ушёл с верха)');
+    }
+
+    // ─── Проверяем: активна ли заморозка прямо сейчас ───
+    function isTopFreezeActive() {
+        if (!TopFreeze.active) return false;
+        // Автоматический выход по таймауту
+        if (Date.now() - TopFreeze.activatedAt > TopFreeze.durationMs) {
+            TopFreeze.active = false;
+            return false;
+        }
+        // Дополнительная проверка: пользователь всё ещё у верха?
+        if (!isAtTop()) {
+            // Пользователь ушёл с верха — снимаем
+            deactivateTopFreeze();
+            return false;
+        }
+        return true;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СЛЕДИМ ЗА СКРОЛЛОМ — активируем заморозку при достижении верха
+    // ═══════════════════════════════════════════════════════════
+    let _lastScrollTop = 0;
+    let _scrollRaf = null;
+
+    messagesContainer.addEventListener('scroll', () => {
+        if (_scrollRaf) return;
+        _scrollRaf = requestAnimationFrame(() => {
+            _scrollRaf = null;
+
+            const currentTop = messagesContainer.scrollTop;
+
+            // Определяем направление скролла
+            const scrollingUp = currentTop < _lastScrollTop;
+            _lastScrollTop = currentTop;
+
+            // Достигли верха при скролле вверх?
+            if (scrollingUp && currentTop < 10) {
+                if (!TopFreeze.active) {
+                    activateTopFreeze('достигнут верх');
+                }
+            }
+
+            // Если пользователь сдвинулся вниз от верха — снимаем заморозку
+            if (currentTop > 50) {
+                deactivateTopFreeze();
+            }
+        });
+    }, { passive: true });
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧИМ scrollToBottom — игнорируем вызовы во время заморозки
+    // ═══════════════════════════════════════════════════════════
+    const _origScrollToBottom = scrollToBottom;
+
+    scrollToBottom = function(force = false) {
+        // Если заморозка активна — игнорируем
+        if (isTopFreezeActive() && !force) {
+            console.log('🩹 [TopFreeze] scrollToBottom заблокирован (у верха)');
+            return;
+        }
+        return _origScrollToBottom.apply(this, arguments);
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧИМ _scheduleBottomCatchup — не «догоняем» вниз у верха
+    // ═══════════════════════════════════════════════════════════
+    if (typeof _scheduleBottomCatchup === 'function') {
+        const _origCatchup = _scheduleBottomCatchup;
+
+        _scheduleBottomCatchup = function() {
+            if (isTopFreezeActive()) {
+                console.log('🩹 [TopFreeze] catchup заблокирован (у верха)');
+                return;
+            }
+            return _origCatchup.apply(this, arguments);
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧИМ loadAttachmentsIn — не прокручиваем вниз у верха
+    // ═══════════════════════════════════════════════════════════
+    if (typeof loadAttachmentsIn === 'function') {
+        const _origLoadAttachments = loadAttachmentsIn;
+
+        loadAttachmentsIn = async function(root) {
+            const result = await _origLoadAttachments.call(this, root);
+
+            // Если заморозка активна — не трогаем скролл
+            if (isTopFreezeActive()) {
+                return result;
+            }
+
+            // Проверяем: пользователь реально у низа?
+            const diff = messagesContainer.scrollHeight
+                       - messagesContainer.scrollTop
+                       - messagesContainer.clientHeight;
+
+            if (diff > 100) {
+                // Пользователь НЕ у низа — не трогаем
+                // (это уже делает наш якорь-компенсатор)
+                return result;
+            }
+
+            return result;
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧИМ activateInitialFreeze — не трогаем, если мы у верха
+    // ═══════════════════════════════════════════════════════════
+    if (typeof window.activateInitialFreeze === 'function') {
+        const _origFreeze = window.activateInitialFreeze;
+
+        window.activateInitialFreeze = function(durationMs) {
+            if (isAtTop()) {
+                console.log('🩹 [TopFreeze] initialFreeze заблокирован (у верха)');
+                return;
+            }
+            return _origFreeze.call(this, durationMs);
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРИОДИЧЕСКАЯ ПРОВЕРКА — держим scrollTop на месте
+    //  Пока заморозка активна, принудительно удерживаем позицию.
+    // ═══════════════════════════════════════════════════════════
+    let _holdTimer = null;
+
+    function startHolding() {
+        if (_holdTimer) return;
+        _holdTimer = setInterval(() => {
+            if (!isTopFreezeActive()) {
+                // Заморозка кончилась — останавливаем
+                if (_holdTimer) {
+                    clearInterval(_holdTimer);
+                    _holdTimer = null;
+                }
+                return;
+            }
+
+            // Если кто-то пытается сдвинуть скролл вниз — возвращаем
+            if (messagesContainer.scrollTop > 10) {
+                // Но только если это не сам пользователь скроллит
+                // (проверяем через _lastUserScroll)
+                const timeSinceUserAction = Date.now() - (_lastUserScroll || 0);
+                if (timeSinceUserAction > 200) {
+                    messagesContainer.scrollTop = 0;
+                }
+            }
+        }, 100);
+    }
+
+    // Запускаем холдер при активации заморозки
+    const _origActivate = activateTopFreeze;
+    activateTopFreeze = function(reason) {
+        _origActivate.call(this, reason);
+        startHolding();
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API
+    // ═══════════════════════════════════════════════════════════
+    window.TopScrollFreeze = {
+        isActive: isTopFreezeActive,
+        activate: () => activateTopFreeze('manual'),
+        deactivate: deactivateTopFreeze,
+        status: () => ({
+            active: TopFreeze.active,
+            activatedAt: TopFreeze.activatedAt,
+            scrollTop: messagesContainer ? messagesContainer.scrollTop : null,
+            isAtTop: isAtTop(),
+        }),
+    };
+
+    console.log('🩹 [TopFreeze] Патч установлен:');
+    console.log('   • При достижении верха — заморозка на 5 сек');
+    console.log('   • scrollToBottom игнорируется у верха');
+    console.log('   • catchup-таймеры игнорируются у верха');
+    console.log('   • API: TopScrollFreeze.status() / .activate() / .deactivate()');
+})();
+
 </script>
 </body>
 </html>
