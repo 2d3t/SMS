@@ -44158,1535 +44158,801 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
 })();
 </script>
 
-
-
 <script>
 // ═══════════════════════════════════════════════════════════════
-//  🎯 OFFLINE ACTIONS QUEUE — офлайн-очередь для действий
+//  📱 DEVICE TRACKER v2 — уведомления внутри меню «⋯»
 //  ─────────────────────────────────────────────────────────────
-//  Поддерживает офлайн-очередь для:
-//   • Реакций (toggleReaction)
-//   • Комментариев (submitComment, deleteComment)
-//   • Редактирования (confirmEditMessage)
-//   • Удаления (deleteMessage)
-//   • Ответов (reply) — маркер, что сообщение должно лечь с replyTo
-//
-//  Каждое действие = отдельная задача в localStorage.
-//  При появлении сети — выполняются последовательно.
+//  Отличия от v1:
+//   • Нет колокольчика в шапке
+//   • Пункт «📱 Уведомления» внутри меню «⋯»
+//   • Если есть непрочитанные — «⋯» светится + точка мигает
 // ═══════════════════════════════════════════════════════════════
 
-(function installOfflineActionsQueue() {
+(function installDeviceTrackerV2() {
     'use strict';
+
+    console.log('📱 [DeviceTracker v2] Установка…');
 
     // ═══════════════════════════════════════════════════════════
     //  КОНФИГ
     // ═══════════════════════════════════════════════════════════
     const CFG = {
-        storageKey: 'smschat_actions_queue_v1',
-        maxRetries: 5,
-        retryDelayMs: 4000,
-        processIntervalMs: 2500,
-        logPrefix: '🎯 [ActionsQueue]',
+        STORAGE_DEVICE_ID:      'smschat_device_id_v1',
+        STORAGE_DEVICE_LABEL:   'smschat_device_label_v1',
+        STORAGE_KNOWN_DEVICES:  'smschat_known_devices_v1',
+        STORAGE_NOTIFICATIONS:  'smschat_notifications_v1',
+        MAX_NOTIFICATIONS:      200,
+        LOG: '📱 [DeviceTracker]',
     };
 
-    const log = (...a) => console.log(CFG.logPrefix, ...a);
-    const warn = (...a) => console.warn(CFG.logPrefix, ...a);
+    const log = (...a) => console.log(CFG.LOG, ...a);
 
     // ═══════════════════════════════════════════════════════════
-    //  СОСТОЯНИЕ
+    //  DEVICE ID
     // ═══════════════════════════════════════════════════════════
-    const AQ = {
-        queue: [],           // массив задач
-        processing: false,
-        _timer: null,
-    };
-
-    // ═══════════════════════════════════════════════════════════
-    //  УТИЛИТЫ
-    // ═══════════════════════════════════════════════════════════
-    function genId() {
-        return 'aq_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
-    }
-
-    function isOnline() {
-        return navigator.onLine === true;
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ЗАГРУЗКА / СОХРАНЕНИЕ
-    // ═══════════════════════════════════════════════════════════
-    function loadQueue() {
-        try {
-            const raw = localStorage.getItem(CFG.storageKey);
-            if (!raw) return [];
-            const data = JSON.parse(raw);
-            return Array.isArray(data) ? data : [];
-        } catch (e) {
-            warn('loadQueue error:', e);
-            return [];
-        }
-    }
-
-    function saveQueue() {
-        try {
-            localStorage.setItem(CFG.storageKey, JSON.stringify(AQ.queue));
-        } catch (e) {
-            warn('saveQueue error:', e);
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ФОРМАТ ЗАДАЧИ
-    //  {
-    //    id: string,
-    //    type: 'reaction' | 'comment' | 'deleteComment' | 'edit' | 'delete',
-    //    chatFile: string,
-    //    msgId: number,
-    //    // Полезная нагрузка зависит от type:
-    //    payload: {...},
-    //    createdAt: number,
-    //    retries: number,
-    //    status: 'pending' | 'sending' | 'error',
-    //    errorMessage: string | null,
-    //  }
-    // ═══════════════════════════════════════════════════════════
-
-    // ═══════════════════════════════════════════════════════════
-    //  ДОБАВЛЕНИЕ ЗАДАЧИ
-    // ═══════════════════════════════════════════════════════════
-    function enqueue(type, chatFile, msgId, payload) {
-        const task = {
-            id: genId(),
-            type: type,
-            chatFile: chatFile,
-            msgId: msgId,
-            payload: payload || {},
-            createdAt: Date.now(),
-            retries: 0,
-            status: 'pending',
-            errorMessage: null,
-        };
-
-        AQ.queue.push(task);
-        saveQueue();
-
-        log(`➕ Задача добавлена: ${type} (msg=${msgId})`);
-
-        // Обновляем бейджи
-        updateBadges();
-
-        // Если онлайн — сразу пробуем
-        if (isOnline() && typeof state !== 'undefined' && state.isAuthorized) {
-            setTimeout(() => processQueue(), 100);
-        }
-
-        return task.id;
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ОБНОВЛЕНИЕ БЕЙДЖЕЙ
-    // ═══════════════════════════════════════════════════════════
-    function updateBadges() {
-        // Считаем общее число задач вместе с сообщениями из AutoOutbox
-        let msgCount = 0;
-        try {
-            if (window.AutoOutbox && AutoOutbox.status) {
-                msgCount = AutoOutbox.status().queueSize || 0;
-            }
-        } catch (e) {}
-
-        const actionCount = AQ.queue.length;
-        const total = msgCount + actionCount;
-        const errors = AQ.queue.filter(t => t.status === 'error').length;
-
-        // Бейдж на кнопке «Назад»
-        try {
-            const backBtn = document.getElementById('backToChatsBtn');
-            if (backBtn) {
-                let badge = backBtn.querySelector('.auto-outbox-badge');
-                if (total > 0) {
-                    backBtn.style.position = 'relative';
-                    if (!badge) {
-                        badge = document.createElement('span');
-                        badge.className = 'auto-outbox-badge';
-                        backBtn.appendChild(badge);
-                    }
-                    badge.textContent = total > 99 ? '99+' : String(total);
-                    badge.classList.toggle('has-errors', errors > 0);
-                } else if (badge) {
-                    badge.remove();
-                }
-            }
-        } catch (e) {}
-
-        // Счётчик в шапке чата
-        try {
-            const chatHeader = document.querySelector('#chatScreen .chat-header');
-            if (chatHeader && state && state.currentScreen === 'chat') {
-                let counter = chatHeader.querySelector('.auto-outbox-counter');
-                if (total > 0) {
-                    if (!counter) {
-                        counter = document.createElement('div');
-                        counter.className = 'auto-outbox-counter';
-                        chatHeader.appendChild(counter);
-                    }
-                    counter.innerHTML = `
-                        <span>${errors > 0 ? '⚠️' : '⏳'}</span>
-                        <span>${total}</span>
-                    `;
-                    counter.classList.toggle('has-errors', errors > 0);
-                } else if (counter) {
-                    counter.remove();
-                }
-            }
-        } catch (e) {}
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ВЫПОЛНЕНИЕ ЗАДАЧИ
-    // ═══════════════════════════════════════════════════════════
-    async function executeTask(task) {
-        if (!task || !task.type || !task.chatFile) {
-            throw new Error('Некорректная задача');
-        }
-        if (!state || !state.isAuthorized || !state.token) {
-            throw new Error('Нет авторизации');
-        }
-
-        const password = state.savedPasswords[task.chatFile];
-        if (!password) {
-            throw new Error(`Нет пароля для чата ${task.chatFile}`);
-        }
-
-        log(`▶️ Выполняю: ${task.type} (msg=${task.msgId})`);
-
-        // Загружаем файл чата
-        const path = getChatPath(task.chatFile);
-        const result = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
-        if (!result.exists) throw new Error('Чат не найден');
-
-        const fileContent = result.content;
-        if (fileContent.v !== CRYPTO.VERSION) throw new Error('Формат не поддерживается');
-
-        // Деривим ключ для целевого чата
-        const targetKey = await deriveKey(password, fileContent.salt);
-
-        // Находим сообщение
-        const idx = (fileContent.messages || []).findIndex(
-            m => String(m.id) === String(task.msgId)
-        );
-        if (idx === -1) throw new Error('Сообщение не найдено');
-
-        // Расшифровываем
-        const enc = fileContent.messages[idx];
-        const iv = new Uint8Array(base64ToArrayBuffer(enc.iv));
-        const ciphertext = base64ToArrayBuffer(enc.data);
-        const plaintext = await crypto.subtle.decrypt(
-            { name: 'AES-GCM', iv },
-            targetKey,
-            ciphertext
-        );
-        const payload = JSON.parse(new TextDecoder().decode(plaintext));
-
-        // ═══ Применяем действие ═══
-        switch (task.type) {
-            case 'reaction': {
-                const emoji = task.payload.emoji;
-                const username = state.username;
-                if (!emoji) throw new Error('Нет emoji');
-
-                if (!payload.reactions) payload.reactions = {};
-                const list = payload.reactions[emoji] || [];
-                const userIdx = list.indexOf(username);
-
-                if (task.payload.action === 'remove') {
-                    // Убрать
-                    if (userIdx >= 0) list.splice(userIdx, 1);
-                    if (list.length === 0) delete payload.reactions[emoji];
-                    else payload.reactions[emoji] = list;
-                } else {
-                    // Добавить
-                    if (userIdx === -1) {
-                        list.push(username);
-                        payload.reactions[emoji] = list;
-                    }
-                }
-                break;
-            }
-
-            case 'comment': {
-                const comment = task.payload.comment;
-                if (!comment) throw new Error('Нет комментария');
-
-                if (!Array.isArray(payload.comments)) payload.comments = [];
-
-                // Проверяем, не добавлен ли уже
-                const exists = payload.comments.some(c =>
-                    String(c.id) === String(comment.id)
-                );
-                if (!exists) {
-                    payload.comments.push(comment);
-                }
-                break;
-            }
-
-            case 'deleteComment': {
-                const commentId = task.payload.commentId;
-                if (!commentId) throw new Error('Нет commentId');
-
-                if (Array.isArray(payload.comments)) {
-                    payload.comments = payload.comments.filter(
-                        c => String(c.id) !== String(commentId)
-                    );
-                }
-                break;
-            }
-
-            case 'edit': {
-                const newText = task.payload.text;
-                if (typeof newText !== 'string') throw new Error('Нет текста');
-
-                // Проверяем, что сообщение наше
-                if (payload.username !== state.username) {
-                    throw new Error('Не ваше сообщение');
-                }
-                payload.text = newText;
-                payload.edited = true;
-                payload.editedAt = task.payload.editedAt || new Date().toISOString();
-                break;
-            }
-
-            case 'delete': {
-                // Удаление самого сообщения — не через payload, а через splice
-                break;
-            }
-
-            default:
-                throw new Error('Неизвестный тип: ' + task.type);
-        }
-
-        // ═══ Шифруем обратно ═══
-        if (task.type === 'delete') {
-            // Удаление — просто вырезаем сообщение
-            fileContent.messages.splice(idx, 1);
-        } else {
-            // Обновляем — шифруем заново
-            const newIv = generateIV();
-            const newPlain = new TextEncoder().encode(JSON.stringify(payload));
-            const newCipher = await crypto.subtle.encrypt(
-                { name: 'AES-GCM', iv: newIv },
-                targetKey,
-                newPlain
-            );
-
-            fileContent.messages[idx] = {
-                id: enc.id,
-                time: enc.time,
-                iv: arrayBufferToBase64(newIv),
-                data: arrayBufferToBase64(newCipher),
-            };
-        }
-
-        // ═══ Сохраняем файл ═══
-        const saveResult = await saveFile(
-            state.token, CONFIG.repoOwner, CONFIG.repoName,
-            path, fileContent, result.sha,
-            {
-                message: getActionCommitMessage(task),
-                maxRetries: 6,
-                silent: true,
-            }
-        );
-
-        // ═══ Обновляем meta ═══
-        try {
-            const newVersion = Date.now();
-            await updateMeta(task.chatFile, newVersion, fileContent.messages.length);
-        } catch (e) {
-            warn('meta update failed:', e.message);
-        }
-
-        // ═══ Обновляем локальное состояние (если открыт этот чат) ═══
-        if (state.chatFile === task.chatFile) {
-            try {
-                // Обновляем sha
-                state.sha = saveResult.blobSha;
-                state._lastCommitSha = saveResult.commitSha;
-                state.lastMessageCount = fileContent.messages.length;
-
-                // Инвалидируем мета-кэш
-                if (state._metaEtagsByFile) {
-                    state._metaEtagsByFile[task.chatFile] = null;
-                }
-                state._metaEtag = null;
-            } catch (e) {}
-        }
-
-        log(`✅ Выполнено: ${task.type} (msg=${task.msgId})`);
-        return true;
-    }
-
-    function getActionCommitMessage(task) {
-        switch (task.type) {
-            case 'reaction': return `❤️ Реакция ${task.payload.emoji || ''}`;
-            case 'comment': return `💬 Комментарий`;
-            case 'deleteComment': return `🗑️ Удаление комментария`;
-            case 'edit': return `✏️ Редактирование сообщения`;
-            case 'delete': return `🗑️ Удаление сообщения`;
-            default: return `💬 Действие`;
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ОБРАБОТКА ОЧЕРЕДИ
-    // ═══════════════════════════════════════════════════════════
-    async function processQueue() {
-        if (AQ.processing) return;
-        if (AQ.queue.length === 0) return;
-        if (!isOnline()) return;
-        if (!state || !state.isAuthorized || !state.token) return;
-
-        AQ.processing = true;
-
-        try {
-            while (AQ.queue.length > 0) {
-                const task = AQ.queue[0];
-
-                // Ошибка — ждём ручного retry (не мешаем другим)
-                if (task.status === 'error') {
-                    // Пропускаем error-задачи, идём дальше
-                    // (или останавливаемся? лучше пропустить)
-                    log(`⏭ Задача ${task.id} в error, пропускаю`);
-                    // Перемещаем в конец, чтобы не зациклиться
-                    const failed = AQ.queue.shift();
-                    AQ.queue.push(failed);
-                    // Если все задачи в error — выходим
-                    if (AQ.queue.every(t => t.status === 'error')) {
-                        log('Все задачи в error — выход');
-                        break;
-                    }
-                    continue;
-                }
-
-                if (!isOnline()) {
-                    log('Связь пропала — пауза');
-                    break;
-                }
-
-                task.status = 'sending';
-                saveQueue();
-
-                try {
-                    await executeTask(task);
-
-                    // Успех — удаляем
-                    AQ.queue.shift();
-                    saveQueue();
-                    updateBadges();
-
-                    // Звук (тихий)
-                    try {
-                        if (soundManager) soundManager.play('click');
-                    } catch (e) {}
-
-                } catch (err) {
-                    warn(`Ошибка задачи ${task.id} (${task.type}):`, err.message);
-                    task.retries = (task.retries || 0) + 1;
-
-                    const isNetError = isNetworkError(err);
-
-                    if (isNetError && task.retries < CFG.maxRetries) {
-                        task.status = 'pending';
-                        saveQueue();
-                        log(`Сетевая ошибка, повтор позже (${task.retries}/${CFG.maxRetries})`);
-                        await new Promise(r => setTimeout(r, CFG.retryDelayMs));
-                        continue;
-                    }
-
-                    task.status = 'error';
-                    task.errorMessage = err.message || 'Ошибка';
-                    saveQueue();
-                    updateBadges();
-                    break;
-                }
-            }
-        } finally {
-            AQ.processing = false;
-            updateBadges();
-        }
-    }
-
-    function isNetworkError(err) {
-        if (!err) return false;
-        if (!navigator.onLine) return true;
-        const msg = (err.message || '').toLowerCase();
-        if (msg.includes('failed to fetch')) return true;
-        if (msg.includes('networkerror')) return true;
-        if (msg.includes('network error')) return true;
-        if (err.name === 'TypeError') return true;
-        if (err.name === 'AbortError') return true;
-        return false;
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ПЕРЕХВАТ toggleReaction
-    // ═══════════════════════════════════════════════════════════
-    if (typeof window.toggleReaction === 'function') {
-        const _origToggleReaction = window.toggleReaction;
-
-        window.toggleReaction = async function(msgId, emoji) {
-            // Офлайн — в очередь
-            if (!isOnline() && state.isAuthorized && state.chatFile) {
-                log(`📵 Офлайн-реакция: ${emoji} на msg=${msgId}`);
-
-                // Локально применяем сразу (оптимистично)
-                const msg = historyState.allMessages.find(m => m.id === msgId);
-                if (msg) {
-                    if (!msg.reactions) msg.reactions = {};
-                    const list = msg.reactions[emoji] || [];
-                    const userIdx = list.indexOf(state.username);
-                    const isRemoving = userIdx >= 0;
-
-                    if (isRemoving) {
-                        list.splice(userIdx, 1);
-                        if (list.length === 0) delete msg.reactions[emoji];
-                    } else {
-                        list.push(state.username);
-                        msg.reactions[emoji] = list;
-                    }
-
-                    if (typeof updateReactionsInDOM === 'function') {
-                        updateReactionsInDOM(msgId);
-                    }
-
-                    // В очередь
-                    enqueue('reaction', state.chatFile, msgId, {
-                        emoji: emoji,
-                        action: isRemoving ? 'remove' : 'add',
-                    });
-
-                    if (typeof showToast === 'function') {
-                        showToast('📵 Реакция в очереди', 1500);
-                    }
-                    try { soundManager.play('click'); } catch (e) {}
-                }
-                return;
-            }
-
-            // Онлайн — как обычно
-            return _origToggleReaction.call(this, msgId, emoji);
-        };
-        log('patched: toggleReaction');
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ПЕРЕХВАТ submitComment
-    // ═══════════════════════════════════════════════════════════
-    if (typeof window.submitComment === 'function') {
-        const _origSubmitComment = window.submitComment;
-
-        window.submitComment = async function(msgId, text) {
-            if (!text || !text.trim()) return;
-            if (!state.isAuthorized || !state.chatFile) return;
-
-            // Офлайн — в очередь
-            if (!isOnline()) {
-                log(`📵 Офлайн-комментарий на msg=${msgId}: "${text.slice(0, 40)}"`);
-
-                const msg = historyState.allMessages.find(m => m.id === msgId);
-                if (!msg) {
-                    if (typeof showToast === 'function') showToast('❌ Сообщение не найдено');
-                    return;
-                }
-
-                const newComment = {
-                    id: Date.now(),
-                    username: state.username,
-                    text: text.trim().slice(0, 2000),
-                    time: new Date().toISOString(),
-                };
-
-                // Локально применяем
-                if (!msg.comments) msg.comments = [];
-                msg.comments.push(newComment);
-
-                if (typeof updateCommentsInDOM === 'function') {
-                    updateCommentsInDOM(msgId);
-                }
-
-                // В очередь
-                enqueue('comment', state.chatFile, msgId, {
-                    comment: newComment,
-                });
-
-                if (typeof showToast === 'function') {
-                    showToast('💬 Комментарий в очереди', 1500);
-                }
-                try { soundManager.play('send'); } catch (e) {}
-                return;
-            }
-
-            // Онлайн — как обычно
-            return _origSubmitComment.call(this, msgId, text);
-        };
-        log('patched: submitComment');
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ПЕРЕХВАТ deleteComment
-    // ═══════════════════════════════════════════════════════════
-    if (typeof window.deleteComment === 'function') {
-        const _origDeleteComment = window.deleteComment;
-
-        window.deleteComment = async function(msgId, commentId) {
-            if (!state.isAuthorized || !state.chatFile) return;
-
-            const msg = historyState.allMessages.find(m => m.id === msgId);
-            if (!msg || !msg.comments) return;
-
-            const comment = msg.comments.find(c => c.id === commentId);
-            if (!comment) return;
-            if (comment.username !== state.username) {
-                if (typeof showToast === 'function') showToast('❌ Только свои комментарии');
-                return;
-            }
-
-            // Офлайн — в очередь
-            if (!isOnline()) {
-                log(`📵 Офлайн-удаление комментария ${commentId}`);
-
-                const backup = msg.comments.slice();
-                msg.comments = msg.comments.filter(c => c.id !== commentId);
-                if (typeof updateCommentsInDOM === 'function') {
-                    updateCommentsInDOM(msgId);
-                }
-
-                enqueue('deleteComment', state.chatFile, msgId, {
-                    commentId: commentId,
-                });
-
-                if (typeof showToast === 'function') {
-                    showToast('🗑️ Удаление в очереди', 1500);
-                }
-                try { soundManager.play('delete'); } catch (e) {}
-                return;
-            }
-
-            // Онлайн — как обычно
-            return _origDeleteComment.call(this, msgId, commentId);
-        };
-        log('patched: deleteComment');
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ПЕРЕХВАТ confirmEditMessage
-    // ═══════════════════════════════════════════════════════════
-    if (typeof window.confirmEditMessage === 'function') {
-        const _origEditMessage = window.confirmEditMessage;
-
-        window.confirmEditMessage = async function() {
-            if (typeof _editingMessageId === 'undefined' || !_editingMessageId) return;
-            if (!state.isAuthorized || !state.chatFile) return;
-
-            const msgId = _editingMessageId;
-            const newText = document.getElementById('editMessageInput')?.value.trim() || '';
-
-            const msg = historyState.allMessages.find(m => m.id === msgId);
-            if (!msg) return;
-            if (msg.username !== state.username) return;
-
-            const oldText = (msg.text || '').trim();
-            if (newText === oldText) return;
-
-            // Офлайн — в очередь
-            if (!isOnline()) {
-                log(`📵 Офлайн-редактирование msg=${msgId}`);
-
-                msg.text = newText;
-                msg.edited = true;
-                msg.editedAt = new Date().toISOString();
-
-                if (typeof updateMessageInDOM === 'function') {
-                    updateMessageInDOM(msgId, msg);
-                }
-
-                enqueue('edit', state.chatFile, msgId, {
-                    text: newText,
-                    editedAt: msg.editedAt,
-                });
-
-                if (typeof closeEditMessageModal === 'function') {
-                    closeEditMessageModal();
-                }
-                if (typeof showToast === 'function') {
-                    showToast('✏️ Изменение в очереди', 1500);
-                }
-                try { soundManager.play('send'); } catch (e) {}
-                return;
-            }
-
-            // Онлайн — как обычно
-            return _origEditMessage.call(this);
-        };
-        log('patched: confirmEditMessage');
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ТАЙМЕРЫ И СОБЫТИЯ
-    // ═══════════════════════════════════════════════════════════
-    AQ._timer = setInterval(() => {
-        if (document.hidden) return;
-        if (AQ.queue.length === 0) return;
-        if (!isOnline()) return;
-        processQueue();
-    }, CFG.processIntervalMs);
-
-    window.addEventListener('online', () => {
-        log('online → process');
-        setTimeout(processQueue, 600);
-    });
-
-    document.addEventListener('visibilitychange', () => {
-        if (document.hidden) return;
-        if (AQ.queue.length > 0 && isOnline()) {
-            setTimeout(processQueue, 400);
-        }
-    });
-
-    // ═══════════════════════════════════════════════════════════
-    //  ВОССТАНОВЛЕНИЕ ПРИ СТАРТЕ
-    // ═══════════════════════════════════════════════════════════
-    function initFromStorage() {
-        const saved = loadQueue();
-        if (saved.length === 0) return;
-
-        log(`📥 Восстановлено задач: ${saved.length}`);
-        AQ.queue = saved;
-        updateBadges();
-
-        setTimeout(() => {
-            if (isOnline()) {
-                setTimeout(processQueue, 3000);
-            }
-        }, 5000);
-    }
-
-    setTimeout(initFromStorage, 4500);
-
-    // ═══════════════════════════════════════════════════════════
-    //  API
-    // ═══════════════════════════════════════════════════════════
-    window.OfflineActionsQueue = {
-        status: () => ({
-            queueSize: AQ.queue.length,
-            errorCount: AQ.queue.filter(t => t.status === 'error').length,
-            processing: AQ.processing,
-            online: isOnline(),
-            queue: AQ.queue.map(t => ({
-                id: t.id,
-                type: t.type,
-                chat: t.chatFile,
-                msgId: t.msgId,
-                status: t.status,
-                retries: t.retries,
-                createdAt: new Date(t.createdAt).toLocaleTimeString('ru-RU'),
-            })),
-        }),
-        process: () => processQueue(),
-        clearAll: () => {
-            AQ.queue = [];
-            saveQueue();
-            updateBadges();
-            log('🗑️ Очередь действий очищена');
-        },
-        retryAll: () => {
-            AQ.queue.forEach(t => {
-                if (t.status === 'error') {
-                    t.status = 'pending';
-                    t.retries = 0;
-                    t.errorMessage = null;
-                }
-            });
-            saveQueue();
-            updateBadges();
-            processQueue();
-        },
-    };
-
-    log('🚀 Очередь действий готова');
-    log('   API: OfflineActionsQueue.status() / .process() / .clearAll()');
-})();
-</script>
-
-<script>
-// ═══════════════════════════════════════════════════════════════
-//  🔐 NAME LOCK — защита имени паролем внутри чата
-//  ─────────────────────────────────────────────────────────────
-//  • Пользователь устанавливает пароль на своё имя в конкретном чате
-//  • Пароль хранится ТОЛЬКО в его localStorage
-//  • При входе другого человека с тем же именем — 3 попытки ввода
-//  • На 4-й — публичное сообщение в чат
-//  • Управление через 🔒 в шапке чата
-// ═══════════════════════════════════════════════════════════════
-
-(function installNameLock() {
-    'use strict';
-
-    console.log('🔐 [NameLock] Установка…');
-
-    // ═══════════════════════════════════════════════════════════
-    //  КОНФИГ
-    // ═══════════════════════════════════════════════════════════
-    const CFG = {
-        STORAGE_LOCKS: 'smschat_name_locks_v1',  // общие лок-имена в чате
-        STORAGE_MY_KEY: 'smschat_my_key_v1',     // мой личный ключ
-        MAX_ATTEMPTS: 3,                          // попыток до публичного сообщения
-        LOG_PREFIX: '🔐 [NameLock]',
-    };
-
-    const log = (...a) => console.log(CFG.LOG_PREFIX, ...a);
-
-    // ═══════════════════════════════════════════════════════════
-    //  УТИЛИТЫ
-    // ═══════════════════════════════════════════════════════════
-
-    // Короткий deviceId (сохраняется навсегда)
     function getDeviceId() {
-        let id = localStorage.getItem('smschat_device_id');
+        let id = localStorage.getItem(CFG.STORAGE_DEVICE_ID);
         if (!id) {
-            id = 'dev_' + Math.random().toString(36).slice(2, 10);
-            localStorage.setItem('smschat_device_id', id);
+            id = 'dev_' + Date.now().toString(36) + '_' +
+                 Math.random().toString(36).slice(2, 10);
+            localStorage.setItem(CFG.STORAGE_DEVICE_ID, id);
+            log('📱 Создан deviceId:', id);
         }
         return id;
     }
 
-    // SHA-256 от строки → base64url
-    async function sha256Base64(str) {
-        const buf = new TextEncoder().encode(str);
-        const hash = await crypto.subtle.digest('SHA-256', buf);
-        const bytes = new Uint8Array(hash);
-        let bin = '';
-        bytes.forEach(b => bin += String.fromCharCode(b));
-        return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-    }
-
-    // Генерируем verifyHash из пароля
-    async function makeVerifyHash(username, chatFile, password) {
-        return sha256Base64(`${username}:${chatFile}:${password}`);
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ХРАНИЛИЩЕ — ЗАЩИЩЁННЫЕ ИМЕНА В ЧАТЕ
-    // ═══════════════════════════════════════════════════════════
-    function loadLocks() {
+    function detectDeviceLabel() {
         try {
-            return JSON.parse(localStorage.getItem(CFG.STORAGE_LOCKS) || '{}');
-        } catch (e) { return {}; }
-    }
+            const ua = navigator.userAgent;
+            let device = 'Устройство';
+            let browser = '';
 
-    function saveLocks(locks) {
-        try {
-            localStorage.setItem(CFG.STORAGE_LOCKS, JSON.stringify(locks));
-        } catch (e) {}
-    }
-
-    // Защищено ли имя X в чате Y?
-    function getLock(chatFile, username) {
-        const locks = loadLocks();
-        return locks[chatFile]?.[username] || null;
-    }
-
-    // Запомнить защиту имени
-    function setLock(chatFile, username, verifyHash, deviceId) {
-        const locks = loadLocks();
-        if (!locks[chatFile]) locks[chatFile] = {};
-        locks[chatFile][username] = {
-            verifyHash,
-            deviceId: deviceId || null,
-            createdAt: Date.now(),
-            lastUsed: Date.now(),
-        };
-        saveLocks(locks);
-    }
-
-    // Снять защиту имени
-    function removeLock(chatFile, username) {
-        const locks = loadLocks();
-        if (locks[chatFile]?.[username]) {
-            delete locks[chatFile][username];
-            if (Object.keys(locks[chatFile]).length === 0) {
-                delete locks[chatFile];
+            if (/iPhone/i.test(ua)) device = 'iPhone';
+            else if (/iPad/i.test(ua)) device = 'iPad';
+            else if (/Android/i.test(ua)) {
+                const m = ua.match(/Android.*?;\s*([^)]+?)(?:\s+Build|\))/i);
+                device = m ? m[1].trim() : 'Android';
             }
-            saveLocks(locks);
+            else if (/Macintosh/i.test(ua)) device = 'Mac';
+            else if (/Windows/i.test(ua)) device = 'Windows PC';
+            else if (/Linux/i.test(ua)) device = 'Linux';
+
+            if (/Edg\//i.test(ua)) browser = 'Edge';
+            else if (/Chrome\//i.test(ua) && !/Edg/i.test(ua)) browser = 'Chrome';
+            else if (/Firefox\//i.test(ua)) browser = 'Firefox';
+            else if (/Safari\//i.test(ua) && !/Chrome/i.test(ua)) browser = 'Safari';
+            else if (/Opera|OPR\//i.test(ua)) browser = 'Opera';
+
+            return browser ? `${device} · ${browser}` : device;
+        } catch (e) {
+            return 'Устройство';
         }
     }
 
-    // Все защищённые имена в чате
-    function getAllLocks(chatFile) {
-        const locks = loadLocks();
-        return locks[chatFile] || {};
+    function getDeviceLabel() {
+        let label = localStorage.getItem(CFG.STORAGE_DEVICE_LABEL);
+        if (!label) {
+            label = detectDeviceLabel();
+            localStorage.setItem(CFG.STORAGE_DEVICE_LABEL, label);
+        }
+        return label;
+    }
+
+    const MY_DEVICE_ID = getDeviceId();
+    const MY_DEVICE_LABEL = getDeviceLabel();
+
+    log('📱 Моё устройство:', MY_DEVICE_LABEL);
+
+    // ═══════════════════════════════════════════════════════════
+    //  📒 ИЗВЕСТНЫЕ УСТРОЙСТВА
+    // ═══════════════════════════════════════════════════════════
+    function loadKnownDevices() {
+        try { return JSON.parse(localStorage.getItem(CFG.STORAGE_KNOWN_DEVICES) || '{}'); }
+        catch (e) { return {}; }
+    }
+    function saveKnownDevices(data) {
+        try { localStorage.setItem(CFG.STORAGE_KNOWN_DEVICES, JSON.stringify(data)); } catch (e) {}
+    }
+    function getKnownDevices(username) {
+        return loadKnownDevices()[username] || {};
+    }
+    function rememberDevice(username, deviceId, deviceLabel, chatFile) {
+        const all = loadKnownDevices();
+        if (!all[username]) all[username] = {};
+
+        if (!all[username][deviceId]) {
+            all[username][deviceId] = {
+                label: deviceLabel || 'Устройство',
+                firstSeen: Date.now(),
+                lastSeen: Date.now(),
+                chatFile,
+            };
+            saveKnownDevices(all);
+            log(`📌 Запомнено: ${username}@${deviceLabel}`);
+            return { isNew: true };
+        } else {
+            all[username][deviceId].lastSeen = Date.now();
+            saveKnownDevices(all);
+            return { isNew: false };
+        }
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ХРАНИЛИЩЕ — МОЙ КЛЮЧ
+    //  🔔 УВЕДОМЛЕНИЯ
     // ═══════════════════════════════════════════════════════════
-    function loadMyKeys() {
-        try {
-            return JSON.parse(localStorage.getItem(CFG.STORAGE_MY_KEY) || '{}');
-        } catch (e) { return {}; }
+    function loadNotifications() {
+        try { return JSON.parse(localStorage.getItem(CFG.STORAGE_NOTIFICATIONS) || '[]'); }
+        catch (e) { return []; }
     }
-
-    function saveMyKeys(keys) {
+    function saveNotifications(arr) {
         try {
-            localStorage.setItem(CFG.STORAGE_MY_KEY, JSON.stringify(keys));
+            if (arr.length > CFG.MAX_NOTIFICATIONS) arr = arr.slice(-CFG.MAX_NOTIFICATIONS);
+            localStorage.setItem(CFG.STORAGE_NOTIFICATIONS, JSON.stringify(arr));
         } catch (e) {}
     }
+    function addNotification(data) {
+        const arr = loadNotifications();
 
-    // Мой ключ для чата
-    function getMyKey(chatFile) {
-        const keys = loadMyKeys();
-        return keys[chatFile] || null;
+        // Дедуп — если такое же непрочитанное за последний час, не добавляем
+        const recent = arr.find(n =>
+            n.username === data.username &&
+            n.deviceId === data.deviceId &&
+            !n.read &&
+            (Date.now() - n.ts) < 60 * 60 * 1000
+        );
+
+        if (recent) {
+            recent.ts = Date.now();
+            saveNotifications(arr);
+            return false;
+        }
+
+        arr.push({
+            id: 'notif_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+            ts: Date.now(),
+            read: false,
+            ...data,
+        });
+        saveNotifications(arr);
+        return true;
     }
-
-    function setMyKey(chatFile, data) {
-        const keys = loadMyKeys();
-        keys[chatFile] = data;
-        saveMyKeys(keys);
+    function getUnreadCount() {
+        return loadNotifications().filter(n => !n.read).length;
     }
-
-    function removeMyKey(chatFile) {
-        const keys = loadMyKeys();
-        if (keys[chatFile]) {
-            delete keys[chatFile];
-            saveMyKeys(keys);
-        }
+    function markAllRead() {
+        const arr = loadNotifications();
+        arr.forEach(n => n.read = true);
+        saveNotifications(arr);
+        updateMenuButtonState();
     }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ПРОВЕРКА: могу ли я отправить сообщение под своим именем?
-    //  ─────────────────────────────────────────────────────────────
-    //  Возвращает:
-    //   { ok: true }  — можно отправлять
-    //   { ok: false, reason: 'locked-need-password' }  — имя защищено, нужен пароль
-    //   { ok: false, reason: 'wrong-password' }        — неверный пароль
-    //   { ok: false, reason: 'other-device' }          — имя защищено, но не мной
-    // ═══════════════════════════════════════════════════════════
-    function canSendAs(chatFile, username) {
-        const lock = getLock(chatFile, username);
-        const myKey = getMyKey(chatFile);
-
-        // Имя не защищено вообще — можно писать
-        if (!lock) {
-            return { ok: true };
-        }
-
-        // Имя защищено. Есть ли мой ключ?
-        if (!myKey || myKey.username !== username) {
-            return { ok: false, reason: 'locked-need-password' };
-        }
-
-        // Мой ключ совпадает с локом?
-        if (myKey.verifyHash !== lock.verifyHash) {
-            return { ok: false, reason: 'wrong-password' };
-        }
-
-        return { ok: true };
+    function clearNotifications() {
+        saveNotifications([]);
+        updateMenuButtonState();
+        renderNotificationsList();
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ГЛАВНЫЙ UI: МОДАЛКА ПРОФИЛЯ (через 🔒)
+    //  🎨 ИНДИКАТОР НА КНОПКЕ «⋯»
     // ═══════════════════════════════════════════════════════════
-    let _profileModal = null;
+    function ensureIndicatorStyles() {
+        if (document.getElementById('deviceTrackerV2Styles')) return;
 
-    function ensureProfileModal() {
-        if (_profileModal && _profileModal.isConnected) return _profileModal;
+        const style = document.createElement('style');
+        style.id = 'deviceTrackerV2Styles';
+        style.textContent = `
+            /* ═══ Индикатор на кнопке «⋯» ═══ */
+            #chatsActionsBtn.has-device-notif {
+                background: linear-gradient(135deg,
+                    rgba(108,92,231,0.35),
+                    rgba(167,139,250,0.25)) !important;
+                color: #fff !important;
+                box-shadow: 0 0 12px rgba(108,92,231,0.5),
+                            0 0 0 2px rgba(167,139,250,0.3);
+                animation: deviceBtnPulse 2.2s ease-in-out infinite;
+            }
+            @keyframes deviceBtnPulse {
+                0%, 100% {
+                    box-shadow: 0 0 12px rgba(108,92,231,0.5),
+                                0 0 0 2px rgba(167,139,250,0.3);
+                }
+                50% {
+                    box-shadow: 0 0 20px rgba(108,92,231,0.85),
+                                0 0 0 4px rgba(167,139,250,0.15);
+                }
+            }
 
-        const old = document.getElementById('nameLockModal');
-        if (old) old.remove();
+            /* ═══ Мигающая точка рядом с «⋯» ═══ */
+            .chats-actions-dot {
+                position: absolute;
+                top: -3px;
+                right: -3px;
+                width: 12px;
+                height: 12px;
+                border-radius: 50%;
+                background: linear-gradient(135deg, #ff6b6b, #ee5253);
+                border: 2px solid #0a0a0f;
+                box-shadow: 0 0 8px rgba(238,82,83,0.9);
+                pointer-events: none;
+                z-index: 10;
+                animation: deviceDotBlink 1.4s ease-in-out infinite;
+            }
+            @keyframes deviceDotBlink {
+                0%, 100% {
+                    transform: scale(1);
+                    opacity: 1;
+                    box-shadow: 0 0 8px rgba(238,82,83,0.9);
+                }
+                50% {
+                    transform: scale(1.25);
+                    opacity: 0.75;
+                    box-shadow: 0 0 16px rgba(238,82,83,1);
+                }
+            }
 
-        const modal = document.createElement('div');
-        modal.id = 'nameLockModal';
-        modal.className = 'image-modal';
-        modal.innerHTML = `
-            <div class="form-modal-content" style="max-width:420px;" onclick="event.stopPropagation()">
-                <h2 id="nlTitle">🔐 Профиль в этом чате</h2>
+            /* ═══ Пункт меню «Уведомления» ═══ */
+            #unifiedChatMenu [data-action="devicenotifs"] {
+                position: relative;
+            }
+            #unifiedChatMenu [data-action="devicenotifs"].has-unread {
+                background: linear-gradient(135deg,
+                    rgba(108,92,231,0.15),
+                    rgba(167,139,250,0.1));
+                border: 1px solid rgba(108,92,231,0.3);
+                border-radius: 12px;
+            }
+            #unifiedChatMenu [data-action="devicenotifs"] .ucm-notif-count {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                min-width: 22px;
+                height: 22px;
+                padding: 0 7px;
+                border-radius: 11px;
+                background: linear-gradient(135deg, #ff6b6b, #ee5253);
+                color: #fff;
+                font-size: 11px;
+                font-weight: 700;
+                margin-left: auto;
+                flex-shrink: 0;
+                box-shadow: 0 2px 6px rgba(238,82,83,0.5);
+                animation: deviceDotBlink 1.8s ease-in-out infinite;
+            }
 
-                <div id="nlStatusBox" style="
-                    padding: 12px 14px;
-                    border-radius: 12px;
-                    margin-bottom: 16px;
-                    font-size: 13px;
-                    line-height: 1.5;
-                "></div>
-
-                <div id="nlProtectedForm" style="display:none;">
-                    <div style="font-size:12px;color:#888;margin-bottom:8px;">
-                        Имя защищено. Управляйте защитой:
-                    </div>
-                    <div class="modal-actions" style="flex-direction:column;gap:8px;">
-                        <button class="btn btn-secondary" id="nlChangePwdBtn">
-                            🔄 Сменить пароль
-                        </button>
-                        <button class="btn btn-secondary" id="nlRemoveLockBtn"
-                                style="background:rgba(255,107,107,0.1);color:#ff6b6b;border:1px solid rgba(255,107,107,0.3);">
-                            🔓 Снять защиту с имени
-                        </button>
-                    </div>
-                </div>
-
-                <div id="nlUnprotectedForm" style="display:none;">
-                    <label style="display:block;font-size:13px;color:#999;margin-bottom:6px;">
-                        🔐 Установить пароль на имя «<span id="nlUsername"></span>»
-                    </label>
-                    <input type="password" id="nlPasswordInput"
-                           placeholder="Придумайте пароль"
-                           style="width:100%;padding:12px 14px;background:rgba(255,255,255,0.06);
-                                  border:1px solid rgba(255,255,255,0.1);border-radius:12px;
-                                  color:#fff;font-size:15px;outline:none;margin-bottom:8px;">
-                    <input type="password" id="nlPasswordConfirm"
-                           placeholder="Повторите пароль"
-                           style="width:100%;padding:12px 14px;background:rgba(255,255,255,0.06);
-                                  border:1px solid rgba(255,255,255,0.1);border-radius:12px;
-                                  color:#fff;font-size:15px;outline:none;margin-bottom:12px;">
-
-                    <div style="font-size:11px;color:#666;line-height:1.5;margin-bottom:14px;
-                                padding:10px 12px;background:rgba(108,92,231,0.06);
-                                border:1px solid rgba(108,92,231,0.15);border-radius:10px;">
-                        💡 Пароль сохраняется <strong>только на этом устройстве</strong>.<br>
-                        Если зайти под этим именем с другого устройства — потребуется ввести пароль.<br>
-                        ⚠️ Забыли пароль — защиту снять нельзя, только через новое имя.
-                    </div>
-
-                    <button class="btn" id="nlSetLockBtn" style="width:100%;">
-                        🔐 Установить защиту
-                    </button>
-                </div>
-
-                <div class="modal-actions" style="margin-top:12px;">
-                    <button class="btn btn-secondary" id="nlCloseBtn" style="width:100%;">Закрыть</button>
-                </div>
-            </div>
+            /* ═══ Панель уведомлений ═══ */
+            .device-notif-item {
+                display: flex;
+                align-items: flex-start;
+                gap: 12px;
+                padding: 14px 16px;
+                background: rgba(255,255,255,0.04);
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 14px;
+                margin-bottom: 8px;
+                cursor: pointer;
+                transition: all 0.15s;
+                user-select: none;
+            }
+            .device-notif-item:hover {
+                background: rgba(108,92,231,0.12);
+                border-color: rgba(108,92,231,0.35);
+                transform: translateY(-1px);
+            }
+            .device-notif-item.unread {
+                background: rgba(108,92,231,0.08);
+                border-left: 3px solid #6c5ce7;
+            }
+            .device-notif-item .dni-icon {
+                width: 42px;
+                height: 42px;
+                border-radius: 12px;
+                background: linear-gradient(135deg,
+                    rgba(108,92,231,0.25),
+                    rgba(0,184,148,0.18));
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 20px;
+                flex-shrink: 0;
+            }
+            .device-notif-item.self-warn .dni-icon {
+                background: linear-gradient(135deg,
+                    rgba(255,159,67,0.25),
+                    rgba(254,202,87,0.15));
+            }
+            .device-notif-item .dni-body { flex: 1; min-width: 0; }
+            .device-notif-item .dni-title {
+                font-size: 14px;
+                font-weight: 600;
+                color: #fff;
+                margin-bottom: 4px;
+                line-height: 1.3;
+            }
+            .device-notif-item .dni-sub {
+                font-size: 12px;
+                color: #aaa;
+                line-height: 1.4;
+                word-break: break-word;
+            }
+            .device-notif-item .dni-time {
+                font-size: 10px;
+                color: #666;
+                margin-top: 6px;
+            }
         `;
-        document.body.appendChild(modal);
-        _profileModal = modal;
-
-        modal.querySelector('#nlCloseBtn').addEventListener('click', () => {
-            modal.classList.remove('active');
-        });
-        modal.addEventListener('click', (e) => {
-            if (e.target === modal) modal.classList.remove('active');
-        });
-        modal.querySelector('#nlSetLockBtn').addEventListener('click', onSetLockClick);
-        modal.querySelector('#nlChangePwdBtn').addEventListener('click', onSetLockClick);
-        modal.querySelector('#nlRemoveLockBtn').addEventListener('click', onRemoveLockClick);
-
-        return modal;
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ОТКРЫТИЕ МОДАЛКИ ПРОФИЛЯ
-    // ═══════════════════════════════════════════════════════════
-    function openProfileModal() {
-        if (!state.chatFile) {
-            showToastSafe('🔒 Сначала войдите в чат');
-            return;
-        }
-
-        ensureProfileModal();
-
-        const chatFile = state.chatFile;
-        const username = state.username;
-        const lock = getLock(chatFile, username);
-        const myKey = getMyKey(chatFile);
-
-        const statusBox = _profileModal.querySelector('#nlStatusBox');
-        const protectedForm = _profileModal.querySelector('#nlProtectedForm');
-        const unprotectedForm = _profileModal.querySelector('#nlUnprotectedForm');
-        const pwdInput = _profileModal.querySelector('#nlPasswordInput');
-        const pwdConfirm = _profileModal.querySelector('#nlPasswordConfirm');
-
-        // Сброс полей
-        pwdInput.value = '';
-        pwdConfirm.value = '';
-
-        _profileModal.querySelector('#nlUsername').textContent = username;
-
-        // Определяем статус
-        if (lock && myKey && myKey.username === username && myKey.verifyHash === lock.verifyHash) {
-            // Защищено И я владелец
-            statusBox.style.background = 'rgba(0,184,148,0.08)';
-            statusBox.style.border = '1px solid rgba(0,184,148,0.3)';
-            statusBox.style.color = '#00b894';
-            statusBox.innerHTML = `
-                ✅ <strong>Имя «${escapeHtml(username)}» защищено</strong><br>
-                <span style="font-size:12px;opacity:0.85;">
-                    Ваш пароль сохранён на этом устройстве.
-                    При входе с другого устройства — потребуется ввод.
-                </span>
-            `;
-            protectedForm.style.display = 'block';
-            unprotectedForm.style.display = 'none';
-        } else if (lock && (!myKey || myKey.username !== username)) {
-            // Имя защищено кем-то другим
-            statusBox.style.background = 'rgba(255,159,67,0.1)';
-            statusBox.style.border = '1px solid rgba(255,159,67,0.3)';
-            statusBox.style.color = '#ff9f43';
-            statusBox.innerHTML = `
-                ⚠️ <strong>Имя «${escapeHtml(username)}» защищено</strong><br>
-                <span style="font-size:12px;opacity:0.85;">
-                    Пароль установлен с другого устройства.
-                    Чтобы писать под этим именем — введите пароль.
-                </span>
-            `;
-            protectedForm.style.display = 'none';
-            unprotectedForm.style.display = 'block';
-        } else {
-            // Не защищено
-            statusBox.style.background = 'rgba(108,92,231,0.08)';
-            statusBox.style.border = '1px solid rgba(108,92,231,0.25)';
-            statusBox.style.color = '#a78bfa';
-            statusBox.innerHTML = `
-                ℹ️ <strong>Имя «${escapeHtml(username)}» не защищено</strong><br>
-                <span style="font-size:12px;opacity:0.85;">
-                    Любой в этом чате может писать под этим именем.
-                    Установите пароль, чтобы защитить.
-                </span>
-            `;
-            protectedForm.style.display = 'none';
-            unprotectedForm.style.display = 'block';
-        }
-
-        _profileModal.classList.add('active');
-        setTimeout(() => pwdInput.focus(), 200);
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  УСТАНОВКА / СМЕНА ПАРОЛЯ
-    // ═══════════════════════════════════════════════════════════
-    async function onSetLockClick() {
-        const chatFile = state.chatFile;
-        const username = state.username;
-
-        const pwdInput = _profileModal.querySelector('#nlPasswordInput');
-        const pwdConfirm = _profileModal.querySelector('#nlPasswordConfirm');
-
-        const pwd = pwdInput.value;
-        const pwd2 = pwdConfirm.value;
-
-        if (!pwd || pwd.length < 4) {
-            showToastSafe('❌ Пароль минимум 4 символа');
-            return;
-        }
-        if (pwd !== pwd2) {
-            showToastSafe('❌ Пароли не совпадают');
-            return;
-        }
-
-        // Есть ли уже лок?
-        const existingLock = getLock(chatFile, username);
-        const myKey = getMyKey(chatFile);
-
-        // Если лок есть и он не мой — сначала надо ввести СТАРЫЙ пароль
-        if (existingLock && (!myKey || myKey.username !== username || myKey.verifyHash !== existingLock.verifyHash)) {
-            // Проверим, совпадает ли введённый пароль со старым
-            const tryHash = await makeVerifyHash(username, chatFile, pwd);
-            if (tryHash !== existingLock.verifyHash) {
-                // Это смена? Тогда надо запросить старый. Мы не поддерживаем.
-                showToastSafe('❌ Это имя защищено другим паролем');
-                return;
-            }
-            // Пароль совпал — просто обновим myKey
-        }
-
-        // Создаём/обновляем
-        const verifyHash = await makeVerifyHash(username, chatFile, pwd);
-
-        setLock(chatFile, username, verifyHash, getDeviceId());
-        setMyKey(chatFile, {
-            username: username,
-            password: pwd,       // храним в открытом виде (как пароль чата)
-            verifyHash: verifyHash,
-            deviceId: getDeviceId(),
-            createdAt: Date.now(),
-        });
-
-        // Обновляем иконку 🔒 в шапке
-        updateLockIcon();
-
-        showToastSafe('✅ Защита установлена');
-        soundManagerSafe('send');
-
-        _profileModal.classList.remove('active');
-
-        log(`✅ Пароль установлен для "${username}" в ${chatFile}`);
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  СНЯТИЕ ЗАЩИТЫ
-    // ═══════════════════════════════════════════════════════════
-    async function onRemoveLockClick() {
-        const chatFile = state.chatFile;
-        const username = state.username;
-
-        const myKey = getMyKey(chatFile);
-        if (!myKey || myKey.username !== username) {
-            showToastSafe('❌ Это не ваш пароль');
-            return;
-        }
-
-        if (!confirm(`Снять защиту с имени «${username}»?\n\nПосле этого любой сможет писать под этим именем.`)) {
-            return;
-        }
-
-        removeLock(chatFile, username);
-        removeMyKey(chatFile);
-
-        updateLockIcon();
-
-        showToastSafe('🔓 Защита снята');
-        soundManagerSafe('delete');
-
-        _profileModal.classList.remove('active');
-
-        log(`🔓 Защита снята для "${username}"`);
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ОБНОВЛЕНИЕ ИКОНКИ ЗАМКА
-    // ═══════════════════════════════════════════════════════════
-    function updateLockIcon() {
-        const btn = document.getElementById('forgetBtn');   // кнопка 🔒 в шапке
-        if (!btn) return;
-
-        if (!state.chatFile || !state.username) return;
-
-        const lock = getLock(state.chatFile, state.username);
-        const myKey = getMyKey(state.chatFile);
-        const isMine = lock && myKey && myKey.username === state.username
-                       && myKey.verifyHash === lock.verifyHash;
-
-        if (isMine) {
-            // 🟢 Защищено мной — золотой фон, другой цвет
-            btn.style.background = 'linear-gradient(135deg, rgba(254,202,87,0.35), rgba(255,159,67,0.25))';
-            btn.style.color = '#feca57';
-            btn.style.boxShadow = '0 0 8px rgba(254,202,87,0.4)';
-            btn.title = '🔐 Имя защищено паролем (нажмите для управления)';
-        } else if (lock) {
-            // 🟠 Защищено кем-то другим
-            btn.style.background = 'rgba(255,159,67,0.15)';
-            btn.style.color = '#ff9f43';
-            btn.style.boxShadow = 'none';
-            btn.title = '⚠️ Имя защищено другим устройством';
-        } else {
-            // Обычный вид
-            btn.style.background = '';
-            btn.style.color = '';
-            btn.style.boxShadow = '';
-            btn.title = '🔒 Защита имени паролем';
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ПЕРЕХВАТ КНОПКИ 🔒 В ШАПКЕ
-    //  ─────────────────────────────────────────────────────────────
-    //  В оригинале 🔒 — это "забыть пароль чата". Заменим на наш профиль.
-    // ═══════════════════════════════════════════════════════════
-    function interceptForgetButton() {
-        const btn = document.getElementById('forgetBtn');
-        if (!btn || btn._nameLockAttached) return;
-        btn._nameLockAttached = true;
-
-        // Снимаем старый onclick полностью (через клон)
-        const clone = btn.cloneNode(true);
-        btn.parentNode.replaceChild(clone, btn);
-
-        clone.addEventListener('click', (e) => {
-            e.stopPropagation();
-            e.preventDefault();
-            openProfileModal();
-        });
-
-        clone.title = '🔒 Профиль в чате';
-        console.log('🔐 [NameLock] Кнопка 🔒 перехвачена');
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ПОПЫТКИ ВВОДА ПАРОЛЯ
-    //  ─────────────────────────────────────────────────────────────
-    //  Когда пользователь открывает чат, и его имя защищено
-    //  другим устройством — показываем модалку ввода.
-    // ═══════════════════════════════════════════════════════════
-    let _attemptsByChat = {};   // { chatFile: { username: attempts } }
-
-    function loadAttempts() {
-        try {
-            _attemptsByChat = JSON.parse(localStorage.getItem('smschat_attempts_v1') || '{}');
-        } catch (e) { _attemptsByChat = {}; }
-    }
-    function saveAttempts() {
-        try {
-            localStorage.setItem('smschat_attempts_v1', JSON.stringify(_attemptsByChat));
-        } catch (e) {}
-    }
-    function getAttempts(chatFile, username) {
-        return _attemptsByChat[chatFile]?.[username] || 0;
-    }
-    function incAttempts(chatFile, username) {
-        if (!_attemptsByChat[chatFile]) _attemptsByChat[chatFile] = {};
-        _attemptsByChat[chatFile][username] = (_attemptsByChat[chatFile][username] || 0) + 1;
-        saveAttempts();
-        return _attemptsByChat[chatFile][username];
-    }
-    function resetAttempts(chatFile, username) {
-        if (_attemptsByChat[chatFile]?.[username]) {
-            delete _attemptsByChat[chatFile][username];
-            saveAttempts();
-        }
+        document.head.appendChild(style);
     }
 
     /**
-     * Показать модалку ввода пароля.
-     * Возвращает Promise<boolean> — успех/провал.
+     * Обновляет состояние кнопки «⋯» — добавляет/убирает
+     * фиолетовую подсветку и мигающую точку.
      */
-    function showPasswordPrompt(chatFile, username) {
-        return new Promise((resolve) => {
-            // Убираем старую
-            const old = document.getElementById('nameLockPrompt');
-            if (old) old.remove();
+    function updateMenuButtonState() {
+        ensureIndicatorStyles();
 
-            const modal = document.createElement('div');
-            modal.id = 'nameLockPrompt';
-            modal.className = 'image-modal active';
-            modal.innerHTML = `
-                <div class="form-modal-content" style="max-width:380px;text-align:center;"
-                     onclick="event.stopPropagation()">
-                    <div style="font-size:56px;margin-bottom:12px;line-height:1;">🔐</div>
-                    <h2 style="margin-bottom:8px;font-size:18px;">Имя защищено</h2>
-                    <div style="font-size:13px;color:#aaa;line-height:1.5;margin-bottom:16px;">
-                        Имя «<strong style="color:#fff;">${escapeHtml(username)}</strong>»
-                        защищено паролем в этом чате.<br>
-                        Введите пароль, чтобы писать под этим именем.
+        const btn = document.getElementById('chatsActionsBtn');
+        if (!btn) return;
+
+        const unread = getUnreadCount();
+
+        // Делаем кнопку relative (для позиционирования точки)
+        btn.style.position = 'relative';
+
+        // Снимаем старую точку
+        const oldDot = btn.querySelector('.chats-actions-dot');
+        if (oldDot) oldDot.remove();
+
+        if (unread > 0) {
+            // ✅ Есть непрочитанные — подсветка + точка
+            btn.classList.add('has-device-notif');
+
+            const dot = document.createElement('span');
+            dot.className = 'chats-actions-dot';
+            btn.appendChild(dot);
+        } else {
+            // Тишина
+            btn.classList.remove('has-device-notif');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  📋 ПАНЕЛЬ УВЕДОМЛЕНИЙ
+    // ═══════════════════════════════════════════════════════════
+    function ensurePanel() {
+        let panel = document.getElementById('deviceNotifPanel');
+        if (panel) return panel;
+
+        panel = document.createElement('div');
+        panel.id = 'deviceNotifPanel';
+        panel.style.cssText = `
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.75);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            z-index: 6000;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            animation: fadeInModal 0.2s ease;
+        `;
+
+        panel.innerHTML = `
+            <div style="
+                background: #1a1a2e;
+                border-radius: 20px;
+                padding: 0;
+                max-width: 480px;
+                width: 100%;
+                max-height: 85vh;
+                display: flex;
+                flex-direction: column;
+                border: 1px solid rgba(255,255,255,0.1);
+                box-shadow: 0 20px 60px rgba(0,0,0,0.7);
+                overflow: hidden;
+                animation: slideUp 0.25s ease;
+            " onclick="event.stopPropagation()">
+                <!-- Заголовок -->
+                <div style="
+                    display: flex;
+                    align-items: center;
+                    gap: 12px;
+                    padding: 16px 20px;
+                    border-bottom: 1px solid rgba(255,255,255,0.08);
+                    background: linear-gradient(135deg,
+                        rgba(108,92,231,0.15),
+                        rgba(0,184,148,0.08));
+                    flex-shrink: 0;
+                ">
+                    <div style="
+                        width: 42px;height:42px;
+                        border-radius: 12px;
+                        background: linear-gradient(135deg, #6c5ce7, #00b894);
+                        display: flex;align-items:center;justify-content:center;
+                        font-size: 20px;
+                        flex-shrink: 0;
+                        box-shadow: 0 4px 12px rgba(108,92,231,0.35);
+                    ">📱</div>
+                    <div style="flex:1;min-width:0;">
+                        <h3 style="font-size:16px;font-weight:700;color:#fff;margin:0 0 2px 0;">
+                            Устройства
+                        </h3>
+                        <div style="font-size:12px;color:#888;" id="deviceNotifSubtitle">
+                            —
+                        </div>
                     </div>
+                    <button id="deviceNotifCloseBtn" style="
+                        width: 34px;height:34px;
+                        border-radius: 50%;
+                        background: rgba(255,255,255,0.06);
+                        border: none;
+                        color: #888;
+                        font-size: 16px;
+                        cursor: pointer;
+                        display: flex;align-items:center;justify-content:center;
+                        flex-shrink: 0;
+                        transition: all 0.15s;
+                    " title="Закрыть">✕</button>
+                </div>
 
-                    <input type="password" id="nlpInput"
-                           placeholder="Пароль"
-                           style="width:100%;padding:14px 16px;background:rgba(255,255,255,0.06);
-                                  border:1px solid rgba(255,255,255,0.12);border-radius:12px;
-                                  color:#fff;font-size:16px;outline:none;margin-bottom:8px;
-                                  text-align:center;letter-spacing:2px;">
+                <!-- Мой device -->
+                <div id="deviceNotifMyDevice" style="
+                    padding: 12px 20px;
+                    border-bottom: 1px solid rgba(255,255,255,0.06);
+                    font-size: 12px;
+                    color: #888;
+                    background: rgba(0,184,148,0.04);
+                    display: flex;
+                    align-items: center;
+                    gap: 8px;
+                    flex-shrink: 0;
+                "></div>
 
-                    <div id="nlpError" style="color:#ff6b6b;font-size:12px;
-                                             height:16px;margin-bottom:12px;"></div>
+                <!-- Список -->
+                <div id="deviceNotifList" style="
+                    flex: 1;
+                    overflow-y: auto;
+                    padding: 14px 16px;
+                    min-height: 0;
+                "></div>
 
-                    <div style="display:flex;gap:8px;">
-                        <button class="btn btn-secondary" id="nlpSkipBtn"
-                                style="flex:1;padding:12px;font-size:14px;">
-                            🚫 Сменить имя
-                        </button>
-                        <button class="btn" id="nlpSubmitBtn"
-                                style="flex:1.4;padding:12px;font-size:14px;">
-                            Войти
-                        </button>
+                <!-- Действия -->
+                <div style="
+                    display: flex;
+                    gap: 8px;
+                    padding: 12px 16px;
+                    border-top: 1px solid rgba(255,255,255,0.06);
+                    background: rgba(255,255,255,0.02);
+                    flex-shrink: 0;
+                ">
+                    <button id="deviceNotifMarkReadBtn" style="
+                        flex: 1;
+                        padding: 11px;
+                        border-radius: 10px;
+                        border: 1px solid rgba(0,184,148,0.3);
+                        background: rgba(0,184,148,0.1);
+                        color: #00b894;
+                        font-size: 13px;
+                        font-weight: 600;
+                        cursor: pointer;
+                        font-family: inherit;
+                        transition: all 0.15s;
+                    ">✓ Прочитано</button>
+                    <button id="deviceNotifClearBtn" style="
+                        flex: 1;
+                        padding: 11px;
+                        border-radius: 10px;
+                        border: 1px solid rgba(255,107,107,0.3);
+                        background: rgba(255,107,107,0.1);
+                        color: #ff6b6b;
+                        font-size: 13px;
+                        font-weight: 600;
+                        cursor: pointer;
+                        font-family: inherit;
+                        transition: all 0.15s;
+                    ">🗑 Очистить</button>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(panel);
+
+        panel.querySelector('#deviceNotifCloseBtn').addEventListener('click', () => {
+            panel.style.display = 'none';
+        });
+
+        panel.addEventListener('click', (e) => {
+            if (e.target === panel) panel.style.display = 'none';
+        });
+
+        panel.querySelector('#deviceNotifMarkReadBtn').addEventListener('click', () => {
+            markAllRead();
+            renderNotificationsList();
+            if (typeof showToast === 'function') showToast('✓ Все прочитаны', 1500);
+        });
+
+        panel.querySelector('#deviceNotifClearBtn').addEventListener('click', () => {
+            if (confirm('Очистить все уведомления?')) {
+                clearNotifications();
+                if (typeof showToast === 'function') showToast('🗑 Очищено', 1500);
+            }
+        });
+
+        return panel;
+    }
+
+    function openNotificationsPanel() {
+        const panel = ensurePanel();
+        panel.style.display = 'flex';
+        renderNotificationsList();
+    }
+
+    function renderNotificationsList() {
+        const list = document.getElementById('deviceNotifList');
+        const subtitle = document.getElementById('deviceNotifSubtitle');
+        const myDeviceEl = document.getElementById('deviceNotifMyDevice');
+        if (!list) return;
+
+        // ─── Показываем моё устройство ───
+        if (myDeviceEl) {
+            myDeviceEl.innerHTML = `
+                <span style="
+                    width: 8px;height:8px;
+                    border-radius: 50%;
+                    background: #00b894;
+                    box-shadow: 0 0 8px rgba(0,184,148,0.8);
+                    flex-shrink: 0;
+                "></span>
+                <span style="color:#00b894;font-weight:600;">Это устройство:</span>
+                <span style="color:#ccc;">${escapeHtml(MY_DEVICE_LABEL)}</span>
+            `;
+        }
+
+        const arr = loadNotifications().sort((a, b) => b.ts - a.ts);
+
+        if (subtitle) {
+            const unread = arr.filter(n => !n.read).length;
+            subtitle.textContent = arr.length === 0
+                ? 'Смена устройств в чатах'
+                : `${arr.length} всего · ${unread} непрочитанных`;
+        }
+
+        if (arr.length === 0) {
+            list.innerHTML = `
+                <div style="
+                    text-align: center;
+                    padding: 40px 20px;
+                    color: #666;
+                ">
+                    <div style="font-size: 48px;margin-bottom: 12px;opacity: 0.7;">📱</div>
+                    <div style="font-size: 14px;color: #aaa;margin-bottom: 6px;">
+                        Пока уведомлений нет
                     </div>
-
-                    <div id="nlpAttemptsInfo" style="font-size:11px;color:#666;
-                                                    margin-top:10px;line-height:1.4;"></div>
+                    <div style="font-size: 12px;color: #666;line-height: 1.5;">
+                        Здесь появятся сообщения о том, что кто-то
+                        зашёл в чат с нового устройства.
+                    </div>
                 </div>
             `;
-            document.body.appendChild(modal);
+            return;
+        }
 
-            const input = modal.querySelector('#nlpInput');
-            const submitBtn = modal.querySelector('#nlpSubmitBtn');
-            const skipBtn = modal.querySelector('#nlpSkipBtn');
-            const errorEl = modal.querySelector('#nlpError');
-            const attemptsInfo = modal.querySelector('#nlpAttemptsInfo');
+        list.innerHTML = arr.map(n => {
+            const timeAgo = formatTimeAgo(n.ts);
+            const chat = state.chats.find(c => c.file === n.chatFile);
+            const chatName = chat ? (chat.name || chat.file) : n.chatFile;
+            const isSelfWarn = n.isSelfWarning === true;
 
-            // Показать оставшиеся попытки
-            const attempts = getAttempts(chatFile, username);
-            const left = CFG.MAX_ATTEMPTS - attempts;
-            if (left > 0) {
-                attemptsInfo.textContent = `Осталось попыток: ${left}`;
-            } else {
-                attemptsInfo.textContent = `⚠️ Следующая ошибка будет объявлена в чате`;
-                attemptsInfo.style.color = '#ff9f43';
-            }
+            const icon = isSelfWarn ? '⚠️' : '📱';
+            const title = isSelfWarn
+                ? `Внимание! Кто-то зашёл под вашим именем`
+                : `${escapeHtml(n.username)} зашёл с нового устройства`;
 
-            setTimeout(() => input.focus(), 200);
+            return `
+                <div class="device-notif-item ${!n.read ? 'unread' : ''} ${isSelfWarn ? 'self-warn' : ''}"
+                     data-notif-id="${n.id}"
+                     data-chat-file="${n.chatFile}">
+                    <div class="dni-icon">${icon}</div>
+                    <div class="dni-body">
+                        <div class="dni-title">${title}</div>
+                        <div class="dni-sub">
+                            📱 ${escapeHtml(n.deviceLabel || 'Неизвестное устройство')}<br>
+                            💬 Чат: ${escapeHtml(chatName)}
+                        </div>
+                        <div class="dni-time">${timeAgo}</div>
+                    </div>
+                </div>
+            `;
+        }).join('');
 
-            const cleanup = () => {
-                modal.remove();
-            };
+        // Клик → переход в чат
+        list.querySelectorAll('.device-notif-item').forEach(item => {
+            item.addEventListener('click', async () => {
+                const notifId = item.dataset.notifId;
+                const chatFile = item.dataset.chatFile;
 
-            const trySubmit = async () => {
-                const pwd = input.value;
-                if (!pwd) {
-                    errorEl.textContent = 'Введите пароль';
+                // Помечаем прочитанным
+                const arr = loadNotifications();
+                const target = arr.find(n => n.id === notifId);
+                if (target && !target.read) {
+                    target.read = true;
+                    saveNotifications(arr);
+                    updateMenuButtonState();
+                }
+
+                // Закрываем панель
+                const panel = document.getElementById('deviceNotifPanel');
+                if (panel) panel.style.display = 'none';
+
+                // Открываем чат
+                if (state.chatFile === chatFile) return;
+
+                const chat = state.chats.find(c => c.file === chatFile);
+                if (!chat) {
+                    if (typeof showToast === 'function') showToast('❌ Чат не найден', 1500);
                     return;
                 }
 
-                errorEl.textContent = '';
-                submitBtn.disabled = true;
-                submitBtn.textContent = '⏳ Проверка…';
-
-                const verifyHash = await makeVerifyHash(username, chatFile, pwd);
-                const lock = getLock(chatFile, username);
-
-                if (lock && verifyHash === lock.verifyHash) {
-                    // ✅ Успех
-                    setMyKey(chatFile, {
-                        username,
-                        password: pwd,
-                        verifyHash,
-                        deviceId: getDeviceId(),
-                        createdAt: Date.now(),
-                    });
-                    resetAttempts(chatFile, username);
-                    updateLockIcon();
-
-                    showToastSafe('✅ Добро пожаловать!');
-                    soundManagerSafe('send');
-                    cleanup();
-                    resolve(true);
-                } else {
-                    // ❌ Провал
-                    const newAttempts = incAttempts(chatFile, username);
-
-                    if (newAttempts >= CFG.MAX_ATTEMPTS) {
-                        // 🚨 Публичное сообщение
-                        sendAttemptsWarning(chatFile, username);
-                        showToastSafe('⚠️ Неверный пароль. Попытка объявлена в чате.', 3000);
-                    } else {
-                        const leftAfter = CFG.MAX_ATTEMPTS - newAttempts;
-                        errorEl.textContent = `Неверный пароль. Осталось: ${leftAfter}`;
-                        attemptsInfo.textContent = leftAfter > 1
-                            ? `Осталось попыток: ${leftAfter}`
-                            : `⚠️ Следующая ошибка будет объявлена в чате`;
-                        attemptsInfo.style.color = leftAfter > 1 ? '#666' : '#ff9f43';
-                    }
-
-                    input.value = '';
-                    input.focus();
-                    submitBtn.disabled = false;
-                    submitBtn.textContent = 'Войти';
-                    soundManagerSafe('error');
+                const password = state.savedPasswords[chatFile];
+                if (!password) {
+                    if (typeof showToast === 'function') showToast('🔐 Нужен пароль чата', 2000);
+                    return;
                 }
-            };
 
-            submitBtn.addEventListener('click', trySubmit);
-            input.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter') trySubmit();
-            });
-
-            skipBtn.addEventListener('click', () => {
-                cleanup();
-                resolve(false);
+                if (typeof enterChat === 'function') {
+                    try {
+                        await enterChat(chatFile, chat.name || chatFile, password);
+                    } catch (e) {
+                        console.warn('Не удалось перейти в чат:', e);
+                    }
+                }
             });
         });
     }
 
-    // ═══════════════════════════════════════════════════════════
-    //  ПУБЛИЧНОЕ СООБЩЕНИЕ О ПОПЫТКЕ ВХОДА
-    // ═══════════════════════════════════════════════════════════
-    async function sendAttemptsWarning(chatFile, username) {
-        try {
-            log(`🚨 Публичное сообщение: попытка входа под "${username}"`);
-
-            // Отправляем системное сообщение в чат
-            // Используем оригинальный sendMessage, но с особой меткой
-            // которая будет отрендерена как системное
-
-            if (typeof _origSendMessage === 'function') {
-                // ВАЖНО: чтобы не попасть в цикл с нашей же проверкой,
-                // отправляем через "сырой" sendMessage с особым флагом
-                const warningText = `🚨 Попытка входа под именем «${username}» с другого устройства — неверный пароль. Если это не вы — смените имя.`;
-
-                // Используем специальную функцию отправки, минуя нашу проверку
-                await _origSendMessage.call(window, warningText, null, null, null, null, null, null);
-            }
-        } catch (e) {
-            console.error('🔐 [NameLock] sendAttemptsWarning failed:', e);
-        }
+    function formatTimeAgo(ts) {
+        const diff = Date.now() - ts;
+        const min = Math.floor(diff / 60000);
+        if (min < 1) return 'только что';
+        if (min < 60) return `${min} мин назад`;
+        const h = Math.floor(min / 60);
+        if (h < 24) return `${h} ч назад`;
+        const d = Math.floor(h / 24);
+        if (d < 30) return `${d} дн назад`;
+        return new Date(ts).toLocaleDateString('ru-RU', {
+            day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit'
+        });
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ПЕРЕХВАТ sendMessage
-    //  ─────────────────────────────────────────────────────────────
-    //  Перед отправкой проверяем: могу ли я писать под этим именем?
+    //  📨 ПАТЧ encryptMessage
     // ═══════════════════════════════════════════════════════════
-    const _origSendMessage = window.sendMessage;
-
-    window.sendMessage = async function(text, imageBlob, audioData, fileAttachment, audioFile, replyContext, videoPayload) {
-        if (!state.isAuthorized || !state.chatFile || !state.username) {
-            return _origSendMessage.apply(this, arguments);
-        }
-
-        // Проверяем, могу ли я писать
-        const check = canSendAs(state.chatFile, state.username);
-
-        if (!check.ok) {
-            // Имя защищено, я не владелец — открываем ввод пароля
-            if (check.reason === 'locked-need-password' || check.reason === 'wrong-password') {
-                const success = await showPasswordPrompt(state.chatFile, state.username);
-
-                if (!success) {
-                    showToastSafe('❌ Отправка отменена — имя защищено', 2500);
-                    return;
-                }
-
-                // Успешно ввели пароль — отправляем
-                return _origSendMessage.apply(this, arguments);
-            }
-        }
-
-        // Всё ок — отправляем
-        return _origSendMessage.apply(this, arguments);
-    };
-
-    // ═══════════════════════════════════════════════════════════
-    //  ПАТЧ encryptMessage — добавляем signer
-    // ═══════════════════════════════════════════════════════════
-    const _origEncryptMessage = encryptMessage;
+    const _origEncrypt = encryptMessage;
 
     encryptMessage = async function(msg) {
-        // Сначала получаем базовый зашифрованный вид
-        // Но нам нужно добавить signer в payload ДО шифрования.
-        // Проще: расшифровать заново исходный msg, добавить signer, зашифровать.
-
-        // Не будем переизобретать — просто допишем signer в msg,
-        // а оригинал сам его зашифрует (он берёт поля из msg напрямую).
-        if (state.chatFile && state.username) {
-            const lock = getLock(state.chatFile, state.username);
-            const myKey = getMyKey(state.chatFile);
-
-            if (lock && myKey && myKey.username === state.username
-                && myKey.verifyHash === lock.verifyHash) {
-
-                // Имя защищено мной — добавляем signer
-                msg.signer = {
-                    verifyHash: myKey.verifyHash,
-                    deviceId: getDeviceId(),
-                };
-            }
+        if (!msg.signer) {
+            msg.signer = {
+                deviceId: MY_DEVICE_ID,
+                deviceLabel: MY_DEVICE_LABEL,
+            };
         }
-
-        return _origEncryptMessage.call(this, msg);
+        return await encryptWithDeviceSigner(msg);
     };
 
+    async function encryptWithDeviceSigner(msg) {
+        const payload = { username: msg.username, text: msg.text || '' };
+        if (msg.reactions && Object.keys(msg.reactions).length) payload.reactions = msg.reactions;
+        if (msg.comments && msg.comments.length) payload.comments = msg.comments;
+        if (msg.image) payload.image = msg.image;
+        if (msg.audio) {
+            payload.audio = msg.audio;
+            payload.audioDuration = msg.audioDuration || 0;
+            payload.audioMime = msg.audioMime || 'audio/webm';
+            if (msg.audioName) payload.audioName = msg.audioName;
+            if (msg.audioCover) payload.audioCover = msg.audioCover;
+        }
+        if (msg.file) {
+            payload.file = msg.file;
+            payload.fileName = msg.fileName || 'file.bin';
+            payload.fileMime = msg.fileMime || 'application/octet-stream';
+            payload.fileSize = msg.fileSize || 0;
+        }
+        if (msg.video) {
+            payload.video = msg.video;
+            payload.videoDuration = msg.videoDuration || 0;
+            payload.videoMime = msg.videoMime || 'video/mp4';
+            payload.videoName = msg.videoName || '';
+            payload.videoSize = msg.videoSize || 0;
+        }
+        if (msg.videoNote) {
+            payload.videoNote = msg.videoNote;
+            payload.videoDuration = msg.videoDuration || 0;
+            payload.videoMime = msg.videoMime || 'video/webm';
+        }
+        if (msg.batchId) {
+            payload.batchId = msg.batchId;
+            payload.batchIndex = msg.batchIndex;
+            payload.batchTotal = msg.batchTotal;
+        }
+        if (msg.replyTo) payload.replyTo = msg.replyTo;
+        if (msg.isSystem) payload.isSystem = msg.isSystem;
+        if (msg.signer) payload.signer = msg.signer;
+
+        const encrypted = await encryptObject(payload, CRYPTO._key);
+        return { id: msg.id, time: msg.time, iv: encrypted.iv, data: encrypted.data };
+    }
+
     // ═══════════════════════════════════════════════════════════
-    //  ПАТЧ decryptMessage — извлекаем signer
+    //  📨 ПАТЧ decryptMessage — детектим новое устройство
     // ═══════════════════════════════════════════════════════════
-    const _origDecryptMessage = decryptMessage;
+    const _origDecrypt = decryptMessage;
 
     decryptMessage = async function(encMsg) {
-        const msg = await _origDecryptMessage.call(this, encMsg);
+        const msg = await _origDecrypt.call(this, encMsg);
+        if (!msg || msg.isSystem) return msg;
 
-        // Если расшифровали успешно и есть signer — обрабатываем
-        if (msg && msg.signer && msg.username && state.chatFile) {
-            // Первый раз видим этот hash от этого имени — запоминаем (TOFU)
-            const existingLock = getLock(state.chatFile, msg.username);
-            if (!existingLock) {
-                setLock(state.chatFile, msg.username, msg.signer.verifyHash, msg.signer.deviceId);
-                log(`📌 Обнаружена защита имени "${msg.username}" (запомнено)`);
+        if (msg.username && msg.signer && msg.signer.deviceId) {
+            const deviceId = msg.signer.deviceId;
+            const deviceLabel = msg.signer.deviceLabel || 'Устройство';
+            const chatFile = state.chatFile;
+
+            // Моё устройство — не уведомляем
+            if (deviceId === MY_DEVICE_ID && msg.username === state.username) {
+                msg._verified = true;
+                return msg;
+            }
+
+            const result = rememberDevice(msg.username, deviceId, deviceLabel, chatFile);
+
+            if (result.isNew) {
+                log(`🔔 Новое устройство: ${msg.username} → ${deviceLabel}`);
+
+                // Не спамим в течение сессии
+                const sessionKey = `notified_v2_${chatFile}_${msg.username}_${deviceId}`;
+                if (sessionStorage.getItem(sessionKey)) return msg;
+                sessionStorage.setItem(sessionKey, '1');
+
+                // Это моё имя или чужое?
+                const isMyName = msg.username === state.username;
+
+                if (isMyName) {
+                    // ⚠️ Кто-то зашёл под моим именем!
+                    const added = addNotification({
+                        username: msg.username,
+                        deviceId: deviceId,
+                        deviceLabel: deviceLabel,
+                        chatFile: chatFile,
+                        isSelfWarning: true,
+                    });
+                    if (added) {
+                        updateMenuButtonState();
+                        if (typeof soundManager !== 'undefined') {
+                            setTimeout(() => soundManager.play('notification'), 100);
+                        }
+                        if (navigator.vibrate) navigator.vibrate([80, 40, 80]);
+                        if (typeof showToast === 'function') {
+                            showToast(`⚠️ Кто-то зашёл под вашим именем с «${deviceLabel}»`, 5000);
+                        }
+                    }
+                } else {
+                    // Кто-то другой зашёл с нового устройства
+                    const added = addNotification({
+                        username: msg.username,
+                        deviceId: deviceId,
+                        deviceLabel: deviceLabel,
+                        chatFile: chatFile,
+                    });
+                    if (added) {
+                        updateMenuButtonState();
+                        if (typeof soundManager !== 'undefined') {
+                            setTimeout(() => soundManager.play('notification'), 100);
+                        }
+                        if (navigator.vibrate) navigator.vibrate([60, 40, 60]);
+                        if (typeof showToast === 'function') {
+                            showToast(`📱 ${msg.username} зашёл с нового устройства`, 3500);
+                        }
+                    }
+                }
             }
         }
 
@@ -45694,110 +44960,164 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
     };
 
     // ═══════════════════════════════════════════════════════════
-    //  ВСПОМОГАТЕЛЬНЫЕ
+    //  🎯 ИНТЕГРАЦИЯ В МЕНЮ «⋯»
+    //  ─────────────────────────────────────────────────────────────
+    //  Добавляем пункт «📱 Уведомления» в начало меню
     // ═══════════════════════════════════════════════════════════
-    function showToastSafe(text, dur) {
-        try {
-            if (typeof showToast === 'function') showToast(text, dur || 2000);
-        } catch (e) {}
+    function injectNotificationsMenuItem() {
+        const menu = document.getElementById('unifiedChatMenu');
+        if (!menu) return;
+        if (menu.querySelector('[data-action="devicenotifs"]')) return;
+
+        // Ищем первый пункт (обычно это «Переместить» или «Аватарка»)
+        const firstItem = menu.querySelector('.ucm-item');
+        if (!firstItem) return;
+
+        const unread = getUnreadCount();
+
+        const item = document.createElement('div');
+        item.className = 'ucm-item' + (unread > 0 ? ' has-unread' : '');
+        item.dataset.action = 'devicenotifs';
+        item.innerHTML = `
+            <span class="ucm-icon">📱</span>
+            <span class="ucm-label">
+                <div>Устройства</div>
+                <div class="ucm-hint">${unread > 0 ? `${unread} новых` : 'Смена устройств'}</div>
+            </span>
+            ${unread > 0 ? `<span class="ucm-notif-count">${unread > 99 ? '99+' : unread}</span>` : ''}
+        `;
+
+        // Вставляем в самое начало
+        firstItem.parentNode.insertBefore(item, firstItem);
+
+        // Разделитель
+        const divider = document.createElement('div');
+        divider.className = 'ucm-divider';
+        item.parentNode.insertBefore(divider, item.nextSibling);
+
+        // Клик
+        item.addEventListener('click', (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+
+            // Закрываем меню
+            menu.classList.remove('show');
+            const backdrop = document.getElementById('unifiedChatMenuBackdrop');
+            if (backdrop) backdrop.classList.remove('show');
+
+            // Открываем панель уведомлений
+            setTimeout(() => openNotificationsPanel(), 200);
+        });
     }
 
-    function soundManagerSafe(type) {
-        try {
-            if (typeof soundManager !== 'undefined') soundManager.play(type);
-        } catch (e) {}
-    }
+    // Следим за появлением меню
+    const menuObserver = new MutationObserver(() => {
+        if (document.getElementById('unifiedChatMenu')) {
+            injectNotificationsMenuItem();
+        }
+    });
+    menuObserver.observe(document.body, { childList: true, subtree: true });
+
+    // На каждое открытие меню — переинжектим (для обновления счётчика)
+    document.addEventListener('click', (e) => {
+        if (e.target.closest('.chat-more-btn') || e.target.closest('#chatsActionsBtn')) {
+            setTimeout(injectNotificationsMenuItem, 50);
+            setTimeout(injectNotificationsMenuItem, 200);
+        }
+    }, true);
 
     // ═══════════════════════════════════════════════════════════
-    //  ПРИ ВХОДЕ В ЧАТ — проверяем защиту
+    //  🔄 ПЕРИОДИЧЕСКОЕ ОБНОВЛЕНИЕ ИНДИКАТОРА
     // ═══════════════════════════════════════════════════════════
-    if (typeof enterChat === 'function') {
-        const _origEnter = enterChat;
-        enterChat = async function(file, name, password) {
-            const result = await _origEnter.apply(this, arguments);
+    setInterval(updateMenuButtonState, 2000);
 
-            if (state.chatFile === file && state.username) {
-                // Обновляем иконку 🔒
-                setTimeout(() => {
-                    interceptForgetButton();
-                    updateLockIcon();
-                }, 200);
+    // Первая инициализация
+    setTimeout(updateMenuButtonState, 2500);
 
-                // Проверяем, защищено ли имя
-                setTimeout(async () => {
-                    const lock = getLock(file, state.username);
-                    const myKey = getMyKey(file);
-
-                    if (lock && (!myKey || myKey.username !== state.username
-                        || myKey.verifyHash !== lock.verifyHash)) {
-                        // Имя защищено, но мы не вводили пароль (или вводили неверный)
-                        log(`⚠️ Имя "${state.username}" защищено — запрашиваем пароль`);
-
-                        // Небольшая задержка, чтобы чат успел отрендериться
-                        await new Promise(r => setTimeout(r, 800));
-
-                        // Показываем prompt только если это первый раз в сессии
-                        const key = `prompted_${file}_${state.username}`;
-                        if (!sessionStorage.getItem(key)) {
-                            sessionStorage.setItem(key, '1');
-                            const success = await showPasswordPrompt(file, state.username);
-                            if (!success) {
-                                showToastSafe('⚠️ Вы не сможете писать под этим именем', 3500);
-                            }
-                        }
-                    }
-                }, 500);
-            }
-
-            return result;
+    // Также обновляем при показе экрана чатов
+    if (typeof showChatsScreen === 'function') {
+        const _origShowChats = showChatsScreen;
+        showChatsScreen = function() {
+            const r = _origShowChats.apply(this, arguments);
+            setTimeout(() => {
+                updateMenuButtonState();
+                injectNotificationsMenuItem();
+            }, 200);
+            return r;
         };
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ИНИЦИАЛИЗАЦИЯ
+    //  УТИЛИТЫ
     // ═══════════════════════════════════════════════════════════
-    loadAttempts();
-    setTimeout(interceptForgetButton, 2000);
-    setInterval(interceptForgetButton, 3000);  // на случай перерисовки
+    function escapeHtml(s) {
+        if (typeof window.escapeHtml === 'function') return window.escapeHtml(s);
+        const div = document.createElement('div');
+        div.textContent = s == null ? '' : String(s);
+        return div.innerHTML;
+    }
 
-    // API для отладки
-    window.NameLock = {
-        status: () => {
-            if (!state.chatFile) return { error: 'Нет активного чата' };
-            const locks = getAllLocks(state.chatFile);
-            const myKey = getMyKey(state.chatFile);
-            return {
-                chatFile: state.chatFile,
-                myUsername: state.username,
-                myKey: myKey ? { username: myKey.username, verifyHash: myKey.verifyHash.slice(0, 16) + '…' } : null,
-                locksInChat: Object.keys(locks).map(u => ({
-                    username: u,
-                    isMine: myKey && myKey.username === u && myKey.verifyHash === locks[u].verifyHash,
-                })),
-            };
+    // ═══════════════════════════════════════════════════════════
+    //  API
+    // ═══════════════════════════════════════════════════════════
+    window.DeviceTracker = {
+        myDevice: () => ({ id: MY_DEVICE_ID, label: MY_DEVICE_LABEL }),
+        allDevices: () => loadKnownDevices(),
+        devicesOf: (username) => getKnownDevices(username),
+        notifications: () => loadNotifications(),
+        unreadCount: () => getUnreadCount(),
+        openPanel: openNotificationsPanel,
+        markAllRead: () => { markAllRead(); renderNotificationsList(); },
+        clearAll: clearNotifications,
+        refreshIndicator: updateMenuButtonState,
+
+        reset: () => {
+            localStorage.removeItem(CFG.STORAGE_KNOWN_DEVICES);
+            localStorage.removeItem(CFG.STORAGE_NOTIFICATIONS);
+            localStorage.removeItem(CFG.STORAGE_DEVICE_ID);
+            localStorage.removeItem(CFG.STORAGE_DEVICE_LABEL);
+            log('🗑️ Сброс');
+            location.reload();
         },
-        openProfile: openProfileModal,
-        clearAll: () => {
-            localStorage.removeItem(CFG.STORAGE_LOCKS);
-            localStorage.removeItem(CFG.STORAGE_MY_KEY);
-            localStorage.removeItem('smschat_attempts_v1');
-            log('🗑️ Все данные NameLock очищены');
+
+        simulateNewDevice: () => {
+            const newId = 'dev_sim_' + Date.now().toString(36);
+            localStorage.setItem(CFG.STORAGE_DEVICE_ID, newId);
+            log('🎭 Симуляция нового устройства:', newId);
+            location.reload();
         },
-        clearMyKey: (chatFile) => {
-            removeMyKey(chatFile || state.chatFile);
-            removeLock(chatFile || state.chatFile, state.username);
-            updateLockIcon();
-            log('🗑️ Мой ключ и лок удалены');
+
+        // Тест: добавить фейковое уведомление
+        testNotification: () => {
+            addNotification({
+                username: 'Тест',
+                deviceId: 'dev_test_' + Date.now(),
+                deviceLabel: 'Samsung Galaxy S24 · Chrome',
+                chatFile: state.chatFile || state.chats[0]?.file || 'test_chat',
+            });
+            updateMenuButtonState();
+            injectNotificationsMenuItem();
+            if (typeof showToast === 'function') {
+                showToast('📱 Тестовое уведомление добавлено', 2000);
+            }
         },
+
+        status: () => ({
+            myDevice: { id: MY_DEVICE_ID, label: MY_DEVICE_LABEL },
+            unreadCount: getUnreadCount(),
+            totalNotifications: loadNotifications().length,
+            knownUsers: Object.keys(loadKnownDevices()).length,
+        }),
     };
 
-    console.log('🔐 [NameLock] Установлено:');
-    console.log('   • Кнопка 🔒 → профиль с защитой имени');
-    console.log('   • Пароль хранится в localStorage');
-    console.log('   • 3 попытки, на 4-й — публичное сообщение');
-    console.log('   • Иконка 🔒 меняет цвет, когда имя защищено');
-    console.log('   • API: NameLock.status() / .openProfile() / .clearAll()');
+    console.log('📱 [DeviceTracker v2] Готово:');
+    console.log('   • Моё устройство:', MY_DEVICE_LABEL);
+    console.log('   • Пункт «📱 Устройства» в меню «⋯»');
+    console.log('   • Кнопка «⋯» светится при новых уведомлениях');
+    console.log('   • API: DeviceTracker.status() / .testNotification()');
+    console.log('   • Тест: DeviceTracker.simulateNewDevice()');
 })();
 </script>
+
 </body>
 </html>
