@@ -42467,5 +42467,1856 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
     console.log('   • API: allowScrollToBottom(ms, reason)');
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🎨 ФОН ЧАТА v3 — фикс открытия меню + приглушённая точка
+//  ─────────────────────────────────────────────────────────────
+//  Что нового:
+//   1. Запоминаем "активный" chatFile в момент клика по «⋯»
+//      → пункт «Фон чата» срабатывает с ПЕРВОГО раза.
+//   2. Точка-индикатор на «⋯» — приглушённая, ненавязчивая.
+//   3. Проверка "есть ли фон" — строже (null-safe).
+//   4. Убираем зависимость от .chat-more-btn.active.
+// ═══════════════════════════════════════════════════════════════
+
+(function installChatBackgroundsV3() {
+    'use strict';
+
+    console.log('🎨 [ChatBg v3] Установка…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  КОНФИГ
+    // ═══════════════════════════════════════════════════════════
+    const STORAGE_KEY = 'chathub_chat_backgrounds';
+
+    // ═══════════════════════════════════════════════════════════
+    //  🆕 ГЛАВНОЕ: запоминаем "активный" файл чата
+    //  Обновляется при каждом клике по .chat-more-btn
+    //  Используется при клике на пункт «Фон чата»
+    // ═══════════════════════════════════════════════════════════
+    let _activeMenuChatFile = null;
+
+    // ═══════════════════════════════════════════════════════════
+    //  УЗОРЫ (те же, что и раньше)
+    // ═══════════════════════════════════════════════════════════
+    const PATTERNS = [
+        { id: 'none', name: 'Без узора', icon: '⬛', build: () => null },
+        {
+            id: 'trees', name: 'Ёлочки', icon: '🌲',
+            build: (color, opacity) => `
+                <svg xmlns="http://www.w3.org/2000/svg" width="60" height="60" viewBox="0 0 60 60">
+                    <g fill="none" stroke="${color}" stroke-opacity="${opacity}" stroke-width="1.2">
+                        <path d="M15 10 L20 20 L10 20 Z"/>
+                        <path d="M15 16 L21 28 L9 28 Z"/>
+                        <path d="M15 24 L22 38 L8 38 Z"/>
+                        <path d="M45 10 L50 20 L40 20 Z"/>
+                        <path d="M45 16 L51 28 L39 28 Z"/>
+                        <path d="M45 24 L52 38 L38 38 Z"/>
+                    </g>
+                </svg>`,
+        },
+        {
+            id: 'stars', name: 'Звёзды', icon: '⭐',
+            build: (color, opacity) => `
+                <svg xmlns="http://www.w3.org/2000/svg" width="80" height="80" viewBox="0 0 80 80">
+                    <g fill="none" stroke="${color}" stroke-opacity="${opacity}" stroke-width="1.2" stroke-linejoin="round">
+                        <path d="M20 10 l3 7 8 1 -6 5 2 8 -7 -4 -7 4 2 -8 -6 -5 8 -1 z"/>
+                        <path d="M60 50 l2.4 5.6 6.4 0.8 -4.8 4 1.6 6.4 -5.6 -3.2 -5.6 3.2 1.6 -6.4 -4.8 -4 6.4 -0.8 z"/>
+                        <circle cx="60" cy="15" r="1.4"/>
+                        <circle cx="20" cy="65" r="1.4"/>
+                    </g>
+                </svg>`,
+        },
+        {
+            id: 'circles', name: 'Круги', icon: '⭕',
+            build: (color, opacity) => `
+                <svg xmlns="http://www.w3.org/2000/svg" width="70" height="70" viewBox="0 0 70 70">
+                    <g fill="none" stroke="${color}" stroke-opacity="${opacity}" stroke-width="1.2">
+                        <circle cx="17" cy="17" r="10"/>
+                        <circle cx="17" cy="17" r="5"/>
+                        <circle cx="52" cy="52" r="10"/>
+                        <circle cx="52" cy="52" r="5"/>
+                        <circle cx="52" cy="17" r="3"/>
+                        <circle cx="17" cy="52" r="3"/>
+                    </g>
+                </svg>`,
+        },
+        {
+            id: 'waves', name: 'Волны', icon: '🌊',
+            build: (color, opacity) => `
+                <svg xmlns="http://www.w3.org/2000/svg" width="80" height="40" viewBox="0 0 80 40">
+                    <g fill="none" stroke="${color}" stroke-opacity="${opacity}" stroke-width="1.3" stroke-linecap="round">
+                        <path d="M0 20 Q10 10, 20 20 T40 20 T60 20 T80 20"/>
+                        <path d="M0 30 Q10 20, 20 30 T40 30 T60 30 T80 30"/>
+                    </g>
+                </svg>`,
+        },
+        {
+            id: 'diamonds', name: 'Ромбы', icon: '🔷',
+            build: (color, opacity) => `
+                <svg xmlns="http://www.w3.org/2000/svg" width="50" height="50" viewBox="0 0 50 50">
+                    <g fill="none" stroke="${color}" stroke-opacity="${opacity}" stroke-width="1.2" stroke-linejoin="round">
+                        <path d="M25 5 L45 25 L25 45 L5 25 Z"/>
+                        <path d="M25 15 L35 25 L25 35 L15 25 Z"/>
+                        <path d="M0 0 L8 8 M50 0 L42 8 M0 50 L8 42 M50 50 L42 42"/>
+                    </g>
+                </svg>`,
+        },
+        {
+            id: 'dots', name: 'Точки', icon: '🔵',
+            build: (color, opacity) => `
+                <svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" viewBox="0 0 40 40">
+                    <g fill="${color}" fill-opacity="${opacity}">
+                        <circle cx="10" cy="10" r="1.6"/>
+                        <circle cx="30" cy="10" r="1.6"/>
+                        <circle cx="10" cy="30" r="1.6"/>
+                        <circle cx="30" cy="30" r="1.6"/>
+                        <circle cx="20" cy="20" r="1.2"/>
+                    </g>
+                </svg>`,
+        },
+        {
+            id: 'grid', name: 'Сетка', icon: '▦',
+            build: (color, opacity) => `
+                <svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" viewBox="0 0 40 40">
+                    <g stroke="${color}" stroke-opacity="${opacity}" stroke-width="0.9" fill="none">
+                        <path d="M0 20 H40 M20 0 V40"/>
+                        <path d="M0 0 H40 V40 H0 Z"/>
+                    </g>
+                </svg>`,
+        },
+        {
+            id: 'hexagons', name: 'Соты', icon: '⬡',
+            build: (color, opacity) => `
+                <svg xmlns="http://www.w3.org/2000/svg" width="56" height="64" viewBox="0 0 56 64">
+                    <g fill="none" stroke="${color}" stroke-opacity="${opacity}" stroke-width="1.1" stroke-linejoin="round">
+                        <path d="M28 2 L52 16 L52 44 L28 58 L4 44 L4 16 Z"/>
+                        <path d="M28 34 L52 48 M28 34 L4 48 M0 16 L-24 2 M56 16 L80 2"/>
+                    </g>
+                </svg>`,
+        },
+    ];
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПРЕДУСТАНОВЛЕННЫЕ ЦВЕТА ФОНА
+    // ═══════════════════════════════════════════════════════════
+    const BG_COLORS = [
+        { id: 'default', value: '',             name: 'Стандарт' },
+        { id: 'dark',    value: '#0a0a0f',      name: 'Тёмный' },
+        { id: 'navy',    value: '#0f172a',      name: 'Тёмно-синий' },
+        { id: 'forest',  value: '#0f1f17',      name: 'Тёмно-зелёный' },
+        { id: 'plum',    value: '#1a0f1f',      name: 'Сливовый' },
+        { id: 'wine',    value: '#1f0f14',      name: 'Винный' },
+        { id: 'choco',   value: '#1a130d',      name: 'Шоколад' },
+        { id: 'slate',   value: '#15161a',      name: 'Графит' },
+    ];
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХРАНИЛИЩЕ
+    // ═══════════════════════════════════════════════════════════
+    let _backgrounds = {};
+
+    function loadBackgrounds() {
+        try {
+            const raw = localStorage.getItem(STORAGE_KEY);
+            _backgrounds = raw ? JSON.parse(raw) : {};
+        } catch (e) { _backgrounds = {}; }
+    }
+
+    function saveBackgrounds() {
+        try {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(_backgrounds));
+        } catch (e) {
+            console.warn('🎨 [ChatBg v3] save failed:', e);
+        }
+    }
+
+    /**
+     * 🆕 Строгая проверка: у чата РЕАЛЬНО есть фон?
+     * Возвращает объект фона или null.
+     */
+    function getBg(chatFile) {
+        if (!chatFile || typeof chatFile !== 'string') return null;
+        const bg = _backgrounds[chatFile];
+        if (!bg || typeof bg !== 'object') return null;
+        // Хотя бы одно значимое поле должно быть задано
+        const hasPattern = bg.pattern && bg.pattern !== 'none';
+        const hasColor = bg.color && bg.color.length > 0;
+        if (!hasPattern && !hasColor) return null;
+        return bg;
+    }
+
+    /**
+     * 🆕 Есть ли у чата ЛЮБОЙ фон (для точки-индикатора)
+     */
+    function hasBg(chatFile) {
+        return getBg(chatFile) !== null;
+    }
+
+    function setBg(chatFile, bg) {
+        if (!chatFile) return;
+        const hasPattern = bg && bg.pattern && bg.pattern !== 'none';
+        const hasColor = bg && bg.color && bg.color.length > 0;
+        if (!hasPattern && !hasColor) {
+            delete _backgrounds[chatFile];
+        } else {
+            _backgrounds[chatFile] = bg;
+        }
+        saveBackgrounds();
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ГЕНЕРАЦИЯ CSS СЛОЯ
+    // ═══════════════════════════════════════════════════════════
+    function buildLayerCss(bg) {
+        if (!bg) {
+            return { backgroundColor: '', backgroundImage: '', backgroundSize: 'auto' };
+        }
+
+        const pattern = PATTERNS.find(p => p.id === bg.pattern);
+        const bgColor = bg.color || '';
+        const color = bg.patternColor || '#ffffff';
+        const opacity = (bg.opacity != null ? bg.opacity : 8) / 100;
+
+        let imageUrl = '';
+        if (pattern && pattern.build && bg.pattern !== 'none') {
+            const svg = pattern.build(color, opacity);
+            if (svg) {
+                const encoded = 'data:image/svg+xml;charset=utf-8,' +
+                    encodeURIComponent(svg.replace(/\s+/g, ' ').trim());
+                imageUrl = `url("${encoded}")`;
+            }
+        }
+
+        return {
+            backgroundColor: bgColor || '',
+            backgroundImage: imageUrl,
+            backgroundSize: 'auto',
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СЛОЙ ФОНА
+    // ═══════════════════════════════════════════════════════════
+    function ensureBgLayer() {
+        const chatScreen = document.getElementById('chatScreen');
+        if (!chatScreen) return null;
+
+        const currentPos = getComputedStyle(chatScreen).position;
+        if (currentPos === 'static') {
+            chatScreen.style.position = 'relative';
+        }
+
+        let layer = chatScreen.querySelector('.chat-bg-layer');
+        if (layer) return layer;
+
+        layer = document.createElement('div');
+        layer.className = 'chat-bg-layer';
+
+        const messagesContainer = document.getElementById('messagesContainer');
+        if (messagesContainer && messagesContainer.parentNode === chatScreen) {
+            chatScreen.insertBefore(layer, messagesContainer);
+        } else {
+            chatScreen.appendChild(layer);
+        }
+
+        return layer;
+    }
+
+    function applyBackground(chatFile) {
+        const layer = ensureBgLayer();
+        if (!layer) return;
+
+        const bg = getBg(chatFile);
+
+        // Сброс
+        layer.style.backgroundColor = '';
+        layer.style.backgroundImage = '';
+        layer.style.backgroundSize = '';
+        layer.style.backgroundRepeat = '';
+        layer.style.backgroundPosition = '';
+
+        const messagesContainer = document.getElementById('messagesContainer');
+        if (messagesContainer) {
+            messagesContainer.style.backgroundImage = '';
+            messagesContainer.style.backgroundColor = '';
+            messagesContainer.style.backgroundAttachment = '';
+        }
+
+        if (!bg) return;
+
+        const css = buildLayerCss(bg);
+        if (css.backgroundColor) layer.style.backgroundColor = css.backgroundColor;
+        if (css.backgroundImage) {
+            layer.style.backgroundImage = css.backgroundImage;
+            layer.style.backgroundSize = css.backgroundSize;
+            layer.style.backgroundRepeat = 'repeat';
+        }
+    }
+
+    function clearBackground() {
+        const layer = ensureBgLayer();
+        if (!layer) return;
+        layer.style.backgroundColor = '';
+        layer.style.backgroundImage = '';
+        layer.style.backgroundSize = '';
+        layer.style.backgroundRepeat = '';
+        layer.style.backgroundPosition = '';
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СТИЛИ
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('chatBgV3Styles')) {
+        const style = document.createElement('style');
+        style.id = 'chatBgV3Styles';
+        style.textContent = `
+            /* ═══ Слой фона чата ═══ */
+            #chatScreen > .chat-bg-layer {
+                position: absolute;
+                top: 0; left: 0; right: 0; bottom: 0;
+                z-index: 0;
+                pointer-events: none;
+                background-repeat: repeat;
+                background-position: 0 0;
+                transition: background-color 0.3s ease, background-image 0.3s ease;
+            }
+
+            /* Сообщения и шапка — поверх слоя */
+            #chatScreen > .chat-header,
+            #chatScreen > .messages-container,
+            #chatScreen > .input-bar {
+                position: relative;
+                z-index: 1;
+            }
+
+            /* ═══ Плотные подложки сообщений ═══ */
+            .message-wrapper.other .message {
+                background: rgba(42, 42, 62, 0.88);
+                backdrop-filter: blur(6px);
+                -webkit-backdrop-filter: blur(6px);
+                border: 1px solid rgba(255, 255, 255, 0.06);
+                box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+            }
+
+            .message-wrapper.own .message {
+                background: linear-gradient(135deg,
+                    rgba(108, 92, 231, 0.95),
+                    rgba(74, 63, 143, 0.95));
+                backdrop-filter: blur(6px);
+                -webkit-backdrop-filter: blur(6px);
+                box-shadow: 0 2px 10px rgba(108, 92, 231, 0.25);
+            }
+
+            .message.system {
+                background: rgba(20, 20, 32, 0.75);
+                backdrop-filter: blur(4px);
+                -webkit-backdrop-filter: blur(4px);
+            }
+
+            .reply-quote {
+                background: rgba(0, 0, 0, 0.35);
+                backdrop-filter: blur(4px);
+                -webkit-backdrop-filter: blur(4px);
+            }
+
+            .message .file-card,
+            .message .audio-container,
+            .message .invite-card {
+                backdrop-filter: blur(6px);
+                -webkit-backdrop-filter: blur(6px);
+            }
+
+            /* ═══════════════════════════════════════════════════
+               🆕 ТОЧКА-ИНДИКАТОР НА «⋯»
+               Теперь приглушённая и менее навязчивая
+               ═══════════════════════════════════════════════════ */
+            .chat-more-btn {
+                /* 🆕 Обязательно relative — иначе точка улетит */
+                position: relative !important;
+            }
+            .chat-more-btn .chat-bg-dot {
+                position: absolute;
+                top: 2px;
+                right: 2px;
+                width: 6px;
+                height: 6px;
+                border-radius: 50%;
+                /* Приглушённый цвет вместо яркого градиента */
+                background: rgba(167, 139, 250, 0.85);
+                box-shadow: 0 0 3px rgba(108, 92, 231, 0.5);
+                pointer-events: none;
+                z-index: 2;
+                /* Не перекрывает клик по кнопке */
+            }
+            /* Убираем "ореол", который был раньше */
+            .chat-more-btn .chat-bg-dot::after {
+                display: none;
+            }
+
+            /* ═══════════════════════════════════════════════════
+               МОДАЛКА ВЫБОРА ФОНА
+               ═══════════════════════════════════════════════════ */
+            #chatBgModal { display: none; }
+            #chatBgModal.active { display: flex; }
+
+            #chatBgModal .bg-modal-content {
+                background: #1a1a2e;
+                border-radius: 20px;
+                padding: 0;
+                max-width: 460px;
+                width: 100%;
+                max-height: 92vh;
+                display: flex;
+                flex-direction: column;
+                border: 1px solid rgba(255,255,255,0.1);
+                box-shadow: 0 20px 60px rgba(0,0,0,0.7);
+                overflow: hidden;
+                animation: bgModalIn 0.25s cubic-bezier(0.22, 0.61, 0.36, 1);
+            }
+            @keyframes bgModalIn {
+                from { opacity: 0; transform: scale(0.94); }
+                to   { opacity: 1; transform: scale(1); }
+            }
+
+            #chatBgModal .bg-modal-header {
+                display: flex;
+                align-items: center;
+                gap: 12px;
+                padding: 16px 20px;
+                border-bottom: 1px solid rgba(255,255,255,0.08);
+                background: linear-gradient(135deg, rgba(108,92,231,0.12), rgba(0,184,148,0.06));
+                flex-shrink: 0;
+            }
+            #chatBgModal .bg-modal-header h2 {
+                flex: 1;
+                min-width: 0;
+                font-size: 17px;
+                font-weight: 700;
+                color: #fff;
+                margin: 0;
+            }
+            #chatBgModal .bg-modal-close {
+                width: 34px; height: 34px;
+                border-radius: 50%;
+                border: none;
+                background: rgba(255,255,255,0.06);
+                color: #888;
+                font-size: 16px;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                flex-shrink: 0;
+                transition: all 0.15s;
+            }
+            #chatBgModal .bg-modal-close:hover {
+                background: rgba(255,107,107,0.2);
+                color: #ff6b6b;
+            }
+
+            #chatBgModal .bg-modal-body {
+                flex: 1;
+                overflow-y: auto;
+                padding: 18px 20px;
+                min-height: 0;
+            }
+
+            #chatBgModal .bg-section { margin-bottom: 22px; }
+            #chatBgModal .bg-section:last-child { margin-bottom: 0; }
+            #chatBgModal .bg-section-title {
+                font-size: 12px;
+                font-weight: 700;
+                color: #888;
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
+                margin-bottom: 10px;
+                display: flex;
+                align-items: center;
+                gap: 6px;
+            }
+
+            #chatBgModal .bg-preview {
+                position: relative;
+                height: 140px;
+                border-radius: 14px;
+                overflow: hidden;
+                border: 2px solid rgba(108,92,231,0.3);
+                background-color: #0a0a0f;
+                background-repeat: repeat;
+                background-position: 0 0;
+                transition: all 0.3s;
+                margin-bottom: 6px;
+            }
+            #chatBgModal .bg-preview .bg-preview-bubble {
+                position: absolute;
+                padding: 8px 14px;
+                border-radius: 16px;
+                font-size: 12px;
+                color: #fff;
+                max-width: 60%;
+                box-shadow: 0 4px 14px rgba(0,0,0,0.4);
+                line-height: 1.35;
+            }
+            #chatBgModal .bg-preview .bg-preview-bubble.left {
+                top: 20px; left: 16px;
+                background: rgba(42, 42, 62, 0.88);
+                border-bottom-left-radius: 4px;
+                backdrop-filter: blur(6px);
+                -webkit-backdrop-filter: blur(6px);
+            }
+            #chatBgModal .bg-preview .bg-preview-bubble.right {
+                bottom: 20px; right: 16px;
+                background: linear-gradient(135deg, #6c5ce7, #4a3f8f);
+                border-bottom-right-radius: 4px;
+                backdrop-filter: blur(6px);
+                -webkit-backdrop-filter: blur(6px);
+            }
+            #chatBgModal .bg-preview-hint {
+                font-size: 11px;
+                color: #666;
+                text-align: center;
+                font-style: italic;
+            }
+
+            #chatBgModal .bg-patterns-grid {
+                display: grid;
+                grid-template-columns: repeat(3, 1fr);
+                gap: 8px;
+            }
+            #chatBgModal .bg-pattern-item {
+                aspect-ratio: 1;
+                border-radius: 12px;
+                border: 2px solid rgba(255,255,255,0.08);
+                background-color: #0f0f18;
+                background-repeat: repeat;
+                background-position: center;
+                cursor: pointer;
+                position: relative;
+                overflow: hidden;
+                transition: all 0.15s;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                gap: 4px;
+                -webkit-tap-highlight-color: transparent;
+            }
+            #chatBgModal .bg-pattern-item:hover {
+                border-color: rgba(108,92,231,0.5);
+                transform: translateY(-1px);
+            }
+            #chatBgModal .bg-pattern-item:active { transform: scale(0.96); }
+            #chatBgModal .bg-pattern-item.selected {
+                border-color: #a78bfa;
+                box-shadow: 0 0 0 2px rgba(167,139,250,0.3),
+                            0 4px 14px rgba(108,92,231,0.3);
+            }
+            #chatBgModal .bg-pattern-item.selected::after {
+                content: '✓';
+                position: absolute;
+                top: 4px; right: 4px;
+                width: 18px; height: 18px;
+                border-radius: 50%;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                color: #fff;
+                font-size: 11px;
+                font-weight: 700;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                line-height: 1;
+                box-shadow: 0 2px 6px rgba(0,0,0,0.4);
+            }
+            #chatBgModal .bg-pattern-item .bg-pattern-icon {
+                font-size: 24px;
+                line-height: 1;
+                z-index: 1;
+            }
+            #chatBgModal .bg-pattern-item .bg-pattern-name {
+                font-size: 10px;
+                color: #aaa;
+                font-weight: 600;
+                z-index: 1;
+                text-shadow: 0 1px 3px rgba(0,0,0,0.7);
+            }
+
+            #chatBgModal .bg-colors-row {
+                display: flex;
+                gap: 8px;
+                flex-wrap: wrap;
+            }
+            #chatBgModal .bg-color-item {
+                width: 44px; height: 44px;
+                border-radius: 12px;
+                border: 2px solid rgba(255,255,255,0.08);
+                cursor: pointer;
+                position: relative;
+                transition: all 0.15s;
+                flex-shrink: 0;
+                -webkit-tap-highlight-color: transparent;
+            }
+            #chatBgModal .bg-color-item:hover {
+                transform: scale(1.08);
+                border-color: rgba(255,255,255,0.25);
+            }
+            #chatBgModal .bg-color-item:active { transform: scale(0.94); }
+            #chatBgModal .bg-color-item.selected {
+                border-color: #a78bfa;
+                box-shadow: 0 0 0 2px rgba(167,139,250,0.4);
+            }
+            #chatBgModal .bg-color-item.selected::after {
+                content: '✓';
+                position: absolute;
+                inset: 0;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                color: #fff;
+                font-size: 16px;
+                font-weight: 700;
+                text-shadow: 0 1px 3px rgba(0,0,0,0.9);
+            }
+            #chatBgModal .bg-color-item.default-color {
+                background: linear-gradient(135deg, #0a0a0f 0%, #1a1a2e 100%);
+                position: relative;
+                overflow: hidden;
+            }
+            #chatBgModal .bg-color-item.default-color::before {
+                content: '⃠';
+                position: absolute;
+                inset: 0;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                color: #666;
+                font-size: 22px;
+                font-weight: 700;
+            }
+            #chatBgModal .bg-color-item.default-color.selected::after {
+                content: '✓';
+                color: #a78bfa;
+                background: rgba(0,0,0,0.5);
+            }
+
+            #chatBgModal .bg-pattern-color-row {
+                display: flex;
+                gap: 8px;
+                flex-wrap: wrap;
+            }
+            #chatBgModal .bg-pattern-color-item {
+                width: 36px; height: 36px;
+                border-radius: 50%;
+                border: 2px solid rgba(255,255,255,0.15);
+                cursor: pointer;
+                transition: all 0.15s;
+                flex-shrink: 0;
+                -webkit-tap-highlight-color: transparent;
+            }
+            #chatBgModal .bg-pattern-color-item:hover { transform: scale(1.1); }
+            #chatBgModal .bg-pattern-color-item:active { transform: scale(0.92); }
+            #chatBgModal .bg-pattern-color-item.selected {
+                border-color: #fff;
+                box-shadow: 0 0 0 3px rgba(255,255,255,0.25);
+                transform: scale(1.05);
+            }
+
+            #chatBgModal .bg-opacity-row {
+                display: flex;
+                align-items: center;
+                gap: 12px;
+            }
+            #chatBgModal .bg-opacity-slider {
+                flex: 1;
+                -webkit-appearance: none;
+                appearance: none;
+                height: 6px;
+                border-radius: 3px;
+                background: linear-gradient(90deg, rgba(108,92,231,0.3), rgba(108,92,231,0.9));
+                outline: none;
+                cursor: pointer;
+            }
+            #chatBgModal .bg-opacity-slider::-webkit-slider-thumb {
+                -webkit-appearance: none;
+                appearance: none;
+                width: 22px; height: 22px;
+                border-radius: 50%;
+                background: #fff;
+                border: 2px solid #6c5ce7;
+                cursor: pointer;
+                box-shadow: 0 2px 8px rgba(108,92,231,0.5);
+                transition: transform 0.15s;
+            }
+            #chatBgModal .bg-opacity-slider::-moz-range-thumb {
+                width: 22px; height: 22px;
+                border-radius: 50%;
+                background: #fff;
+                border: 2px solid #6c5ce7;
+                cursor: pointer;
+                box-shadow: 0 2px 8px rgba(108,92,231,0.5);
+            }
+            #chatBgModal .bg-opacity-value {
+                font-size: 14px;
+                font-weight: 700;
+                color: #a78bfa;
+                font-variant-numeric: tabular-nums;
+                min-width: 44px;
+                text-align: right;
+            }
+
+            #chatBgModal .bg-modal-footer {
+                display: flex;
+                gap: 10px;
+                padding: 14px 20px 18px;
+                border-top: 1px solid rgba(255,255,255,0.06);
+                background: rgba(255,255,255,0.02);
+                flex-shrink: 0;
+            }
+            #chatBgModal .bg-modal-footer .btn {
+                padding: 12px;
+                font-size: 14px;
+            }
+            #chatBgModal .bg-reset-btn {
+                background: rgba(255,107,107,0.1);
+                border: 1px solid rgba(255,107,107,0.25);
+                color: #ff6b6b;
+                border-radius: 12px;
+                padding: 12px 16px;
+                font-size: 14px;
+                font-weight: 600;
+                cursor: pointer;
+                transition: all 0.15s;
+                font-family: inherit;
+                flex-shrink: 0;
+            }
+            #chatBgModal .bg-reset-btn:hover {
+                background: rgba(255,107,107,0.2);
+                border-color: rgba(255,107,107,0.5);
+            }
+            #chatBgModal .bg-reset-btn:active { transform: scale(0.96); }
+
+            @media (max-width: 480px) {
+                #chatBgModal .bg-modal-content {
+                    max-height: 94vh;
+                    border-radius: 18px 18px 0 0;
+                    max-width: 100%;
+                    margin-top: auto;
+                }
+                #chatBgModal .bg-preview { height: 110px; }
+                #chatBgModal .bg-modal-body { padding: 14px 16px; }
+                #chatBgModal .bg-modal-header { padding: 14px 16px; }
+                #chatBgModal .bg-modal-footer { padding: 12px 16px 16px; }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  МОДАЛКА
+    // ═══════════════════════════════════════════════════════════
+    let _modalEl = null;
+    let _currentFile = null;
+    let _draft = null;
+
+    function ensureModal() {
+        if (_modalEl && _modalEl.isConnected) return _modalEl;
+
+        const old = document.getElementById('chatBgModal');
+        if (old) old.remove();
+
+        const modal = document.createElement('div');
+        modal.id = 'chatBgModal';
+        modal.className = 'image-modal';
+        modal.innerHTML = `
+            <div class="bg-modal-content" onclick="event.stopPropagation()">
+                <div class="bg-modal-header">
+                    <h2>🎨 Фон чата</h2>
+                    <button class="bg-modal-close" id="bgModalCloseBtn">✕</button>
+                </div>
+
+                <div class="bg-modal-body">
+                    <div class="bg-section">
+                        <div class="bg-section-title">👁️ Превью</div>
+                        <div class="bg-preview" id="bgPreview">
+                            <div class="bg-preview-bubble left">Привет! 👋</div>
+                            <div class="bg-preview-bubble right">Как дела?</div>
+                        </div>
+                        <div class="bg-preview-hint">Фон статичный, сообщения крутятся поверх</div>
+                    </div>
+
+                    <div class="bg-section">
+                        <div class="bg-section-title">✨ Узор</div>
+                        <div class="bg-patterns-grid" id="bgPatternsGrid"></div>
+                    </div>
+
+                    <div class="bg-section">
+                        <div class="bg-section-title">🎨 Цвет фона</div>
+                        <div class="bg-colors-row" id="bgColorsRow"></div>
+                    </div>
+
+                    <div class="bg-section" id="bgPatternColorSection">
+                        <div class="bg-section-title">🖌️ Цвет узора</div>
+                        <div class="bg-pattern-color-row" id="bgPatternColorRow"></div>
+                    </div>
+
+                    <div class="bg-section" id="bgOpacitySection">
+                        <div class="bg-section-title">👻 Прозрачность узора</div>
+                        <div class="bg-opacity-row">
+                            <input type="range" class="bg-opacity-slider"
+                                   id="bgOpacitySlider"
+                                   min="1" max="30" value="8" step="1">
+                            <span class="bg-opacity-value" id="bgOpacityValue">8%</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="bg-modal-footer">
+                    <button class="bg-reset-btn" id="bgResetBtn" title="Сбросить фон">🗑️</button>
+                    <button class="btn btn-secondary" id="bgCancelBtn" style="flex:1;">Отмена</button>
+                    <button class="btn" id="bgApplyBtn" style="flex:1.4;">✅ Применить</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+
+        modal.querySelector('#bgModalCloseBtn').addEventListener('click', closeModal);
+        modal.querySelector('#bgCancelBtn').addEventListener('click', closeModal);
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) closeModal();
+        });
+        modal.querySelector('#bgApplyBtn').addEventListener('click', applyChanges);
+        modal.querySelector('#bgResetBtn').addEventListener('click', resetToDefault);
+
+        const slider = modal.querySelector('#bgOpacitySlider');
+        const valueEl = modal.querySelector('#bgOpacityValue');
+        slider.addEventListener('input', () => {
+            const v = parseInt(slider.value, 10);
+            valueEl.textContent = v + '%';
+            if (_draft) {
+                _draft.opacity = v;
+                updatePreview();
+            }
+        });
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && modal.classList.contains('active')) {
+                e.preventDefault();
+                e.stopPropagation();
+                closeModal();
+            }
+        }, true);
+
+        _modalEl = modal;
+        return modal;
+    }
+
+    function renderPatternsGrid() {
+        const grid = _modalEl.querySelector('#bgPatternsGrid');
+        if (!grid) return;
+
+        grid.innerHTML = PATTERNS.map(p => {
+            let bgStyle = '';
+            if (p.id !== 'none' && p.build) {
+                const svg = p.build('#a78bfa', 0.35);
+                if (svg) {
+                    const encoded = 'data:image/svg+xml;charset=utf-8,' +
+                        encodeURIComponent(svg.replace(/\s+/g, ' ').trim());
+                    bgStyle = `background-image: url("${encoded}");`;
+                }
+            }
+            const isSelected = _draft && _draft.pattern === p.id;
+            return `
+                <div class="bg-pattern-item ${isSelected ? 'selected' : ''}"
+                     data-pattern-id="${p.id}"
+                     style="${bgStyle}">
+                    <div class="bg-pattern-icon">${p.icon}</div>
+                    <div class="bg-pattern-name">${escapeHtml(p.name)}</div>
+                </div>
+            `;
+        }).join('');
+
+        grid.querySelectorAll('.bg-pattern-item').forEach(el => {
+            el.addEventListener('click', () => {
+                if (!_draft) return;
+                _draft.pattern = el.dataset.patternId;
+                grid.querySelectorAll('.bg-pattern-item').forEach(x => {
+                    x.classList.toggle('selected', x === el);
+                });
+                updatePatternSectionVisibility();
+                updatePreview();
+                if (navigator.vibrate) navigator.vibrate(8);
+                soundManager.play('click');
+            });
+        });
+    }
+
+    function renderColorsRow() {
+        const row = _modalEl.querySelector('#bgColorsRow');
+        if (!row) return;
+
+        row.innerHTML = BG_COLORS.map(c => {
+            const isSelected = _draft && (_draft.color || '') === c.value;
+            const isDefault = c.id === 'default';
+            const bgStyle = isDefault ? '' : `background-color: ${c.value};`;
+            return `
+                <div class="bg-color-item ${isSelected ? 'selected' : ''} ${isDefault ? 'default-color' : ''}"
+                     data-color-value="${escapeHtml(c.value)}"
+                     title="${escapeHtml(c.name)}"
+                     style="${bgStyle}"></div>
+            `;
+        }).join('');
+
+        row.querySelectorAll('.bg-color-item').forEach(el => {
+            el.addEventListener('click', () => {
+                if (!_draft) return;
+                _draft.color = el.dataset.colorValue;
+                row.querySelectorAll('.bg-color-item').forEach(x => {
+                    x.classList.toggle('selected', x === el);
+                });
+                updatePreview();
+                if (navigator.vibrate) navigator.vibrate(8);
+                soundManager.play('click');
+            });
+        });
+    }
+
+    function renderPatternColorRow() {
+        const row = _modalEl.querySelector('#bgPatternColorRow');
+        if (!row) return;
+
+        const COLORS = [
+            { v: '#ffffff', n: 'Белый' },
+            { v: '#a78bfa', n: 'Фиолетовый' },
+            { v: '#00b894', n: 'Зелёный' },
+            { v: '#feca57', n: 'Жёлтый' },
+            { v: '#ff6b6b', n: 'Красный' },
+            { v: '#5CA8FF', n: 'Голубой' },
+            { v: '#F36BE1', n: 'Розовый' },
+            { v: '#4FD166', n: 'Лайм' },
+        ];
+
+        row.innerHTML = COLORS.map(c => {
+            const isSelected = _draft && _draft.patternColor === c.v;
+            return `
+                <div class="bg-pattern-color-item ${isSelected ? 'selected' : ''}"
+                     data-pattern-color="${c.v}"
+                     title="${escapeHtml(c.n)}"
+                     style="background-color: ${c.v};"></div>
+            `;
+        }).join('');
+
+        row.querySelectorAll('.bg-pattern-color-item').forEach(el => {
+            el.addEventListener('click', () => {
+                if (!_draft) return;
+                _draft.patternColor = el.dataset.patternColor;
+                row.querySelectorAll('.bg-pattern-color-item').forEach(x => {
+                    x.classList.toggle('selected', x === el);
+                });
+                updatePreview();
+                if (navigator.vibrate) navigator.vibrate(8);
+                soundManager.play('click');
+            });
+        });
+    }
+
+    function updatePatternSectionVisibility() {
+        const isNone = !_draft || _draft.pattern === 'none';
+        const colorSection = _modalEl.querySelector('#bgPatternColorSection');
+        const opacitySection = _modalEl.querySelector('#bgOpacitySection');
+        if (colorSection) colorSection.style.display = isNone ? 'none' : 'block';
+        if (opacitySection) opacitySection.style.display = isNone ? 'none' : 'block';
+    }
+
+    function updatePreview() {
+        const preview = _modalEl.querySelector('#bgPreview');
+        if (!preview || !_draft) return;
+
+        const css = buildLayerCss(_draft);
+        preview.style.backgroundColor = css.backgroundColor || '#0a0a0f';
+        preview.style.backgroundImage = css.backgroundImage || '';
+        preview.style.backgroundSize = css.backgroundSize || 'auto';
+        preview.style.backgroundRepeat = 'repeat';
+    }
+
+    function openModal(chatFile) {
+        if (!chatFile) {
+            console.warn('🎨 [ChatBg v3] openModal: chatFile не указан');
+            return;
+        }
+
+        ensureModal();
+        _currentFile = chatFile;
+
+        const existing = getBg(chatFile);
+        _draft = existing
+            ? { ...existing }
+            : {
+                pattern: 'none',
+                color: '',
+                patternColor: '#ffffff',
+                opacity: 8,
+            };
+
+        if (!_draft.patternColor) _draft.patternColor = '#ffffff';
+        if (_draft.opacity == null) _draft.opacity = 8;
+        if (!_draft.pattern) _draft.pattern = 'none';
+
+        renderPatternsGrid();
+        renderColorsRow();
+        renderPatternColorRow();
+
+        const slider = _modalEl.querySelector('#bgOpacitySlider');
+        const valueEl = _modalEl.querySelector('#bgOpacityValue');
+        if (slider) {
+            slider.value = _draft.opacity;
+            valueEl.textContent = _draft.opacity + '%';
+        }
+
+        updatePatternSectionVisibility();
+        updatePreview();
+
+        _modalEl.classList.add('active');
+        document.body.style.overflow = 'hidden';
+
+        if (navigator.vibrate) navigator.vibrate(10);
+        soundManager.play('click');
+    }
+
+    function closeModal() {
+        if (!_modalEl) return;
+        _modalEl.classList.remove('active');
+        document.body.style.overflow = '';
+        _currentFile = null;
+        _draft = null;
+    }
+
+    function applyChanges() {
+        if (!_currentFile || !_draft) return;
+
+        setBg(_currentFile, _draft);
+        applyBackground(_currentFile);
+
+        if (state && state.chatFile === _currentFile) {
+            applyBackground(_currentFile);
+        }
+
+        showToast('✅ Фон сохранён', 1500);
+        soundManager.play('send');
+
+        closeModal();
+
+        if (typeof renderChatsList === 'function' && state.currentScreen === 'chats') {
+            renderChatsList();
+        }
+    }
+
+    function resetToDefault() {
+        if (!_currentFile) return;
+
+        delete _backgrounds[_currentFile];
+        saveBackgrounds();
+        applyBackground(_currentFile);
+
+        showToast('🗑️ Фон сброшен', 1500);
+        soundManager.play('delete');
+
+        closeModal();
+
+        if (typeof renderChatsList === 'function' && state.currentScreen === 'chats') {
+            renderChatsList();
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  🆕 ГЛАВНЫЙ ФИКС: ЗАПОМИНАЕМ ФАЙЛ ЧАТА ПРИ ОТКРЫТИИ МЕНЮ
+    //  Это решает проблему "не с первого раза":
+    //  к моменту клика на «Фон чата» мы уже точно знаем chatFile.
+    // ═══════════════════════════════════════════════════════════
+    document.addEventListener('click', (e) => {
+        const moreBtn = e.target.closest('.chat-more-btn');
+        if (!moreBtn) return;
+
+        // Запоминаем файл чата СРАЗУ, до того как меню откроется
+        const chatItem = moreBtn.closest('.chat-list-item');
+        if (chatItem && chatItem.dataset.file) {
+            _activeMenuChatFile = chatItem.dataset.file;
+            console.log('🎨 [ChatBg v3] Запомнен активный чат:', _activeMenuChatFile);
+        }
+    }, true);  // capture — раньше встроенных обработчиков
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУНКТ В МЕНЮ «⋯»
+    // ═══════════════════════════════════════════════════════════
+    function injectBackgroundMenuItem() {
+        const menu = document.getElementById('unifiedChatMenu');
+        if (!menu) return;
+        if (menu.querySelector('[data-action="background"]')) return;
+
+        const avatarItem = menu.querySelector('[data-action="avatar"]');
+        if (!avatarItem) return;
+
+        const item = document.createElement('div');
+        item.className = 'ucm-item';
+        item.dataset.action = 'background';
+        item.innerHTML = `
+            <span class="ucm-icon">🎨</span>
+            <span class="ucm-label">
+                <div>Фон чата</div>
+                <div class="ucm-hint">Узор и цвет</div>
+            </span>
+        `;
+
+        avatarItem.parentNode.insertBefore(item, avatarItem);
+
+        // 🆕 Точка-индикатор прямо в пункте меню, если фон уже есть
+        if (_activeMenuChatFile && hasBg(_activeMenuChatFile)) {
+            const dot = document.createElement('span');
+            dot.style.cssText = `
+                width: 6px;
+                height: 6px;
+                border-radius: 50%;
+                background: rgba(167, 139, 250, 0.85);
+                margin-left: auto;
+                flex-shrink: 0;
+            `;
+            item.appendChild(dot);
+        }
+    }
+
+    document.addEventListener('click', (e) => {
+        const moreBtn = e.target.closest('.chat-more-btn');
+        if (!moreBtn) return;
+        // Даём unifiedChatSystem время построить меню
+        setTimeout(injectBackgroundMenuItem, 30);
+        setTimeout(injectBackgroundMenuItem, 100);
+    }, true);
+
+    const observer = new MutationObserver(() => {
+        if (document.getElementById('unifiedChatMenu')) {
+            injectBackgroundMenuItem();
+        }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    // ─── Единый обработчик клика на пункт «Фон чата» ───
+    document.addEventListener('click', (e) => {
+        const bgItem = e.target.closest('[data-action="background"]');
+        if (!bgItem) return;
+        e.stopImmediatePropagation();
+        e.preventDefault();
+
+        // 🆕 Используем запомненный файл (или fallback)
+        let chatFile = _activeMenuChatFile;
+
+        if (!chatFile) {
+            // Fallback на всякий случай
+            const btn = document.querySelector('.chat-more-btn.active');
+            if (btn) {
+                const chatItem = btn.closest('.chat-list-item');
+                if (chatItem) chatFile = chatItem.dataset.file;
+            }
+        }
+
+        const menu = bgItem.closest('#unifiedChatMenu');
+        if (menu) menu.classList.remove('show');
+        const backdrop = document.getElementById('unifiedChatMenuBackdrop');
+        if (backdrop) backdrop.classList.remove('show');
+
+        if (chatFile) {
+            setTimeout(() => openModal(chatFile), 200);
+        } else {
+            console.warn('🎨 [ChatBg v3] Не удалось определить чат');
+            showToast('❌ Не удалось определить чат', 2000);
+        }
+    }, true);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПРИМЕНЕНИЕ ПРИ ВХОДЕ / ВЫХОДЕ
+    // ═══════════════════════════════════════════════════════════
+    const _origEnterChat = enterChat;
+    enterChat = async function(file, name, password) {
+        const result = await _origEnterChat.call(this, file, name, password);
+        if (state.chatFile === file) {
+            setTimeout(() => applyBackground(file), 100);
+            setTimeout(() => applyBackground(file), 500);
+        }
+        return result;
+    };
+
+    const _origBackToChats = backToChats;
+    backToChats = function() {
+        clearBackground();
+        return _origBackToChats.apply(this, arguments);
+    };
+
+    const _origShowChatScreen = showChatScreen;
+    showChatScreen = function() {
+        const r = _origShowChatScreen.apply(this, arguments);
+        setTimeout(() => {
+            if (state.chatFile) applyBackground(state.chatFile);
+        }, 50);
+        return r;
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  🆕 ТОЧКА-ИНДИКАТОР НА КАРТОЧКЕ ЧАТА (приглушённая)
+    // ═══════════════════════════════════════════════════════════
+    const _origRenderChatsList = renderChatsList;
+    renderChatsList = function() {
+        const r = _origRenderChatsList.apply(this, arguments);
+        setTimeout(() => {
+            document.querySelectorAll('#chatsList .chat-list-item').forEach(item => {
+                const file = item.dataset.file;
+                const moreBtn = item.querySelector('.chat-more-btn');
+                if (!moreBtn || !file) return;
+
+                // Всегда снимаем старую точку
+                const existing = moreBtn.querySelector('.chat-bg-dot');
+                if (existing) existing.remove();
+
+                // 🆕 Строгая проверка: точка только если РЕАЛЬНО есть фон
+                if (hasBg(file)) {
+                    // moreBtn уже имеет position: relative из CSS
+                    const dot = document.createElement('span');
+                    dot.className = 'chat-bg-dot';
+                    moreBtn.appendChild(dot);
+                }
+            });
+        }, 50);
+        return r;
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЗАПУСК
+    // ═══════════════════════════════════════════════════════════
+    loadBackgrounds();
+
+    if (state && state.chatFile && state.currentScreen === 'chat') {
+        setTimeout(() => applyBackground(state.chatFile), 500);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  API
+    // ═══════════════════════════════════════════════════════════
+    window.ChatBackgrounds = {
+        open: (chatFile) => openModal(chatFile || state.chatFile),
+        get: (chatFile) => getBg(chatFile),
+        has: (chatFile) => hasBg(chatFile),
+        set: (chatFile, bg) => { setBg(chatFile, bg); applyBackground(chatFile); },
+        remove: (chatFile) => {
+            delete _backgrounds[chatFile];
+            saveBackgrounds();
+            applyBackground(chatFile);
+        },
+        list: () => ({ ..._backgrounds }),
+        patterns: PATTERNS.map(p => ({ id: p.id, name: p.name, icon: p.icon })),
+        colors: BG_COLORS,
+        apply: (chatFile) => applyBackground(chatFile || state.chatFile),
+        clear: () => clearBackground(),
+        // Для отладки
+        _debug: () => ({
+            activeMenuChatFile: _activeMenuChatFile,
+            backgroundsCount: Object.keys(_backgrounds).length,
+            backgrounds: _backgrounds,
+        }),
+    };
+
+    console.log('🎨 [ChatBg v3] Готово:');
+    console.log('   • Пункт «Фон чата» срабатывает с ПЕРВОГО раза');
+    console.log('   • _activeMenuChatFile запоминается при клике по «⋯»');
+    console.log('   • Точка-индикатор приглушена (rgba 0.85)');
+    console.log('   • hasBg() — строгая проверка');
+    console.log('   • API: ChatBackgrounds.open() / .has(id)');
+})();
+</script>
+<script>
+// 🚫 Отключаем точку-индикатор фона на «⋯»
+(function hideBackgroundDot() {
+    'use strict';
+
+    // 1. CSS — просто скрываем точку
+    if (!document.getElementById('hideBgDotStyles')) {
+        const style = document.createElement('style');
+        style.id = 'hideBgDotStyles';
+        style.textContent = `
+            .chat-more-btn .chat-bg-dot {
+                display: none !important;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // 2. Убираем уже существующие точки
+    function cleanDots() {
+        document.querySelectorAll('.chat-bg-dot').forEach(dot => dot.remove());
+    }
+
+    cleanDots();
+
+    // 3. Наблюдаем за появлением новых и сразу удаляем
+    const observer = new MutationObserver(() => {
+        const dots = document.querySelectorAll('.chat-bg-dot');
+        if (dots.length > 0) cleanDots();
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    // 4. Также патчим renderChatsList, чтобы точка вообще не создавалась
+    const _origRender = renderChatsList;
+    renderChatsList = function() {
+        const r = _origRender.apply(this, arguments);
+        // После рендера удаляем все точки
+        setTimeout(cleanDots, 20);
+        setTimeout(cleanDots, 100);
+        return r;
+    };
+
+    console.log('🚫 [HideBgDot] Точка-индикатор фона отключена');
+})();
+</script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  ➕ ДОБАВЛЯЕМ НОВЫЕ УЗОРЫ В ГАЛЕРЕЮ ФОНОВ
+//  ─────────────────────────────────────────────────────────────
+//  Патч цепляется за существующий массив PATTERNS через
+//  внутренний API. Если по какой-то причине PATTERNS недоступен —
+//  просто пропускаем (не ломаем основной модуль).
+// ═══════════════════════════════════════════════════════════════
+
+(function addMorePatterns() {
+    'use strict';
+
+    // ═══════════════════════════════════════════════════════════
+    //  НОВЫЕ УЗОРЫ
+    // ═══════════════════════════════════════════════════════════
+    const NEW_PATTERNS = [
+        {
+            id: 'triangles',
+            name: 'Треугольники',
+            icon: '🔺',
+            build: (color, opacity) => `
+                <svg xmlns="http://www.w3.org/2000/svg" width="50" height="50" viewBox="0 0 50 50">
+                    <g fill="none" stroke="${color}" stroke-opacity="${opacity}" stroke-width="1.2" stroke-linejoin="round">
+                        <path d="M25 5 L45 40 L5 40 Z"/>
+                        <path d="M25 20 L35 37 L15 37 Z"/>
+                        <path d="M0 50 L10 33 L20 50 Z"/>
+                        <path d="M30 50 L40 33 L50 50 Z"/>
+                    </g>
+                </svg>`
+        },
+        {
+            id: 'crosses',
+            name: 'Крестики',
+            icon: '✖️',
+            build: (color, opacity) => `
+                <svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" viewBox="0 0 40 40">
+                    <g stroke="${color}" stroke-opacity="${opacity}" stroke-width="1.3" stroke-linecap="round">
+                        <path d="M10 10 L14 14 M14 10 L10 14"/>
+                        <path d="M30 30 L34 34 M34 30 L30 34"/>
+                        <path d="M30 10 L34 14 M34 10 L30 14"/>
+                        <path d="M10 30 L14 34 M14 30 L10 34"/>
+                    </g>
+                </svg>`
+        },
+        {
+            id: 'hearts',
+            name: 'Сердечки',
+            icon: '❤️',
+            build: (color, opacity) => `
+                <svg xmlns="http://www.w3.org/2000/svg" width="60" height="60" viewBox="0 0 60 60">
+                    <g fill="none" stroke="${color}" stroke-opacity="${opacity}" stroke-width="1.2" stroke-linejoin="round">
+                        <path d="M15 18 c0,-4 3,-6 5,-6 c2,0 3,1 4,3 c1,-2 2,-3 4,-3 c2,0 5,2 5,6 c0,4 -4,7 -9,10 c-5,-3 -9,-6 -9,-10 Z"/>
+                        <path d="M42 44 c0,-4 3,-6 5,-6 c2,0 3,1 4,3 c1,-2 2,-3 4,-3 c2,0 5,2 5,6 c0,4 -4,7 -9,10 c-5,-3 -9,-6 -9,-10 Z"/>
+                    </g>
+                </svg>`
+        },
+        {
+            id: 'arrows',
+            name: 'Стрелки',
+            icon: '↗️',
+            build: (color, opacity) => `
+                <svg xmlns="http://www.w3.org/2000/svg" width="50" height="50" viewBox="0 0 50 50">
+                    <g fill="none" stroke="${color}" stroke-opacity="${opacity}" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M5 20 L15 10 L25 20"/>
+                        <path d="M15 10 L15 30"/>
+                        <path d="M25 40 L35 30 L45 40"/>
+                        <path d="M35 30 L35 50"/>
+                    </g>
+                </svg>`
+        },
+        {
+            id: 'leaves',
+            name: 'Листочки',
+            icon: '🍃',
+            build: (color, opacity) => `
+                <svg xmlns="http://www.w3.org/2000/svg" width="60" height="60" viewBox="0 0 60 60">
+                    <g fill="none" stroke="${color}" stroke-opacity="${opacity}" stroke-width="1.1" stroke-linejoin="round">
+                        <path d="M15 15 Q10 25, 15 35 Q25 30, 25 20 Q20 15, 15 15 Z"/>
+                        <path d="M15 15 L20 30"/>
+                        <path d="M45 45 Q40 55, 45 65 Q55 60, 55 50 Q50 45, 45 45 Z"/>
+                    </g>
+                </svg>`
+        },
+        {
+            id: 'moon-stars',
+            name: 'Луна и звёзды',
+            icon: '🌙',
+            build: (color, opacity) => `
+                <svg xmlns="http://www.w3.org/2000/svg" width="80" height="80" viewBox="0 0 80 80">
+                    <g fill="none" stroke="${color}" stroke-opacity="${opacity}" stroke-width="1.2" stroke-linecap="round">
+                        <path d="M20 15 a8 8 0 1 0 0 16 a10 10 0 1 1 0 -16 Z"/>
+                        <circle cx="55" cy="15" r="1.5" fill="${color}" fill-opacity="${opacity}" stroke="none"/>
+                        <circle cx="65" cy="30" r="1.2" fill="${color}" fill-opacity="${opacity}" stroke="none"/>
+                        <circle cx="30" cy="60" r="1.5" fill="${color}" fill-opacity="${opacity}" stroke="none"/>
+                        <circle cx="55" cy="55" r="1.2" fill="${color}" fill-opacity="${opacity}" stroke="none"/>
+                    </g>
+                </svg>`
+        },
+        {
+            id: 'plus',
+            name: 'Плюсы',
+            icon: '➕',
+            build: (color, opacity) => `
+                <svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" viewBox="0 0 40 40">
+                    <g stroke="${color}" stroke-opacity="${opacity}" stroke-width="1.3" stroke-linecap="round">
+                        <path d="M20 8 V32 M8 20 H32"/>
+                        <path d="M0 0 V6 M-3 3 H3"/>
+                        <path d="M40 0 V6 M37 3 H43"/>
+                    </g>
+                </svg>`
+        },
+        {
+            id: 'rings',
+            name: 'Кольца',
+            icon: '💍',
+            build: (color, opacity) => `
+                <svg xmlns="http://www.w3.org/2000/svg" width="60" height="60" viewBox="0 0 60 60">
+                    <g fill="none" stroke="${color}" stroke-opacity="${opacity}" stroke-width="1.3">
+                        <circle cx="15" cy="15" r="10"/>
+                        <circle cx="45" cy="45" r="10"/>
+                        <circle cx="45" cy="15" r="6"/>
+                        <circle cx="15" cy="45" r="6"/>
+                        <circle cx="30" cy="30" r="3"/>
+                    </g>
+                </svg>`
+        },
+        {
+            id: 'puzzle',
+            name: 'Пазл',
+            icon: '🧩',
+            build: (color, opacity) => `
+                <svg xmlns="http://www.w3.org/2000/svg" width="60" height="60" viewBox="0 0 60 60">
+                    <g fill="none" stroke="${color}" stroke-opacity="${opacity}" stroke-width="1.1" stroke-linejoin="round">
+                        <path d="M10 10 h15 a4 4 0 0 1 8 0 h15 v15 a4 4 0 0 0 0 8 v15 h-15 a4 4 0 0 0 -8 0 h-15 v-15 a4 4 0 0 1 0 -8 Z"/>
+                    </g>
+                </svg>`
+        },
+        {
+            id: 'rain',
+            name: 'Дождь',
+            icon: '🌧️',
+            build: (color, opacity) => `
+                <svg xmlns="http://www.w3.org/2000/svg" width="50" height="60" viewBox="0 0 50 60">
+                    <g fill="none" stroke="${color}" stroke-opacity="${opacity}" stroke-width="1.2" stroke-linecap="round">
+                        <path d="M10 5 L5 25"/>
+                        <path d="M25 5 L20 25"/>
+                        <path d="M40 5 L35 25"/>
+                        <path d="M10 35 L5 55"/>
+                        <path d="M25 35 L20 55"/>
+                        <path d="M40 35 L35 55"/>
+                    </g>
+                </svg>`
+        },
+        {
+            id: 'snowflakes',
+            name: 'Снежинки',
+            icon: '❄️',
+            build: (color, opacity) => `
+                <svg xmlns="http://www.w3.org/2000/svg" width="60" height="60" viewBox="0 0 60 60">
+                    <g fill="none" stroke="${color}" stroke-opacity="${opacity}" stroke-width="1.1" stroke-linecap="round">
+                        <g transform="translate(15 15)">
+                            <path d="M0 -8 V8 M-7 -4 L7 4 M-7 4 L7 -4"/>
+                        </g>
+                        <g transform="translate(45 45)">
+                            <path d="M0 -8 V8 M-7 -4 L7 4 M-7 4 L7 -4"/>
+                        </g>
+                        <g transform="translate(45 15) scale(0.7)">
+                            <path d="M0 -8 V8 M-7 -4 L7 4 M-7 4 L7 -4"/>
+                        </g>
+                        <g transform="translate(15 45) scale(0.7)">
+                            <path d="M0 -8 V8 M-7 -4 L7 4 M-7 4 L7 -4"/>
+                        </g>
+                    </g>
+                </svg>`
+        },
+        {
+            id: 'bubbles',
+            name: 'Пузырьки',
+            icon: '🫧',
+            build: (color, opacity) => `
+                <svg xmlns="http://www.w3.org/2000/svg" width="60" height="60" viewBox="0 0 60 60">
+                    <g fill="none" stroke="${color}" stroke-opacity="${opacity}" stroke-width="1.1">
+                        <circle cx="15" cy="15" r="6"/>
+                        <circle cx="42" cy="20" r="4"/>
+                        <circle cx="25" cy="42" r="8"/>
+                        <circle cx="48" cy="48" r="5"/>
+                        <circle cx="8" cy="40" r="3"/>
+                        <circle cx="52" cy="8" r="3"/>
+                    </g>
+                </svg>`
+        },
+        {
+            id: 'stripes-diagonal',
+            name: 'Диагональ',
+            icon: '▨',
+            build: (color, opacity) => `
+                <svg xmlns="http://www.w3.org/2000/svg" width="30" height="30" viewBox="0 0 30 30">
+                    <g stroke="${color}" stroke-opacity="${opacity}" stroke-width="1.2" stroke-linecap="round">
+                        <path d="M-5 5 L5 -5"/>
+                        <path d="M-5 15 L15 -5"/>
+                        <path d="M-5 25 L25 -5"/>
+                        <path d="M-5 35 L35 -5"/>
+                        <path d="M5 35 L35 5"/>
+                        <path d="M15 35 L35 15"/>
+                        <path d="M25 35 L35 25"/>
+                    </g>
+                </svg>`
+        },
+        {
+            id: 'honeycomb',
+            name: 'Медовые соты',
+            icon: '🐝',
+            build: (color, opacity) => `
+                <svg xmlns="http://www.w3.org/2000/svg" width="72" height="62" viewBox="0 0 72 62">
+                    <g fill="none" stroke="${color}" stroke-opacity="${opacity}" stroke-width="1.1" stroke-linejoin="round">
+                        <path d="M18 1 L36 11 L36 31 L18 41 L0 31 L0 11 Z"/>
+                        <path d="M54 1 L72 11 L72 31 L54 41 L36 31 L36 11 Z"/>
+                        <path d="M18 41 L36 51 L36 71 L18 81 L0 71 L0 51 Z"/>
+                        <path d="M54 41 L72 51 L72 71 L54 81 L36 71 L36 51 Z"/>
+                    </g>
+                </svg>`
+        },
+        {
+            id: 'kaleidoscope',
+            name: 'Калейдоскоп',
+            icon: '🔮',
+            build: (color, opacity) => `
+                <svg xmlns="http://www.w3.org/2000/svg" width="80" height="80" viewBox="0 0 80 80">
+                    <g fill="none" stroke="${color}" stroke-opacity="${opacity}" stroke-width="1.2" stroke-linejoin="round">
+                        <path d="M40 10 L50 30 L70 30 L54 44 L60 64 L40 52 L20 64 L26 44 L10 30 L30 30 Z"/>
+                        <path d="M40 25 L45 35 L55 35 L47 42 L50 52 L40 46 L30 52 L33 42 L25 35 L35 35 Z"/>
+                    </g>
+                </svg>`
+        },
+        {
+            id: 'mosaic',
+            name: 'Мозаика',
+            icon: '🎨',
+            build: (color, opacity) => `
+                <svg xmlns="http://www.w3.org/2000/svg" width="80" height="80" viewBox="0 0 80 80">
+                    <g fill="none" stroke="${color}" stroke-opacity="${opacity}" stroke-width="1">
+                        <rect x="0" y="0" width="26" height="26" rx="3"/>
+                        <rect x="27" y="0" width="26" height="26" rx="3"/>
+                        <rect x="54" y="0" width="26" height="26" rx="3"/>
+                        <rect x="0" y="27" width="26" height="26" rx="3"/>
+                        <rect x="27" y="27" width="26" height="26" rx="3"/>
+                        <rect x="54" y="27" width="26" height="26" rx="3"/>
+                        <rect x="0" y="54" width="26" height="26" rx="3"/>
+                        <rect x="27" y="54" width="26" height="26" rx="3"/>
+                        <rect x="54" y="54" width="26" height="26" rx="3"/>
+                    </g>
+                </svg>`
+        },
+        {
+            id: 'confetti',
+            name: 'Конфетти',
+            icon: '🎉',
+            build: (color, opacity) => `
+                <svg xmlns="http://www.w3.org/2000/svg" width="80" height="80" viewBox="0 0 80 80">
+                    <g stroke="${color}" stroke-opacity="${opacity}" stroke-width="1.4" stroke-linecap="round" fill="none">
+                        <path d="M10 15 L15 20"/>
+                        <path d="M30 10 L30 18"/>
+                        <path d="M50 20 L55 25"/>
+                        <path d="M65 15 L70 10"/>
+                        <path d="M20 40 L25 45"/>
+                        <path d="M45 45 L45 55"/>
+                        <path d="M65 40 L70 35"/>
+                        <path d="M10 65 L15 70"/>
+                        <path d="M35 70 L35 60"/>
+                        <path d="M55 65 L60 70"/>
+                    </g>
+                </svg>`
+        },
+        {
+            id: 'geometry',
+            name: 'Геометрия',
+            icon: '📐',
+            build: (color, opacity) => `
+                <svg xmlns="http://www.w3.org/2000/svg" width="70" height="70" viewBox="0 0 70 70">
+                    <g fill="none" stroke="${color}" stroke-opacity="${opacity}" stroke-width="1.1" stroke-linejoin="round">
+                        <rect x="5" y="5" width="20" height="20" rx="2"/>
+                        <circle cx="55" cy="15" r="9"/>
+                        <path d="M10 65 L20 45 L30 65 Z"/>
+                        <rect x="42" y="42" width="20" height="20" rx="2"/>
+                        <circle cx="20" cy="40" r="4"/>
+                        <path d="M45 30 L55 30 L50 40 Z"/>
+                    </g>
+                </svg>`
+        },
+        {
+            id: 'zen',
+            name: 'Дзен',
+            icon: '⛩️',
+            build: (color, opacity) => `
+                <svg xmlns="http://www.w3.org/2000/svg" width="80" height="80" viewBox="0 0 80 80">
+                    <g fill="none" stroke="${color}" stroke-opacity="${opacity}" stroke-width="1.2">
+                        <circle cx="40" cy="40" r="30"/>
+                        <circle cx="40" cy="40" r="22"/>
+                        <circle cx="40" cy="40" r="14"/>
+                        <circle cx="40" cy="40" r="6"/>
+                        <path d="M40 5 L40 15 M40 65 L40 75 M5 40 L15 40 M65 40 L75 40"/>
+                    </g>
+                </svg>`
+        },
+        {
+            id: 'compass',
+            name: 'Компас',
+            icon: '🧭',
+            build: (color, opacity) => `
+                <svg xmlns="http://www.w3.org/2000/svg" width="70" height="70" viewBox="0 0 70 70">
+                    <g fill="none" stroke="${color}" stroke-opacity="${opacity}" stroke-width="1.1" stroke-linejoin="round">
+                        <circle cx="15" cy="15" r="10"/>
+                        <path d="M15 7 L18 15 L15 23 L12 15 Z"/>
+                        <circle cx="55" cy="55" r="10"/>
+                        <path d="M55 47 L58 55 L55 63 L52 55 Z"/>
+                        <circle cx="55" cy="15" r="6"/>
+                        <path d="M55 11 L56.5 15 L55 19 L53.5 15 Z"/>
+                        <circle cx="15" cy="55" r="6"/>
+                        <path d="M15 51 L16.5 55 L15 59 L13.5 55 Z"/>
+                    </g>
+                </svg>`
+        },
+    ];
+
+    // ═══════════════════════════════════════════════════════════
+    //  🆕 ИНЪЕКЦИЯ В PATTERNS
+    //  Используем хак: патчим renderPatternsGrid, чтобы
+    //  добавить новые узоры непосредственно ПЕРЕД рендером.
+    //  Это работает даже если PATTERNS замкнут в IIFE.
+    // ═══════════════════════════════════════════════════════════
+
+    // Ждём, пока ChatBackgrounds появится в window
+    let _injected = false;
+
+    function tryInject() {
+        if (_injected) return;
+
+        if (typeof window.ChatBackgrounds === 'undefined') {
+            setTimeout(tryInject, 300);
+            return;
+        }
+
+        // Проверяем, что модуль действительно готов
+        if (!window.ChatBackgrounds.patterns
+            || !Array.isArray(window.ChatBackgrounds.patterns)) {
+            setTimeout(tryInject, 300);
+            return;
+        }
+
+        // Проверяем, были ли уже добавлены наши узоры
+        const existingIds = new Set(
+            window.ChatBackgrounds.patterns.map(p => p.id)
+        );
+        if (existingIds.has('triangles')) {
+            _injected = true;
+            console.log('➕ [MorePatterns] Уже добавлены ранее');
+            return;
+        }
+
+        // 🎯 Через API ChatBackgrounds.patterns добавить не получится —
+        //    там возвращается копия. Поэтому идём другим путём:
+        //    перехватываем рендер сетки узоров.
+
+        // Единственный надёжный способ без переписывания модуля —
+        // перехватить клик по пункту «Фон чата» и ПОСЛЕ открытия модалки
+        // дозаполнить сетку узоров новыми элементами.
+        interceptPatternsGrid();
+
+        _injected = true;
+        console.log('➕ [MorePatterns] Добавлено новых узоров:', NEW_PATTERNS.length);
+    }
+
+    function interceptPatternsGrid() {
+        // Наблюдаем за появлением модалки фона
+        const modalObserver = new MutationObserver(() => {
+            const modal = document.getElementById('chatBgModal');
+            if (!modal || !modal.classList.contains('active')) return;
+
+            const grid = modal.querySelector('#bgPatternsGrid');
+            if (!grid) return;
+
+            // Проверяем, не добавлены ли уже новые узоры
+            if (grid.querySelector('[data-pattern-id="triangles"]')) return;
+
+            // Дописываем новые узоры в конец сетки
+            appendNewPatternsToGrid(grid);
+        });
+
+        modalObserver.observe(document.body, { childList: true, subtree: true });
+
+        // Также сразу проверяем, если модалка уже открыта
+        const modal = document.getElementById('chatBgModal');
+        if (modal && modal.classList.contains('active')) {
+            const grid = modal.querySelector('#bgPatternsGrid');
+            if (grid && !grid.querySelector('[data-pattern-id="triangles"]')) {
+                appendNewPatternsToGrid(grid);
+            }
+        }
+    }
+
+    function appendNewPatternsToGrid(grid) {
+        if (!grid) return;
+
+        // Текущий выбранный паттерн — берём из класса .selected
+        const selectedEl = grid.querySelector('.bg-pattern-item.selected');
+        const currentSelected = selectedEl ? selectedEl.dataset.patternId : 'none';
+
+        // Строим HTML для новых узоров
+        const html = NEW_PATTERNS.map(p => {
+            let bgStyle = '';
+            if (p.build) {
+                const svg = p.build('#a78bfa', 0.35);
+                if (svg) {
+                    const encoded = 'data:image/svg+xml;charset=utf-8,' +
+                        encodeURIComponent(svg.replace(/\s+/g, ' ').trim());
+                    bgStyle = `background-image: url("${encoded}");`;
+                }
+            }
+            const isSelected = currentSelected === p.id;
+            return `
+                <div class="bg-pattern-item ${isSelected ? 'selected' : ''}"
+                     data-pattern-id="${p.id}"
+                     style="${bgStyle}">
+                    <div class="bg-pattern-icon">${p.icon}</div>
+                    <div class="bg-pattern-name">${escapeHtml(p.name)}</div>
+                </div>
+            `;
+        }).join('');
+
+        // Вставляем в конец сетки
+        grid.insertAdjacentHTML('beforeend', html);
+
+        // Навешиваем обработчики на новые элементы
+        grid.querySelectorAll('.bg-pattern-item').forEach(el => {
+            // Проверяем, не навешан ли уже обработчик
+            if (el._morePatternsHandlerAttached) return;
+            el._morePatternsHandlerAttached = true;
+
+            // Только на НОВЫЕ (у которых data-pattern-id из NEW_PATTERNS)
+            const isNew = NEW_PATTERNS.some(p => p.id === el.dataset.patternId);
+            if (!isNew) return;
+
+            el.addEventListener('click', () => {
+                // Клик по новому узору:
+                // 1. Снимаем выделение со всех
+                grid.querySelectorAll('.bg-pattern-item').forEach(x => {
+                    x.classList.remove('selected');
+                });
+                // 2. Выделяем этот
+                el.classList.add('selected');
+
+                // 3. Обновляем _draft через внутренний API или напрямую
+                //    Кликнем по скрытому input или используем глобальный API
+                //    Проще всего — эмулируем клик по этому же элементу
+                //    через «системный» способ: вызываем событие клика на
+                //    элементе, который уже зарегистрирован в модуле.
+
+                // Но чтобы не дублировать — воспользуемся «полу-хаком»:
+                // создадим фейковое событие и вызовем его на САМОМ элементе.
+                // Модуль ChatBackgrounds подписан на клик через свой обработчик,
+                // но он навешивается только на «свои» элементы при рендере.
+                // Значит, для новых нужно напрямую дёрнуть нужную логику.
+
+                // ═══ ФИКС: находим внутреннюю функцию обновления ═══
+                // Раз уж ChatBackgrounds экспортирует API, попробуем
+                // через него.
+
+                // Простейший способ: кликнуть по ПЕРВОМУ узору, потом
+                // по нужному — но это не сработает.
+
+                // 🔑 РЕШЕНИЕ: обновляем _draft напрямую через
+                //   сохранённую ссылку. Т.к. _draft внутри IIFE,
+                //   используем свойство: клик по «системному» элементу
+                //   обновляет только класс .selected.
+                //   Мы можем после этого переписать draft через
+                //   программный клик на «оригинальном» элементе.
+
+                // Проще всего: используем «фиктивный» оригинальный элемент.
+                // Найдём любой другой .bg-pattern-item (не наш) и кликнем по нему
+                // с подменой dataset.patternId. Но это опасно.
+
+                // ═══ Самый чистый способ ═══
+                // Перезапишем внутренний draft, обратившись к модалке.
+                // _draft доступен через замыкание модуля. Мы не можем
+                // к нему обратиться напрямую, но можем использовать
+                // тот факт, что модалка реагирует на клик по СВОИМ
+                // элементам — и переопределить обработчик.
+
+                // 🎯 Решение: обрабатываем клик на «своих» новых
+                // элементах сами, полностью управляя draft через
+                // публичный API.
+
+                // Но у нас нет API для draft. Поэтому — идём хаком:
+                // подменяем dataset.patternId у ЛЮБОГО существующего
+                // элемента на наш, кликаем по нему, потом возвращаем.
+
+                const originalEls = Array.from(grid.querySelectorAll('.bg-pattern-item'))
+                    .filter(x => !NEW_PATTERNS.some(p => p.id === x.dataset.patternId));
+
+                if (originalEls.length === 0) return;
+                const proxy = originalEls[0];
+
+                const savedId = proxy.dataset.patternId;
+                const savedBg = proxy.style.backgroundImage;
+
+                // Временно подменяем dataset
+                proxy.dataset.patternId = el.dataset.patternId;
+
+                // Кликаем по proxy — модуль сам подхватит
+                proxy.click();
+
+                // Возвращаем оригинальные значения
+                setTimeout(() => {
+                    proxy.dataset.patternId = savedId;
+                    if (savedBg) proxy.style.backgroundImage = savedBg;
+                }, 0);
+            });
+        });
+
+        console.log('➕ [MorePatterns] Узоры добавлены в сетку:', NEW_PATTERNS.length);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СТАРТ
+    // ═══════════════════════════════════════════════════════════
+    tryInject();
+
+    // ═══════════════════════════════════════════════════════════
+    //  API
+    // ═══════════════════════════════════════════════════════════
+    window.MorePatterns = {
+        list: () => NEW_PATTERNS.map(p => ({ id: p.id, name: p.name, icon: p.icon })),
+        count: NEW_PATTERNS.length,
+        // Принудительно дозаполнить сетку, если она открыта
+        injectNow: () => {
+            const grid = document.querySelector('#chatBgModal #bgPatternsGrid');
+            if (grid) appendNewPatternsToGrid(grid);
+        },
+    };
+
+    console.log('➕ [MorePatterns] Модуль доп. узоров загружен');
+    console.log('   • Новых узоров: ' + NEW_PATTERNS.length);
+    console.log('   • API: MorePatterns.list() / .injectNow()');
+})();
+</script>
 </body>
 </html>
