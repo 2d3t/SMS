@@ -44918,6 +44918,886 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
 })();
 </script>
 
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🔐 NAME LOCK — защита имени паролем внутри чата
+//  ─────────────────────────────────────────────────────────────
+//  • Пользователь устанавливает пароль на своё имя в конкретном чате
+//  • Пароль хранится ТОЛЬКО в его localStorage
+//  • При входе другого человека с тем же именем — 3 попытки ввода
+//  • На 4-й — публичное сообщение в чат
+//  • Управление через 🔒 в шапке чата
+// ═══════════════════════════════════════════════════════════════
 
+(function installNameLock() {
+    'use strict';
+
+    console.log('🔐 [NameLock] Установка…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  КОНФИГ
+    // ═══════════════════════════════════════════════════════════
+    const CFG = {
+        STORAGE_LOCKS: 'smschat_name_locks_v1',  // общие лок-имена в чате
+        STORAGE_MY_KEY: 'smschat_my_key_v1',     // мой личный ключ
+        MAX_ATTEMPTS: 3,                          // попыток до публичного сообщения
+        LOG_PREFIX: '🔐 [NameLock]',
+    };
+
+    const log = (...a) => console.log(CFG.LOG_PREFIX, ...a);
+
+    // ═══════════════════════════════════════════════════════════
+    //  УТИЛИТЫ
+    // ═══════════════════════════════════════════════════════════
+
+    // Короткий deviceId (сохраняется навсегда)
+    function getDeviceId() {
+        let id = localStorage.getItem('smschat_device_id');
+        if (!id) {
+            id = 'dev_' + Math.random().toString(36).slice(2, 10);
+            localStorage.setItem('smschat_device_id', id);
+        }
+        return id;
+    }
+
+    // SHA-256 от строки → base64url
+    async function sha256Base64(str) {
+        const buf = new TextEncoder().encode(str);
+        const hash = await crypto.subtle.digest('SHA-256', buf);
+        const bytes = new Uint8Array(hash);
+        let bin = '';
+        bytes.forEach(b => bin += String.fromCharCode(b));
+        return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
+
+    // Генерируем verifyHash из пароля
+    async function makeVerifyHash(username, chatFile, password) {
+        return sha256Base64(`${username}:${chatFile}:${password}`);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХРАНИЛИЩЕ — ЗАЩИЩЁННЫЕ ИМЕНА В ЧАТЕ
+    // ═══════════════════════════════════════════════════════════
+    function loadLocks() {
+        try {
+            return JSON.parse(localStorage.getItem(CFG.STORAGE_LOCKS) || '{}');
+        } catch (e) { return {}; }
+    }
+
+    function saveLocks(locks) {
+        try {
+            localStorage.setItem(CFG.STORAGE_LOCKS, JSON.stringify(locks));
+        } catch (e) {}
+    }
+
+    // Защищено ли имя X в чате Y?
+    function getLock(chatFile, username) {
+        const locks = loadLocks();
+        return locks[chatFile]?.[username] || null;
+    }
+
+    // Запомнить защиту имени
+    function setLock(chatFile, username, verifyHash, deviceId) {
+        const locks = loadLocks();
+        if (!locks[chatFile]) locks[chatFile] = {};
+        locks[chatFile][username] = {
+            verifyHash,
+            deviceId: deviceId || null,
+            createdAt: Date.now(),
+            lastUsed: Date.now(),
+        };
+        saveLocks(locks);
+    }
+
+    // Снять защиту имени
+    function removeLock(chatFile, username) {
+        const locks = loadLocks();
+        if (locks[chatFile]?.[username]) {
+            delete locks[chatFile][username];
+            if (Object.keys(locks[chatFile]).length === 0) {
+                delete locks[chatFile];
+            }
+            saveLocks(locks);
+        }
+    }
+
+    // Все защищённые имена в чате
+    function getAllLocks(chatFile) {
+        const locks = loadLocks();
+        return locks[chatFile] || {};
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХРАНИЛИЩЕ — МОЙ КЛЮЧ
+    // ═══════════════════════════════════════════════════════════
+    function loadMyKeys() {
+        try {
+            return JSON.parse(localStorage.getItem(CFG.STORAGE_MY_KEY) || '{}');
+        } catch (e) { return {}; }
+    }
+
+    function saveMyKeys(keys) {
+        try {
+            localStorage.setItem(CFG.STORAGE_MY_KEY, JSON.stringify(keys));
+        } catch (e) {}
+    }
+
+    // Мой ключ для чата
+    function getMyKey(chatFile) {
+        const keys = loadMyKeys();
+        return keys[chatFile] || null;
+    }
+
+    function setMyKey(chatFile, data) {
+        const keys = loadMyKeys();
+        keys[chatFile] = data;
+        saveMyKeys(keys);
+    }
+
+    function removeMyKey(chatFile) {
+        const keys = loadMyKeys();
+        if (keys[chatFile]) {
+            delete keys[chatFile];
+            saveMyKeys(keys);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПРОВЕРКА: могу ли я отправить сообщение под своим именем?
+    //  ─────────────────────────────────────────────────────────────
+    //  Возвращает:
+    //   { ok: true }  — можно отправлять
+    //   { ok: false, reason: 'locked-need-password' }  — имя защищено, нужен пароль
+    //   { ok: false, reason: 'wrong-password' }        — неверный пароль
+    //   { ok: false, reason: 'other-device' }          — имя защищено, но не мной
+    // ═══════════════════════════════════════════════════════════
+    function canSendAs(chatFile, username) {
+        const lock = getLock(chatFile, username);
+        const myKey = getMyKey(chatFile);
+
+        // Имя не защищено вообще — можно писать
+        if (!lock) {
+            return { ok: true };
+        }
+
+        // Имя защищено. Есть ли мой ключ?
+        if (!myKey || myKey.username !== username) {
+            return { ok: false, reason: 'locked-need-password' };
+        }
+
+        // Мой ключ совпадает с локом?
+        if (myKey.verifyHash !== lock.verifyHash) {
+            return { ok: false, reason: 'wrong-password' };
+        }
+
+        return { ok: true };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ГЛАВНЫЙ UI: МОДАЛКА ПРОФИЛЯ (через 🔒)
+    // ═══════════════════════════════════════════════════════════
+    let _profileModal = null;
+
+    function ensureProfileModal() {
+        if (_profileModal && _profileModal.isConnected) return _profileModal;
+
+        const old = document.getElementById('nameLockModal');
+        if (old) old.remove();
+
+        const modal = document.createElement('div');
+        modal.id = 'nameLockModal';
+        modal.className = 'image-modal';
+        modal.innerHTML = `
+            <div class="form-modal-content" style="max-width:420px;" onclick="event.stopPropagation()">
+                <h2 id="nlTitle">🔐 Профиль в этом чате</h2>
+
+                <div id="nlStatusBox" style="
+                    padding: 12px 14px;
+                    border-radius: 12px;
+                    margin-bottom: 16px;
+                    font-size: 13px;
+                    line-height: 1.5;
+                "></div>
+
+                <div id="nlProtectedForm" style="display:none;">
+                    <div style="font-size:12px;color:#888;margin-bottom:8px;">
+                        Имя защищено. Управляйте защитой:
+                    </div>
+                    <div class="modal-actions" style="flex-direction:column;gap:8px;">
+                        <button class="btn btn-secondary" id="nlChangePwdBtn">
+                            🔄 Сменить пароль
+                        </button>
+                        <button class="btn btn-secondary" id="nlRemoveLockBtn"
+                                style="background:rgba(255,107,107,0.1);color:#ff6b6b;border:1px solid rgba(255,107,107,0.3);">
+                            🔓 Снять защиту с имени
+                        </button>
+                    </div>
+                </div>
+
+                <div id="nlUnprotectedForm" style="display:none;">
+                    <label style="display:block;font-size:13px;color:#999;margin-bottom:6px;">
+                        🔐 Установить пароль на имя «<span id="nlUsername"></span>»
+                    </label>
+                    <input type="password" id="nlPasswordInput"
+                           placeholder="Придумайте пароль"
+                           style="width:100%;padding:12px 14px;background:rgba(255,255,255,0.06);
+                                  border:1px solid rgba(255,255,255,0.1);border-radius:12px;
+                                  color:#fff;font-size:15px;outline:none;margin-bottom:8px;">
+                    <input type="password" id="nlPasswordConfirm"
+                           placeholder="Повторите пароль"
+                           style="width:100%;padding:12px 14px;background:rgba(255,255,255,0.06);
+                                  border:1px solid rgba(255,255,255,0.1);border-radius:12px;
+                                  color:#fff;font-size:15px;outline:none;margin-bottom:12px;">
+
+                    <div style="font-size:11px;color:#666;line-height:1.5;margin-bottom:14px;
+                                padding:10px 12px;background:rgba(108,92,231,0.06);
+                                border:1px solid rgba(108,92,231,0.15);border-radius:10px;">
+                        💡 Пароль сохраняется <strong>только на этом устройстве</strong>.<br>
+                        Если зайти под этим именем с другого устройства — потребуется ввести пароль.<br>
+                        ⚠️ Забыли пароль — защиту снять нельзя, только через новое имя.
+                    </div>
+
+                    <button class="btn" id="nlSetLockBtn" style="width:100%;">
+                        🔐 Установить защиту
+                    </button>
+                </div>
+
+                <div class="modal-actions" style="margin-top:12px;">
+                    <button class="btn btn-secondary" id="nlCloseBtn" style="width:100%;">Закрыть</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+        _profileModal = modal;
+
+        modal.querySelector('#nlCloseBtn').addEventListener('click', () => {
+            modal.classList.remove('active');
+        });
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) modal.classList.remove('active');
+        });
+        modal.querySelector('#nlSetLockBtn').addEventListener('click', onSetLockClick);
+        modal.querySelector('#nlChangePwdBtn').addEventListener('click', onSetLockClick);
+        modal.querySelector('#nlRemoveLockBtn').addEventListener('click', onRemoveLockClick);
+
+        return modal;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОТКРЫТИЕ МОДАЛКИ ПРОФИЛЯ
+    // ═══════════════════════════════════════════════════════════
+    function openProfileModal() {
+        if (!state.chatFile) {
+            showToastSafe('🔒 Сначала войдите в чат');
+            return;
+        }
+
+        ensureProfileModal();
+
+        const chatFile = state.chatFile;
+        const username = state.username;
+        const lock = getLock(chatFile, username);
+        const myKey = getMyKey(chatFile);
+
+        const statusBox = _profileModal.querySelector('#nlStatusBox');
+        const protectedForm = _profileModal.querySelector('#nlProtectedForm');
+        const unprotectedForm = _profileModal.querySelector('#nlUnprotectedForm');
+        const pwdInput = _profileModal.querySelector('#nlPasswordInput');
+        const pwdConfirm = _profileModal.querySelector('#nlPasswordConfirm');
+
+        // Сброс полей
+        pwdInput.value = '';
+        pwdConfirm.value = '';
+
+        _profileModal.querySelector('#nlUsername').textContent = username;
+
+        // Определяем статус
+        if (lock && myKey && myKey.username === username && myKey.verifyHash === lock.verifyHash) {
+            // Защищено И я владелец
+            statusBox.style.background = 'rgba(0,184,148,0.08)';
+            statusBox.style.border = '1px solid rgba(0,184,148,0.3)';
+            statusBox.style.color = '#00b894';
+            statusBox.innerHTML = `
+                ✅ <strong>Имя «${escapeHtml(username)}» защищено</strong><br>
+                <span style="font-size:12px;opacity:0.85;">
+                    Ваш пароль сохранён на этом устройстве.
+                    При входе с другого устройства — потребуется ввод.
+                </span>
+            `;
+            protectedForm.style.display = 'block';
+            unprotectedForm.style.display = 'none';
+        } else if (lock && (!myKey || myKey.username !== username)) {
+            // Имя защищено кем-то другим
+            statusBox.style.background = 'rgba(255,159,67,0.1)';
+            statusBox.style.border = '1px solid rgba(255,159,67,0.3)';
+            statusBox.style.color = '#ff9f43';
+            statusBox.innerHTML = `
+                ⚠️ <strong>Имя «${escapeHtml(username)}» защищено</strong><br>
+                <span style="font-size:12px;opacity:0.85;">
+                    Пароль установлен с другого устройства.
+                    Чтобы писать под этим именем — введите пароль.
+                </span>
+            `;
+            protectedForm.style.display = 'none';
+            unprotectedForm.style.display = 'block';
+        } else {
+            // Не защищено
+            statusBox.style.background = 'rgba(108,92,231,0.08)';
+            statusBox.style.border = '1px solid rgba(108,92,231,0.25)';
+            statusBox.style.color = '#a78bfa';
+            statusBox.innerHTML = `
+                ℹ️ <strong>Имя «${escapeHtml(username)}» не защищено</strong><br>
+                <span style="font-size:12px;opacity:0.85;">
+                    Любой в этом чате может писать под этим именем.
+                    Установите пароль, чтобы защитить.
+                </span>
+            `;
+            protectedForm.style.display = 'none';
+            unprotectedForm.style.display = 'block';
+        }
+
+        _profileModal.classList.add('active');
+        setTimeout(() => pwdInput.focus(), 200);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  УСТАНОВКА / СМЕНА ПАРОЛЯ
+    // ═══════════════════════════════════════════════════════════
+    async function onSetLockClick() {
+        const chatFile = state.chatFile;
+        const username = state.username;
+
+        const pwdInput = _profileModal.querySelector('#nlPasswordInput');
+        const pwdConfirm = _profileModal.querySelector('#nlPasswordConfirm');
+
+        const pwd = pwdInput.value;
+        const pwd2 = pwdConfirm.value;
+
+        if (!pwd || pwd.length < 4) {
+            showToastSafe('❌ Пароль минимум 4 символа');
+            return;
+        }
+        if (pwd !== pwd2) {
+            showToastSafe('❌ Пароли не совпадают');
+            return;
+        }
+
+        // Есть ли уже лок?
+        const existingLock = getLock(chatFile, username);
+        const myKey = getMyKey(chatFile);
+
+        // Если лок есть и он не мой — сначала надо ввести СТАРЫЙ пароль
+        if (existingLock && (!myKey || myKey.username !== username || myKey.verifyHash !== existingLock.verifyHash)) {
+            // Проверим, совпадает ли введённый пароль со старым
+            const tryHash = await makeVerifyHash(username, chatFile, pwd);
+            if (tryHash !== existingLock.verifyHash) {
+                // Это смена? Тогда надо запросить старый. Мы не поддерживаем.
+                showToastSafe('❌ Это имя защищено другим паролем');
+                return;
+            }
+            // Пароль совпал — просто обновим myKey
+        }
+
+        // Создаём/обновляем
+        const verifyHash = await makeVerifyHash(username, chatFile, pwd);
+
+        setLock(chatFile, username, verifyHash, getDeviceId());
+        setMyKey(chatFile, {
+            username: username,
+            password: pwd,       // храним в открытом виде (как пароль чата)
+            verifyHash: verifyHash,
+            deviceId: getDeviceId(),
+            createdAt: Date.now(),
+        });
+
+        // Обновляем иконку 🔒 в шапке
+        updateLockIcon();
+
+        showToastSafe('✅ Защита установлена');
+        soundManagerSafe('send');
+
+        _profileModal.classList.remove('active');
+
+        log(`✅ Пароль установлен для "${username}" в ${chatFile}`);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СНЯТИЕ ЗАЩИТЫ
+    // ═══════════════════════════════════════════════════════════
+    async function onRemoveLockClick() {
+        const chatFile = state.chatFile;
+        const username = state.username;
+
+        const myKey = getMyKey(chatFile);
+        if (!myKey || myKey.username !== username) {
+            showToastSafe('❌ Это не ваш пароль');
+            return;
+        }
+
+        if (!confirm(`Снять защиту с имени «${username}»?\n\nПосле этого любой сможет писать под этим именем.`)) {
+            return;
+        }
+
+        removeLock(chatFile, username);
+        removeMyKey(chatFile);
+
+        updateLockIcon();
+
+        showToastSafe('🔓 Защита снята');
+        soundManagerSafe('delete');
+
+        _profileModal.classList.remove('active');
+
+        log(`🔓 Защита снята для "${username}"`);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОБНОВЛЕНИЕ ИКОНКИ ЗАМКА
+    // ═══════════════════════════════════════════════════════════
+    function updateLockIcon() {
+        const btn = document.getElementById('forgetBtn');   // кнопка 🔒 в шапке
+        if (!btn) return;
+
+        if (!state.chatFile || !state.username) return;
+
+        const lock = getLock(state.chatFile, state.username);
+        const myKey = getMyKey(state.chatFile);
+        const isMine = lock && myKey && myKey.username === state.username
+                       && myKey.verifyHash === lock.verifyHash;
+
+        if (isMine) {
+            // 🟢 Защищено мной — золотой фон, другой цвет
+            btn.style.background = 'linear-gradient(135deg, rgba(254,202,87,0.35), rgba(255,159,67,0.25))';
+            btn.style.color = '#feca57';
+            btn.style.boxShadow = '0 0 8px rgba(254,202,87,0.4)';
+            btn.title = '🔐 Имя защищено паролем (нажмите для управления)';
+        } else if (lock) {
+            // 🟠 Защищено кем-то другим
+            btn.style.background = 'rgba(255,159,67,0.15)';
+            btn.style.color = '#ff9f43';
+            btn.style.boxShadow = 'none';
+            btn.title = '⚠️ Имя защищено другим устройством';
+        } else {
+            // Обычный вид
+            btn.style.background = '';
+            btn.style.color = '';
+            btn.style.boxShadow = '';
+            btn.title = '🔒 Защита имени паролем';
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ КНОПКИ 🔒 В ШАПКЕ
+    //  ─────────────────────────────────────────────────────────────
+    //  В оригинале 🔒 — это "забыть пароль чата". Заменим на наш профиль.
+    // ═══════════════════════════════════════════════════════════
+    function interceptForgetButton() {
+        const btn = document.getElementById('forgetBtn');
+        if (!btn || btn._nameLockAttached) return;
+        btn._nameLockAttached = true;
+
+        // Снимаем старый onclick полностью (через клон)
+        const clone = btn.cloneNode(true);
+        btn.parentNode.replaceChild(clone, btn);
+
+        clone.addEventListener('click', (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            openProfileModal();
+        });
+
+        clone.title = '🔒 Профиль в чате';
+        console.log('🔐 [NameLock] Кнопка 🔒 перехвачена');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПОПЫТКИ ВВОДА ПАРОЛЯ
+    //  ─────────────────────────────────────────────────────────────
+    //  Когда пользователь открывает чат, и его имя защищено
+    //  другим устройством — показываем модалку ввода.
+    // ═══════════════════════════════════════════════════════════
+    let _attemptsByChat = {};   // { chatFile: { username: attempts } }
+
+    function loadAttempts() {
+        try {
+            _attemptsByChat = JSON.parse(localStorage.getItem('smschat_attempts_v1') || '{}');
+        } catch (e) { _attemptsByChat = {}; }
+    }
+    function saveAttempts() {
+        try {
+            localStorage.setItem('smschat_attempts_v1', JSON.stringify(_attemptsByChat));
+        } catch (e) {}
+    }
+    function getAttempts(chatFile, username) {
+        return _attemptsByChat[chatFile]?.[username] || 0;
+    }
+    function incAttempts(chatFile, username) {
+        if (!_attemptsByChat[chatFile]) _attemptsByChat[chatFile] = {};
+        _attemptsByChat[chatFile][username] = (_attemptsByChat[chatFile][username] || 0) + 1;
+        saveAttempts();
+        return _attemptsByChat[chatFile][username];
+    }
+    function resetAttempts(chatFile, username) {
+        if (_attemptsByChat[chatFile]?.[username]) {
+            delete _attemptsByChat[chatFile][username];
+            saveAttempts();
+        }
+    }
+
+    /**
+     * Показать модалку ввода пароля.
+     * Возвращает Promise<boolean> — успех/провал.
+     */
+    function showPasswordPrompt(chatFile, username) {
+        return new Promise((resolve) => {
+            // Убираем старую
+            const old = document.getElementById('nameLockPrompt');
+            if (old) old.remove();
+
+            const modal = document.createElement('div');
+            modal.id = 'nameLockPrompt';
+            modal.className = 'image-modal active';
+            modal.innerHTML = `
+                <div class="form-modal-content" style="max-width:380px;text-align:center;"
+                     onclick="event.stopPropagation()">
+                    <div style="font-size:56px;margin-bottom:12px;line-height:1;">🔐</div>
+                    <h2 style="margin-bottom:8px;font-size:18px;">Имя защищено</h2>
+                    <div style="font-size:13px;color:#aaa;line-height:1.5;margin-bottom:16px;">
+                        Имя «<strong style="color:#fff;">${escapeHtml(username)}</strong>»
+                        защищено паролем в этом чате.<br>
+                        Введите пароль, чтобы писать под этим именем.
+                    </div>
+
+                    <input type="password" id="nlpInput"
+                           placeholder="Пароль"
+                           style="width:100%;padding:14px 16px;background:rgba(255,255,255,0.06);
+                                  border:1px solid rgba(255,255,255,0.12);border-radius:12px;
+                                  color:#fff;font-size:16px;outline:none;margin-bottom:8px;
+                                  text-align:center;letter-spacing:2px;">
+
+                    <div id="nlpError" style="color:#ff6b6b;font-size:12px;
+                                             height:16px;margin-bottom:12px;"></div>
+
+                    <div style="display:flex;gap:8px;">
+                        <button class="btn btn-secondary" id="nlpSkipBtn"
+                                style="flex:1;padding:12px;font-size:14px;">
+                            🚫 Сменить имя
+                        </button>
+                        <button class="btn" id="nlpSubmitBtn"
+                                style="flex:1.4;padding:12px;font-size:14px;">
+                            Войти
+                        </button>
+                    </div>
+
+                    <div id="nlpAttemptsInfo" style="font-size:11px;color:#666;
+                                                    margin-top:10px;line-height:1.4;"></div>
+                </div>
+            `;
+            document.body.appendChild(modal);
+
+            const input = modal.querySelector('#nlpInput');
+            const submitBtn = modal.querySelector('#nlpSubmitBtn');
+            const skipBtn = modal.querySelector('#nlpSkipBtn');
+            const errorEl = modal.querySelector('#nlpError');
+            const attemptsInfo = modal.querySelector('#nlpAttemptsInfo');
+
+            // Показать оставшиеся попытки
+            const attempts = getAttempts(chatFile, username);
+            const left = CFG.MAX_ATTEMPTS - attempts;
+            if (left > 0) {
+                attemptsInfo.textContent = `Осталось попыток: ${left}`;
+            } else {
+                attemptsInfo.textContent = `⚠️ Следующая ошибка будет объявлена в чате`;
+                attemptsInfo.style.color = '#ff9f43';
+            }
+
+            setTimeout(() => input.focus(), 200);
+
+            const cleanup = () => {
+                modal.remove();
+            };
+
+            const trySubmit = async () => {
+                const pwd = input.value;
+                if (!pwd) {
+                    errorEl.textContent = 'Введите пароль';
+                    return;
+                }
+
+                errorEl.textContent = '';
+                submitBtn.disabled = true;
+                submitBtn.textContent = '⏳ Проверка…';
+
+                const verifyHash = await makeVerifyHash(username, chatFile, pwd);
+                const lock = getLock(chatFile, username);
+
+                if (lock && verifyHash === lock.verifyHash) {
+                    // ✅ Успех
+                    setMyKey(chatFile, {
+                        username,
+                        password: pwd,
+                        verifyHash,
+                        deviceId: getDeviceId(),
+                        createdAt: Date.now(),
+                    });
+                    resetAttempts(chatFile, username);
+                    updateLockIcon();
+
+                    showToastSafe('✅ Добро пожаловать!');
+                    soundManagerSafe('send');
+                    cleanup();
+                    resolve(true);
+                } else {
+                    // ❌ Провал
+                    const newAttempts = incAttempts(chatFile, username);
+
+                    if (newAttempts >= CFG.MAX_ATTEMPTS) {
+                        // 🚨 Публичное сообщение
+                        sendAttemptsWarning(chatFile, username);
+                        showToastSafe('⚠️ Неверный пароль. Попытка объявлена в чате.', 3000);
+                    } else {
+                        const leftAfter = CFG.MAX_ATTEMPTS - newAttempts;
+                        errorEl.textContent = `Неверный пароль. Осталось: ${leftAfter}`;
+                        attemptsInfo.textContent = leftAfter > 1
+                            ? `Осталось попыток: ${leftAfter}`
+                            : `⚠️ Следующая ошибка будет объявлена в чате`;
+                        attemptsInfo.style.color = leftAfter > 1 ? '#666' : '#ff9f43';
+                    }
+
+                    input.value = '';
+                    input.focus();
+                    submitBtn.disabled = false;
+                    submitBtn.textContent = 'Войти';
+                    soundManagerSafe('error');
+                }
+            };
+
+            submitBtn.addEventListener('click', trySubmit);
+            input.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') trySubmit();
+            });
+
+            skipBtn.addEventListener('click', () => {
+                cleanup();
+                resolve(false);
+            });
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ СООБЩЕНИЕ О ПОПЫТКЕ ВХОДА
+    // ═══════════════════════════════════════════════════════════
+    async function sendAttemptsWarning(chatFile, username) {
+        try {
+            log(`🚨 Публичное сообщение: попытка входа под "${username}"`);
+
+            // Отправляем системное сообщение в чат
+            // Используем оригинальный sendMessage, но с особой меткой
+            // которая будет отрендерена как системное
+
+            if (typeof _origSendMessage === 'function') {
+                // ВАЖНО: чтобы не попасть в цикл с нашей же проверкой,
+                // отправляем через "сырой" sendMessage с особым флагом
+                const warningText = `🚨 Попытка входа под именем «${username}» с другого устройства — неверный пароль. Если это не вы — смените имя.`;
+
+                // Используем специальную функцию отправки, минуя нашу проверку
+                await _origSendMessage.call(window, warningText, null, null, null, null, null, null);
+            }
+        } catch (e) {
+            console.error('🔐 [NameLock] sendAttemptsWarning failed:', e);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ sendMessage
+    //  ─────────────────────────────────────────────────────────────
+    //  Перед отправкой проверяем: могу ли я писать под этим именем?
+    // ═══════════════════════════════════════════════════════════
+    const _origSendMessage = window.sendMessage;
+
+    window.sendMessage = async function(text, imageBlob, audioData, fileAttachment, audioFile, replyContext, videoPayload) {
+        if (!state.isAuthorized || !state.chatFile || !state.username) {
+            return _origSendMessage.apply(this, arguments);
+        }
+
+        // Проверяем, могу ли я писать
+        const check = canSendAs(state.chatFile, state.username);
+
+        if (!check.ok) {
+            // Имя защищено, я не владелец — открываем ввод пароля
+            if (check.reason === 'locked-need-password' || check.reason === 'wrong-password') {
+                const success = await showPasswordPrompt(state.chatFile, state.username);
+
+                if (!success) {
+                    showToastSafe('❌ Отправка отменена — имя защищено', 2500);
+                    return;
+                }
+
+                // Успешно ввели пароль — отправляем
+                return _origSendMessage.apply(this, arguments);
+            }
+        }
+
+        // Всё ок — отправляем
+        return _origSendMessage.apply(this, arguments);
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧ encryptMessage — добавляем signer
+    // ═══════════════════════════════════════════════════════════
+    const _origEncryptMessage = encryptMessage;
+
+    encryptMessage = async function(msg) {
+        // Сначала получаем базовый зашифрованный вид
+        // Но нам нужно добавить signer в payload ДО шифрования.
+        // Проще: расшифровать заново исходный msg, добавить signer, зашифровать.
+
+        // Не будем переизобретать — просто допишем signer в msg,
+        // а оригинал сам его зашифрует (он берёт поля из msg напрямую).
+        if (state.chatFile && state.username) {
+            const lock = getLock(state.chatFile, state.username);
+            const myKey = getMyKey(state.chatFile);
+
+            if (lock && myKey && myKey.username === state.username
+                && myKey.verifyHash === lock.verifyHash) {
+
+                // Имя защищено мной — добавляем signer
+                msg.signer = {
+                    verifyHash: myKey.verifyHash,
+                    deviceId: getDeviceId(),
+                };
+            }
+        }
+
+        return _origEncryptMessage.call(this, msg);
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧ decryptMessage — извлекаем signer
+    // ═══════════════════════════════════════════════════════════
+    const _origDecryptMessage = decryptMessage;
+
+    decryptMessage = async function(encMsg) {
+        const msg = await _origDecryptMessage.call(this, encMsg);
+
+        // Если расшифровали успешно и есть signer — обрабатываем
+        if (msg && msg.signer && msg.username && state.chatFile) {
+            // Первый раз видим этот hash от этого имени — запоминаем (TOFU)
+            const existingLock = getLock(state.chatFile, msg.username);
+            if (!existingLock) {
+                setLock(state.chatFile, msg.username, msg.signer.verifyHash, msg.signer.deviceId);
+                log(`📌 Обнаружена защита имени "${msg.username}" (запомнено)`);
+            }
+        }
+
+        return msg;
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ВСПОМОГАТЕЛЬНЫЕ
+    // ═══════════════════════════════════════════════════════════
+    function showToastSafe(text, dur) {
+        try {
+            if (typeof showToast === 'function') showToast(text, dur || 2000);
+        } catch (e) {}
+    }
+
+    function soundManagerSafe(type) {
+        try {
+            if (typeof soundManager !== 'undefined') soundManager.play(type);
+        } catch (e) {}
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПРИ ВХОДЕ В ЧАТ — проверяем защиту
+    // ═══════════════════════════════════════════════════════════
+    if (typeof enterChat === 'function') {
+        const _origEnter = enterChat;
+        enterChat = async function(file, name, password) {
+            const result = await _origEnter.apply(this, arguments);
+
+            if (state.chatFile === file && state.username) {
+                // Обновляем иконку 🔒
+                setTimeout(() => {
+                    interceptForgetButton();
+                    updateLockIcon();
+                }, 200);
+
+                // Проверяем, защищено ли имя
+                setTimeout(async () => {
+                    const lock = getLock(file, state.username);
+                    const myKey = getMyKey(file);
+
+                    if (lock && (!myKey || myKey.username !== state.username
+                        || myKey.verifyHash !== lock.verifyHash)) {
+                        // Имя защищено, но мы не вводили пароль (или вводили неверный)
+                        log(`⚠️ Имя "${state.username}" защищено — запрашиваем пароль`);
+
+                        // Небольшая задержка, чтобы чат успел отрендериться
+                        await new Promise(r => setTimeout(r, 800));
+
+                        // Показываем prompt только если это первый раз в сессии
+                        const key = `prompted_${file}_${state.username}`;
+                        if (!sessionStorage.getItem(key)) {
+                            sessionStorage.setItem(key, '1');
+                            const success = await showPasswordPrompt(file, state.username);
+                            if (!success) {
+                                showToastSafe('⚠️ Вы не сможете писать под этим именем', 3500);
+                            }
+                        }
+                    }
+                }, 500);
+            }
+
+            return result;
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ИНИЦИАЛИЗАЦИЯ
+    // ═══════════════════════════════════════════════════════════
+    loadAttempts();
+    setTimeout(interceptForgetButton, 2000);
+    setInterval(interceptForgetButton, 3000);  // на случай перерисовки
+
+    // API для отладки
+    window.NameLock = {
+        status: () => {
+            if (!state.chatFile) return { error: 'Нет активного чата' };
+            const locks = getAllLocks(state.chatFile);
+            const myKey = getMyKey(state.chatFile);
+            return {
+                chatFile: state.chatFile,
+                myUsername: state.username,
+                myKey: myKey ? { username: myKey.username, verifyHash: myKey.verifyHash.slice(0, 16) + '…' } : null,
+                locksInChat: Object.keys(locks).map(u => ({
+                    username: u,
+                    isMine: myKey && myKey.username === u && myKey.verifyHash === locks[u].verifyHash,
+                })),
+            };
+        },
+        openProfile: openProfileModal,
+        clearAll: () => {
+            localStorage.removeItem(CFG.STORAGE_LOCKS);
+            localStorage.removeItem(CFG.STORAGE_MY_KEY);
+            localStorage.removeItem('smschat_attempts_v1');
+            log('🗑️ Все данные NameLock очищены');
+        },
+        clearMyKey: (chatFile) => {
+            removeMyKey(chatFile || state.chatFile);
+            removeLock(chatFile || state.chatFile, state.username);
+            updateLockIcon();
+            log('🗑️ Мой ключ и лок удалены');
+        },
+    };
+
+    console.log('🔐 [NameLock] Установлено:');
+    console.log('   • Кнопка 🔒 → профиль с защитой имени');
+    console.log('   • Пароль хранится в localStorage');
+    console.log('   • 3 попытки, на 4-й — публичное сообщение');
+    console.log('   • Иконка 🔒 меняет цвет, когда имя защищено');
+    console.log('   • API: NameLock.status() / .openProfile() / .clearAll()');
+})();
+</script>
 </body>
 </html>
