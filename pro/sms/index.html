@@ -44157,900 +44157,453 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
     console.log('   • Задачи-дубликаты чистятся при старте');
 })();
 </script>
-
 <script>
 // ═══════════════════════════════════════════════════════════════
-//  📱 DEVICE TRACKER v2 — уведомления внутри меню «⋯»
+//  🛡️ DEVICE FINGERPRINT SECURITY v1
 //  ─────────────────────────────────────────────────────────────
-//  Отличия от v1:
-//   • Нет колокольчика в шапке
-//   • Пункт «📱 Уведомления» внутри меню «⋯»
-//   • Если есть непрочитанные — «⋯» светится + точка мигает
+//  • Каждое устройство получает стабильный ID
+//  • ID скрыто прикрепляется к каждому сообщению
+//  • При смене устройства под тем же именем → системное уведомление
+//  • Панель со списком устройств пользователя
 // ═══════════════════════════════════════════════════════════════
 
-(function installDeviceTrackerV2() {
+(function installDeviceFingerprint() {
     'use strict';
 
-    console.log('📱 [DeviceTracker v2] Установка…');
-
-    // ═══════════════════════════════════════════════════════════
-    //  КОНФИГ
-    // ═══════════════════════════════════════════════════════════
+    // ─── Конфиг ───
     const CFG = {
-        STORAGE_DEVICE_ID:      'smschat_device_id_v1',
-        STORAGE_DEVICE_LABEL:   'smschat_device_label_v1',
-        STORAGE_KNOWN_DEVICES:  'smschat_known_devices_v1',
-        STORAGE_NOTIFICATIONS:  'smschat_notifications_v1',
-        MAX_NOTIFICATIONS:      200,
-        LOG: '📱 [DeviceTracker]',
+        FP_VERSION: 1,
+        STORAGE_KEY: 'smschat_device_fp_v1',
+        TRUST_STORAGE_KEY: 'smschat_trusted_devices_v1',
+        NOTIFY_ON_NEW_DEVICE: true,
+        // Если устройство "новое" но зашло в первые 30 дней после первого
+        // — считаем миграцией, а не подозрительным
+        GRACE_PERIOD_MS: 30 * 24 * 60 * 60 * 1000,
+        LOG: true,
     };
 
-    const log = (...a) => console.log(CFG.LOG, ...a);
+    const log = (...a) => CFG.LOG && console.log('🛡️ [DeviceFP]', ...a);
 
     // ═══════════════════════════════════════════════════════════
-    //  DEVICE ID
+    //  1. СБОР FINGERPRINT
     // ═══════════════════════════════════════════════════════════
-    function getDeviceId() {
-        let id = localStorage.getItem(CFG.STORAGE_DEVICE_ID);
-        if (!id) {
-            id = 'dev_' + Date.now().toString(36) + '_' +
-                 Math.random().toString(36).slice(2, 10);
-            localStorage.setItem(CFG.STORAGE_DEVICE_ID, id);
-            log('📱 Создан deviceId:', id);
-        }
-        return id;
-    }
+    function collectRawFingerprint() {
+        const parts = [];
 
-    function detectDeviceLabel() {
         try {
-            const ua = navigator.userAgent;
-            let device = 'Устройство';
-            let browser = '';
+            // Браузер и версия
+            parts.push(navigator.userAgent || 'unknown-ua');
+            parts.push(navigator.appVersion || '');
+            parts.push(navigator.platform || 'unknown-platform');
 
-            if (/iPhone/i.test(ua)) device = 'iPhone';
-            else if (/iPad/i.test(ua)) device = 'iPad';
-            else if (/Android/i.test(ua)) {
-                const m = ua.match(/Android.*?;\s*([^)]+?)(?:\s+Build|\))/i);
-                device = m ? m[1].trim() : 'Android';
-            }
-            else if (/Macintosh/i.test(ua)) device = 'Mac';
-            else if (/Windows/i.test(ua)) device = 'Windows PC';
-            else if (/Linux/i.test(ua)) device = 'Linux';
+            // Языки
+            parts.push((navigator.languages || [navigator.language || '']).join(','));
 
-            if (/Edg\//i.test(ua)) browser = 'Edge';
-            else if (/Chrome\//i.test(ua) && !/Edg/i.test(ua)) browser = 'Chrome';
-            else if (/Firefox\//i.test(ua)) browser = 'Firefox';
-            else if (/Safari\//i.test(ua) && !/Chrome/i.test(ua)) browser = 'Safari';
-            else if (/Opera|OPR\//i.test(ua)) browser = 'Opera';
+            // Часовой пояс
+            try {
+                parts.push(Intl.DateTimeFormat().resolvedOptions().timeZone || '');
+            } catch (e) {}
 
-            return browser ? `${device} · ${browser}` : device;
+            // Экран
+            parts.push(`${screen.width}x${screen.height}x${screen.colorDepth}`);
+            parts.push(`avail:${screen.availWidth}x${screen.availHeight}`);
+            parts.push(`dpr:${window.devicePixelRatio || 1}`);
+
+            // Железо
+            parts.push(`cores:${navigator.hardwareConcurrency || 0}`);
+            parts.push(`mem:${navigator.deviceMemory || 0}`);
+            parts.push(`touch:${navigator.maxTouchPoints || 0}`);
+
+            // Локаль
+            try {
+                parts.push(`locale:${Intl.DateTimeFormat().resolvedOptions().locale || ''}`);
+            } catch (e) {}
+
+            // Особенности движка
+            parts.push(`cookieEnabled:${navigator.cookieEnabled}`);
+            parts.push(`doNotTrack:${navigator.doNotTrack || '0'}`);
+
         } catch (e) {
-            return 'Устройство';
+            console.warn('🛡️ [DeviceFP] collectRawFingerprint error:', e);
         }
+
+        return parts.join('|');
     }
 
-    function getDeviceLabel() {
-        let label = localStorage.getItem(CFG.STORAGE_DEVICE_LABEL);
-        if (!label) {
-            label = detectDeviceLabel();
-            localStorage.setItem(CFG.STORAGE_DEVICE_LABEL, label);
-        }
-        return label;
+    // ─── SHA-256 через WebCrypto ───
+    async function sha256Hex(text) {
+        const enc = new TextEncoder();
+        const buf = await crypto.subtle.digest('SHA-256', enc.encode(text));
+        const bytes = new Uint8Array(buf);
+        return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
     }
 
-    const MY_DEVICE_ID = getDeviceId();
-    const MY_DEVICE_LABEL = getDeviceLabel();
-
-    log('📱 Моё устройство:', MY_DEVICE_LABEL);
-
-    // ═══════════════════════════════════════════════════════════
-    //  📒 ИЗВЕСТНЫЕ УСТРОЙСТВА
-    // ═══════════════════════════════════════════════════════════
-    function loadKnownDevices() {
-        try { return JSON.parse(localStorage.getItem(CFG.STORAGE_KNOWN_DEVICES) || '{}'); }
-        catch (e) { return {}; }
-    }
-    function saveKnownDevices(data) {
-        try { localStorage.setItem(CFG.STORAGE_KNOWN_DEVICES, JSON.stringify(data)); } catch (e) {}
-    }
-    function getKnownDevices(username) {
-        return loadKnownDevices()[username] || {};
-    }
-    function rememberDevice(username, deviceId, deviceLabel, chatFile) {
-        const all = loadKnownDevices();
-        if (!all[username]) all[username] = {};
-
-        if (!all[username][deviceId]) {
-            all[username][deviceId] = {
-                label: deviceLabel || 'Устройство',
-                firstSeen: Date.now(),
-                lastSeen: Date.now(),
-                chatFile,
-            };
-            saveKnownDevices(all);
-            log(`📌 Запомнено: ${username}@${deviceLabel}`);
-            return { isNew: true };
-        } else {
-            all[username][deviceId].lastSeen = Date.now();
-            saveKnownDevices(all);
-            return { isNew: false };
-        }
+    // ─── Публичная короткая версия ID (для отображения) ───
+    function shortId(fullHash) {
+        return fullHash.slice(0, 8).toUpperCase();
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  🔔 УВЕДОМЛЕНИЯ
+    //  2. ХРАНИЛИЩЕ
     // ═══════════════════════════════════════════════════════════
-    function loadNotifications() {
-        try { return JSON.parse(localStorage.getItem(CFG.STORAGE_NOTIFICATIONS) || '[]'); }
-        catch (e) { return []; }
-    }
-    function saveNotifications(arr) {
+    let _deviceId = null;      // полный хеш
+    let _deviceShort = null;   // первые 8 символов
+    let _createdAt = null;
+
+    function loadDeviceId() {
         try {
-            if (arr.length > CFG.MAX_NOTIFICATIONS) arr = arr.slice(-CFG.MAX_NOTIFICATIONS);
-            localStorage.setItem(CFG.STORAGE_NOTIFICATIONS, JSON.stringify(arr));
+            const raw = localStorage.getItem(CFG.STORAGE_KEY);
+            if (raw) {
+                const data = JSON.parse(raw);
+                if (data && data.id && data.v === CFG.FP_VERSION) {
+                    _deviceId = data.id;
+                    _deviceShort = data.short || shortId(data.id);
+                    _createdAt = data.createdAt || Date.now();
+                    return true;
+                }
+            }
+        } catch (e) {}
+        return false;
+    }
+
+    function saveDeviceId(id) {
+        try {
+            const data = {
+                id: id,
+                short: shortId(id),
+                v: CFG.FP_VERSION,
+                createdAt: Date.now(),
+            };
+            localStorage.setItem(CFG.STORAGE_KEY, JSON.stringify(data));
+            _createdAt = data.createdAt;
         } catch (e) {}
     }
-    function addNotification(data) {
-        const arr = loadNotifications();
 
-        // Дедуп — если такое же непрочитанное за последний час, не добавляем
-        const recent = arr.find(n =>
-            n.username === data.username &&
-            n.deviceId === data.deviceId &&
-            !n.read &&
-            (Date.now() - n.ts) < 60 * 60 * 1000
-        );
-
-        if (recent) {
-            recent.ts = Date.now();
-            saveNotifications(arr);
-            return false;
-        }
-
-        arr.push({
-            id: 'notif_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
-            ts: Date.now(),
-            read: false,
-            ...data,
-        });
-        saveNotifications(arr);
-        return true;
-    }
-    function getUnreadCount() {
-        return loadNotifications().filter(n => !n.read).length;
-    }
-    function markAllRead() {
-        const arr = loadNotifications();
-        arr.forEach(n => n.read = true);
-        saveNotifications(arr);
-        updateMenuButtonState();
-    }
-    function clearNotifications() {
-        saveNotifications([]);
-        updateMenuButtonState();
-        renderNotificationsList();
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  🎨 ИНДИКАТОР НА КНОПКЕ «⋯»
-    // ═══════════════════════════════════════════════════════════
-    function ensureIndicatorStyles() {
-        if (document.getElementById('deviceTrackerV2Styles')) return;
-
-        const style = document.createElement('style');
-        style.id = 'deviceTrackerV2Styles';
-        style.textContent = `
-            /* ═══ Индикатор на кнопке «⋯» ═══ */
-            #chatsActionsBtn.has-device-notif {
-                background: linear-gradient(135deg,
-                    rgba(108,92,231,0.35),
-                    rgba(167,139,250,0.25)) !important;
-                color: #fff !important;
-                box-shadow: 0 0 12px rgba(108,92,231,0.5),
-                            0 0 0 2px rgba(167,139,250,0.3);
-                animation: deviceBtnPulse 2.2s ease-in-out infinite;
-            }
-            @keyframes deviceBtnPulse {
-                0%, 100% {
-                    box-shadow: 0 0 12px rgba(108,92,231,0.5),
-                                0 0 0 2px rgba(167,139,250,0.3);
-                }
-                50% {
-                    box-shadow: 0 0 20px rgba(108,92,231,0.85),
-                                0 0 0 4px rgba(167,139,250,0.15);
-                }
-            }
-
-            /* ═══ Мигающая точка рядом с «⋯» ═══ */
-            .chats-actions-dot {
-                position: absolute;
-                top: -3px;
-                right: -3px;
-                width: 12px;
-                height: 12px;
-                border-radius: 50%;
-                background: linear-gradient(135deg, #ff6b6b, #ee5253);
-                border: 2px solid #0a0a0f;
-                box-shadow: 0 0 8px rgba(238,82,83,0.9);
-                pointer-events: none;
-                z-index: 10;
-                animation: deviceDotBlink 1.4s ease-in-out infinite;
-            }
-            @keyframes deviceDotBlink {
-                0%, 100% {
-                    transform: scale(1);
-                    opacity: 1;
-                    box-shadow: 0 0 8px rgba(238,82,83,0.9);
-                }
-                50% {
-                    transform: scale(1.25);
-                    opacity: 0.75;
-                    box-shadow: 0 0 16px rgba(238,82,83,1);
-                }
-            }
-
-            /* ═══ Пункт меню «Уведомления» ═══ */
-            #unifiedChatMenu [data-action="devicenotifs"] {
-                position: relative;
-            }
-            #unifiedChatMenu [data-action="devicenotifs"].has-unread {
-                background: linear-gradient(135deg,
-                    rgba(108,92,231,0.15),
-                    rgba(167,139,250,0.1));
-                border: 1px solid rgba(108,92,231,0.3);
-                border-radius: 12px;
-            }
-            #unifiedChatMenu [data-action="devicenotifs"] .ucm-notif-count {
-                display: inline-flex;
-                align-items: center;
-                justify-content: center;
-                min-width: 22px;
-                height: 22px;
-                padding: 0 7px;
-                border-radius: 11px;
-                background: linear-gradient(135deg, #ff6b6b, #ee5253);
-                color: #fff;
-                font-size: 11px;
-                font-weight: 700;
-                margin-left: auto;
-                flex-shrink: 0;
-                box-shadow: 0 2px 6px rgba(238,82,83,0.5);
-                animation: deviceDotBlink 1.8s ease-in-out infinite;
-            }
-
-            /* ═══ Панель уведомлений ═══ */
-            .device-notif-item {
-                display: flex;
-                align-items: flex-start;
-                gap: 12px;
-                padding: 14px 16px;
-                background: rgba(255,255,255,0.04);
-                border: 1px solid rgba(255,255,255,0.08);
-                border-radius: 14px;
-                margin-bottom: 8px;
-                cursor: pointer;
-                transition: all 0.15s;
-                user-select: none;
-            }
-            .device-notif-item:hover {
-                background: rgba(108,92,231,0.12);
-                border-color: rgba(108,92,231,0.35);
-                transform: translateY(-1px);
-            }
-            .device-notif-item.unread {
-                background: rgba(108,92,231,0.08);
-                border-left: 3px solid #6c5ce7;
-            }
-            .device-notif-item .dni-icon {
-                width: 42px;
-                height: 42px;
-                border-radius: 12px;
-                background: linear-gradient(135deg,
-                    rgba(108,92,231,0.25),
-                    rgba(0,184,148,0.18));
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                font-size: 20px;
-                flex-shrink: 0;
-            }
-            .device-notif-item.self-warn .dni-icon {
-                background: linear-gradient(135deg,
-                    rgba(255,159,67,0.25),
-                    rgba(254,202,87,0.15));
-            }
-            .device-notif-item .dni-body { flex: 1; min-width: 0; }
-            .device-notif-item .dni-title {
-                font-size: 14px;
-                font-weight: 600;
-                color: #fff;
-                margin-bottom: 4px;
-                line-height: 1.3;
-            }
-            .device-notif-item .dni-sub {
-                font-size: 12px;
-                color: #aaa;
-                line-height: 1.4;
-                word-break: break-word;
-            }
-            .device-notif-item .dni-time {
-                font-size: 10px;
-                color: #666;
-                margin-top: 6px;
-            }
-        `;
-        document.head.appendChild(style);
-    }
-
-    /**
-     * Обновляет состояние кнопки «⋯» — добавляет/убирает
-     * фиолетовую подсветку и мигающую точку.
-     */
-    function updateMenuButtonState() {
-        ensureIndicatorStyles();
-
-        const btn = document.getElementById('chatsActionsBtn');
-        if (!btn) return;
-
-        const unread = getUnreadCount();
-
-        // Делаем кнопку relative (для позиционирования точки)
-        btn.style.position = 'relative';
-
-        // Снимаем старую точку
-        const oldDot = btn.querySelector('.chats-actions-dot');
-        if (oldDot) oldDot.remove();
-
-        if (unread > 0) {
-            // ✅ Есть непрочитанные — подсветка + точка
-            btn.classList.add('has-device-notif');
-
-            const dot = document.createElement('span');
-            dot.className = 'chats-actions-dot';
-            btn.appendChild(dot);
-        } else {
-            // Тишина
-            btn.classList.remove('has-device-notif');
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  📋 ПАНЕЛЬ УВЕДОМЛЕНИЙ
-    // ═══════════════════════════════════════════════════════════
-    function ensurePanel() {
-        let panel = document.getElementById('deviceNotifPanel');
-        if (panel) return panel;
-
-        panel = document.createElement('div');
-        panel.id = 'deviceNotifPanel';
-        panel.style.cssText = `
-            position: fixed;
-            inset: 0;
-            background: rgba(0,0,0,0.75);
-            backdrop-filter: blur(10px);
-            -webkit-backdrop-filter: blur(10px);
-            z-index: 6000;
-            display: none;
-            align-items: center;
-            justify-content: center;
-            padding: 20px;
-            animation: fadeInModal 0.2s ease;
-        `;
-
-        panel.innerHTML = `
-            <div style="
-                background: #1a1a2e;
-                border-radius: 20px;
-                padding: 0;
-                max-width: 480px;
-                width: 100%;
-                max-height: 85vh;
-                display: flex;
-                flex-direction: column;
-                border: 1px solid rgba(255,255,255,0.1);
-                box-shadow: 0 20px 60px rgba(0,0,0,0.7);
-                overflow: hidden;
-                animation: slideUp 0.25s ease;
-            " onclick="event.stopPropagation()">
-                <!-- Заголовок -->
-                <div style="
-                    display: flex;
-                    align-items: center;
-                    gap: 12px;
-                    padding: 16px 20px;
-                    border-bottom: 1px solid rgba(255,255,255,0.08);
-                    background: linear-gradient(135deg,
-                        rgba(108,92,231,0.15),
-                        rgba(0,184,148,0.08));
-                    flex-shrink: 0;
-                ">
-                    <div style="
-                        width: 42px;height:42px;
-                        border-radius: 12px;
-                        background: linear-gradient(135deg, #6c5ce7, #00b894);
-                        display: flex;align-items:center;justify-content:center;
-                        font-size: 20px;
-                        flex-shrink: 0;
-                        box-shadow: 0 4px 12px rgba(108,92,231,0.35);
-                    ">📱</div>
-                    <div style="flex:1;min-width:0;">
-                        <h3 style="font-size:16px;font-weight:700;color:#fff;margin:0 0 2px 0;">
-                            Устройства
-                        </h3>
-                        <div style="font-size:12px;color:#888;" id="deviceNotifSubtitle">
-                            —
-                        </div>
-                    </div>
-                    <button id="deviceNotifCloseBtn" style="
-                        width: 34px;height:34px;
-                        border-radius: 50%;
-                        background: rgba(255,255,255,0.06);
-                        border: none;
-                        color: #888;
-                        font-size: 16px;
-                        cursor: pointer;
-                        display: flex;align-items:center;justify-content:center;
-                        flex-shrink: 0;
-                        transition: all 0.15s;
-                    " title="Закрыть">✕</button>
-                </div>
-
-                <!-- Мой device -->
-                <div id="deviceNotifMyDevice" style="
-                    padding: 12px 20px;
-                    border-bottom: 1px solid rgba(255,255,255,0.06);
-                    font-size: 12px;
-                    color: #888;
-                    background: rgba(0,184,148,0.04);
-                    display: flex;
-                    align-items: center;
-                    gap: 8px;
-                    flex-shrink: 0;
-                "></div>
-
-                <!-- Список -->
-                <div id="deviceNotifList" style="
-                    flex: 1;
-                    overflow-y: auto;
-                    padding: 14px 16px;
-                    min-height: 0;
-                "></div>
-
-                <!-- Действия -->
-                <div style="
-                    display: flex;
-                    gap: 8px;
-                    padding: 12px 16px;
-                    border-top: 1px solid rgba(255,255,255,0.06);
-                    background: rgba(255,255,255,0.02);
-                    flex-shrink: 0;
-                ">
-                    <button id="deviceNotifMarkReadBtn" style="
-                        flex: 1;
-                        padding: 11px;
-                        border-radius: 10px;
-                        border: 1px solid rgba(0,184,148,0.3);
-                        background: rgba(0,184,148,0.1);
-                        color: #00b894;
-                        font-size: 13px;
-                        font-weight: 600;
-                        cursor: pointer;
-                        font-family: inherit;
-                        transition: all 0.15s;
-                    ">✓ Прочитано</button>
-                    <button id="deviceNotifClearBtn" style="
-                        flex: 1;
-                        padding: 11px;
-                        border-radius: 10px;
-                        border: 1px solid rgba(255,107,107,0.3);
-                        background: rgba(255,107,107,0.1);
-                        color: #ff6b6b;
-                        font-size: 13px;
-                        font-weight: 600;
-                        cursor: pointer;
-                        font-family: inherit;
-                        transition: all 0.15s;
-                    ">🗑 Очистить</button>
-                </div>
-            </div>
-        `;
-
-        document.body.appendChild(panel);
-
-        panel.querySelector('#deviceNotifCloseBtn').addEventListener('click', () => {
-            panel.style.display = 'none';
-        });
-
-        panel.addEventListener('click', (e) => {
-            if (e.target === panel) panel.style.display = 'none';
-        });
-
-        panel.querySelector('#deviceNotifMarkReadBtn').addEventListener('click', () => {
-            markAllRead();
-            renderNotificationsList();
-            if (typeof showToast === 'function') showToast('✓ Все прочитаны', 1500);
-        });
-
-        panel.querySelector('#deviceNotifClearBtn').addEventListener('click', () => {
-            if (confirm('Очистить все уведомления?')) {
-                clearNotifications();
-                if (typeof showToast === 'function') showToast('🗑 Очищено', 1500);
-            }
-        });
-
-        return panel;
-    }
-
-    function openNotificationsPanel() {
-        const panel = ensurePanel();
-        panel.style.display = 'flex';
-        renderNotificationsList();
-    }
-
-    function renderNotificationsList() {
-        const list = document.getElementById('deviceNotifList');
-        const subtitle = document.getElementById('deviceNotifSubtitle');
-        const myDeviceEl = document.getElementById('deviceNotifMyDevice');
-        if (!list) return;
-
-        // ─── Показываем моё устройство ───
-        if (myDeviceEl) {
-            myDeviceEl.innerHTML = `
-                <span style="
-                    width: 8px;height:8px;
-                    border-radius: 50%;
-                    background: #00b894;
-                    box-shadow: 0 0 8px rgba(0,184,148,0.8);
-                    flex-shrink: 0;
-                "></span>
-                <span style="color:#00b894;font-weight:600;">Это устройство:</span>
-                <span style="color:#ccc;">${escapeHtml(MY_DEVICE_LABEL)}</span>
-            `;
-        }
-
-        const arr = loadNotifications().sort((a, b) => b.ts - a.ts);
-
-        if (subtitle) {
-            const unread = arr.filter(n => !n.read).length;
-            subtitle.textContent = arr.length === 0
-                ? 'Смена устройств в чатах'
-                : `${arr.length} всего · ${unread} непрочитанных`;
-        }
-
-        if (arr.length === 0) {
-            list.innerHTML = `
-                <div style="
-                    text-align: center;
-                    padding: 40px 20px;
-                    color: #666;
-                ">
-                    <div style="font-size: 48px;margin-bottom: 12px;opacity: 0.7;">📱</div>
-                    <div style="font-size: 14px;color: #aaa;margin-bottom: 6px;">
-                        Пока уведомлений нет
-                    </div>
-                    <div style="font-size: 12px;color: #666;line-height: 1.5;">
-                        Здесь появятся сообщения о том, что кто-то
-                        зашёл в чат с нового устройства.
-                    </div>
-                </div>
-            `;
+    // ─── Инициализация ───
+    async function initDeviceId() {
+        // Уже есть — используем
+        if (loadDeviceId()) {
+            log(`Загружен device ID: ${_deviceShort}`);
             return;
         }
 
-        list.innerHTML = arr.map(n => {
-            const timeAgo = formatTimeAgo(n.ts);
-            const chat = state.chats.find(c => c.file === n.chatFile);
-            const chatName = chat ? (chat.name || chat.file) : n.chatFile;
-            const isSelfWarn = n.isSelfWarning === true;
+        // Генерируем из fingerprint + salt
+        const raw = collectRawFingerprint();
 
-            const icon = isSelfWarn ? '⚠️' : '📱';
-            const title = isSelfWarn
-                ? `Внимание! Кто-то зашёл под вашим именем`
-                : `${escapeHtml(n.username)} зашёл с нового устройства`;
+        // Соль — уникальная для этого браузера
+        let salt = '';
+        try {
+            salt = localStorage.getItem('smschat_fp_salt');
+            if (!salt) {
+                const arr = crypto.getRandomValues(new Uint8Array(16));
+                salt = Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join('');
+                localStorage.setItem('smschat_fp_salt', salt);
+            }
+        } catch (e) {
+            salt = 'no-salt-' + Date.now();
+        }
 
-            return `
-                <div class="device-notif-item ${!n.read ? 'unread' : ''} ${isSelfWarn ? 'self-warn' : ''}"
-                     data-notif-id="${n.id}"
-                     data-chat-file="${n.chatFile}">
-                    <div class="dni-icon">${icon}</div>
-                    <div class="dni-body">
-                        <div class="dni-title">${title}</div>
-                        <div class="dni-sub">
-                            📱 ${escapeHtml(n.deviceLabel || 'Неизвестное устройство')}<br>
-                            💬 Чат: ${escapeHtml(chatName)}
-                        </div>
-                        <div class="dni-time">${timeAgo}</div>
-                    </div>
-                </div>
-            `;
-        }).join('');
+        const full = await sha256Hex(raw + '|' + salt);
+        _deviceId = full;
+        _deviceShort = shortId(full);
+        saveDeviceId(full);
 
-        // Клик → переход в чат
-        list.querySelectorAll('.device-notif-item').forEach(item => {
-            item.addEventListener('click', async () => {
-                const notifId = item.dataset.notifId;
-                const chatFile = item.dataset.chatFile;
-
-                // Помечаем прочитанным
-                const arr = loadNotifications();
-                const target = arr.find(n => n.id === notifId);
-                if (target && !target.read) {
-                    target.read = true;
-                    saveNotifications(arr);
-                    updateMenuButtonState();
-                }
-
-                // Закрываем панель
-                const panel = document.getElementById('deviceNotifPanel');
-                if (panel) panel.style.display = 'none';
-
-                // Открываем чат
-                if (state.chatFile === chatFile) return;
-
-                const chat = state.chats.find(c => c.file === chatFile);
-                if (!chat) {
-                    if (typeof showToast === 'function') showToast('❌ Чат не найден', 1500);
-                    return;
-                }
-
-                const password = state.savedPasswords[chatFile];
-                if (!password) {
-                    if (typeof showToast === 'function') showToast('🔐 Нужен пароль чата', 2000);
-                    return;
-                }
-
-                if (typeof enterChat === 'function') {
-                    try {
-                        await enterChat(chatFile, chat.name || chatFile, password);
-                    } catch (e) {
-                        console.warn('Не удалось перейти в чат:', e);
-                    }
-                }
-            });
-        });
-    }
-
-    function formatTimeAgo(ts) {
-        const diff = Date.now() - ts;
-        const min = Math.floor(diff / 60000);
-        if (min < 1) return 'только что';
-        if (min < 60) return `${min} мин назад`;
-        const h = Math.floor(min / 60);
-        if (h < 24) return `${h} ч назад`;
-        const d = Math.floor(h / 24);
-        if (d < 30) return `${d} дн назад`;
-        return new Date(ts).toLocaleDateString('ru-RU', {
-            day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit'
-        });
+        log(`Создан новый device ID: ${_deviceShort}`);
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  📨 ПАТЧ encryptMessage
+    //  3. КАРТА ДОВЕРЕННЫХ УСТРОЙСТВ ПО ПОЛЬЗОВАТЕЛЯМ
+    //  Формат:
+    //  {
+    //    "username": {
+    //      "devices": {
+    //         "shortId": {
+    //           "fullId": "...",
+    //           "firstSeen": 1234567890,
+    //           "lastSeen": 1234567890,
+    //           "msgCount": 5,
+    //           "msgIds": [123, 456, ...],  // последние 20
+    //         }
+    //      },
+    //      "lastWarnedAt": 1234567890,
+    //      "lastWarnedDevice": "abcd1234",
+    //    }
+    //  }
     // ═══════════════════════════════════════════════════════════
-    const _origEncrypt = encryptMessage;
+    let _trusted = {};
 
-    encryptMessage = async function(msg) {
-        if (!msg.signer) {
-            msg.signer = {
-                deviceId: MY_DEVICE_ID,
-                deviceLabel: MY_DEVICE_LABEL,
+    function loadTrusted() {
+        try {
+            const raw = localStorage.getItem(CFG.TRUST_STORAGE_KEY);
+            _trusted = raw ? JSON.parse(raw) : {};
+        } catch (e) { _trusted = {}; }
+    }
+
+    function saveTrusted() {
+        try {
+            localStorage.setItem(CFG.TRUST_STORAGE_KEY, JSON.stringify(_trusted));
+        } catch (e) {
+            // Квота — обрезаем старые записи
+            if (e.name === 'QuotaExceededError') {
+                const keys = Object.keys(_trusted);
+                keys.slice(0, Math.floor(keys.length / 2)).forEach(k => delete _trusted[k]);
+                try { localStorage.setItem(CFG.TRUST_STORAGE_KEY, JSON.stringify(_trusted)); } catch (e2) {}
+            }
+        }
+    }
+
+    // ─── Регистрация сообщения в карте устройств ───
+    function registerMessageDevice(username, deviceId, msgId) {
+        if (!username || !deviceId) return null;
+
+        const short = shortId(deviceId);
+        const now = Date.now();
+
+        if (!_trusted[username]) {
+            _trusted[username] = {
+                devices: {},
+                lastWarnedAt: 0,
+                lastWarnedDevice: null,
             };
         }
-        return await encryptWithDeviceSigner(msg);
-    };
 
-    async function encryptWithDeviceSigner(msg) {
-        const payload = { username: msg.username, text: msg.text || '' };
-        if (msg.reactions && Object.keys(msg.reactions).length) payload.reactions = msg.reactions;
-        if (msg.comments && msg.comments.length) payload.comments = msg.comments;
-        if (msg.image) payload.image = msg.image;
-        if (msg.audio) {
-            payload.audio = msg.audio;
-            payload.audioDuration = msg.audioDuration || 0;
-            payload.audioMime = msg.audioMime || 'audio/webm';
-            if (msg.audioName) payload.audioName = msg.audioName;
-            if (msg.audioCover) payload.audioCover = msg.audioCover;
+        const entry = _trusted[username];
+        if (!entry.devices[short]) {
+            entry.devices[short] = {
+                fullId: deviceId,
+                firstSeen: now,
+                lastSeen: now,
+                msgCount: 0,
+                msgIds: [],
+                warnedAt: 0,
+            };
         }
-        if (msg.file) {
-            payload.file = msg.file;
-            payload.fileName = msg.fileName || 'file.bin';
-            payload.fileMime = msg.fileMime || 'application/octet-stream';
-            payload.fileSize = msg.fileSize || 0;
-        }
-        if (msg.video) {
-            payload.video = msg.video;
-            payload.videoDuration = msg.videoDuration || 0;
-            payload.videoMime = msg.videoMime || 'video/mp4';
-            payload.videoName = msg.videoName || '';
-            payload.videoSize = msg.videoSize || 0;
-        }
-        if (msg.videoNote) {
-            payload.videoNote = msg.videoNote;
-            payload.videoDuration = msg.videoDuration || 0;
-            payload.videoMime = msg.videoMime || 'video/webm';
-        }
-        if (msg.batchId) {
-            payload.batchId = msg.batchId;
-            payload.batchIndex = msg.batchIndex;
-            payload.batchTotal = msg.batchTotal;
-        }
-        if (msg.replyTo) payload.replyTo = msg.replyTo;
-        if (msg.isSystem) payload.isSystem = msg.isSystem;
-        if (msg.signer) payload.signer = msg.signer;
 
-        const encrypted = await encryptObject(payload, CRYPTO._key);
-        return { id: msg.id, time: msg.time, iv: encrypted.iv, data: encrypted.data };
+        const dev = entry.devices[short];
+        dev.lastSeen = now;
+        dev.msgCount++;
+        if (msgId && !dev.msgIds.includes(msgId)) {
+            dev.msgIds.push(msgId);
+            if (dev.msgIds.length > 20) dev.msgIds = dev.msgIds.slice(-20);
+        }
+
+        saveTrusted();
+        return { short, entry, dev };
+    }
+
+    // ─── Проверка: новое ли это устройство для пользователя? ───
+    function isNewDeviceForUser(username, deviceId) {
+        if (!username || !deviceId) return false;
+        const short = shortId(deviceId);
+        const entry = _trusted[username];
+        if (!entry || !entry.devices) return true;   // первый раз вообще
+        return !entry.devices[short];
+    }
+
+    // ─── Список устройств пользователя ───
+    function getDevicesForUser(username) {
+        const entry = _trusted[username];
+        if (!entry || !entry.devices) return [];
+        return Object.entries(entry.devices).map(([short, data]) => ({
+            short,
+            ...data,
+        })).sort((a, b) => b.lastSeen - a.lastSeen);
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  📨 ПАТЧ decryptMessage — детектим новое устройство
+    //  4. ПАТЧ encryptMessage / decryptMessage — добавляем deviceId
     // ═══════════════════════════════════════════════════════════
-    const _origDecrypt = decryptMessage;
 
-    decryptMessage = async function(encMsg) {
-        const msg = await _origDecrypt.call(this, encMsg);
-        if (!msg || msg.isSystem) return msg;
+    // ─── encryptMessage ───
+    if (typeof encryptMessage === 'function') {
+        const _origEncrypt = encryptMessage;
 
-        if (msg.username && msg.signer && msg.signer.deviceId) {
-            const deviceId = msg.signer.deviceId;
-            const deviceLabel = msg.signer.deviceLabel || 'Устройство';
-            const chatFile = state.chatFile;
+        encryptMessage = async function(msg) {
+            // 🆕 Внедряем deviceId в payload
+            if (_deviceId) {
+                msg._deviceId = _deviceId;
+                msg._deviceShort = _deviceShort;
+            }
+            return _origEncrypt.call(this, msg);
+        };
+        log('patched: encryptMessage');
+    }
 
-            // Моё устройство — не уведомляем
-            if (deviceId === MY_DEVICE_ID && msg.username === state.username) {
-                msg._verified = true;
-                return msg;
+    // ─── decryptMessage ───
+    if (typeof decryptMessage === 'function') {
+        const _origDecrypt = decryptMessage;
+
+        decryptMessage = async function(encMsg) {
+            const msg = await _origDecrypt.call(this, encMsg);
+            if (!msg) return msg;
+
+            // 🆕 Извлекаем deviceId из payload (он уже в msg благодаря
+            //     patch'у оригинала, который сохраняет все поля)
+            // Но оригинал мог не сохранить — проверим напрямую.
+            // На самом деле decryptMessage возвращает уже все поля
+            // из payload, включая _deviceId, если он был записан.
+            // Убедимся, что он есть:
+            if (msg._deviceId) {
+                log(`Расшифровано сообщение от ${msg.username} с device ${shortId(msg._deviceId)}`);
+            } else {
+                // Старое сообщение без deviceId
+                msg._deviceId = null;
+                msg._deviceShort = null;
             }
 
-            const result = rememberDevice(msg.username, deviceId, deviceLabel, chatFile);
+            return msg;
+        };
+        log('patched: decryptMessage');
+    }
 
-            if (result.isNew) {
-                log(`🔔 Новое устройство: ${msg.username} → ${deviceLabel}`);
+    // ═══════════════════════════════════════════════════════════
+    //  5. ПРОВЕРКА ПРИ ПОЛУЧЕНИИ НОВЫХ СООБЩЕНИЙ
+    // ═══════════════════════════════════════════════════════════
 
-                // Не спамим в течение сессии
-                const sessionKey = `notified_v2_${chatFile}_${msg.username}_${deviceId}`;
-                if (sessionStorage.getItem(sessionKey)) return msg;
-                sessionStorage.setItem(sessionKey, '1');
+    // Отслеживаем уже обработанные msgId, чтобы не дублировать уведомления
+    const _processedMsgIds = new Set();
 
-                // Это моё имя или чужое?
-                const isMyName = msg.username === state.username;
+    /**
+     * Обрабатывает одно сообщение: регистрирует устройство,
+     * при необходимости показывает уведомление о смене.
+     */
+    function processIncomingMessage(msg) {
+        if (!msg || !msg.username) return;
+        if (_processedMsgIds.has(msg.id)) return;
+        _processedMsgIds.add(msg.id);
 
-                if (isMyName) {
-                    // ⚠️ Кто-то зашёл под моим именем!
-                    const added = addNotification({
-                        username: msg.username,
-                        deviceId: deviceId,
-                        deviceLabel: deviceLabel,
-                        chatFile: chatFile,
-                        isSelfWarning: true,
-                    });
-                    if (added) {
-                        updateMenuButtonState();
-                        if (typeof soundManager !== 'undefined') {
-                            setTimeout(() => soundManager.play('notification'), 100);
-                        }
-                        if (navigator.vibrate) navigator.vibrate([80, 40, 80]);
-                        if (typeof showToast === 'function') {
-                            showToast(`⚠️ Кто-то зашёл под вашим именем с «${deviceLabel}»`, 5000);
-                        }
-                    }
+        // Обрезаем множество, чтобы не росло бесконечно
+        if (_processedMsgIds.size > 5000) {
+            const arr = Array.from(_processedMsgIds);
+            _processedMsgIds.clear();
+            arr.slice(-2000).forEach(id => _processedMsgIds.add(id));
+        }
+
+        const username = msg.username;
+        const deviceId = msg._deviceId;
+
+        // 🆕 Если у сообщения нет deviceId — старый формат,
+        //    пропускаем без регистрации (не можем ничего сказать)
+        if (!deviceId) {
+            return;
+        }
+
+        // Проверяем: новое ли устройство?
+        const isNew = isNewDeviceForUser(username, deviceId);
+
+        // Регистрируем
+        const result = registerMessageDevice(username, deviceId, msg.id);
+        if (!result) return;
+
+        // 🆕 Если это новое устройство — показываем уведомление
+        if (isNew && CFG.NOTIFY_ON_NEW_DEVICE) {
+            const entry = result.entry;
+            const now = Date.now();
+
+            // Защита от спама: не чаще раза в 10 минут на пользователя
+            const SPAWN_COOLDOWN = 10 * 60 * 1000;
+
+            // Исключение: своё же сообщение с нового устройства —
+            // показываем предупреждение ВСЕМ, включая себя, но с другим текстом
+            const isSelf = username === state.username;
+
+            if (now - entry.lastWarnedAt > SPAWN_COOLDOWN
+                || entry.lastWarnedDevice !== result.short) {
+
+                entry.lastWarnedAt = now;
+                entry.lastWarnedDevice = result.short;
+                saveTrusted();
+
+                // 🆕 Это первый раз когда мы вообще видим этого пользователя?
+                const totalDevices = Object.keys(entry.devices).length;
+                const isVeryFirst = totalDevices === 1 && result.dev.msgCount === 1;
+
+                if (isVeryFirst) {
+                    // Первое сообщение от пользователя — просто "первое устройство"
+                    // не паникуем, но фиксируем
+                    log(`Первое устройство для ${username}: ${result.short}`);
+
+                    // Не показываем системку для первого сообщения
+                    // (это нормально когда только познакомились)
+
                 } else {
-                    // Кто-то другой зашёл с нового устройства
-                    const added = addNotification({
-                        username: msg.username,
-                        deviceId: deviceId,
-                        deviceLabel: deviceLabel,
-                        chatFile: chatFile,
-                    });
-                    if (added) {
-                        updateMenuButtonState();
-                        if (typeof soundManager !== 'undefined') {
-                            setTimeout(() => soundManager.play('notification'), 100);
-                        }
-                        if (navigator.vibrate) navigator.vibrate([60, 40, 60]);
-                        if (typeof showToast === 'function') {
-                            showToast(`📱 ${msg.username} зашёл с нового устройства`, 3500);
-                        }
-                    }
+                    // 🆕 Настоящая смена устройства
+                    log(`⚠️ Смена устройства: ${username} теперь ${result.short}`);
+
+                    showDeviceChangeNotification(username, result.short, isSelf);
                 }
             }
         }
+    }
 
-        return msg;
-    };
+    // ─── Показ системного уведомления ───
+    function showDeviceChangeNotification(username, deviceShort, isSelf) {
+        const isOwn = isSelf || username === state.username;
 
-    // ═══════════════════════════════════════════════════════════
-    //  🎯 ИНТЕГРАЦИЯ В МЕНЮ «⋯»
-    //  ─────────────────────────────────────────────────────────────
-    //  Добавляем пункт «📱 Уведомления» в начало меню
-    // ═══════════════════════════════════════════════════════════
-    function injectNotificationsMenuItem() {
-        const menu = document.getElementById('unifiedChatMenu');
-        if (!menu) return;
-        if (menu.querySelector('[data-action="devicenotifs"]')) return;
+        const icon = isOwn ? '📱' : '⚠️';
+        const name = isOwn ? 'Вы' : `«${username}»`;
 
-        // Ищем первый пункт (обычно это «Переместить» или «Аватарка»)
-        const firstItem = menu.querySelector('.ucm-item');
-        if (!firstItem) return;
+        const text = isOwn
+            ? `📱 Вы пишете с нового устройства (${deviceShort})`
+            : `⚠️ «${username}» теперь пишет с другого устройства (${deviceShort})`;
 
-        const unread = getUnreadCount();
+        // ─── 1. Системное сообщение в чате ───
+        appendSystemNotification(text, isOwn ? 'info' : 'warn');
 
-        const item = document.createElement('div');
-        item.className = 'ucm-item' + (unread > 0 ? ' has-unread' : '');
-        item.dataset.action = 'devicenotifs';
-        item.innerHTML = `
-            <span class="ucm-icon">📱</span>
-            <span class="ucm-label">
-                <div>Устройства</div>
-                <div class="ucm-hint">${unread > 0 ? `${unread} новых` : 'Смена устройств'}</div>
-            </span>
-            ${unread > 0 ? `<span class="ucm-notif-count">${unread > 99 ? '99+' : unread}</span>` : ''}
+        // ─── 2. Тост ───
+        if (typeof showToast === 'function') {
+            showToast(text, 3500);
+        }
+
+        // ─── 3. Звук ───
+        if (!isOwn && typeof soundManager !== 'undefined') {
+            try { soundManager.play('notification'); } catch (e) {}
+        }
+
+        // ─── 4. Вибрация ───
+        if (navigator.vibrate) {
+            navigator.vibrate([80, 40, 80]);
+        }
+    }
+
+    // ─── Добавление системного уведомления в DOM ───
+    function appendSystemNotification(text, kind) {
+        if (typeof messagesInner === 'undefined' || !messagesInner) return;
+
+        const wrapper = document.createElement('div');
+        wrapper.className = 'message system device-notification';
+        if (kind === 'warn') wrapper.classList.add('warn');
+        if (kind === 'info') wrapper.classList.add('info');
+
+        wrapper.innerHTML = `
+            <span class="device-notif-icon">${kind === 'warn' ? '⚠️' : 'ℹ️'}</span>
+            <span class="device-notif-text">${escapeHtmlSafe(text)}</span>
         `;
 
-        // Вставляем в самое начало
-        firstItem.parentNode.insertBefore(item, firstItem);
+        // Вставляем в конец
+        messagesInner.appendChild(wrapper);
 
-        // Разделитель
-        const divider = document.createElement('div');
-        divider.className = 'ucm-divider';
-        item.parentNode.insertBefore(divider, item.nextSibling);
+        // Скроллим если внизу
+        try {
+            if (typeof scrollState !== 'undefined' && scrollState.isAtBottom) {
+                if (typeof scrollToBottom === 'function') scrollToBottom(true);
+            }
+        } catch (e) {}
 
-        // Клик
-        item.addEventListener('click', (e) => {
-            e.stopPropagation();
-            e.preventDefault();
-
-            // Закрываем меню
-            menu.classList.remove('show');
-            const backdrop = document.getElementById('unifiedChatMenuBackdrop');
-            if (backdrop) backdrop.classList.remove('show');
-
-            // Открываем панель уведомлений
-            setTimeout(() => openNotificationsPanel(), 200);
-        });
+        // Удаляем через 15 секунд (или оставляем как историю — на выбор)
+        // Решаем оставить на 15 секунд, чтобы не засорять чат
+        setTimeout(() => {
+            if (wrapper.parentNode) {
+                wrapper.style.transition = 'opacity 0.5s ease';
+                wrapper.style.opacity = '0';
+                setTimeout(() => {
+                    if (wrapper.parentNode) wrapper.remove();
+                }, 500);
+            }
+        }, 15000);
     }
 
-    // Следим за появлением меню
-    const menuObserver = new MutationObserver(() => {
-        if (document.getElementById('unifiedChatMenu')) {
-            injectNotificationsMenuItem();
-        }
-    });
-    menuObserver.observe(document.body, { childList: true, subtree: true });
-
-    // На каждое открытие меню — переинжектим (для обновления счётчика)
-    document.addEventListener('click', (e) => {
-        if (e.target.closest('.chat-more-btn') || e.target.closest('#chatsActionsBtn')) {
-            setTimeout(injectNotificationsMenuItem, 50);
-            setTimeout(injectNotificationsMenuItem, 200);
-        }
-    }, true);
-
-    // ═══════════════════════════════════════════════════════════
-    //  🔄 ПЕРИОДИЧЕСКОЕ ОБНОВЛЕНИЕ ИНДИКАТОРА
-    // ═══════════════════════════════════════════════════════════
-    setInterval(updateMenuButtonState, 2000);
-
-    // Первая инициализация
-    setTimeout(updateMenuButtonState, 2500);
-
-    // Также обновляем при показе экрана чатов
-    if (typeof showChatsScreen === 'function') {
-        const _origShowChats = showChatsScreen;
-        showChatsScreen = function() {
-            const r = _origShowChats.apply(this, arguments);
-            setTimeout(() => {
-                updateMenuButtonState();
-                injectNotificationsMenuItem();
-            }, 200);
-            return r;
-        };
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  УТИЛИТЫ
-    // ═══════════════════════════════════════════════════════════
-    function escapeHtml(s) {
+    function escapeHtmlSafe(s) {
         if (typeof window.escapeHtml === 'function') return window.escapeHtml(s);
         const div = document.createElement('div');
         div.textContent = s == null ? '' : String(s);
@@ -45058,66 +44611,900 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  API
+    //  6. ХУКИ: ПЕРЕХВАТ appendMessages И POLLING
     // ═══════════════════════════════════════════════════════════
-    window.DeviceTracker = {
-        myDevice: () => ({ id: MY_DEVICE_ID, label: MY_DEVICE_LABEL }),
-        allDevices: () => loadKnownDevices(),
-        devicesOf: (username) => getKnownDevices(username),
-        notifications: () => loadNotifications(),
-        unreadCount: () => getUnreadCount(),
-        openPanel: openNotificationsPanel,
-        markAllRead: () => { markAllRead(); renderNotificationsList(); },
-        clearAll: clearNotifications,
-        refreshIndicator: updateMenuButtonState,
+    if (typeof appendMessages === 'function') {
+        const _origAppend = appendMessages;
 
-        reset: () => {
-            localStorage.removeItem(CFG.STORAGE_KNOWN_DEVICES);
-            localStorage.removeItem(CFG.STORAGE_NOTIFICATIONS);
-            localStorage.removeItem(CFG.STORAGE_DEVICE_ID);
-            localStorage.removeItem(CFG.STORAGE_DEVICE_LABEL);
-            log('🗑️ Сброс');
-            location.reload();
-        },
-
-        simulateNewDevice: () => {
-            const newId = 'dev_sim_' + Date.now().toString(36);
-            localStorage.setItem(CFG.STORAGE_DEVICE_ID, newId);
-            log('🎭 Симуляция нового устройства:', newId);
-            location.reload();
-        },
-
-        // Тест: добавить фейковое уведомление
-        testNotification: () => {
-            addNotification({
-                username: 'Тест',
-                deviceId: 'dev_test_' + Date.now(),
-                deviceLabel: 'Samsung Galaxy S24 · Chrome',
-                chatFile: state.chatFile || state.chats[0]?.file || 'test_chat',
-            });
-            updateMenuButtonState();
-            injectNotificationsMenuItem();
-            if (typeof showToast === 'function') {
-                showToast('📱 Тестовое уведомление добавлено', 2000);
+        appendMessages = function(newMsgs) {
+            // 🆕 Сначала обрабатываем каждое новое сообщение
+            if (Array.isArray(newMsgs)) {
+                for (const msg of newMsgs) {
+                    try {
+                        processIncomingMessage(msg);
+                    } catch (e) {
+                        console.warn('🛡️ [DeviceFP] processIncomingMessage error:', e);
+                    }
+                }
             }
+            return _origAppend.apply(this, arguments);
+        };
+
+        log('patched: appendMessages');
+    }
+
+    // ─── Обработка загруженной истории (для первого захода в чат) ───
+    if (typeof renderMessages === 'function') {
+        const _origRender = renderMessages;
+
+        renderMessages = function(messages) {
+            // Регистрируем устройства из истории, но БЕЗ уведомлений
+            if (Array.isArray(messages)) {
+                for (const msg of messages) {
+                    if (msg && msg._deviceId) {
+                        registerMessageDevice(msg.username, msg._deviceId, msg.id);
+                        _processedMsgIds.add(msg.id);
+                    }
+                }
+            }
+            return _origRender.apply(this, arguments);
+        };
+    }
+
+    if (typeof renderHistory === 'function') {
+        const _origRenderHistory = renderHistory;
+
+        renderHistory = function() {
+            // Регистрируем устройства из истории перед рендером
+            if (historyState && Array.isArray(historyState.allMessages)) {
+                for (const msg of historyState.allMessages) {
+                    if (msg && msg._deviceId) {
+                        registerMessageDevice(msg.username, msg._deviceId, msg.id);
+                        _processedMsgIds.add(msg.id);
+                    }
+                }
+            }
+            return _origRenderHistory.apply(this, arguments);
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  7. UI: ПАНЕЛЬ УСТРОЙСТВ
+    // ═══════════════════════════════════════════════════════════
+
+    // ─── Стили ───
+    if (!document.getElementById('deviceFpStyles')) {
+        const style = document.createElement('style');
+        style.id = 'deviceFpStyles';
+        style.textContent = `
+            /* ═══ Системное уведомление в чате ═══ */
+            .message.system.device-notification {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                max-width: 90%;
+                padding: 8px 14px;
+                margin: 8px auto;
+                border-radius: 20px;
+                font-size: 12px;
+                text-align: left;
+                animation: deviceNotifIn 0.4s cubic-bezier(0.22, 0.61, 0.36, 1);
+                backdrop-filter: blur(8px);
+                -webkit-backdrop-filter: blur(8px);
+            }
+            .message.system.device-notification.warn {
+                background: linear-gradient(135deg,
+                    rgba(255, 159, 67, 0.15),
+                    rgba(254, 202, 87, 0.08));
+                border: 1px solid rgba(254, 202, 87, 0.35);
+                color: #feca57;
+            }
+            .message.system.device-notification.info {
+                background: linear-gradient(135deg,
+                    rgba(108, 92, 231, 0.15),
+                    rgba(0, 184, 148, 0.08));
+                border: 1px solid rgba(108, 92, 231, 0.3);
+                color: #a78bfa;
+            }
+            .message.system.device-notification .device-notif-icon {
+                font-size: 14px;
+                flex-shrink: 0;
+            }
+            .message.system.device-notification .device-notif-text {
+                flex: 1;
+                min-width: 0;
+                line-height: 1.4;
+                word-break: break-word;
+            }
+            @keyframes deviceNotifIn {
+                from {
+                    opacity: 0;
+                    transform: translateY(-8px) scale(0.95);
+                }
+                to {
+                    opacity: 1;
+                    transform: translateY(0) scale(1);
+                }
+            }
+
+            /* ═══ Бейдж на сообщении ═══ */
+            .device-fp-badge {
+                display: inline-flex;
+                align-items: center;
+                gap: 3px;
+                padding: 1px 6px;
+                border-radius: 8px;
+                background: rgba(108, 92, 231, 0.18);
+                border: 1px solid rgba(108, 92, 231, 0.35);
+                color: #a78bfa;
+                font-size: 9px;
+                font-weight: 700;
+                letter-spacing: 0.5px;
+                margin-left: 6px;
+                vertical-align: middle;
+                font-family: 'SF Mono', 'Courier New', monospace;
+                cursor: pointer;
+                transition: all 0.15s;
+                user-select: none;
+                -webkit-user-select: none;
+            }
+            .device-fp-badge:hover {
+                background: rgba(108, 92, 231, 0.3);
+                border-color: rgba(108, 92, 231, 0.6);
+                color: #fff;
+            }
+            .device-fp-badge.new-device {
+                background: rgba(254, 202, 87, 0.2);
+                border-color: rgba(254, 202, 87, 0.5);
+                color: #feca57;
+                animation: devBadgePulse 2s ease-in-out infinite;
+            }
+            @keyframes devBadgePulse {
+                0%, 100% { box-shadow: 0 0 0 0 rgba(254, 202, 87, 0.4); }
+                50%      { box-shadow: 0 0 0 5px rgba(254, 202, 87, 0); }
+            }
+
+            /* ═══ Модалка со списком устройств ═══ */
+            #deviceListModal {
+                display: none;
+                position: fixed;
+                inset: 0;
+                background: rgba(0, 0, 0, 0.75);
+                backdrop-filter: blur(10px);
+                -webkit-backdrop-filter: blur(10px);
+                z-index: 5500;
+                align-items: center;
+                justify-content: center;
+                padding: 20px;
+                animation: devModalFade 0.2s ease;
+            }
+            #deviceListModal.show { display: flex; }
+            @keyframes devModalFade {
+                from { opacity: 0; }
+                to   { opacity: 1; }
+            }
+
+            #deviceListModal .dev-modal {
+                background: #1a1a2e;
+                border: 1px solid rgba(255,255,255,0.12);
+                border-radius: 20px;
+                max-width: 440px;
+                width: 100%;
+                max-height: 80vh;
+                display: flex;
+                flex-direction: column;
+                overflow: hidden;
+                box-shadow: 0 20px 60px rgba(0,0,0,0.7);
+                animation: devModalIn 0.25s cubic-bezier(0.22, 0.61, 0.36, 1);
+            }
+            @keyframes devModalIn {
+                from { transform: scale(0.92) translateY(10px); opacity: 0; }
+                to   { transform: scale(1) translateY(0); opacity: 1; }
+            }
+            #deviceListModal .dev-header {
+                display: flex;
+                align-items: center;
+                gap: 12px;
+                padding: 16px 20px;
+                border-bottom: 1px solid rgba(255,255,255,0.08);
+                background: linear-gradient(135deg,
+                    rgba(108, 92, 231, 0.12),
+                    rgba(0, 184, 148, 0.06));
+                flex-shrink: 0;
+            }
+            #deviceListModal .dev-header-icon {
+                width: 40px;
+                height: 40px;
+                border-radius: 12px;
+                background: linear-gradient(135deg,
+                    rgba(108, 92, 231, 0.35),
+                    rgba(0, 184, 148, 0.25));
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 20px;
+                flex-shrink: 0;
+            }
+            #deviceListModal .dev-header-body {
+                flex: 1;
+                min-width: 0;
+            }
+            #deviceListModal .dev-header-title {
+                font-size: 15px;
+                font-weight: 700;
+                color: #fff;
+                margin-bottom: 2px;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            #deviceListModal .dev-header-sub {
+                font-size: 11px;
+                color: #888;
+            }
+            #deviceListModal .dev-close {
+                width: 34px;
+                height: 34px;
+                border-radius: 50%;
+                border: none;
+                background: rgba(255,255,255,0.06);
+                color: #888;
+                font-size: 16px;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                flex-shrink: 0;
+                transition: all 0.15s;
+            }
+            #deviceListModal .dev-close:hover {
+                background: rgba(255,107,107,0.2);
+                color: #ff6b6b;
+            }
+
+            #deviceListModal .dev-body {
+                flex: 1;
+                overflow-y: auto;
+                padding: 14px 16px;
+                min-height: 0;
+            }
+
+            #deviceListModal .dev-item {
+                display: flex;
+                align-items: flex-start;
+                gap: 12px;
+                padding: 12px 14px;
+                background: rgba(255,255,255,0.04);
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 14px;
+                margin-bottom: 8px;
+                transition: all 0.15s;
+            }
+            #deviceListModal .dev-item:last-child { margin-bottom: 0; }
+            #deviceListModal .dev-item.current {
+                background: linear-gradient(135deg,
+                    rgba(108, 92, 231, 0.15),
+                    rgba(0, 184, 148, 0.08));
+                border-color: rgba(108, 92, 231, 0.4);
+            }
+            #deviceListModal .dev-item-icon {
+                width: 36px;
+                height: 36px;
+                border-radius: 10px;
+                background: rgba(255,255,255,0.06);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 18px;
+                flex-shrink: 0;
+            }
+            #deviceListModal .dev-item.current .dev-item-icon {
+                background: linear-gradient(135deg,
+                    rgba(108, 92, 231, 0.4),
+                    rgba(0, 184, 148, 0.3));
+            }
+            #deviceListModal .dev-item-body {
+                flex: 1;
+                min-width: 0;
+            }
+            #deviceListModal .dev-item-id {
+                font-family: 'SF Mono', 'Courier New', monospace;
+                font-size: 13px;
+                font-weight: 700;
+                color: #a78bfa;
+                margin-bottom: 3px;
+                letter-spacing: 0.5px;
+            }
+            #deviceListModal .dev-item.current .dev-item-id {
+                color: #00b894;
+            }
+            #deviceListModal .dev-item-badge {
+                display: inline-block;
+                padding: 2px 8px;
+                border-radius: 8px;
+                background: rgba(0, 184, 148, 0.2);
+                border: 1px solid rgba(0, 184, 148, 0.4);
+                color: #00b894;
+                font-size: 9px;
+                font-weight: 700;
+                text-transform: uppercase;
+                letter-spacing: 0.4px;
+                margin-left: 6px;
+                vertical-align: middle;
+            }
+            #deviceListModal .dev-item-meta {
+                font-size: 11px;
+                color: #888;
+                line-height: 1.5;
+            }
+            #deviceListModal .dev-item-meta strong {
+                color: #ccc;
+                font-weight: 600;
+            }
+
+            #deviceListModal .dev-empty {
+                text-align: center;
+                padding: 40px 20px;
+                color: #666;
+            }
+            #deviceListModal .dev-empty-icon {
+                font-size: 48px;
+                margin-bottom: 12px;
+                opacity: 0.5;
+            }
+            #deviceListModal .dev-empty-title {
+                font-size: 14px;
+                color: #aaa;
+                margin-bottom: 6px;
+                font-weight: 600;
+            }
+            #deviceListModal .dev-empty-sub {
+                font-size: 12px;
+                color: #666;
+            }
+
+            #deviceListModal .dev-footer {
+                padding: 12px 16px 16px;
+                border-top: 1px solid rgba(255,255,255,0.06);
+                background: rgba(255,255,255,0.02);
+                flex-shrink: 0;
+            }
+            #deviceListModal .dev-my-id {
+                font-size: 11px;
+                color: #666;
+                text-align: center;
+                line-height: 1.5;
+            }
+            #deviceListModal .dev-my-id strong {
+                color: #a78bfa;
+                font-family: 'SF Mono', 'Courier New', monospace;
+                font-weight: 700;
+            }
+            #deviceListModal .dev-my-id button {
+                display: inline-block;
+                margin-left: 6px;
+                padding: 2px 8px;
+                border-radius: 6px;
+                border: 1px solid rgba(108, 92, 231, 0.3);
+                background: rgba(108, 92, 231, 0.15);
+                color: #a78bfa;
+                font-size: 10px;
+                font-weight: 600;
+                cursor: pointer;
+                font-family: inherit;
+                transition: all 0.15s;
+            }
+            #deviceListModal .dev-my-id button:hover {
+                background: rgba(108, 92, 231, 0.3);
+                color: #fff;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ─── Модалка списка устройств ───
+    let _deviceModalEl = null;
+
+    function ensureDeviceModal() {
+        if (_deviceModalEl && _deviceModalEl.isConnected) return _deviceModalEl;
+
+        const modal = document.createElement('div');
+        modal.id = 'deviceListModal';
+        modal.innerHTML = `
+            <div class="dev-modal" onclick="event.stopPropagation()">
+                <div class="dev-header">
+                    <div class="dev-header-icon">🛡️</div>
+                    <div class="dev-header-body">
+                        <div class="dev-header-title" id="devModalTitle">Устройства пользователя</div>
+                        <div class="dev-header-sub" id="devModalSub">—</div>
+                    </div>
+                    <button class="dev-close" id="devModalClose">✕</button>
+                </div>
+                <div class="dev-body" id="devModalBody"></div>
+                <div class="dev-footer">
+                    <div class="dev-my-id">
+                        🖥️ Ваше устройство: <strong id="devMyId">—</strong>
+                        <button id="devCopyMyId">📋 Копировать</button>
+                    </div>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+
+        modal.querySelector('#devModalClose').addEventListener('click', () => {
+            modal.classList.remove('show');
+        });
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) modal.classList.remove('show');
+        });
+
+        // Копирование своего ID
+        modal.querySelector('#devCopyMyId').addEventListener('click', async () => {
+            try {
+                await navigator.clipboard.writeText(_deviceId || '');
+                if (typeof showToast === 'function') showToast('📋 ID скопирован', 1500);
+            } catch (e) {
+                if (typeof showToast === 'function') showToast('❌ Не удалось скопировать', 2000);
+            }
+        });
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && modal.classList.contains('show')) {
+                e.preventDefault();
+                e.stopPropagation();
+                modal.classList.remove('show');
+            }
+        }, true);
+
+        _deviceModalEl = modal;
+        return modal;
+    }
+
+    function openDeviceModal(username) {
+        const modal = ensureDeviceModal();
+        const title = modal.querySelector('#devModalTitle');
+        const sub = modal.querySelector('#devModalSub');
+        const body = modal.querySelector('#devModalBody');
+        const myIdEl = modal.querySelector('#devMyId');
+
+        myIdEl.textContent = _deviceShort || '—';
+
+        const devices = getDevicesForUser(username);
+        const isSelf = username === state.username;
+
+        title.textContent = isSelf
+            ? '🛡️ Ваши устройства'
+            : `🛡️ Устройства «${username}»`;
+
+        sub.textContent = devices.length === 0
+            ? 'Нет данных'
+            : `${devices.length} ${pluralizeDevices(devices.length)}`;
+
+        if (devices.length === 0) {
+            body.innerHTML = `
+                <div class="dev-empty">
+                    <div class="dev-empty-icon">📱</div>
+                    <div class="dev-empty-title">Пока нет данных</div>
+                    <div class="dev-empty-sub">Устройства появятся здесь, как только<br>пользователь отправит сообщение</div>
+                </div>
+            `;
+        } else {
+            body.innerHTML = devices.map(d => {
+                const isCurrent = d.short === _deviceShort;
+                const firstSeen = new Date(d.firstSeen).toLocaleString('ru-RU', {
+                    day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit'
+                });
+                const lastSeen = formatTimeAgo(d.lastSeen);
+
+                return `
+                    <div class="dev-item ${isCurrent ? 'current' : ''}">
+                        <div class="dev-item-icon">${isCurrent ? '🖥️' : '📱'}</div>
+                        <div class="dev-item-body">
+                            <div class="dev-item-id">
+                                ${escapeHtmlSafe(d.short)}
+                                ${isCurrent ? '<span class="dev-item-badge">Это устройство</span>' : ''}
+                            </div>
+                            <div class="dev-item-meta">
+                                Первое сообщение: <strong>${escapeHtmlSafe(firstSeen)}</strong><br>
+                                Последнее: <strong>${escapeHtmlSafe(lastSeen)}</strong><br>
+                                Сообщений: <strong>${d.msgCount}</strong>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        modal.classList.add('show');
+    }
+
+    function pluralizeDevices(n) {
+        const mod10 = n % 10, mod100 = n % 100;
+        if (mod10 === 1 && mod100 !== 11) return 'устройство';
+        if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) return 'устройства';
+        return 'устройств';
+    }
+
+    function formatTimeAgo(ts) {
+        if (!ts) return '—';
+        const diff = Date.now() - ts;
+        if (diff < 60 * 1000) return 'только что';
+        if (diff < 60 * 60 * 1000) return `${Math.floor(diff / 60000)} мин назад`;
+        if (diff < 24 * 60 * 60 * 1000) return `${Math.floor(diff / 3600000)} ч назад`;
+        if (diff < 30 * 24 * 60 * 60 * 1000) return `${Math.floor(diff / 86400000)} дн назад`;
+        return new Date(ts).toLocaleDateString('ru-RU');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  8. БЕЙДЖ DEVICE ID НА СООБЩЕНИЯХ
+    // ═══════════════════════════════════════════════════════════
+    if (typeof buildMessageHTML === 'function') {
+        const _origBuild = buildMessageHTML;
+
+        buildMessageHTML = function(msg, opts) {
+            let html = _origBuild.call(this, msg, opts);
+
+            // 🆕 Добавляем бейдж с коротким ID устройства
+            if (msg && msg._deviceShort) {
+                const isOwn = msg.username === state.username;
+                const isNew = isNewDeviceBadge(msg.username, msg._deviceShort);
+
+                const badge = `<span class="device-fp-badge ${isNew ? 'new-device' : ''}"
+                                     data-device-user="${escapeHtmlSafe(msg.username)}"
+                                     title="Устройство ${msg._deviceShort} — нажмите для подробностей">
+                                 ${isOwn ? '🖥️' : '📱'} ${escapeHtmlSafe(msg._deviceShort)}
+                             </span>`;
+
+                // Вставляем после имени отправителя
+                // Ищем `<span class="sender">...</span>` и добавляем после него
+                const senderRegex = /(<span class="sender">.*?<\/span>)/;
+                if (senderRegex.test(html)) {
+                    html = html.replace(senderRegex, `$1${badge}`);
+                }
+            }
+
+            return html;
+        };
+
+        log('patched: buildMessageHTML (бейдж deviceId)');
+    }
+
+    // ─── Является ли это устройство "новым" (для стилизации бейджа) ───
+    function isNewDeviceBadge(username, deviceShort) {
+        const entry = _trusted[username];
+        if (!entry || !entry.devices) return false;
+        const dev = entry.devices[deviceShort];
+        if (!dev) return false;
+        // Новое = добавлено меньше 24 часов назад
+        return (Date.now() - dev.firstSeen) < 24 * 60 * 60 * 1000;
+    }
+
+    // ─── Обработчик клика по бейджу ───
+    document.addEventListener('click', (e) => {
+        const badge = e.target.closest('.device-fp-badge');
+        if (!badge) return;
+        e.stopPropagation();
+        e.preventDefault();
+        const username = badge.dataset.deviceUser;
+        if (username) openDeviceModal(username);
+    }, true);
+
+    // ═══════════════════════════════════════════════════════════
+    //  9. ПУНКТ В МЕНЮ "⋯" КАРТОЧКИ ЧАТА — "Доверие и устройства"
+    // ═══════════════════════════════════════════════════════════
+    function injectDeviceMenuItem() {
+        const menu = document.getElementById('unifiedChatMenu');
+        if (!menu) return;
+        if (menu.querySelector('[data-action="devices"]')) return;
+
+        const removeItem = menu.querySelector('[data-action="remove"]');
+        if (!removeItem) return;
+
+        const divider = removeItem.previousElementSibling;
+        if (!divider || !divider.classList.contains('ucm-divider')) return;
+
+        const item = document.createElement('div');
+        item.className = 'ucm-item';
+        item.dataset.action = 'devices';
+        item.innerHTML = `
+            <span class="ucm-icon">🛡️</span>
+            <span class="ucm-label">
+                <div>Устройства и доверие</div>
+                <div class="ucm-hint">Кто и с каких устройств пишет</div>
+            </span>
+        `;
+
+        removeItem.parentNode.insertBefore(item, removeItem);
+
+        item.addEventListener('click', (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+
+            const menuEl = document.getElementById('unifiedChatMenu');
+            if (menuEl) menuEl.classList.remove('show');
+            const backdrop = document.getElementById('unifiedChatMenuBackdrop');
+            if (backdrop) backdrop.classList.remove('show');
+
+            // Показываем список устройств для всех участников этого чата
+            setTimeout(() => showAllChatDevices(), 200);
+        });
+    }
+
+    document.addEventListener('click', (e) => {
+        const moreBtn = e.target.closest('.chat-more-btn');
+        if (!moreBtn) return;
+        setTimeout(injectDeviceMenuItem, 30);
+        setTimeout(injectDeviceMenuItem, 100);
+    }, true);
+
+    const observer = new MutationObserver(() => {
+        if (document.getElementById('unifiedChatMenu')) {
+            injectDeviceMenuItem();
+        }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    // ─── Показ устройств всех участников текущего чата ───
+    function showAllChatDevices() {
+        if (!state.chatFile) {
+            if (typeof showToast === 'function') showToast('❌ Откройте чат', 1500);
+            return;
+        }
+
+        // Собираем всех уникальных пользователей из истории
+        const users = new Set();
+        if (historyState && Array.isArray(historyState.allMessages)) {
+            historyState.allMessages.forEach(m => {
+                if (m && m.username) users.add(m.username);
+            });
+        }
+
+        if (users.size === 0) {
+            if (typeof showToast === 'function') showToast('ℹ️ Пока нет участников', 1500);
+            return;
+        }
+
+        // Пока показываем свою карточку + перечисляем участников
+        const modal = ensureDeviceModal();
+        const title = modal.querySelector('#devModalTitle');
+        const sub = modal.querySelector('#devModalSub');
+        const body = modal.querySelector('#devModalBody');
+        const myIdEl = modal.querySelector('#devMyId');
+
+        myIdEl.textContent = _deviceShort || '—';
+        title.textContent = '🛡️ Устройства в чате';
+        sub.textContent = `${users.size} ${pluralizeUsers(users.size)}`;
+
+        body.innerHTML = Array.from(users).map(username => {
+            const devices = getDevicesForUser(username);
+            const isSelf = username === state.username;
+
+            if (devices.length === 0) {
+                return `
+                    <div class="dev-item">
+                        <div class="dev-item-icon">❓</div>
+                        <div class="dev-item-body">
+                            <div class="dev-item-id">${escapeHtmlSafe(username)}</div>
+                            <div class="dev-item-meta">Нет данных об устройствах</div>
+                        </div>
+                    </div>
+                `;
+            }
+
+            const deviceBadges = devices.map(d => {
+                const isCurrent = d.short === _deviceShort;
+                return `<span style="display:inline-block;padding:1px 6px;border-radius:6px;background:${isCurrent ? 'rgba(0,184,148,0.2)' : 'rgba(108,92,231,0.18)'};color:${isCurrent ? '#00b894' : '#a78bfa'};font-family:'SF Mono',monospace;font-size:10px;font-weight:700;margin:2px 4px 2px 0;">${escapeHtmlSafe(d.short)}</span>`;
+            }).join('');
+
+            return `
+                <div class="dev-item ${isSelf ? 'current' : ''}" style="flex-direction:column;align-items:stretch;">
+                    <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+                        <div class="dev-item-icon">${isSelf ? '🖥️' : '📱'}</div>
+                        <div class="dev-item-body">
+                            <div class="dev-item-id" style="color:${isSelf ? '#00b894' : '#fff'};font-family:inherit;font-size:14px;">
+                                ${escapeHtmlSafe(username)} ${isSelf ? '<span class="dev-item-badge">Вы</span>' : ''}
+                            </div>
+                            <div class="dev-item-meta">${devices.length} ${pluralizeDevices(devices.length)}</div>
+                        </div>
+                    </div>
+                    <div style="padding-left:46px;">${deviceBadges}</div>
+                </div>
+            `;
+        }).join('');
+
+        modal.classList.add('show');
+    }
+
+    function pluralizeUsers(n) {
+        const mod10 = n % 10, mod100 = n % 100;
+        if (mod10 === 1 && mod100 !== 11) return 'участник';
+        if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) return 'участника';
+        return 'участников';
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  10. БЕЙДЖ В СПИСКЕ ЧАТОВ (если есть смена устройств)
+    // ═══════════════════════════════════════════════════════════
+    // Патчим renderChatsList — добавляем индикатор "⚠️ новая активность"
+    if (typeof renderChatsList === 'function') {
+        const _origRenderChats = renderChatsList;
+
+        renderChatsList = function() {
+            const result = _origRenderChats.apply(this, arguments);
+
+            // Проверяем для каждого чата — есть ли свежие смены устройств
+            // К сожалению, мы не знаем какое устройство "новое" без контекста чата,
+            // поэтому используем глобальную карту _trusted.
+            // Если у какого-то пользователя появилось новое устройство за последние 24 часа,
+            // и он есть в этом чате — покажем метку.
+
+            // Упрощённо: проверяем сами чаты через состояние чата
+            document.querySelectorAll('#chatsList .chat-list-item').forEach(item => {
+                const file = item.dataset.file;
+                if (!file) return;
+
+                // Проверяем: есть ли в этом чате свежие смены устройств?
+                const hasRecent = checkChatForRecentDeviceChanges(file);
+                if (hasRecent) {
+                    const moreBtn = item.querySelector('.chat-more-btn');
+                    if (moreBtn && !moreBtn.querySelector('.device-alert-dot')) {
+                        const dot = document.createElement('span');
+                        dot.className = 'device-alert-dot';
+                        dot.style.cssText = `
+                            position: absolute;
+                            top: -2px;
+                            left: -2px;
+                            width: 8px;
+                            height: 8px;
+                            border-radius: 50%;
+                            background: #feca57;
+                            box-shadow: 0 0 6px rgba(254, 202, 87, 0.8);
+                            pointer-events: none;
+                            z-index: 2;
+                            animation: devBadgePulse 2s ease-in-out infinite;
+                        `;
+                        moreBtn.style.position = 'relative';
+                        moreBtn.appendChild(dot);
+                    }
+                }
+            });
+
+            return result;
+        };
+    }
+
+    /**
+     * Проверяет, есть ли в кэше чата свежие смены устройств
+     * (за последние 24 часа).
+     */
+    function checkChatForRecentDeviceChanges(chatFile) {
+        // У нас нет прямого доступа к сообщениям каждого чата,
+        // но мы можем проверить OfflineCache
+        try {
+            if (typeof OfflineCache === 'undefined' || !OfflineCache.getChat) return false;
+
+            // Асинхронно проверим позже, а сейчас — синхронная эвристика:
+            // смотрим по _trusted: если для какого-то пользователя
+            // (не self) есть устройство, firstSeen которого < 24ч —
+            // считаем что есть свежая смена.
+
+            const now = Date.now();
+            const DAY = 24 * 60 * 60 * 1000;
+
+            for (const username of Object.keys(_trusted)) {
+                if (username === state.username) continue;
+                const entry = _trusted[username];
+                if (!entry || !entry.devices) continue;
+
+                const devices = Object.values(entry.devices);
+                // Если устройств больше 1 и хотя бы одно новое (< 24ч)
+                if (devices.length >= 2) {
+                    for (const d of devices) {
+                        if (now - d.firstSeen < DAY && now - d.firstSeen > 60000) {
+                            // Очень свежее (< 24ч, но не "только что")
+                            return true;
+                        }
+                    }
+                }
+            }
+        } catch (e) {}
+        return false;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  11. ИНИЦИАЛИЗАЦИЯ
+    // ═══════════════════════════════════════════════════════════
+    loadTrusted();
+
+    // Инициализируем deviceId асинхронно
+    initDeviceId().then(() => {
+        log(`✅ DeviceFingerprint готов, ID: ${_deviceShort}`);
+    }).catch(e => {
+        console.warn('🛡️ [DeviceFP] init error:', e);
+    });
+
+    // ─── Периодически проверяем новые сообщения в текущем чате ───
+    // (на случай, если appendMessages не сработал)
+    setInterval(() => {
+        if (!state.chatFile || state.currentScreen !== 'chat') return;
+        if (!historyState || !Array.isArray(historyState.allMessages)) return;
+
+        // Берём последние 50 сообщений и проверяем, не пропустили ли мы
+        const recent = historyState.allMessages.slice(-50);
+        for (const msg of recent) {
+            if (msg && msg._deviceId && !_processedMsgIds.has(msg.id)) {
+                processIncomingMessage(msg);
+            }
+        }
+    }, 5000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  12. ПУБЛИЧНОЕ API
+    // ═══════════════════════════════════════════════════════════
+    window.DeviceFingerprint = {
+        // Свой ID
+        myId: () => _deviceShort,
+        myFullId: () => _deviceId,
+        myCreatedAt: () => _createdAt,
+
+        // Список устройств пользователя
+        getUserDevices: (username) => getDevicesForUser(username),
+        getAllTracked: () => ({ ..._trusted }),
+
+        // Показать модалку
+        show: (username) => openDeviceModal(username || state.username),
+        showAllInChat: () => showAllChatDevices(),
+
+        // Проверки
+        isNewDeviceForUser: (username, deviceId) => isNewDeviceForUser(username, deviceId),
+
+        // Утилиты
+        shortId: (fullHash) => shortId(fullHash),
+        collectRaw: () => collectRawFingerprint(),
+
+        // Сброс (для отладки)
+        reset: () => {
+            try {
+                localStorage.removeItem(CFG.STORAGE_KEY);
+                localStorage.removeItem(CFG.TRUST_STORAGE_KEY);
+                localStorage.removeItem('smschat_fp_salt');
+                _trusted = {};
+                _deviceId = null;
+                _deviceShort = null;
+                _processedMsgIds.clear();
+                log('Полный сброс выполнен');
+            } catch (e) {}
         },
 
+        // Пометить устройство как доверенное (без уведомлений)
+        markTrusted: (username, deviceShort) => {
+            if (!_trusted[username]) _trusted[username] = { devices: {} };
+            if (!_trusted[username].devices[deviceShort]) {
+                _trusted[username].devices[deviceShort] = {
+                    fullId: deviceShort,
+                    firstSeen: Date.now(),
+                    lastSeen: Date.now(),
+                    msgCount: 0,
+                    msgIds: [],
+                    warnedAt: Date.now(),
+                };
+                saveTrusted();
+            }
+            log(`Устройство ${deviceShort} для ${username} помечено доверенным`);
+        },
+
+        // Статус
         status: () => ({
-            myDevice: { id: MY_DEVICE_ID, label: MY_DEVICE_LABEL },
-            unreadCount: getUnreadCount(),
-            totalNotifications: loadNotifications().length,
-            knownUsers: Object.keys(loadKnownDevices()).length,
+            initialized: !!_deviceId,
+            myId: _deviceShort,
+            trackedUsers: Object.keys(_trusted).length,
+            processedMessages: _processedMsgIds.size,
         }),
     };
 
-    console.log('📱 [DeviceTracker v2] Готово:');
-    console.log('   • Моё устройство:', MY_DEVICE_LABEL);
-    console.log('   • Пункт «📱 Устройства» в меню «⋯»');
-    console.log('   • Кнопка «⋯» светится при новых уведомлениях');
-    console.log('   • API: DeviceTracker.status() / .testNotification()');
-    console.log('   • Тест: DeviceTracker.simulateNewDevice()');
+    log('✅ Система Device Fingerprint активна');
+    log('API: DeviceFingerprint.status() / .myId() / .show()');
 })();
 </script>
-
 </body>
 </html>
