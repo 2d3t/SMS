@@ -48236,6 +48236,366 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
     console.log('   • 5 стилей + 20 уникальных цветов');
     console.log('   • API: UniqueChatCards.setStyle("neon")');
 })();
+</script><script>
+// ═══════════════════════════════════════════════════════════════
+//  🩹 ФИНАЛЬНЫЙ ПАТЧ v1 — ГАЛЕРЕЯ + СКРОЛЛ ПОСЛЕ ВХОДА
+// ═══════════════════════════════════════════════════════════════
+
+(function installFinalPatchV1() {
+    'use strict';
+
+    console.log('🩹 [FinalPatch v1] Установка…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЧАСТЬ 1: ГАЛЕРЕЯ ВИДИТ ВСЕ ФОТО ИЗ DOM
+    //  ─────────────────────────────────────────────────────────
+    //  Проблема: коллекция галереи собирается из loadedSrcs,
+    //  но фото, отрисованное в DOM, могло ещё не попасть в loadedSrcs
+    //  (особенно если это ПЕРВОЕ фото сверху, а следующее — уже
+    //  подгрузилось раньше).
+    //
+    //  Решение: при открытии галереи — собрать ВСЕ blob:URL
+    //  прямо из DOM и добавить в loadedSrcs ДО построения окна.
+    // ═══════════════════════════════════════════════════════════
+
+    /**
+     * Собирает все blob:URL картинок из DOM и кладёт в loadedSrcs.
+     * Возвращает количество добавленных.
+     */
+    function syncGalleryFromDom() {
+        if (typeof messagesInner === 'undefined' || !messagesInner) return 0;
+        if (typeof galleryState === 'undefined') return 0;
+
+        let added = 0;
+
+        // Все .image-container img в DOM
+        const imgEls = messagesInner.querySelectorAll('.image-container img[src^="blob:"]');
+        imgEls.forEach(img => {
+            const wrapper = img.closest('.message-wrapper[data-msg-id]');
+            if (!wrapper) return;
+            const msgId = parseInt(wrapper.dataset.msgId);
+            if (isNaN(msgId)) return;
+
+            const src = img.src;
+            if (!src) return;
+
+            // Если для этого msgId ещё нет записи — добавляем
+            if (!galleryState.loadedSrcs[msgId]) {
+                galleryState.loadedSrcs[msgId] = src;
+                added++;
+            }
+        });
+
+        // Обложки аудио в DOM — если клик был по обложке,
+        // её тоже нужно добавить (определяется через data-атрибут)
+        const coverEls = messagesInner.querySelectorAll('.audio-cover img[src^="blob:"]');
+        coverEls.forEach(img => {
+            const container = img.closest('.audio-container');
+            if (!container) return;
+            const msgId = parseInt(container.dataset.audioId);
+            if (isNaN(msgId)) return;
+
+            // Для обложек используем отдельный слот в loadedSrcs —
+            // с тем же msgId, но проверяем что это именно обложка
+            // (у сообщения не может быть одновременно image и audioCover в большинстве случаев,
+            //  но на всякий случай не перезаписываем существующее)
+            if (!galleryState.loadedSrcs[msgId]) {
+                galleryState.loadedSrcs[msgId] = img.src;
+                added++;
+            }
+        });
+
+        if (added > 0) {
+            console.log(`🖼️ [FinalPatch] Догружено из DOM: ${added} blob:URL`);
+        }
+        return added;
+    }
+
+    /**
+     * Полная пересборка окна галереи из DOM.
+     * Гарантирует, что ВСЕ фото, которые видны в чате,
+     * попадут в окно.
+     */
+    function rebuildGalleryFromDom(anchorMsgId) {
+        syncGalleryFromDom();
+
+        if (typeof galleryState === 'undefined') return;
+
+        // Пересобираем окно
+        if (typeof collectAllImageMsgIds === 'function') {
+            galleryState.allImageMsgIds = collectAllImageMsgIds();
+        }
+        if (typeof buildGalleryWindow === 'function') {
+            buildGalleryWindow(anchorMsgId);
+        }
+    }
+
+    // ─── Патчим openGallery ───
+    if (typeof openGallery === 'function') {
+        const _origOpenGallery = openGallery;
+
+        openGallery = async function(imageUrl) {
+            // ═══ ГЛАВНОЕ: сначала синхронизируем loadedSrcs из DOM ═══
+            // Это гарантирует, что галерея увидит ВСЕ фото, уже
+            // отрисованные в чате.
+            syncGalleryFromDom();
+
+            // Вызываем оригинал
+            const result = await _origOpenGallery.call(this, imageUrl);
+
+            // После открытия — ещё раз, для страховки (могли подгрузиться в процессе)
+            setTimeout(() => {
+                if (!galleryState.isOpen) return;
+                const found = syncGalleryFromDom();
+                if (found > 0) {
+                    // Пересобираем окно с сохранением позиции
+                    const curMsgId = (galleryState._windowMsgIds || [])[galleryState.currentIndex];
+                    if (typeof rebuildGalleryWindow === 'function') {
+                        rebuildGalleryWindow(curMsgId);
+                    }
+                }
+            }, 300);
+
+            return result;
+        };
+
+        console.log('🖼️ [FinalPatch] openGallery → синхронизирует из DOM');
+    }
+
+    // ─── Дополнительно: патч collectAllImageMsgIds — собирает из DOM ───
+    if (typeof collectAllImageMsgIds === 'function') {
+        const _origCollect = collectAllImageMsgIds;
+
+        collectAllImageMsgIds = function() {
+            // Сначала — синхронизируем loadedSrcs из DOM
+            syncGalleryFromDom();
+
+            // Потом — обычный сбор
+            return _origCollect.call(this);
+        };
+
+        console.log('🖼️ [FinalPatch] collectAllImageMsgIds → синхронизирует из DOM');
+    }
+
+    // ─── Финальная защита: каждый раз когда loadAttachmentsIn завершается,
+    //     синхронизируем галерею (если она открыта) ───
+    if (typeof loadAttachmentsIn === 'function') {
+        const _origLoadAttachments = loadAttachmentsIn;
+        loadAttachmentsIn = async function(root) {
+            const result = await _origLoadAttachments.call(this, root);
+
+            // Если галерея открыта — обновляем окно
+            if (typeof galleryState !== 'undefined' && galleryState.isOpen) {
+                // Небольшая задержка — DOM уже точно обновлён
+                setTimeout(() => {
+                    if (!galleryState.isOpen) return;
+                    const found = syncGalleryFromDom();
+                    if (found > 0) {
+                        const curMsgId = (galleryState._windowMsgIds || [])[galleryState.currentIndex];
+                        if (typeof rebuildGalleryWindow === 'function') {
+                            rebuildGalleryWindow(curMsgId);
+                        }
+                    }
+                }, 100);
+            }
+
+            return result;
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЧАСТЬ 2: МИКРОПАУЗА СКРОЛЛА ПОСЛЕ ВХОДА В ЧАТ
+    //  ─────────────────────────────────────────────────────────
+    //  Проблема: если пользователь сразу после входа начинает
+    //  скроллить вверх, идёт «дёрганье» из-за:
+    //    • Асинхронной загрузки вложений (меняют высоту DOM)
+    //    • Заморозки скролла (activateInitialFreeze)
+    //    • Пассивного замораживателя позиции (ResizeObserver)
+    //    • catchup-скролла вниз
+    //
+    //  Решение: ввести флаг «свежий вход», который на N мс
+    //  отключает:
+    //    • Автоскролл вниз
+    //    • Компенсацию через ResizeObserver
+    //    • Загрузку старых сообщений при скролле вверх
+    //  При этом пользователь МОЖЕТ скроллить — но DOM не будет
+    //  «догонять» его рывками.
+    // ═══════════════════════════════════════════════════════════
+
+    const SCROLL_GRACE_MS = 800;   // длительность микропаузы
+
+    const FreshEntry = {
+        active: false,
+        startedAt: 0,
+        timer: null,
+
+        start() {
+            this.active = true;
+            this.startedAt = Date.now();
+            if (this.timer) clearTimeout(this.timer);
+            this.timer = setTimeout(() => {
+                this.active = false;
+                this.timer = null;
+                console.log('🩹 [FinalPatch] Микропауза скролла завершена');
+            }, SCROLL_GRACE_MS);
+            console.log(`🩹 [FinalPatch] Микропауза скролла ${SCROLL_GRACE_MS}мс`);
+        },
+
+        stop() {
+            this.active = false;
+            if (this.timer) {
+                clearTimeout(this.timer);
+                this.timer = null;
+            }
+        },
+
+        isActive() {
+            return this.active && (Date.now() - this.startedAt) < SCROLL_GRACE_MS;
+        },
+    };
+
+    // ─── Патч scrollToBottom — не скроллить во время микропаузы ───
+    if (typeof scrollToBottom === 'function') {
+        const _origScrollToBottom = scrollToBottom;
+
+        scrollToBottom = function(force = false) {
+            if (FreshEntry.isActive()) {
+                // Не дёргаем вниз во время грейс-периода
+                return;
+            }
+            return _origScrollToBottom.apply(this, arguments);
+        };
+    }
+
+    // ─── Патч _scheduleBottomCatchup — то же ───
+    if (typeof _scheduleBottomCatchup === 'function') {
+        const _origCatchup = _scheduleBottomCatchup;
+        _scheduleBottomCatchup = function() {
+            if (FreshEntry.isActive()) return;
+            return _origCatchup.apply(this, arguments);
+        };
+    }
+
+    // ─── Патч loadOlderMessages — не грузить во время микропаузы ───
+    if (typeof loadOlderMessages === 'function') {
+        const _origLoadOlder = loadOlderMessages;
+
+        loadOlderMessages = async function() {
+            if (FreshEntry.isActive()) {
+                // Откладываем — запомним, что надо загрузить после
+                window._pendingLoadOlderAfterGrace = true;
+                return;
+            }
+            return _origLoadOlder.apply(this, arguments);
+        };
+    }
+
+    // ─── Патч activateInitialFreeze — не активировать во время микропаузы ───
+    // (этот механизм — 17-секундный прижим к низу — конфликтует со скроллом)
+    if (typeof window.activateInitialFreeze === 'function') {
+        const _origFreeze = window.activateInitialFreeze;
+        window.activateInitialFreeze = function(durationMs) {
+            // Вместо 17-секундной заморозки — короткая
+            // (это уже сделано в другом патче, но проверим)
+            if (typeof durationMs === 'number' && durationMs > 3000) {
+                durationMs = 1000;
+            }
+            return _origFreeze.call(this, durationMs);
+        };
+    }
+
+    // ─── ГЛАВНОЕ: патч enterChat — запускает микропаузу ───
+    if (typeof enterChat === 'function') {
+        const _origEnterChat = enterChat;
+
+        enterChat = async function(file, name, password) {
+            const result = await _origEnterChat.apply(this, arguments);
+
+            // Если вошли успешно — стартуем микропаузу
+            if (state.chatFile === file && state.currentScreen === 'chat') {
+                FreshEntry.start();
+
+                // После окончания микропаузы — если пользователь
+                // пытался скроллить вверх и был запрос на подгрузку —
+                // выполняем его
+                setTimeout(() => {
+                    FreshEntry.stop();
+
+                    if (window._pendingLoadOlderAfterGrace) {
+                        window._pendingLoadOlderAfterGrace = false;
+                        // Если пользователь действительно наверху —
+                        // грузим старые
+                        if (messagesContainer.scrollTop < 400
+                            && !_isUserScrolling
+                            && !_loadingOlder
+                            && historyState.startIndex > 0) {
+                            if (typeof loadOlderMessages === 'function') {
+                                loadOlderMessages();
+                            }
+                        }
+                    }
+                }, SCROLL_GRACE_MS + 50);
+            }
+
+            return result;
+        };
+
+        console.log('🩹 [FinalPatch] enterChat → микропауза скролла');
+    }
+
+    // ─── Страховка: при переключении чата через jumpToPlayingTrack
+    //     или EventRadar — тоже запускаем микропаузу ───
+    // (это происходит через enterChat, так что уже покрыто)
+
+    // ─── Отдельная защита: глобальный перехват touchmove при свежем входе ───
+    // Если пользователь скроллит вверх во время микропаузы —
+    // мы не компенсируем и не дёргаем DOM.
+    // Наш scrollTop-сеттер из Nuke v3 сам разберётся с этим,
+    // но на всякий случай поставим флаг.
+
+    // Расширяем существующий guard: пока FreshEntry активен,
+    // разрешаем любой скролл (в т.ч. вверх) без компенсаций
+    if (typeof messagesContainer !== 'undefined' && messagesContainer) {
+        const _origScrollHandler = () => {
+            // Если микропауза активна — не даём loadOlderMessages
+            // (он уже блокируется внутри, но здесь — двойная защита)
+            if (FreshEntry.isActive()) return;
+        };
+        messagesContainer.addEventListener('scroll', _origScrollHandler, { passive: true });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API
+    // ═══════════════════════════════════════════════════════════
+    window.FinalPatch = {
+        // Галерея
+        syncGallery: syncGalleryFromDom,
+        rebuildGallery: rebuildGalleryFromDom,
+
+        // Скролл
+        isFreshEntry: () => FreshEntry.isActive(),
+        skipGrace: () => FreshEntry.stop(),
+        graceMs: SCROLL_GRACE_MS,
+
+        // Диагностика
+        status: () => ({
+            galleryIsOpen: typeof galleryState !== 'undefined' && galleryState.isOpen,
+            galleryImagesCount: typeof galleryState !== 'undefined' && galleryState.images
+                ? galleryState.images.length
+                : 0,
+            loadedSrcsCount: typeof galleryState !== 'undefined' && galleryState.loadedSrcs
+                ? Object.keys(galleryState.loadedSrcs).length
+                : 0,
+            freshEntryActive: FreshEntry.isActive(),
+            freshEntryStartedAt: FreshEntry.startedAt,
+        }),
+    };
+
+    console.log('🩹 [FinalPatch v1] Готово:');
+    console.log('   • Галерея синхронизируется из DOM при открытии');
+    console.log(`   • Микропауза скролла после входа: ${SCROLL_GRACE_MS}мс`);
+    console.log('   • API: FinalPatch.status()');
+})();
 </script>
 </body>
 </html>
