@@ -43957,5 +43957,66 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
     console.log('🚫 [HideBgDot] Точка-индикатор фона отключена');
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🎨 ФОН ПО УМОЛЧАНИЮ: РОМБЫ
+//  ─────────────────────────────────────────────────────────────
+//  Если у чата нет своего фона — применяем «Ромбы»
+//  с приглушённой фиолетовой подсветкой. Пользователь может
+//  перезаписать это в модалке «Фон чата».
+// ═══════════════════════════════════════════════════════════════
+
+(function installDefaultDiamondsBackground() {
+    'use strict';
+
+    // ─── Настройки фона по умолчанию ───
+    const DEFAULT_BG = {
+        pattern: 'diamonds',      // узор
+        color: '#0f0f18',         // цвет фона (тёмный, но не чёрный)
+        patternColor: '#a78bfa',  // цвет ромбов (фиолетовый, как акцент)
+        opacity: 6,               // прозрачность узора (1-30)
+    };
+
+    // ─── Патчим функцию getBg ───
+    const _origGetBg = window.ChatBackgrounds.get;
+
+    window.ChatBackgrounds.get = function(chatFile) {
+        const real = _origGetBg.call(this, chatFile);
+        // Если у чата свой фон — возвращаем его
+        if (real) return real;
+        // Иначе — возвращаем фон по умолчанию
+        return { ...DEFAULT_BG };
+    };
+
+    // ─── Патчим applyBackground ───
+    // Когда чат открывается, applyBackground вызывается с файлом чата.
+    // Внутри вызывается getBg() — который мы уже пропатчили.
+    // Значит, ромбы применятся автоматически. ✅
+
+    // ─── Патчим hasBg ───
+    // hasBg используется для точки-индикатора. Она отключена, но на всякий
+    // случай — не считаем дефолтный фон «своим», чтобы точка не появлялась.
+    const _origHasBg = window.ChatBackgrounds.has;
+    window.ChatBackgrounds.has = function(chatFile) {
+        return _origHasBg.call(this, chatFile);   // только «настоящие» фоны
+    };
+
+    // ─── Применяем к открытому чату сразу ───
+    if (typeof state !== 'undefined' && state.chatFile) {
+        setTimeout(() => {
+            if (typeof ChatBackgrounds.apply === 'function') {
+                ChatBackgrounds.apply(state.chatFile);
+            }
+        }, 300);
+    }
+
+    console.log('🎨 [DefaultBg] Ромбы теперь фон по умолчанию');
+    console.log('   • Узор: ромбы');
+    console.log('   • Цвет фона: #0f0f18 (тёмный)');
+    console.log('   • Цвет ромбов: #a78bfa (фиолетовый)');
+    console.log('   • Прозрачность: 6%');
+    console.log('   • Переопределяется в «Фон чата»');
+})();
+</script>
 </body>
 </html>
