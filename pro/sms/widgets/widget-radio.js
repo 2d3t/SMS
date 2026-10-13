@@ -993,3 +993,148 @@
     console.log('Проверить: RadioWidget.debug()');
 
 })();
+
+// ═══════════════════════════════════════════════════════════
+//  ТОЧЕЧНЫЕ ОБНОВЛЕНИЯ (не пересобирают input, не сбрасывают клавиатуру)
+// ═══════════════════════════════════════════════════════════
+
+/** Полная перерисовка — только при первом рендере, развороте/сворачивании */
+function renderRadioCard() {
+    const container = document.getElementById('chatsList');
+    if (!container) return;
+    const oldCard = container.querySelector('.widget-card.radio');
+    if (!oldCard) return;
+
+    const newHtml = buildRadioCardHTML();
+    const temp = document.createElement('div');
+    temp.innerHTML = newHtml;
+    const newCard = temp.firstElementChild;
+    if (!newCard) return;
+
+    oldCard.replaceWith(newCard);
+}
+
+/** Обновить строку «сейчас играет» + кнопки play/pause/clear */
+function updateNowPlaying() {
+    const card = document.querySelector('.widget-card.radio');
+    if (!card) return;
+
+    const body = card.querySelector('.wc-radio-body');
+    if (!body) return;
+
+    const cur = _current;
+    const curName = cur ? cur.name : 'Не выбрано';
+    const status = _playing ? '▶️ Играет' : (cur ? '⏸ Пауза' : '—');
+
+    // Обновляем текст «сейчас играет»
+    const nameEl = body.querySelector('.wc-radio-now-name');
+    const statusEl = body.querySelector('.wc-radio-now-status');
+    if (nameEl) nameEl.textContent = curName;
+    if (statusEl) statusEl.textContent = status;
+
+    // Обновляем кнопку play/pause
+    const playBtn = body.querySelector('[data-radio-action="toggle"]');
+    if (playBtn) playBtn.textContent = _playing ? '⏸' : '▶️';
+
+    // Кнопка «clear» — есть/нет
+    const hasClear = !!body.querySelector('[data-radio-action="clear"]');
+    if (cur && !hasClear) {
+        const clearBtn = document.createElement('button');
+        clearBtn.className = 'wc-radio-btn';
+        clearBtn.dataset.radioAction = 'clear';
+        clearBtn.textContent = '✕';
+        body.querySelector('.wc-radio-controls').appendChild(clearBtn);
+    } else if (!cur && hasClear) {
+        body.querySelector('[data-radio-action="clear"]').remove();
+    }
+
+    // Подсветка активной станции в списке
+    card.querySelectorAll('.wc-radio-item').forEach(el => {
+        const key = el.dataset.stationKey;
+        if (!key) return;
+        const isActive = cur && stationKey(cur) === key;
+        el.classList.toggle('active', isActive);
+    });
+}
+
+/** Обновить только список избранного */
+function updateFavoritesList() {
+    const card = document.querySelector('.widget-card.radio');
+    if (!card) return;
+
+    const favSection = card.querySelector('.wc-radio-section:first-of-type .wc-radio-list');
+    if (!favSection) return;
+
+    if (_favorites.length === 0) {
+        favSection.innerHTML = '<div class="wc-radio-empty">Пока пусто. Найди станцию ниже и нажми ⭐</div>';
+        return;
+    }
+
+    const cur = _current;
+    favSection.innerHTML = _favorites.map(s => `
+        <div class="wc-radio-item ${cur && stationKey(cur) === stationKey(s) ? 'active' : ''}"
+             data-station-key="${escapeHtmlSafe(stationKey(s))}">
+            <span class="wc-radio-item-name">${escapeHtmlSafe(s.name)}</span>
+            <span class="wc-radio-item-tag">${escapeHtmlSafe((s.tags || '').split(',')[0] || s.country || '')}</span>
+            <button class="wc-radio-mini-btn" data-radio-action="play-fav" data-key="${escapeHtmlSafe(stationKey(s))}">▶️</button>
+            <button class="wc-radio-mini-btn danger" data-radio-action="remove-fav" data-key="${escapeHtmlSafe(stationKey(s))}">✕</button>
+        </div>
+    `).join('');
+}
+
+/** Обновить только блок результатов поиска */
+function updateSearchResults() {
+    const card = document.querySelector('.widget-card.radio');
+    if (!card) return;
+
+    // Находим или создаём секцию результатов
+    let resultsSection = card.querySelector('.wc-radio-section[data-radio-results]');
+
+    // Если результатов нет и запрос пуст — скрываем секцию
+    if (!_searchResults.length && !_searchQuery && !_searching) {
+        if (resultsSection) resultsSection.remove();
+        return;
+    }
+
+    // Если секции нет — создаём и вставляем после избранного
+    if (!resultsSection) {
+        resultsSection = document.createElement('div');
+        resultsSection.className = 'wc-radio-section';
+        resultsSection.dataset.radioResults = '1';
+        resultsSection.innerHTML = `
+            <div class="wc-radio-section-title">🔎 Результаты</div>
+            <div class="wc-radio-list"></div>
+        `;
+        const searchBlock = card.querySelector('.wc-radio-search');
+        if (searchBlock) searchBlock.after(resultsSection);
+    }
+
+    const listEl = resultsSection.querySelector('.wc-radio-list');
+    if (!listEl) return;
+
+    if (_searching) {
+        listEl.innerHTML = '<div class="wc-radio-empty">🔎 Ищу…</div>';
+        return;
+    }
+
+    if (_searchResults.length === 0 && _searchQuery) {
+        listEl.innerHTML = '<div class="wc-radio-empty">Ничего не найдено</div>';
+        return;
+    }
+
+    listEl.innerHTML = _searchResults.map(s => {
+        const inFav = isFavorite(s);
+        return `
+            <div class="wc-radio-item">
+                <span class="wc-radio-item-name">${escapeHtmlSafe(s.name)}</span>
+                <span class="wc-radio-item-tag">${escapeHtmlSafe(s.countrycode || '')} ${s.bitrate ? '· ' + s.bitrate + 'k' : ''}</span>
+                <button class="wc-radio-mini-btn" data-radio-action="play-search" data-key="${escapeHtmlSafe(stationKey(s))}">▶️</button>
+                <button class="wc-radio-mini-btn ${inFav ? 'starred' : ''}"
+                        data-radio-action="${inFav ? 'remove-fav' : 'add-fav'}"
+                        data-key="${escapeHtmlSafe(stationKey(s))}">
+                    ${inFav ? '★' : '⭐'}
+                </button>
+            </div>
+        `;
+    }).join('');
+}
