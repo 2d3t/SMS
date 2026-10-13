@@ -1,14 +1,4 @@
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Pogoda2.js</title>
-<style>
-    body { font-family: sans-serif; padding: 20px; background: #f5f5f5; }
-</style>
-</head>
-<body>
+
 // ═══════════════════════════════════════════════════════════════
 //  🧩 WIDGETS MODULE v6 — погода + прогноз + свайп по дням
 //  ─────────────────────────────────────────────────────────────
@@ -1377,5 +1367,3 @@
     console.log('Проверить: Widgets.debug()');
 
 })();
-</body>
-</html>
