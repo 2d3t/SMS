@@ -1,47 +1,68 @@
-
-
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pogoda2.js</title>
+<style>
+    body { font-family: sans-serif; padding: 20px; background: #f5f5f5; }
+</style>
+</head>
+<body>
 // ═══════════════════════════════════════════════════════════════
-//  🧩 WIDGETS MODULE v5 — без дёрганья, с постоянным кэшем
+//  🧩 WIDGETS MODULE v6 — погода + прогноз + свайп по дням
 //  ─────────────────────────────────────────────────────────────
-//  Ключевое отличие:
-//   • HTML карточки погоды генерируется ИЗ КЭША (если есть данные)
-//   • Данные в localStorage живут бессрочно, обновляются по TTL
-//   • renderChatsList может вызываться сколько угодно раз —
-//     карточка всегда покажет уже загруженные данные
-//   • Автообновление каждые 30 минут
+//  Новое в v6:
+//   • Прогноз на 4 дня прямо в карточке (тап → развернуть)
+//   • Свайп влево/вправо по развёрнутой карточке = смена дня
+//   • Тап по дню в ленте = выбор дня
+//   • Точки-индикаторы + подсветка активного дня
+//   • Клавиши ← → на десктопе
+//   • Мягкие вибро-отклики на смене дня и на границах
+//   • Всё из кэша, без лишних запросов
 // ═══════════════════════════════════════════════════════════════
 
-(function installWidgetsModuleV5() {
+(function installWidgetsModuleV6() {
     'use strict';
 
-    console.log('🧩 [Widgets v5] Запуск…');
+    console.log('🧩 [Widgets v6] Запуск…');
 
     const CFG = {
         STORAGE_KEY: 'smschat_widgets',
         CACHE_KEY: 'smschat_widgets_cache',
-        // Данные в кэше считаются валидными 30 минут
+        EXPANDED_KEY: 'smschat_weather_expanded',
         CACHE_TTL_MS: 30 * 60 * 1000,
-        // Автообновление — раз в 30 минут
         WEATHER_REFRESH_MS: 30 * 60 * 1000,
+        SWIPE_THRESHOLD: 50,
+        LONG_PRESS_MS: 600,
         DEBUG: true,
     };
 
-    const log = (...a) => CFG.DEBUG && console.log('🧩 [Widgets v5]', ...a);
-    const warn = (...a) => console.warn('🧩 [Widgets v5]', ...a);
+    const log = (...a) => CFG.DEBUG && console.log('🧩 [Widgets v6]', ...a);
+    const warn = (...a) => console.warn('🧩 [Widgets v6]', ...a);
 
     const AVAILABLE_WIDGETS = [
-        { id: 'weather', name: 'Погода', icon: '⛅', description: 'Текущая погода в вашем городе' },
+        { id: 'weather', name: 'Погода', icon: '⛅', description: 'Текущая погода и прогноз на 4 дня' },
     ];
 
     let _widgets = [];
-
-    // ═══════════════════════════════════════════════════════════
-    //  КЭШ — плоская структура: { key: { ts, data } }
-    //  НЕ имеет TTL на уровне чтения — TTL проверяется отдельно,
-    //  чтобы можно было показать устаревшие данные пока грузятся новые.
-    // ═══════════════════════════════════════════════════════════
     let _cache = {};
 
+    // ─── Состояние UI виджета погоды ───
+    let _weatherExpanded = (() => {
+        try { return localStorage.getItem(CFG.EXPANDED_KEY) === '1'; }
+        catch (e) { return false; }
+    })();
+    let _weatherDayIndex = 0;
+
+    function setWeatherExpanded(v) {
+        _weatherExpanded = !!v;
+        try { localStorage.setItem(CFG.EXPANDED_KEY, _weatherExpanded ? '1' : '0'); } catch (e) {}
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХРАНИЛИЩЕ ВИДЖЕТОВ
+    // ═══════════════════════════════════════════════════════════
     function loadWidgets() {
         try {
             const raw = localStorage.getItem(CFG.STORAGE_KEY);
@@ -68,19 +89,16 @@
 
     function getCacheKey(id, sub) { return sub ? `${id}::${sub}` : id; }
 
-    /** Возвращает данные из кэша ВНЕ зависимости от TTL. */
     function readCacheRaw(id, sub) {
         const entry = _cache[getCacheKey(id, sub)];
         return entry ? entry.data : null;
     }
 
-    /** Возвращает timestamp записи в кэше. */
     function readCacheTs(id, sub) {
         const entry = _cache[getCacheKey(id, sub)];
         return entry ? entry.ts : 0;
     }
 
-    /** Проверяет, свежие ли данные (в пределах TTL). */
     function isCacheFresh(id, sub) {
         const ts = readCacheTs(id, sub);
         return ts > 0 && (Date.now() - ts < CFG.CACHE_TTL_MS);
@@ -95,13 +113,9 @@
     //  ГЕОЛОКАЦИЯ / ПОГОДА
     // ═══════════════════════════════════════════════════════════
     async function detectLocationByIp() {
-        // 1. Возвращаем из кэша, если есть (даже устаревшее)
         const cached = readCacheRaw('weather', 'location');
-        if (cached && isCacheFresh('weather', 'location')) {
-            return cached;
-        }
+        if (cached && isCacheFresh('weather', 'location')) return cached;
 
-        // 2. Пробуем обновить
         try {
             let data;
             try {
@@ -136,7 +150,6 @@
             warn('IP-геолокация не удалась:', e.message);
         }
 
-        // 3. Фолбэк — старый кэш или Минск
         if (cached) return cached;
         return { city: 'Минск', country: 'Belarus', lat: 53.9, lon: 27.5667, timezone: 'Europe/Minsk', _fallback: true };
     }
@@ -145,19 +158,17 @@
         const location = await detectLocationByIp();
         const subKey = `${location.lat.toFixed(3)}_${location.lon.toFixed(3)}`;
 
-        // 1. Если данные свежие — возвращаем сразу
         if (isCacheFresh('weather', subKey)) {
             const cached = readCacheRaw('weather', subKey);
             if (cached) return { ...cached, location };
         }
 
-        // 2. Иначе — обновляем с сервера
         try {
             const url = `https://api.open-meteo.com/v1/forecast?` +
                 `latitude=${location.lat}&longitude=${location.lon}` +
                 `&current=temperature_2m,relative_humidity_2m,apparent_temperature,is_day,precipitation,weather_code,wind_speed_10m` +
-                `&daily=temperature_2m_max,temperature_2m_min,weather_code` +
-                `&timezone=${encodeURIComponent(location.timezone)}&forecast_days=1`;
+                `&daily=temperature_2m_max,temperature_2m_min,weather_code,precipitation_sum` +
+                `&timezone=${encodeURIComponent(location.timezone)}&forecast_days=4`;
 
             const res = await fetch(url);
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -174,6 +185,15 @@
                 code: c.weather_code,
                 minTemp: d.temperature_2m_min?.[0],
                 maxTemp: d.temperature_2m_max?.[0],
+
+                // 🆕 Прогноз на 4 дня
+                forecast: (d.time || []).map((date, i) => ({
+                    date,
+                    code: d.weather_code?.[i],
+                    min: d.temperature_2m_min?.[i],
+                    max: d.temperature_2m_max?.[i],
+                    precip: d.precipitation_sum?.[i] || 0,
+                })),
             };
 
             writeCache('weather', weather, subKey);
@@ -181,7 +201,6 @@
         } catch (e) {
             warn('Погода недоступна:', e.message);
 
-            // 3. Если есть устаревший кэш — используем его как fallback
             const stale = readCacheRaw('weather', subKey);
             if (stale) {
                 log('Используем устаревший кэш погоды');
@@ -224,8 +243,15 @@
         return flags[country] || '🌍';
     }
 
+    function escapeHtmlSafe(s) {
+        if (typeof escapeHtml === 'function') return escapeHtml(s);
+        const div = document.createElement('div');
+        div.textContent = s == null ? '' : String(s);
+        return div.innerHTML;
+    }
+
     // ═══════════════════════════════════════════════════════════
-    //  ДОБАВЛЕНИЕ / УДАЛЕНИЕ
+    //  ДОБАВЛЕНИЕ / УДАЛЕНИЕ ВИДЖЕТОВ
     // ═══════════════════════════════════════════════════════════
     function addWidget(widgetId) {
         if (!AVAILABLE_WIDGETS.find(w => w.id === widgetId)) {
@@ -243,14 +269,8 @@
         if (typeof showToast === 'function') showToast('✅ Виджет добавлен', 2000);
         if (typeof soundManager !== 'undefined') { try { soundManager.play('send'); } catch (e) {} }
 
-        // 🎯 Сразу запускаем загрузку (если ещё не загружено)
-        if (widgetId === 'weather') {
-            loadWeatherDataInBackground();
-        }
-
-        // Принудительный ререндер — виджет появится с уже готовым HTML
+        if (widgetId === 'weather') loadWeatherDataInBackground();
         rerenderChatsList();
-
         return true;
     }
 
@@ -259,6 +279,11 @@
         if (idx === -1) return false;
         _widgets.splice(idx, 1);
         saveWidgets();
+
+        if (widgetId === 'weather') {
+            setWeatherExpanded(false);
+            _weatherDayIndex = 0;
+        }
 
         if (typeof showToast === 'function') showToast('🗑️ Виджет удалён', 1500);
         if (typeof soundManager !== 'undefined') { try { soundManager.play('delete'); } catch (e) {} }
@@ -269,10 +294,7 @@
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  🎯 ГЛАВНОЕ: генерация HTML карточки погоды ИЗ КЭША
-    //  ─────────────────────────────────────────────────────────
-    //  Если в кэше уже есть данные — рисуем сразу с ними.
-    //  Если нет — рисуем скелет (загрузится чуть позже).
+    //  HTML КАРТОЧКИ ПОГОДЫ
     // ═══════════════════════════════════════════════════════════
     function buildWeatherCardHTML() {
         const location = readCacheRaw('weather', 'location');
@@ -282,7 +304,7 @@
             weather = readCacheRaw('weather', subKey);
         }
 
-        // ─── Если данных нет — рисуем скелет ───
+        // ─── Скелет ───
         if (!location || !weather) {
             return `
                 <div class="widget-card weather" data-widget-id="weather">
@@ -310,43 +332,123 @@
             `;
         }
 
-        // ─── Есть данные — рисуем сразу с ними ───
-        const desc = describeWeatherCode(weather.code, weather.isDay);
         const flag = getCountryFlag(location.country);
-        const temp = Math.round(weather.temp);
-        const feels = Math.round(weather.apparentTemp);
-        const min = Math.round(weather.minTemp);
-        const max = Math.round(weather.maxTemp);
         const staleMark = weather._stale ? ' <span style="color:#feca57;font-size:10px;">•</span>' : '';
 
+        const forecast = Array.isArray(weather.forecast) ? weather.forecast : [];
+        const dayNames = ['Вс', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'];
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+
+        const maxIdx = Math.max(0, forecast.length - 1);
+        if (_weatherDayIndex > maxIdx) _weatherDayIndex = maxIdx;
+        if (_weatherDayIndex < 0) _weatherDayIndex = 0;
+
+        // Сегодняшний день (из current)
+        const todayDesc = describeWeatherCode(weather.code, weather.isDay);
+
+        // Выбранный день
+        let bodyIcon = todayDesc.icon;
+        let bodyTemp = Math.round(weather.temp);
+        let bodyDesc = todayDesc.text;
+        let bodyMin = Math.round(weather.minTemp);
+        let bodyMax = Math.round(weather.maxTemp);
+        let bodyFeelsLabel = `Ощущ. ${Math.round(weather.apparentTemp)}°`;
+        let selectedLabel = 'Сегодня';
+
+        if (_weatherDayIndex > 0 && forecast[_weatherDayIndex]) {
+            const d = forecast[_weatherDayIndex];
+            const dDesc = describeWeatherCode(d.code, true);
+            bodyIcon = dDesc.icon;
+            bodyTemp = Math.round(d.max);
+            bodyDesc = dDesc.text;
+            bodyMin = Math.round(d.min);
+            bodyMax = Math.round(d.max);
+            bodyFeelsLabel = d.precip > 0
+                ? `💧 ${d.precip.toFixed(1)} мм`
+                : 'Без осадков';
+
+            const date = new Date(d.date + 'T00:00:00');
+            const diff = Math.round((date - today) / 86400000);
+            if (diff === 1) selectedLabel = 'Завтра';
+            else selectedLabel = dayNames[date.getDay()] + ', ' +
+                date.getDate() + '.' + String(date.getMonth() + 1).padStart(2, '0');
+        }
+
+        // ─── Лента дней (в развёрнутом виде) ───
+        let stripHTML = '';
+        if (_weatherExpanded && forecast.length > 0) {
+            stripHTML = `
+                <div class="wc-strip-wrap">
+                    <div class="wc-strip">
+                        ${forecast.map((d, i) => {
+                            const date = new Date(d.date + 'T00:00:00');
+                            const diff = Math.round((date - today) / 86400000);
+                            let label;
+                            if (diff === 0) label = 'Сегодня';
+                            else if (diff === 1) label = 'Завтра';
+                            else label = dayNames[date.getDay()];
+
+                            const dd = describeWeatherCode(d.code, true);
+                            const active = i === _weatherDayIndex ? 'active' : '';
+
+                            return `
+                                <div class="wc-day ${active}" data-day-index="${i}">
+                                    <div class="wc-day-label">${label}</div>
+                                    <div class="wc-day-icon">${dd.icon}</div>
+                                    <div class="wc-day-temp">
+                                        <span class="wc-day-max">${Math.round(d.max)}°</span>
+                                        <span class="wc-day-min">${Math.round(d.min)}°</span>
+                                    </div>
+                                </div>
+                            `;
+                        }).join('')}
+                    </div>
+                    <div class="wc-dots">
+                        ${forecast.map((_, i) =>
+                            `<span class="wc-dot ${i === _weatherDayIndex ? 'active' : ''}"></span>`
+                        ).join('')}
+                    </div>
+                </div>
+            `;
+        }
+
+        const hint = _weatherExpanded
+            ? '<div class="wc-hint">👈 Свайп по дням · Тап — свернуть 👉</div>'
+            : '<div class="wc-hint">👆 Прогноз на 4 дня</div>';
+
         return `
-            <div class="widget-card weather" data-widget-id="weather">
+            <div class="widget-card weather ${_weatherExpanded ? 'expanded' : ''}"
+                 data-widget-id="weather"
+                 data-day-index="${_weatherDayIndex}">
                 <div class="wc-header">
                     <div class="wc-icon">⛅</div>
                     <div class="wc-title-block">
                         <div class="wc-title">${flag} ${escapeHtmlSafe(location.city || '—')}</div>
-                        <div class="wc-subtitle">Погода${staleMark}</div>
+                        <div class="wc-subtitle">${selectedLabel}${staleMark}</div>
                     </div>
                 </div>
                 <div class="wc-body">
                     <div class="wc-weather-main">
-                        <div class="wc-weather-icon">${desc.icon}</div>
+                        <div class="wc-weather-icon">${bodyIcon}</div>
                         <div>
-                            <div class="wc-weather-temp">${temp}°</div>
-                            <div class="wc-weather-desc">${escapeHtmlSafe(desc.text)}</div>
+                            <div class="wc-weather-temp">${bodyTemp}°</div>
+                            <div class="wc-weather-desc">${escapeHtmlSafe(bodyDesc)}</div>
                         </div>
                     </div>
                     <div class="wc-weather-extra">
-                        <div class="wc-minmax">${min}° / ${max}°</div>
-                        <div class="wc-feels">Ощущ. ${feels}°</div>
+                        <div class="wc-minmax">${bodyMin}° / ${bodyMax}°</div>
+                        <div class="wc-feels">${bodyFeelsLabel}</div>
                     </div>
                 </div>
+                ${stripHTML}
+                ${hint}
             </div>
         `;
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  HTML ВСЕХ ВИДЖЕТОВ (для вставки в renderChatsList)
+    //  HTML ВСЕХ ВИДЖЕТОВ
     // ═══════════════════════════════════════════════════════════
     function buildWidgetsHTML() {
         if (_widgets.length === 0) return '';
@@ -370,14 +472,10 @@
 
     // ═══════════════════════════════════════════════════════════
     //  ФОНОВАЯ ЗАГРУЗКА ПОГОДЫ
-    //  НЕ трогает DOM, если данные уже показаны. Просто тихо
-    //  сохраняет в кэш. Если данных в DOM ещё нет (скелет) —
-    //  после загрузки делает один точечный ререндер.
     // ═══════════════════════════════════════════════════════════
     let _weatherLoadPromise = null;
 
     async function loadWeatherDataInBackground() {
-        // Защита от параллельных загрузок
         if (_weatherLoadPromise) return _weatherLoadPromise;
 
         _weatherLoadPromise = (async () => {
@@ -388,14 +486,10 @@
 
                 const data = await fetchWeatherData();
 
-                // Проверяем — изменились ли данные (после загрузки)
                 const after = readCacheRaw('weather', 'location');
                 const afterSub = after ? `${after.lat.toFixed(3)}_${after.lon.toFixed(3)}` : null;
                 const afterData = afterSub ? readCacheRaw('weather', afterSub) : null;
 
-                // 🎯 Триггерим ререндер ТОЛЬКО если:
-                //   • Раньше данных не было (был скелет)
-                //   • Или данные изменились существенно
                 const wasSkeleton = !beforeData;
                 const changed = !wasSkeleton && afterData && beforeData &&
                     (beforeData.temp !== afterData.temp ||
@@ -403,8 +497,6 @@
 
                 if (wasSkeleton || changed) {
                     log('Ререндер виджетов после загрузки погоды');
-                    // Мягкий ререндер — не пересоздаём весь список,
-                    // а заменяем ТОЛЬКО карточку виджета
                     replaceWeatherCardInDom();
                 } else {
                     log('Данные погоды актуальны, ререндер не нужен');
@@ -419,16 +511,12 @@
         return _weatherLoadPromise;
     }
 
-    /** Заменяет только карточку виджета погоды в DOM — без полного ререндера. */
     function replaceWeatherCardInDom() {
         const container = document.getElementById('chatsList');
         if (!container) return;
 
         const oldCard = container.querySelector('.widget-card.weather');
-        if (!oldCard) {
-            // Карточки нет — значит нужно вставить (могло случиться при удалении)
-            return;
-        }
+        if (!oldCard) return;
 
         const newHtml = buildWeatherCardHTML();
         const temp = document.createElement('div');
@@ -436,20 +524,60 @@
         const newCard = temp.firstElementChild;
         if (!newCard) return;
 
-        // Плавная подмена без анимации (мгновенно)
         oldCard.replaceWith(newCard);
         log('Карточка погоды обновлена в DOM');
     }
 
-    function escapeHtmlSafe(s) {
-        if (typeof escapeHtml === 'function') return escapeHtml(s);
-        const div = document.createElement('div');
-        div.textContent = s == null ? '' : String(s);
-        return div.innerHTML;
+    /** Плавная анимация смены состояния/дня карточки */
+    function animateWeatherCardToggle(oldCard) {
+        const wasExpanded = oldCard.classList.contains('expanded');
+        const willExpand = _weatherExpanded;
+
+        const newHtml = buildWeatherCardHTML();
+        const temp = document.createElement('div');
+        temp.innerHTML = newHtml;
+        const newCard = temp.firstElementChild;
+        if (!newCard) return;
+
+        // Только смена дня — fade без анимации высоты
+        if (wasExpanded === willExpand) {
+            newCard.style.opacity = '0';
+            newCard.style.transition = 'opacity 0.18s ease';
+            oldCard.replaceWith(newCard);
+            requestAnimationFrame(() => { newCard.style.opacity = '1'; });
+            setTimeout(() => {
+                newCard.style.opacity = '';
+                newCard.style.transition = '';
+            }, 200);
+            return;
+        }
+
+        // Разворот/сворачивание — анимируем высоту
+        const oldH = oldCard.offsetHeight;
+        oldCard.style.height = oldH + 'px';
+        oldCard.style.overflow = 'hidden';
+        oldCard.style.transition = 'height 0.3s ease';
+
+        oldCard.replaceWith(newCard);
+
+        const newH = newCard.offsetHeight;
+        newCard.style.height = oldH + 'px';
+        newCard.style.overflow = 'hidden';
+        newCard.style.transition = 'height 0.3s ease';
+
+        requestAnimationFrame(() => {
+            newCard.style.height = newH + 'px';
+        });
+
+        setTimeout(() => {
+            newCard.style.height = '';
+            newCard.style.overflow = '';
+            newCard.style.transition = '';
+        }, 320);
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ПАТЧ innerHTML #chatsList — вставка виджетов синхронно
+    //  ПАТЧ innerHTML #chatsList
     // ═══════════════════════════════════════════════════════════
     let _innerHTMLPatched = false;
 
@@ -492,13 +620,11 @@
     function rerenderChatsList() {
         if (typeof renderChatsList !== 'function') return;
         renderChatsList();
-        // После рендера проверяем — если данных в карточке нет,
-        // но они есть в кэше — заменяем
         setTimeout(() => {
             const card = document.querySelector('.widget-card.weather');
             if (!card) return;
             const hasSkeleton = card.querySelector('.wc-weather-temp')?.textContent === '—°';
-            if (!hasSkeleton) return; // уже с данными
+            if (!hasSkeleton) return;
             replaceWeatherCardInDom();
         }, 100);
     }
@@ -509,9 +635,10 @@
     function installDelegatedHandlers() {
         const container = document.getElementById('chatsList');
         if (!container) { setTimeout(installDelegatedHandlers, 500); return; }
-        if (container._widgetsV5Handlers) return;
-        container._widgetsV5Handlers = true;
+        if (container._widgetsV6Handlers) return;
+        container._widgetsV6Handlers = true;
 
+        // ─── Долгое нажатие (для удаления) ───
         let pressTimer = null, pressTarget = null, fired = false;
         let startX = 0, startY = 0;
 
@@ -536,22 +663,37 @@
                 if (confirm(`Удалить виджет «${info ? info.name : widgetId}»?`)) {
                     removeWidget(widgetId);
                 }
-            }, 600);
+            }, CFG.LONG_PRESS_MS);
         }
 
-        // Клик — тихое обновление погоды
+        // ─── КЛИК: разворот / смена дня / сворачивание ───
         container.addEventListener('click', (e) => {
             const card = e.target.closest('.widget-card');
             if (!card) return;
             if (fired) { fired = false; return; }
 
             const widgetId = card.dataset.widgetId;
-            if (widgetId === 'weather') {
-                // Просто запускаем фоновую перезагрузку — она сама заменит данные
-                loadWeatherDataInBackground();
+            if (widgetId !== 'weather') return;
+
+            // Тап по конкретному дню в ленте
+            const dayEl = e.target.closest('.wc-day');
+            if (dayEl && _weatherExpanded) {
+                const idx = parseInt(dayEl.dataset.dayIndex, 10);
+                if (!isNaN(idx) && idx !== _weatherDayIndex) {
+                    _weatherDayIndex = idx;
+                    if (navigator.vibrate) navigator.vibrate(8);
+                    animateWeatherCardToggle(card);
+                }
+                return;
             }
+
+            // Обычный тап — свернуть/развернуть
+            setWeatherExpanded(!_weatherExpanded);
+            if (!_weatherExpanded) _weatherDayIndex = 0;
+            animateWeatherCardToggle(card);
         });
 
+        // ─── Долгое нажатие (touch) ───
         container.addEventListener('touchstart', (e) => {
             const card = e.target.closest('.widget-card');
             if (!card) return;
@@ -571,6 +713,7 @@
         container.addEventListener('touchend', cancelPress);
         container.addEventListener('touchcancel', cancelPress);
 
+        // ─── Долгое нажатие (mouse) ───
         container.addEventListener('mousedown', (e) => {
             if (e.button !== 0) return;
             const card = e.target.closest('.widget-card');
@@ -593,6 +736,117 @@
             }
         });
 
+        // ═══ СВАЙП ПО ДНЯМ (только для развёрнутой карточки) ═══
+        let swipeStartX = 0, swipeStartY = 0, swipeCard = null, swipeActive = false;
+
+        container.addEventListener('touchstart', (e) => {
+            const card = e.target.closest('.widget-card.weather.expanded');
+            if (!card) return;
+            if (e.touches.length !== 1) return;
+            const t = e.touches[0];
+            swipeStartX = t.clientX;
+            swipeStartY = t.clientY;
+            swipeCard = card;
+            swipeActive = false;
+            card._edgeBuzzed = false;
+        }, { passive: true });
+
+        container.addEventListener('touchmove', (e) => {
+            if (!swipeCard) return;
+            const t = e.touches[0];
+            const dx = t.clientX - swipeStartX;
+            const dy = t.clientY - swipeStartY;
+
+            if (!swipeActive) {
+                if (Math.abs(dx) > 12 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+                    swipeActive = true;
+                } else if (Math.abs(dy) > 12) {
+                    swipeCard = null;
+                    return;
+                }
+            }
+
+            if (swipeActive) {
+                if (e.cancelable) e.preventDefault();
+
+                const strip = swipeCard.querySelector('.wc-strip');
+                if (strip) {
+                    const dayCount = swipeCard.querySelectorAll('.wc-day').length || 1;
+                    const maxIdx = dayCount - 1;
+                    const atEdgeLeft = _weatherDayIndex <= 0 && dx > 0;
+                    const atEdgeRight = _weatherDayIndex >= maxIdx && dx < 0;
+                    const resist = (atEdgeLeft || atEdgeRight) ? 0.3 : 1;
+
+                    strip.style.transform = `translateX(${dx * resist}px)`;
+                    strip.style.transition = 'none';
+
+                    // Вибро-«отказ» на границе — один раз за жест
+                    if ((atEdgeLeft || atEdgeRight) && navigator.vibrate && !swipeCard._edgeBuzzed) {
+                        swipeCard._edgeBuzzed = true;
+                        navigator.vibrate(5);
+                    }
+                }
+            }
+        }, { passive: false });
+
+        container.addEventListener('touchend', (e) => {
+            if (!swipeCard) return;
+            const t = e.changedTouches[0];
+            const dx = t.clientX - swipeStartX;
+
+            const strip = swipeCard.querySelector('.wc-strip');
+            if (strip) {
+                strip.style.transition = 'transform 0.25s ease';
+                strip.style.transform = '';
+            }
+
+            if (swipeActive) {
+                const dayCount = swipeCard.querySelectorAll('.wc-day').length || 1;
+                const maxIdx = dayCount - 1;
+
+                if (dx < -CFG.SWIPE_THRESHOLD && _weatherDayIndex < maxIdx) {
+                    _weatherDayIndex++;
+                    if (navigator.vibrate) navigator.vibrate(8);
+                    animateWeatherCardToggle(swipeCard);
+                } else if (dx > CFG.SWIPE_THRESHOLD && _weatherDayIndex > 0) {
+                    _weatherDayIndex--;
+                    if (navigator.vibrate) navigator.vibrate(8);
+                    animateWeatherCardToggle(swipeCard);
+                }
+            }
+
+            swipeCard = null;
+            swipeActive = false;
+        }, { passive: true });
+
+        container.addEventListener('touchcancel', () => {
+            if (swipeCard) {
+                const strip = swipeCard.querySelector('.wc-strip');
+                if (strip) {
+                    strip.style.transition = 'transform 0.25s ease';
+                    strip.style.transform = '';
+                }
+            }
+            swipeCard = null;
+            swipeActive = false;
+        });
+
+        // ─── Клавиатура (десктоп) ───
+        container.addEventListener('keydown', (e) => {
+            if (!_weatherExpanded) return;
+            const card = e.target.closest('.widget-card.weather');
+            if (!card) return;
+
+            const maxIdx = (card.querySelectorAll('.wc-day').length || 1) - 1;
+            if (e.key === 'ArrowRight' && _weatherDayIndex < maxIdx) {
+                _weatherDayIndex++;
+                animateWeatherCardToggle(card);
+            } else if (e.key === 'ArrowLeft' && _weatherDayIndex > 0) {
+                _weatherDayIndex--;
+                animateWeatherCardToggle(card);
+            }
+        });
+
         log('✅ Обработчики установлены');
     }
 
@@ -602,9 +856,9 @@
     //  СТИЛИ
     // ═══════════════════════════════════════════════════════════
     function ensureStyles() {
-        if (document.getElementById('widgetPickerStylesV5')) return;
+        if (document.getElementById('widgetPickerStylesV6')) return;
         const style = document.createElement('style');
-        style.id = 'widgetPickerStylesV5';
+        style.id = 'widgetPickerStylesV6';
         style.textContent = `
             .widget-card {
                 position: relative;
@@ -680,7 +934,112 @@
             }
             .widget-card.weather .wc-weather-extra .wc-minmax { color: #feca57; font-weight: 700; }
             .widget-card.weather .wc-weather-extra .wc-feels { color: #a78bfa; }
-            /* Модалка */
+
+            /* ─── Лента дней ─── */
+            .widget-card.weather .wc-strip-wrap {
+                margin-top: 12px;
+                padding-top: 12px;
+                border-top: 1px solid rgba(255, 255, 255, 0.08);
+                animation: wcFadeIn 0.25s ease;
+            }
+            @keyframes wcFadeIn {
+                from { opacity: 0; transform: translateY(-4px); }
+                to   { opacity: 1; transform: translateY(0); }
+            }
+            .widget-card.weather .wc-strip {
+                display: flex;
+                gap: 6px;
+                touch-action: pan-y;
+                will-change: transform;
+            }
+            .widget-card.weather .wc-day {
+                flex: 1;
+                min-width: 0;
+                text-align: center;
+                padding: 8px 4px;
+                border-radius: 10px;
+                background: rgba(255, 255, 255, 0.03);
+                border: 1px solid rgba(255, 255, 255, 0.05);
+                transition: background 0.2s, border-color 0.2s, transform 0.15s;
+                cursor: pointer;
+                -webkit-tap-highlight-color: transparent;
+            }
+            .widget-card.weather .wc-day:hover {
+                background: rgba(255, 255, 255, 0.07);
+            }
+            .widget-card.weather .wc-day.active {
+                background: linear-gradient(135deg,
+                    rgba(108, 92, 231, 0.28),
+                    rgba(0, 184, 148, 0.14));
+                border-color: rgba(108, 92, 231, 0.5);
+                box-shadow: 0 3px 12px rgba(108, 92, 231, 0.25);
+            }
+            .widget-card.weather .wc-day-label {
+                font-size: 10px;
+                color: #aaa;
+                margin-bottom: 4px;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .widget-card.weather .wc-day.active .wc-day-label {
+                color: #c4b5fd;
+                font-weight: 700;
+            }
+            .widget-card.weather .wc-day-icon {
+                font-size: 22px;
+                line-height: 1;
+                margin-bottom: 4px;
+                transition: transform 0.2s;
+            }
+            .widget-card.weather .wc-day.active .wc-day-icon {
+                transform: scale(1.1);
+            }
+            .widget-card.weather .wc-day-temp {
+                display: flex;
+                justify-content: center;
+                gap: 4px;
+                font-size: 12px;
+                font-variant-numeric: tabular-nums;
+            }
+            .widget-card.weather .wc-day-max { color: #fff; font-weight: 700; }
+            .widget-card.weather .wc-day-min { color: #888; }
+
+            /* ─── Точки ─── */
+            .widget-card.weather .wc-dots {
+                display: flex;
+                justify-content: center;
+                gap: 6px;
+                margin-top: 10px;
+            }
+            .widget-card.weather .wc-dot {
+                width: 6px;
+                height: 6px;
+                border-radius: 50%;
+                background: rgba(255, 255, 255, 0.15);
+                transition: all 0.25s ease;
+            }
+            .widget-card.weather .wc-dot.active {
+                width: 18px;
+                border-radius: 3px;
+                background: linear-gradient(90deg, #6c5ce7, #00b894);
+                box-shadow: 0 0 8px rgba(108, 92, 231, 0.5);
+            }
+
+            /* ─── Подсказка ─── */
+            .widget-card.weather .wc-hint {
+                text-align: center;
+                font-size: 10px;
+                color: rgba(255, 255, 255, 0.35);
+                margin-top: 10px;
+                letter-spacing: 0.3px;
+                transition: color 0.2s;
+            }
+            .widget-card.weather:hover .wc-hint {
+                color: rgba(255, 255, 255, 0.55);
+            }
+
+            /* ─── Модалка выбора виджетов ─── */
             #widgetPickerModal { display: none; }
             #widgetPickerModal.active { display: flex; }
             #widgetPickerModal .wp-content {
@@ -773,6 +1132,9 @@
         document.head.appendChild(style);
     }
 
+    // ═══════════════════════════════════════════════════════════
+    //  МОДАЛКА ВЫБОРА ВИДЖЕТОВ
+    // ═══════════════════════════════════════════════════════════
     function openWidgetPicker() {
         ensureStyles();
         const existing = document.getElementById('widgetPickerModal');
@@ -790,7 +1152,9 @@
                 <div class="wp-body">
                     <div class="wp-hint">
                         Виджеты появляются над списком чатов.<br>
-                        <strong style="color:#feca57;">Долгое нажатие</strong> на виджет — удалить.
+                        <strong style="color:#feca57;">Тап</strong> — прогноз на 4 дня,<br>
+                        <strong style="color:#feca57;">свайп</strong> по дням,<br>
+                        <strong style="color:#feca57;">долгое нажатие</strong> — удалить.
                     </div>
                     <div id="wpWidgetsList"></div>
                 </div>
@@ -895,7 +1259,7 @@
     setTimeout(injectWidgetMenuItem, 5000);
 
     // ═══════════════════════════════════════════════════════════
-    //  ПАТЧ showChatsScreen — запускаем фоновую загрузку
+    //  ПАТЧ showChatsScreen
     // ═══════════════════════════════════════════════════════════
     if (typeof showChatsScreen === 'function') {
         const _orig = showChatsScreen;
@@ -915,23 +1279,19 @@
     // ═══════════════════════════════════════════════════════════
     setInterval(() => {
         if (document.hidden) return;
-        if (!state || state.currentScreen !== 'chats') return;
+        if (typeof state !== 'undefined' && state && state.currentScreen !== 'chats') return;
         if (!_widgets.find(w => w.id === 'weather')) return;
         log('Автообновление погоды');
         loadWeatherDataInBackground();
     }, CFG.WEATHER_REFRESH_MS);
 
     // ═══════════════════════════════════════════════════════════
-//  ЗАПУСК
-// ═══════════════════════════════════════════════════════════
+    //  ЗАПУСК
+    // ═══════════════════════════════════════════════════════════
+    ensureStyles();
+    loadWidgets();
+    loadCache();
 
-// 🎯 СНАЧАЛА — CSS. Чтобы виджеты выглядели правильно с первой секунды
-ensureStyles();
-
-loadWidgets();
-loadCache();
-
-    // Фоновая загрузка погоды при старте, если виджет добавлен
     setTimeout(() => {
         if (_widgets.find(w => w.id === 'weather')) {
             loadWeatherDataInBackground();
@@ -939,7 +1299,7 @@ loadCache();
     }, 2000);
 
     // ═══════════════════════════════════════════════════════════
-    //  API
+    //  ПУБЛИЧНЫЙ API
     // ═══════════════════════════════════════════════════════════
     window.Widgets = {
         openPicker: openWidgetPicker,
@@ -950,9 +1310,31 @@ loadCache();
         refresh: () => rerenderChatsList(),
         refreshWeather: () => {
             delete _cache[getCacheKey('weather', 'location')];
-            const loc = readCacheRaw('weather', 'location');
             saveCache();
             return loadWeatherDataInBackground();
+        },
+        expand: () => {
+            setWeatherExpanded(true);
+            _weatherDayIndex = 0;
+            replaceWeatherCardInDom();
+        },
+        collapse: () => {
+            setWeatherExpanded(false);
+            _weatherDayIndex = 0;
+            replaceWeatherCardInDom();
+        },
+        selectDay: (idx) => {
+            const loc = readCacheRaw('weather', 'location');
+            if (!loc) return;
+            const subKey = `${loc.lat.toFixed(3)}_${loc.lon.toFixed(3)}`;
+            const w = readCacheRaw('weather', subKey);
+            if (!w || !Array.isArray(w.forecast)) return;
+            const maxIdx = Math.max(0, w.forecast.length - 1);
+            _weatherDayIndex = Math.max(0, Math.min(maxIdx, idx | 0));
+            setWeatherExpanded(true);
+            const card = document.querySelector('.widget-card.weather');
+            if (card) animateWeatherCardToggle(card);
+            else replaceWeatherCardInDom();
         },
         debug: () => {
             const container = document.getElementById('chatsList');
@@ -960,11 +1342,13 @@ loadCache();
                 widgets: _widgets.length,
                 cardsInDom: container ? container.querySelectorAll('.widget-card').length : 0,
                 innerHTMLPatched: _innerHTMLPatched,
+                expanded: _weatherExpanded,
+                dayIndex: _weatherDayIndex,
                 cachedLocation: readCacheRaw('weather', 'location'),
                 cacheAge: (Date.now() - readCacheTs('weather', 'location')) / 1000 + ' сек',
                 isFresh: isCacheFresh('weather', 'location'),
             };
-            console.log('=== WIDGETS DEBUG v5 ===');
+            console.log('=== WIDGETS DEBUG v6 ===');
             console.table(info);
             return info;
         },
@@ -974,12 +1358,13 @@ loadCache();
             saveWidgets();
             _cache = {};
             saveCache();
+            setWeatherExpanded(false);
+            _weatherDayIndex = 0;
             document.querySelectorAll('.widget-card').forEach(el => el.remove());
             if (typeof showToast === 'function') showToast('🗑️ Все виджеты удалены', 1500);
         },
         clearWeatherCache: () => {
             delete _cache[getCacheKey('weather', 'location')];
-            // Также чистим weather-кэши по координатам
             Object.keys(_cache).forEach(k => {
                 if (k.startsWith('weather::')) delete _cache[k];
             });
@@ -988,8 +1373,9 @@ loadCache();
         },
     };
 
-    console.log('🧩 [Widgets v5] Готово');
+    console.log('🧩 [Widgets v6] Готово');
     console.log('Проверить: Widgets.debug()');
 
 })();
-
+</body>
+</html>
