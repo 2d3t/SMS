@@ -1,37 +1,188 @@
+
 // ═══════════════════════════════════════════════════════════════
-//  📻 RADIO WIDGET v1 — бесплатные станции через Radio Browser
+//  📻 RADIO WIDGET v2 — фиксированный список станций
 //  ─────────────────────────────────────────────────────────────
-//  • Поиск по названию через Radio Browser API (без ключей)
-//  • Избранное в localStorage (живёт вечно)
-//  • Плеер — глобальный <audio> в document.body (не сносится ререндером)
-//  • Фильтр HTTPS-потоков (иначе Mixed Content блокирует воспроизведение)
+//  • Большой готовый список станций (наши + зарубежные)
+//  • Избранное в localStorage
+//  • Плеер — глобальный <audio> в document.body
+//  • Только HTTPS-потоки
 //  • В стиле widget-weather v7: карточка + разворот + долгое нажатие
 // ═══════════════════════════════════════════════════════════════
 
-(function installRadioWidgetV1() {
+(function installRadioWidgetV2() {
     'use strict';
 
-    console.log('📻 [Radio v1] Запуск…');
+    console.log('📻 [Radio v2] Запуск…');
 
     const CFG = {
-        WIDGET_KEY: 'smschat_widgets',              // общий список виджетов
-        FAV_KEY: 'smschat_radio_favorites',         // избранные станции
-        STATE_KEY: 'smschat_radio_state',           // что играло последним
-        EXPANDED_KEY: 'smschat_radio_expanded',     // развёрнуто/свёрнуто
-        SEARCH_CACHE_KEY: 'smschat_radio_search',   // кэш поиска (на сессию)
-        API_BASE: 'https://de1.api.radio-browser.info',
-        SEARCH_LIMIT: 20,
+        WIDGET_KEY: 'smschat_widgets',
+        FAV_KEY: 'smschat_radio_favorites',
+        STATE_KEY: 'smschat_radio_state',
+        EXPANDED_KEY: 'smschat_radio_expanded',
         LONG_PRESS_MS: 600,
         DEBUG: true,
     };
 
-    const log = (...a) => CFG.DEBUG && console.log('📻 [Radio v1]', ...a);
-    const warn = (...a) => console.warn('📻 [Radio v1]', ...a);
+    const log = (...a) => CFG.DEBUG && console.log('📻 [Radio v2]', ...a);
+    const warn = (...a) => console.warn('📻 [Radio v2]', ...a);
 
-    // Станции по умолчанию — добавим при первом запуске, если избранное пустое
-    const DEFAULT_STATIONS = [
-        { name: 'Европа Плюс',   search: 'Европа Плюс' },
-        { name: 'Relax FM',      search: 'Relax FM' },
+    // ═══════════════════════════════════════════════════════════
+    //  БОЛЬШОЙ СПИСОК СТАНЦИЙ (только HTTPS-потоки)
+    // ═══════════════════════════════════════════════════════════
+    const STATIONS = [
+        // ───🇷🇺 РОССИЯ / СНГ ───
+        { id: 'ru-europaplus',  name: 'Европа Плюс',        country: '🇷🇺', genre: 'Pop',       url: 'https://ep128.hostingradio.ru:8030/ep128' },
+        { id: 'ru-retro',       name: 'Ретро FM',           country: '🇷🇺', genre: 'Retro',     url: 'https://retroserver.streamr.ru:8043/retro256.mp3' },
+        { id: 'ru-relax',       name: 'Relax FM',           country: '🇷🇺', genre: 'Chill',     url: 'https://pub0302.101.ru:8443/stream/air/aac/64' },
+        { id: 'ru-russian',     name: 'Русское Радио',      country: '🇷🇺', genre: 'Pop',       url: 'https://rusradio.hostingradio.ru/rusradio96.aacp' },
+        { id: 'ru-road',        name: 'Дорожное Радио',     country: '🇷🇺', genre: 'Pop',       url: 'https://dorognoe.hostingradio.ru:8000/dorognoe' },
+        { id: 'ru-record',      name: 'Radio Record',       country: '🇷🇺', genre: 'Dance',     url: 'https://radiorecord.hostingradio.ru/rr_main96.aacp' },
+        { id: 'ru-montekarlo',  name: 'Монте-Карло',        country: '🇷🇺', genre: 'Pop',       url: 'https://montecarlo.hostingradio.ru/montecarlo96.aacp' },
+        { id: 'ru-energy',      name: 'NRJ Energy',         country: '🇷🇺', genre: 'Dance',     url: 'https://energydance.hostingradio.ru/energydance96.aacp' },
+        { id: 'ru-dfm',         name: 'DFM',                country: '🇷🇺', genre: 'Dance',     url: 'https://dfm.hostingradio.ru/dfm96.aacp' },
+        { id: 'ru-hitfm',       name: 'Хит FM',             country: '🇷🇺', genre: 'Pop',       url: 'https://hitfm.hostingradio.ru/hitfm96.aacp' },
+        { id: 'ru-maximum',     name: 'Radio Maximum',      country: '🇷🇺', genre: 'Rock',      url: 'https://maximum.hostingradio.ru/maximum96.aacp' },
+        { id: 'ru-ultra',       name: 'Ultra',              country: '🇷🇺', genre: 'Electronic',url: 'https://ultra.hostingradio.ru/ultra96.aacp' },
+        { id: 'ru-comedy',      name: 'Comedy Radio',       country: '🇷🇺', genre: 'Talk',      url: 'https://comedy.hostingradio.ru/comedy96.aacp' },
+        { id: 'ru-vesti',       name: 'Вести FM',           country: '🇷🇺', genre: 'News',      url: 'https://icecast-vgtrk.cdnvideo.ru/vestifm_mp3_128kbps' },
+        { id: 'ru-mayak',       name: 'Маяк',               country: '🇷🇺', genre: 'Talk',      url: 'https://icecast-vgtrk.cdnvideo.ru/mayakfm_mp3_128kbps' },
+        { id: 'ru-jazz',        name: 'Radio Jazz',         country: '🇷🇺', genre: 'Jazz',      url: 'https://jazz.hostingradio.ru:8014/jazz128.mp3' },
+        { id: 'ru-7not',        name: '7 Нот',              country: '🇷🇺', genre: 'Classical', url: 'https://7not.fm/mp3/' },
+        { id: 'ru-child',       name: 'Детское Радио',      country: '🇷🇺', genre: 'Kids',      url: 'https://deti.hostingradio.ru/deti96.aacp' },
+
+        // ───🇺🇦 УКРАИНА ───
+        { id: 'ua-hit',         name: 'Хіт FM',             country: '🇺🇦', genre: 'Pop',       url: 'https://online.hitfm.ua/HitFM' },
+        { id: 'ua-kiss',        name: 'Kiss FM UA',         country: '🇺🇦', genre: 'Dance',     url: 'https://online.kissfm.ua/KissFM' },
+        { id: 'ua-roks',        name: 'Radio ROKS',         country: '🇺🇦', genre: 'Rock',      url: 'https://online.radioroks.ua/RadioROKS' },
+        { id: 'ua-nv',          name: 'Radio NV',           country: '🇺🇦', genre: 'News',      url: 'https://online.radiorelax.ua/RadioNV' },
+
+        // ───🇧🇾 БЕЛАРУСЬ ───
+        { id: 'by-unistar',     name: 'Unistar',            country: '🇧🇾', genre: 'Pop',       url: 'https://stream.unistar.by/unistar-128.mp3' },
+
+        // ───🇰🇿 КАЗАХСТАН ───
+        { id: 'kz-europa',      name: 'Европа Плюс KZ',     country: '🇰🇿', genre: 'Pop',       url: 'https://ep128.hostingradio.ru:8030/ep128' },
+
+        // ───🇺🇸 США ───
+        { id: 'us-npr',         name: 'NPR News',           country: '🇺🇸', genre: 'News',      url: 'https://npr-ice.streamguys1.com/live.mp3' },
+        { id: 'us-classic',     name: 'Classic FM USA',     country: '🇺🇸', genre: 'Classical', url: 'https://live.wostreaming.net/direct/whrb-fm1-ibc1' },
+        { id: 'us-lofi',        name: 'Lofi Girl',          country: '🇺🇸', genre: 'Lo-Fi',     url: 'https://stream.zeno.fm/0r0xa792kwzuv' },
+
+        // ───🇬🇧 ВЕЛИКОБРИТАНИЯ ───
+        { id: 'uk-bbc1',        name: 'BBC Radio 1',        country: '🇬🇧', genre: 'Pop',       url: 'https://stream.live.vc.bbcmedia.co.uk/bbc_radio_one' },
+        { id: 'uk-bbc2',        name: 'BBC Radio 2',        country: '🇬🇧', genre: 'Pop',       url: 'https://stream.live.vc.bbcmedia.co.uk/bbc_radio_two' },
+        { id: 'uk-bbc4',        name: 'BBC Radio 4',        country: '🇬🇧', genre: 'Talk',      url: 'https://stream.live.vc.bbcmedia.co.uk/bbc_radio_fourfm' },
+        { id: 'uk-classic',     name: 'Classic FM UK',      country: '🇬🇧', genre: 'Classical', url: 'https://media-ice.musicradio.com/ClassicFMMP3' },
+        { id: 'uk-capital',     name: 'Capital FM',         country: '🇬🇧', genre: 'Pop',       url: 'https://media-ice.musicradio.com/CapitalMP3' },
+        { id: 'uk-heart',       name: 'Heart FM',           country: '🇬🇧', genre: 'Pop',       url: 'https://media-ice.musicradio.com/HeartLondonMP3' },
+
+        // ───🇩🇪 ГЕРМАНИЯ ───
+        { id: 'de-1live',       name: '1LIVE',              country: '🇩🇪', genre: 'Pop',       url: 'https://wdr-1live-live.icecast.wdr.de/wdr/1live/live/mp3/128/stream.mp3' },
+        { id: 'de-swr3',        name: 'SWR3',               country: '🇩🇪', genre: 'Pop',       url: 'https://liveradio.swr.de/sw282p3/swr3/play.mp3' },
+        { id: 'de-bayern3',     name: 'Bayern 3',           country: '🇩🇪', genre: 'Pop',       url: 'https://streams.br.de/bayern3_2.m3u' },
+
+        // ───🇫🇷 ФРАНЦИЯ ───
+        { id: 'fr-nrj',         name: 'NRJ France',         country: '🇫🇷', genre: 'Pop',       url: 'https://cdn.nrjaudio.fm/audio1/fr/30001/mp3_128.mp3' },
+        { id: 'fr-nostalgie',   name: 'Nostalgie',          country: '🇫🇷', genre: 'Retro',     url: 'https://cdn.nrjaudio.fm/audio1/fr/30601/mp3_128.mp3' },
+        { id: 'fr-rire',        name: 'Rire & Chansons',    country: '🇫🇷', genre: 'Comedy',    url: 'https://cdn.nrjaudio.fm/audio1/fr/30401/mp3_128.mp3' },
+        { id: 'fr-classique',   name: 'Radio Classique',    country: '🇫🇷', genre: 'Classical', url: 'https://radioclassique.ice.infomaniak.ch/radioclassique-high.mp3' },
+
+        // ───🇮🇹 ИТАЛИЯ ───
+        { id: 'it-rai1',        name: 'Rai Radio 1',        country: '🇮🇹', genre: 'News',      url: 'https://icestreaming.rai.it/1.mp3' },
+        { id: 'it-rai2',        name: 'Rai Radio 2',        country: '🇮🇹', genre: 'Pop',       url: 'https://icestreaming.rai.it/2.mp3' },
+        { id: 'it-rai3',        name: 'Rai Radio 3',        country: '🇮🇹', genre: 'Classical', url: 'https://icestreaming.rai.it/3.mp3' },
+        { id: 'it-virgin',      name: 'Virgin Radio IT',    country: '🇮🇹', genre: 'Rock',      url: 'https://icy.unitedradio.it/Virgin.mp3' },
+        { id: 'it-deejay',      name: 'Radio Deejay',       country: '🇮🇹', genre: 'Pop',       url: 'https://4c4b867c89244861ac216426883d1ad0.msvdn.net/radiodeejay/radiodeejay/master.m3u8' },
+        { id: 'it-105',         name: 'Radio 105',          country: '🇮🇹', genre: 'Pop',       url: 'https://icy.unitedradio.it/Radio105.mp3' },
+
+        // ───🇪🇸 ИСПАНИЯ ───
+        { id: 'es-los40',       name: 'LOS40',              country: '🇪🇸', genre: 'Pop',       url: 'https://21423.live.streamtheworld.com/LOS40AAC.aac' },
+        { id: 'es-cadena',      name: 'Cadena SER',         country: '🇪🇸', genre: 'News',      url: 'https://25603.live.streamtheworld.com/CADENASER.mp3' },
+        { id: 'es-flamenco',    name: 'Flamenco Radio',     country: '🇪🇸', genre: 'Flamenco',  url: 'https://cdnapi.kaltura.com/p/2209221/sp/220922100/playManifest/entryId/1_gxqqn89h/format/applehttp/protocol/https/a.m3u8' },
+
+        // ───🇳🇱 НИДЕРЛАНДЫ ───
+        { id: 'nl-538',         name: 'Radio 538',          country: '🇳🇱', genre: 'Pop',       url: 'https://25293.live.streamtheworld.com/RADIO538.mp3' },
+        { id: 'nl-sky',         name: 'Sky Radio',          country: '🇳🇱', genre: 'Pop',       url: 'https://25293.live.streamtheworld.com/SKYRADIO.mp3' },
+        { id: 'nl-veronica',    name: 'Radio Veronica',     country: '🇳🇱', genre: 'Rock',      url: 'https://25353.live.streamtheworld.com/VERONICA.mp3' },
+
+        // ───🇨🇭 ШВЕЙЦАРИЯ ───
+        { id: 'ch-srf3',        name: 'SRF 3',              country: '🇨🇭', genre: 'Pop',       url: 'https://stream.srg-ssr.ch/m/drs3/mp3_128' },
+        { id: 'ch-srf2',        name: 'SRF 2 Kultur',       country: '🇨🇭', genre: 'Classical', url: 'https://stream.srg-ssr.ch/m/drs2/mp3_128' },
+
+        // ───🇸🇪 ШВЕЦИЯ ───
+        { id: 'se-p3',          name: 'Sveriges Radio P3',  country: '🇸🇪', genre: 'Pop',       url: 'https://sverigesradio.se/topsy/direkt/164-hi-mp3' },
+        { id: 'se-p1',          name: 'Sveriges Radio P1',  country: '🇸🇪', genre: 'Talk',      url: 'https://sverigesradio.se/topsy/direkt/132-hi-mp3' },
+
+        // ───🇦🇹 АВСТРИЯ ───
+        { id: 'at-oe3',         name: 'Hitradio Ö3',        country: '🇦🇹', genre: 'Pop',       url: 'https://orf-live.ors-shoutcast.at/oe3-q2a' },
+        { id: 'at-fm4',         name: 'FM4',                country: '🇦🇹', genre: 'Alternative',url: 'https://orf-live.ors-shoutcast.at/fm4-q2a' },
+
+        // ───🇵🇱 ПОЛЬША ───
+        { id: 'pl-rmf',         name: 'RMF FM',             country: '🇵🇱', genre: 'Pop',       url: 'https://rs6-krk2.rmfstream.pl/RMFFM48' },
+        { id: 'pl-zeto',        name: 'Radio ZET',          country: '🇵🇱', genre: 'Pop',       url: 'https://n-4-7.dcs.redcdn.pl/sc/o2/Eurozet/live/audio.livx?audio=5' },
+
+        // ───🇨🇿 ЧЕХИЯ ───
+        { id: 'cz-impuls',      name: 'Rádio Impuls',       country: '🇨🇿', genre: 'Pop',       url: 'https://icecast5.play.cz/impuls128.mp3' },
+        { id: 'cz-europa2',     name: 'Evropa 2',           country: '🇨🇿', genre: 'Pop',       url: 'https://ice.actve.net/fm-evropa2-128' },
+
+        // ───🇬🇷 ГРЕЦИЯ ───
+        { id: 'gr-ert',         name: 'ERT Open',           country: '🇬🇷', genre: 'Talk',      url: 'https://radiostreaming.ert.gr/ert-open' },
+
+        // ───🇯🇵 ЯПОНИЯ ───
+        { id: 'jp-jpop',        name: 'J-Pop Powerplay',    country: '🇯🇵', genre: 'J-Pop',     url: 'https://kathy.torontocast.com:3560/;' },
+
+        // ───🇧🇷 БРАЗИЛИЯ ───
+        { id: 'br-jovem',       name: 'Jovem Pan FM',       country: '🇧🇷', genre: 'Pop',       url: 'https://stream.jovempanfm.com.br/jp_sp_hd' },
+
+        // ───🇲🇽 МЕКСИКА ───
+        { id: 'mx-exa',         name: 'Exa FM',             country: '🇲🇽', genre: 'Pop',       url: 'https://playerservices.streamtheworld.com/api/livestream-redirect/XHEXAAC.aac' },
+
+        // ───🇦🇷 АРГЕНТИНА ───
+        { id: 'ar-la100',       name: 'La 100',             country: '🇦🇷', genre: 'Pop',       url: 'https://buecl2.cienradios.com/la100.aac' },
+
+        // ───🌍 МЕЖДУНАРОДНЫЕ / ОНЛАЙН ───
+        { id: 'int-soma',       name: 'SomaFM Groove Salad',country: '🌍', genre: 'Chill',     url: 'https://ice1.somafm.com/groovesalad-128-mp3' },
+        { id: 'int-soma-indie', name: 'SomaFM Indie Pop',   country: '🌍', genre: 'Indie',     url: 'https://ice1.somafm.com/indiepop-128-mp3' },
+        { id: 'int-soma-def',   name: 'SomaFM DEF CON',     country: '🌍', genre: 'Electronic',url: 'https://ice1.somafm.com/defcon-128-mp3' },
+        { id: 'int-soma-space', name: 'SomaFM Space',       country: '🌍', genre: 'Ambient',   url: 'https://ice1.somafm.com/spacestation-128-mp3' },
+        { id: 'int-soma-lush',  name: 'SomaFM Lush',        country: '🌍', genre: 'Vocal',     url: 'https://ice1.somafm.com/lush-128-mp3' },
+        { id: 'int-soma-boot',  name: 'SomaFM Boot Liquor', country: '🌍', genre: 'Country',   url: 'https://ice1.somafm.com/bootliquor-128-mp3' },
+        { id: 'int-radioparadise', name: 'Radio Paradise',  country: '🌍', genre: 'Eclectic',  url: 'https://stream.radioparadise.com/mp3-128' },
+        { id: 'int-nectarine',  name: 'Nectarine Demoscene',country: '🌍', genre: 'Electronic',url: 'https://necta.burn.net:8443/necta' },
+        { id: 'int-fip',        name: 'FIP (France)',       country: '🇫🇷', genre: 'Eclectic',  url: 'https://icecast.radiofrance.fr/fip-midfi.mp3' },
+        { id: 'int-fipjazz',    name: 'FIP Jazz',           country: '🇫🇷', genre: 'Jazz',      url: 'https://icecast.radiofrance.fr/fipjazz-midfi.mp3' },
+        { id: 'int-fiprock',    name: 'FIP Rock',           country: '🇫🇷', genre: 'Rock',      url: 'https://icecast.radiofrance.fr/fiprock-midfi.mp3' },
+        { id: 'int-fipgroove',  name: 'FIP Groove',         country: '🇫🇷', genre: 'Funk',      url: 'https://icecast.radiofrance.fr/fipgroove-midfi.mp3' },
+        { id: 'int-fipworld',   name: 'FIP Monde',          country: '🇫🇷', genre: 'World',     url: 'https://icecast.radiofrance.fr/fipworld-midfi.mp3' },
+        { id: 'int-fipreggae',  name: 'FIP Reggae',         country: '🇫🇷', genre: 'Reggae',    url: 'https://icecast.radiofrance.fr/fipreggae-midfi.mp3' },
+        { id: 'int-fipnouveau', name: 'FIP Nouveautés',     country: '🇫🇷', genre: 'New',       url: 'https://icecast.radiofrance.fr/fipnouveautes-midfi.mp3' },
+        { id: 'int-mouv',       name: 'Mouv\'',             country: '🇫🇷', genre: 'Hip-Hop',   url: 'https://icecast.radiofrance.fr/mouv-midfi.mp3' },
+        { id: 'int-classique',  name: 'France Musique',     country: '🇫🇷', genre: 'Classical', url: 'https://icecast.radiofrance.fr/francemusique-midfi.mp3' },
+        { id: 'int-franceinfo', name: 'France Info',        country: '🇫🇷', genre: 'News',      url: 'https://icecast.radiofrance.fr/franceinfo-midfi.mp3' },
+        { id: 'int-franceinter',name: 'France Inter',       country: '🇫🇷', genre: 'Talk',      url: 'https://icecast.radiofrance.fr/franceinter-midfi.mp3' },
+        { id: 'int-franceri',   name: 'France Culture',     country: '🇫🇷', genre: 'Culture',   url: 'https://icecast.radiofrance.fr/franceculture-midfi.mp3' },
+
+        // ───🎵 ЖАНРОВЫЕ МЕЖДУНАРОДНЫЕ ───
+        { id: 'g-jazz24',       name: 'Jazz24',             country: '🌍', genre: 'Jazz',      url: 'https://live.wostreaming.net/direct/ppm-jazz24aac-ibc1' },
+        { id: 'g-classicfm',    name: 'Classic FM',         country: '🌍', genre: 'Classical', url: 'https://media-ssl.musicradio.com/ClassicFMMP3' },
+        { id: 'g-1fm',          name: '1.FM Top 40',        country: '🌍', genre: 'Top 40',    url: 'https://strm112.1.fm/top40_mobile_mp3' },
+        { id: 'g-1fmrock',      name: '1.FM Rock',          country: '🌍', genre: 'Rock',      url: 'https://strm112.1.fm/rock_mobile_mp3' },
+        { id: 'g-1fmtrance',    name: '1.FM Trance',        country: '🌍', genre: 'Trance',    url: 'https://strm112.1.fm/trance_mobile_mp3' },
+        { id: 'g-1fm80s',       name: '1.FM 80s',           country: '🌍', genre: '80s',       url: 'https://strm112.1.fm/back280s_mobile_mp3' },
+        { id: 'g-1fm90s',       name: '1.FM 90s',           country: '🌍', genre: '90s',       url: 'https://strm112.1.fm/90s_mobile_mp3' },
+        { id: 'g-1fmlounge',    name: '1.FM Lounge',        country: '🌍', genre: 'Lounge',    url: 'https://strm112.1.fm/lounge_mobile_mp3' },
+        { id: 'g-1fmchill',     name: '1.FM Chillout',      country: '🌍', genre: 'Chillout',  url: 'https://strm112.1.fm/chilloutlounge_mobile_mp3' },
+        { id: 'g-1fmambient',   name: '1.FM Ambient',       country: '🌍', genre: 'Ambient',   url: 'https://strm112.1.fm/ambient_mobile_mp3' },
+        { id: 'g-1fmsalsa',     name: '1.FM Salsa',         country: '🌍', genre: 'Salsa',     url: 'https://strm112.1.fm/salsa_mobile_mp3' },
+        { id: 'g-1fmreggae',    name: '1.FM Reggae',        country: '🌍', genre: 'Reggae',    url: 'https://strm112.1.fm/reggae_mobile_mp3' },
+        { id: 'g-1fmcountry',   name: '1.FM Country',       country: '🌍', genre: 'Country',   url: 'https://strm112.1.fm/country_mobile_mp3' },
+        { id: 'g-1fmcountry',   name: '1.FM Blues',         country: '🌍', genre: 'Blues',     url: 'https://strm112.1.fm/blues_mobile_mp3' },
+        { id: 'g-1fmoldies',    name: '1.FM Oldies',        country: '🌍', genre: 'Oldies',    url: 'https://strm112.1.fm/oldies_mobile_mp3' },
+        { id: 'g-1fmdisco',     name: '1.FM Disco',         country: '🌍', genre: 'Disco',     url: 'https://strm112.1.fm/disco_mobile_mp3' },
+        { id: 'g-lofi',         name: 'Lofi Radio',         country: '🌍', genre: 'Lo-Fi',     url: 'https://stream.zeno.fm/f3wvbbqmdg8uv' },
+        { id: 'g-chillhop',     name: 'Chillhop',           country: '🌍', genre: 'Chillhop',  url: 'https://streams.fluxfm.de/Chillhop/mp3-128/streams.fluxfm.de/' },
+        { id: 'g-fluxfm',       name: 'FluxFM',             country: '🇩🇪', genre: 'Alternative',url: 'https://streams.fluxfm.de/FluxFM/mp3-128/streams.fluxfm.de/' },
+        { id: 'g-sunshine',     name: 'Sunshine Live',      country: '🇩🇪', genre: 'Electronic',url: 'https://stream.sunshine-live.de/live/mp3-192/stream.sunshine-live.de/' },
+        { id: 'g-innergong',    name: 'Inner Gong',         country: '🇩🇪', genre: 'Chill',     url: 'https://stream.innergong.de/mp3' },
     ];
 
     // ═══════════════════════════════════════════════════════════
@@ -42,22 +193,32 @@
         catch (e) { return false; }
     })();
 
+    // Избранное хранит МАССИВ ID станций
     let _favorites = (() => {
-        try { return JSON.parse(localStorage.getItem(CFG.FAV_KEY) || '[]'); }
-        catch (e) { return []; }
+        try {
+            const raw = JSON.parse(localStorage.getItem(CFG.FAV_KEY) || '[]');
+            if (!Array.isArray(raw)) return [];
+            // Совместимость со старой версией (там были объекты станций)
+            return raw.map(x => typeof x === 'string' ? x : (x.stationuuid || x.id)).filter(Boolean);
+        } catch (e) { return []; }
     })();
 
-    let _current = (() => {
-        try { return JSON.parse(localStorage.getItem(CFG.STATE_KEY) || 'null'); }
-        catch (e) { return null; }
+    // Текущая станция — ID
+    let _currentId = (() => {
+        try {
+            const raw = localStorage.getItem(CFG.STATE_KEY);
+            if (!raw) return null;
+            const parsed = JSON.parse(raw);
+            if (typeof parsed === 'string') return parsed;
+            return parsed?.id || null;
+        } catch (e) { return null; }
     })();
 
-    let _searchResults = [];
-    let _searchQuery = '';
-    let _searching = false;
     let _audio = null;
     let _playing = false;
     let _volume = 0.8;
+    let _filterGenre = 'all';
+    let _filterCountry = 'all';
 
     // ═══════════════════════════════════════════════════════════
     //  УТИЛИТЫ
@@ -83,7 +244,7 @@
 
     function saveCurrent() {
         try {
-            if (_current) localStorage.setItem(CFG.STATE_KEY, JSON.stringify(_current));
+            if (_currentId) localStorage.setItem(CFG.STATE_KEY, JSON.stringify(_currentId));
             else localStorage.removeItem(CFG.STATE_KEY);
         } catch (e) {}
     }
@@ -93,17 +254,29 @@
         try { localStorage.setItem(CFG.EXPANDED_KEY, _expanded ? '1' : '0'); } catch (e) {}
     }
 
-    function stationKey(s) {
-        return s.stationuuid || s.url_resolved || s.name;
+    function getStationById(id) {
+        return STATIONS.find(s => s.id === id) || null;
     }
 
-    function isFavorite(s) {
-        const k = stationKey(s);
-        return _favorites.some(f => stationKey(f) === k);
+    function getCurrentStation() {
+        return _currentId ? getStationById(_currentId) : null;
+    }
+
+    function isFavorite(id) {
+        return _favorites.includes(id);
+    }
+
+    function toggleFavorite(id) {
+        if (isFavorite(id)) {
+            _favorites = _favorites.filter(x => x !== id);
+        } else {
+            _favorites.push(id);
+        }
+        saveFavorites();
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ПЛЕЕР (глобальный <audio>, один на всё приложение)
+    //  ПЛЕЕР
     // ═══════════════════════════════════════════════════════════
     function ensureAudio() {
         if (_audio) return _audio;
@@ -111,52 +284,44 @@
         _audio.id = 'radioWidgetAudio';
         _audio.preload = 'none';
         _audio.volume = _volume;
-        _audio.crossOrigin = 'anonymous';
         _audio.style.display = 'none';
         document.body.appendChild(_audio);
 
         _audio.addEventListener('playing', () => {
             _playing = true;
             renderRadioCard();
-            log('▶️ Играет:', _current?.name);
         });
         _audio.addEventListener('pause', () => {
             _playing = false;
             renderRadioCard();
         });
-        _audio.addEventListener('waiting', () => {
-            log('⏳ Буферизация…');
-        });
-        _audio.addEventListener('error', (e) => {
+        _audio.addEventListener('error', () => {
             _playing = false;
             warn('Ошибка потока:', _audio.src);
             if (typeof showToast === 'function') showToast('❌ Не удалось воспроизвести', 2500);
             renderRadioCard();
         });
-
         return _audio;
     }
 
     async function playStation(station) {
-        if (!station || !station.url_resolved) return;
-
-        // Mixed Content: только HTTPS
-        if (!station.url_resolved.startsWith('https://')) {
-            if (typeof showToast === 'function') showToast('⚠️ Станция доступна только по HTTP', 2500);
+        if (!station || !station.url) return;
+        if (!station.url.startsWith('https://')) {
+            if (typeof showToast === 'function') showToast('⚠️ Станция только по HTTP', 2500);
             return;
         }
 
         const audio = ensureAudio();
-        _current = station;
+        _currentId = station.id;
         saveCurrent();
 
         try {
-            audio.src = station.url_resolved;
+            audio.src = station.url;
             audio.load();
             await audio.play();
             _playing = true;
         } catch (e) {
-            warn('play() не удался:', e.message);
+            warn('play() ошибка:', e.message);
             _playing = false;
             if (typeof showToast === 'function') showToast('❌ Поток не запустился', 2000);
         }
@@ -170,14 +335,16 @@
     }
 
     function togglePlay() {
-        if (!_current) {
-            // Ничего не выбрано — включаем первую из избранного
-            if (_favorites.length > 0) playStation(_favorites[0]);
-            else if (typeof showToast === 'function') showToast('📻 Сначала выбери станцию', 2000);
+        const cur = getCurrentStation();
+        if (!cur) {
+            // Нет текущей — берём первую из избранного или первую из списка
+            const firstFav = _favorites[0] ? getStationById(_favorites[0]) : null;
+            if (firstFav) playStation(firstFav);
+            else if (STATIONS[0]) playStation(STATIONS[0]);
             return;
         }
         if (_playing) pauseStation();
-        else playStation(_current);
+        else playStation(cur);
     }
 
     function setVolume(v) {
@@ -186,82 +353,33 @@
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ПОИСК ЧЕРЕЗ RADIO BROWSER
+    //  ФИЛЬТРАЦИЯ
     // ═══════════════════════════════════════════════════════════
-    async function searchStations(query) {
-        const q = (query || '').trim();
-        if (!q) return [];
-
-        _searching = true;
-        renderRadioCard();
-
-        try {
-            const url = `${CFG.API_BASE}/json/stations/search?` +
-                `name=${encodeURIComponent(q)}` +
-                `&limit=${CFG.SEARCH_LIMIT}` +
-                `&order=clickcount` +
-                `&reverse=true` +
-                `&hidebroken=true` +
-                `&is_https=true`;
-
-            const res = await fetch(url, {
-                headers: { 'User-Agent': 'SMSChatWidget/1.0' },
-            });
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            const data = await res.json();
-
-            // Фильтр: только HTTPS-потоки с валидным url_resolved
-            const filtered = (Array.isArray(data) ? data : [])
-                .filter(s => s.url_resolved && s.url_resolved.startsWith('https://'))
-                .map(s => ({
-                    stationuuid: s.stationuuid,
-                    name: s.name,
-                    url_resolved: s.url_resolved,
-                    favicon: s.favicon,
-                    country: s.country,
-                    countrycode: s.countrycode,
-                    tags: s.tags,
-                    codec: s.codec,
-                    bitrate: s.bitrate,
-                }));
-
-            log('Найдено:', filtered.length, 'из', data.length);
-            return filtered;
-        } catch (e) {
-            warn('Поиск не удался:', e.message);
-            if (typeof showToast === 'function') showToast('❌ Поиск недоступен', 2000);
-            return [];
-        } finally {
-            _searching = false;
-        }
+    function getFilteredStations() {
+        return STATIONS.filter(s => {
+            if (_filterGenre !== 'all' && s.genre !== _filterGenre) return false;
+            if (_filterCountry !== 'all' && s.country !== _filterCountry) return false;
+            return true;
+        });
     }
 
-    async function findDefaultStation(nameQuery) {
-        const results = await searchStations(nameQuery);
-        return results[0] || null;
+    function getAllGenres() {
+        const set = new Set();
+        STATIONS.forEach(s => s.genre && set.add(s.genre));
+        return ['all', ...Array.from(set).sort()];
     }
 
-    async function seedDefaultsIfEmpty() {
-        if (_favorites.length > 0) return;
-        log('Избранное пусто — загружаю станции по умолчанию…');
-        for (const def of DEFAULT_STATIONS) {
-            try {
-                const st = await findDefaultStation(def.search);
-                if (st && !isFavorite(st)) {
-                    _favorites.push(st);
-                    saveFavorites();
-                    log('Добавлена по умолчанию:', st.name);
-                }
-            } catch (e) {}
-        }
-        if (_favorites.length > 0) renderRadioCard();
+    function getAllCountries() {
+        const set = new Set();
+        STATIONS.forEach(s => s.country && set.add(s.country));
+        return ['all', ...Array.from(set).sort()];
     }
 
     // ═══════════════════════════════════════════════════════════
     //  HTML КАРТОЧКИ
     // ═══════════════════════════════════════════════════════════
     function buildRadioCardHTML() {
-        const cur = _current;
+        const cur = getCurrentStation();
         const curName = cur ? cur.name : 'Не выбрано';
         const status = _playing ? '▶️ Играет' : (cur ? '⏸ Пауза' : '—');
 
@@ -282,69 +400,71 @@
         // ─── Развёрнутое тело ───
         let expandedBody = '';
         if (_expanded) {
-            // Избранное
-            const favHTML = _favorites.length === 0
-                ? '<div class="wc-radio-empty">Пока пусто. Найди станцию ниже и нажми ⭐</div>'
-                : _favorites.map(s => `
-                    <div class="wc-radio-item ${cur && stationKey(cur) === stationKey(s) ? 'active' : ''}"
-                         data-station-key="${escapeHtmlSafe(stationKey(s))}">
+            // ─── Избранное ───
+            const favStations = _favorites.map(getStationById).filter(Boolean);
+            const favHTML = favStations.length === 0
+                ? '<div class="wc-radio-empty">Пока пусто. Нажми ⭐ у станции ниже</div>'
+                : favStations.map(s => `
+                    <div class="wc-radio-item ${_currentId === s.id ? 'active' : ''}">
+                        <button class="wc-radio-mini-btn" data-radio-action="play" data-id="${escapeHtmlSafe(s.id)}">▶️</button>
                         <span class="wc-radio-item-name">${escapeHtmlSafe(s.name)}</span>
-                        <span class="wc-radio-item-tag">${escapeHtmlSafe((s.tags || '').split(',')[0] || s.country || '')}</span>
-                        <button class="wc-radio-mini-btn" data-radio-action="play-fav" data-key="${escapeHtmlSafe(stationKey(s))}">▶️</button>
-                        <button class="wc-radio-mini-btn danger" data-radio-action="remove-fav" data-key="${escapeHtmlSafe(stationKey(s))}">✕</button>
+                        <span class="wc-radio-item-tag">${escapeHtmlSafe(s.country)} · ${escapeHtmlSafe(s.genre)}</span>
+                        <button class="wc-radio-mini-btn starred" data-radio-action="unfav" data-id="${escapeHtmlSafe(s.id)}">★</button>
                     </div>
                 `).join('');
 
-            // Результаты поиска
-            let searchHTML = '';
-            if (_searching) {
-                searchHTML = '<div class="wc-radio-empty">🔎 Ищу…</div>';
-            } else if (_searchResults.length > 0) {
-                searchHTML = _searchResults.map(s => {
-                    const inFav = isFavorite(s);
-                    return `
-                        <div class="wc-radio-item">
-                            <span class="wc-radio-item-name">${escapeHtmlSafe(s.name)}</span>
-                            <span class="wc-radio-item-tag">${escapeHtmlSafe(s.countrycode || '')} ${s.bitrate ? '· ' + s.bitrate + 'k' : ''}</span>
-                            <button class="wc-radio-mini-btn" data-radio-action="play-search" data-key="${escapeHtmlSafe(stationKey(s))}">▶️</button>
-                            <button class="wc-radio-mini-btn ${inFav ? 'starred' : ''}"
-                                    data-radio-action="${inFav ? 'remove-fav' : 'add-fav'}"
-                                    data-key="${escapeHtmlSafe(stationKey(s))}">
-                                ${inFav ? '★' : '⭐'}
-                            </button>
-                        </div>
-                    `;
-                }).join('');
-            } else if (_searchQuery) {
-                searchHTML = '<div class="wc-radio-empty">Ничего не найдено</div>';
-            }
+            // ─── Фильтры ───
+            const genres = getAllGenres();
+            const countries = getAllCountries();
+
+            const genreOpts = genres.map(g =>
+                `<option value="${escapeHtmlSafe(g)}" ${_filterGenre === g ? 'selected' : ''}>${g === 'all' ? 'Все жанры' : escapeHtmlSafe(g)}</option>`
+            ).join('');
+
+            const countryOpts = countries.map(c =>
+                `<option value="${escapeHtmlSafe(c)}" ${_filterCountry === c ? 'selected' : ''}>${c === 'all' ? 'Все страны' : escapeHtmlSafe(c)}</option>`
+            ).join('');
+
+            // ─── Список станций ───
+            const filtered = getFilteredStations();
+            const listHTML = filtered.length === 0
+                ? '<div class="wc-radio-empty">Ничего не найдено</div>'
+                : filtered.map(s => `
+                    <div class="wc-radio-item ${_currentId === s.id ? 'active' : ''}">
+                        <button class="wc-radio-mini-btn" data-radio-action="play" data-id="${escapeHtmlSafe(s.id)}">▶️</button>
+                        <span class="wc-radio-item-name">
+                            <span class="wc-radio-flag">${escapeHtmlSafe(s.country)}</span>
+                            ${escapeHtmlSafe(s.name)}
+                        </span>
+                        <span class="wc-radio-item-tag">${escapeHtmlSafe(s.genre)}</span>
+                        <button class="wc-radio-mini-btn ${isFavorite(s.id) ? 'starred' : ''}"
+                                data-radio-action="${isFavorite(s.id) ? 'unfav' : 'fav'}"
+                                data-id="${escapeHtmlSafe(s.id)}">
+                            ${isFavorite(s.id) ? '★' : '⭐'}
+                        </button>
+                    </div>
+                `).join('');
 
             expandedBody = `
-                <div class="wc-radio-search">
-                    <input type="text" class="wc-radio-input"
-                           placeholder="Поиск станции…"
-                           value="${escapeHtmlSafe(_searchQuery)}"
-                           data-radio-input>
-                    <button class="wc-radio-search-btn" data-radio-action="search">🔍</button>
-                </div>
-
                 <div class="wc-radio-section">
-                    <div class="wc-radio-section-title">⭐ Избранное</div>
+                    <div class="wc-radio-section-title">⭐ Избранное (${favStations.length})</div>
                     <div class="wc-radio-list">${favHTML}</div>
                 </div>
 
-                ${_searchResults.length > 0 || _searchQuery || _searching ? `
                 <div class="wc-radio-section">
-                    <div class="wc-radio-section-title">🔎 Результаты</div>
-                    <div class="wc-radio-list">${searchHTML}</div>
+                    <div class="wc-radio-section-title">🎵 Все станции (${filtered.length} из ${STATIONS.length})</div>
+                    <div class="wc-radio-filters">
+                        <select class="wc-radio-select" data-radio-filter="genre">${genreOpts}</select>
+                        <select class="wc-radio-select" data-radio-filter="country">${countryOpts}</select>
+                    </div>
+                    <div class="wc-radio-list wc-radio-list-scroll">${listHTML}</div>
                 </div>
-                ` : ''}
             `;
         }
 
         const hint = _expanded
             ? '<div class="wc-hint">👆 Тап по пустому месту — свернуть</div>'
-            : '<div class="wc-hint">👆 Поиск станций</div>';
+            : '<div class="wc-hint">👆 Список станций</div>';
 
         return `
             <div class="widget-card radio ${_expanded ? 'expanded' : ''}" data-widget-id="radio">
@@ -352,7 +472,7 @@
                     <div class="wc-icon">📻</div>
                     <div class="wc-title-block">
                         <div class="wc-title">Радио</div>
-                        <div class="wc-subtitle">${_favorites.length} в избранном</div>
+                        <div class="wc-subtitle">${_favorites.length} в избранном · ${STATIONS.length} станций</div>
                     </div>
                 </div>
                 <div class="wc-body wc-radio-body">
@@ -365,15 +485,8 @@
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ВСТАВКА В #chatsList (патч innerHTML)
+    //  ПАТЧ #chatsList.innerHTML
     // ═══════════════════════════════════════════════════════════
-    let _innerHTMLPatched = false;
-
-    function buildWidgetHTMLIfAdded() {
-        if (!isRadioAdded()) return '';
-        return buildRadioCardHTML();
-    }
-
     function patchChatsListInnerHTML() {
         const container = document.getElementById('chatsList');
         if (!container) { setTimeout(patchChatsListInnerHTML, 500); return; }
@@ -382,33 +495,25 @@
         const originalDescriptor = Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML');
         if (!originalDescriptor) return;
 
-        // Сохраняем предыдущий патч (от weather-модуля), если был
-        const prevSetter = container.innerHTML !== undefined
-            ? Object.getOwnPropertyDescriptor(container, 'innerHTML')?.set
-            : null;
-
-        const _patchedSetter = function(value) {
-            if (this === container && isRadioAdded()) {
-                const radioHtml = buildRadioCardHTML();
-                // Если weather уже вставил свою часть — добавим после неё
-                value = radioHtml + value;
-            }
-            return originalDescriptor.set.call(this, value);
-        };
-
-        const _patchedGetter = function() {
-            return originalDescriptor.get.call(this);
-        };
-
         try {
             Object.defineProperty(container, 'innerHTML', {
-                get: _patchedGetter,
-                set: _patchedSetter,
+                get() {
+                    return originalDescriptor.get.call(this);
+                },
+                set(value) {
+                    if (isRadioAdded()) {
+                        // Проверяем: не вставили ли мы уже радио в этот HTML?
+                        if (typeof value === 'string' && value.indexOf('data-widget-id="radio"') === -1) {
+                            const radioHtml = buildRadioCardHTML();
+                            value = radioHtml + value;
+                        }
+                    }
+                    return originalDescriptor.set.call(this, value);
+                },
                 configurable: true,
             });
             container._radioPatched = true;
-            _innerHTMLPatched = true;
-            log('✅ innerHTML #chatsList пропатчен (radio)');
+            log('✅ innerHTML #chatsList пропатчен (radio v2)');
         } catch (e) {
             warn('Патч innerHTML не удался:', e);
         }
@@ -418,7 +523,7 @@
     setTimeout(patchChatsListInnerHTML, 2500);
 
     // ═══════════════════════════════════════════════════════════
-    //  РЕРЕНДЕР ТОЛЬКО КАРТОЧКИ РАДИО
+    //  РЕРЕНДЕР ТОЛЬКО КАРТОЧКИ
     // ═══════════════════════════════════════════════════════════
     function renderRadioCard() {
         const container = document.getElementById('chatsList');
@@ -432,39 +537,26 @@
         const newCard = temp.firstElementChild;
         if (!newCard) return;
 
-        // Сохраняем фокус на инпуте, если он был
-        const oldInput = oldCard.querySelector('[data-radio-input]');
-        const wasFocused = oldInput && document.activeElement === oldInput;
-        const selStart = wasFocused ? oldInput.selectionStart : 0;
-        const selEnd = wasFocused ? oldInput.selectionEnd : 0;
+        // Сохраняем позицию скролла в списке станций
+        const oldScroll = oldCard.querySelector('.wc-radio-list-scroll');
+        const scrollTop = oldScroll ? oldScroll.scrollTop : 0;
 
         oldCard.replaceWith(newCard);
 
-        if (wasFocused) {
-            const newInput = newCard.querySelector('[data-radio-input]');
-            if (newInput) {
-                newInput.focus();
-                try { newInput.setSelectionRange(selStart, selEnd); } catch (e) {}
-            }
-        }
+        const newScroll = newCard.querySelector('.wc-radio-list-scroll');
+        if (newScroll && scrollTop > 0) newScroll.scrollTop = scrollTop;
     }
 
     // ═══════════════════════════════════════════════════════════
     //  ОБРАБОТЧИКИ
     // ═══════════════════════════════════════════════════════════
-    function findStationByKey(key) {
-        return _favorites.find(s => stationKey(s) === key)
-            || _searchResults.find(s => stationKey(s) === key)
-            || null;
-    }
-
     function installHandlers() {
         const container = document.getElementById('chatsList');
         if (!container) { setTimeout(installHandlers, 500); return; }
         if (container._radioHandlers) return;
         container._radioHandlers = true;
 
-        // ─── Долгое нажатие (удалить виджет) ───
+        // ─── Долгое нажатие ───
         let pressTimer = null, pressTarget = null, fired = false;
         let startX = 0, startY = 0;
 
@@ -495,91 +587,71 @@
             const card = e.target.closest('.widget-card.radio');
             if (!card) return;
 
-            // Кнопка действия
+            // Кнопки
             const actionEl = e.target.closest('[data-radio-action]');
             if (actionEl) {
                 e.stopPropagation();
                 const action = actionEl.dataset.radioAction;
-                const key = actionEl.dataset.key;
+                const id = actionEl.dataset.id;
 
                 switch (action) {
                     case 'toggle': togglePlay(); return;
                     case 'clear':
-                        _current = null; saveCurrent();
+                        _currentId = null; saveCurrent();
                         if (_audio) { _audio.pause(); _audio.src = ''; }
                         _playing = false;
                         renderRadioCard();
                         return;
-                    case 'play-fav':
-                    case 'play-search': {
-                        const st = findStationByKey(key);
+                    case 'play': {
+                        const st = getStationById(id);
                         if (st) playStation(st);
                         return;
                     }
-                    case 'add-fav': {
-                        const st = findStationByKey(key);
-                        if (st && !isFavorite(st)) {
-                            _favorites.push(st);
-                            saveFavorites();
-                            if (typeof showToast === 'function') showToast('⭐ Добавлено в избранное', 1500);
-                            renderRadioCard();
-                        }
+                    case 'fav': {
+                        toggleFavorite(id);
+                        if (typeof showToast === 'function') showToast('⭐ Добавлено', 1200);
+                        renderRadioCard();
                         return;
                     }
-                    case 'remove-fav': {
-                        const st = findStationByKey(key);
-                        if (st) {
-                            _favorites = _favorites.filter(f => stationKey(f) !== stationKey(st));
-                            saveFavorites();
-                            if (typeof showToast === 'function') showToast('Убрано из избранного', 1500);
-                            renderRadioCard();
-                        }
-                        return;
-                    }
-                    case 'search': {
-                        const input = card.querySelector('[data-radio-input]');
-                        const q = input ? input.value : '';
-                        _searchQuery = q;
-                        searchStations(q).then(res => {
-                            _searchResults = res;
-                            renderRadioCard();
-                        });
+                    case 'unfav': {
+                        toggleFavorite(id);
+                        if (typeof showToast === 'function') showToast('Убрано', 1200);
+                        renderRadioCard();
                         return;
                     }
                 }
                 return;
             }
 
-            // Долгое нажатие сработало — игнорируем клик
+            // Селекты фильтров
+            const filterEl = e.target.closest('[data-radio-filter]');
+            if (filterEl) return; // даём браузеру обработать
+
             if (fired) { fired = false; return; }
 
-            // Клик по инпуту / внутри развёрнутого контента — не сворачиваем
-            if (e.target.closest('.wc-radio-search, .wc-radio-list, .wc-radio-section')) return;
-            if (e.target.closest('input, button')) return;
+            // Клик по развёрнутому контенту — не сворачиваем
+            if (e.target.closest('.wc-radio-section')) return;
+            if (e.target.closest('button, select, input')) return;
 
-            // Клик по телу — развернуть/свернуть
             setExpanded(!_expanded);
             renderRadioCard();
         });
 
-        // ─── Enter в поиске ───
-        container.addEventListener('keydown', (e) => {
-            if (!e.target.matches('[data-radio-input]')) return;
-            if (e.key === 'Enter') {
-                e.preventDefault();
-                _searchQuery = e.target.value;
-                searchStations(_searchQuery).then(res => {
-                    _searchResults = res;
-                    renderRadioCard();
-                });
-            }
+        // ─── Смена фильтров ───
+        container.addEventListener('change', (e) => {
+            const sel = e.target.closest('[data-radio-filter]');
+            if (!sel) return;
+            const type = sel.dataset.radioFilter;
+            if (type === 'genre') _filterGenre = sel.value;
+            if (type === 'country') _filterCountry = sel.value;
+            renderRadioCard();
         });
 
-        // ─── Долгое нажатие (touch) ───
+        // ─── Долгое нажатие touch ───
         container.addEventListener('touchstart', (e) => {
             const card = e.target.closest('.widget-card.radio');
             if (!card) return;
-            if (e.target.closest('input, button')) return;
+            if (e.target.closest('button, select, input')) return;
             const t = e.touches[0];
             startX = t.clientX; startY = t.clientY;
             startPress(card);
@@ -596,12 +668,12 @@
         container.addEventListener('touchend', cancelPress);
         container.addEventListener('touchcancel', cancelPress);
 
-        // ─── Долгое нажатие (mouse) ───
+        // ─── Долгое нажатие mouse ───
         container.addEventListener('mousedown', (e) => {
             if (e.button !== 0) return;
             const card = e.target.closest('.widget-card.radio');
             if (!card) return;
-            if (e.target.closest('input, button')) return;
+            if (e.target.closest('button, select, input')) return;
             startX = e.clientX; startY = e.clientY;
             startPress(card);
         });
@@ -611,7 +683,7 @@
         container.addEventListener('contextmenu', (e) => {
             const card = e.target.closest('.widget-card.radio');
             if (!card) return;
-            if (e.target.closest('input')) return;
+            if (e.target.closest('select, input')) return;
             e.preventDefault();
             e.stopPropagation();
             if (confirm('Удалить виджет «Радио»?')) removeRadioWidget();
@@ -623,7 +695,7 @@
     installHandlers();
 
     // ═══════════════════════════════════════════════════════════
-    //  ДОБАВЛЕНИЕ / УДАЛЕНИЕ ВИДЖЕТА
+    //  ДОБАВЛЕНИЕ / УДАЛЕНИЕ
     // ═══════════════════════════════════════════════════════════
     function addRadioWidget() {
         try {
@@ -637,17 +709,14 @@
             list.push({ id: 'radio', addedAt: Date.now() });
             localStorage.setItem(CFG.WIDGET_KEY, JSON.stringify(list));
         } catch (e) {
-            warn('Не удалось сохранить виджет:', e);
+            warn('Не удалось сохранить:', e);
             return false;
         }
 
         if (typeof showToast === 'function') showToast('✅ Виджет «Радио» добавлен', 2000);
         if (typeof soundManager !== 'undefined') { try { soundManager.play('send'); } catch (e) {} }
 
-        // Загружаем дефолтные станции и рендерим
-        seedDefaultsIfEmpty();
-        rerenderChatsList();
-
+        if (typeof renderChatsList === 'function') renderChatsList();
         return true;
     }
 
@@ -660,12 +729,11 @@
             localStorage.setItem(CFG.WIDGET_KEY, JSON.stringify(list));
         } catch (e) {}
 
-        // Останавливаем плеер
         if (_audio) {
             try { _audio.pause(); _audio.src = ''; } catch (e) {}
         }
         _playing = false;
-        _current = null;
+        _currentId = null;
         saveCurrent();
 
         if (typeof showToast === 'function') showToast('🗑️ Виджет «Радио» удалён', 1500);
@@ -675,21 +743,14 @@
         document.querySelectorAll('.widget-card.radio').forEach(el => el.remove());
     }
 
-    function rerenderChatsList() {
-        if (typeof renderChatsList === 'function') renderChatsList();
-    }
-
     // ═══════════════════════════════════════════════════════════
     //  СТИЛИ
     // ═══════════════════════════════════════════════════════════
     function ensureStyles() {
-        if (document.getElementById('radioWidgetStylesV1')) return;
+        if (document.getElementById('radioWidgetStylesV2')) return;
         const style = document.createElement('style');
-        style.id = 'radioWidgetStylesV1';
+        style.id = 'radioWidgetStylesV2';
         style.textContent = `
-            /* ─── Общие стили карточки берём из weather v7 ─── */
-            /* Тут только специфика радио */
-
             .widget-card.radio .wc-radio-body {
                 display: flex;
                 align-items: center;
@@ -723,8 +784,8 @@
                 width: 40px;
                 height: 40px;
                 border-radius: 10px;
-                border: 1px solid rgba(255, 255, 255, 0.15);
-                background: rgba(255, 255, 255, 0.06);
+                border: 1px solid rgba(255,255,255,0.15);
+                background: rgba(255,255,255,0.06);
                 color: #fff;
                 font-size: 18px;
                 cursor: pointer;
@@ -735,53 +796,12 @@
                 -webkit-tap-highlight-color: transparent;
             }
             .widget-card.radio .wc-radio-btn:hover {
-                background: rgba(108, 92, 231, 0.25);
-                border-color: rgba(108, 92, 231, 0.5);
+                background: rgba(108,92,231,0.25);
+                border-color: rgba(108,92,231,0.5);
             }
             .widget-card.radio .wc-radio-play {
                 background: linear-gradient(135deg, #6c5ce7, #00b894);
                 border-color: transparent;
-            }
-
-            /* ─── Развёрнутое: поиск ─── */
-            .widget-card.radio .wc-radio-search {
-                display: flex;
-                gap: 6px;
-                margin-top: 12px;
-                padding-top: 12px;
-                border-top: 1px solid rgba(255, 255, 255, 0.08);
-            }
-            .widget-card.radio .wc-radio-input {
-                flex: 1;
-                min-width: 0;
-                padding: 10px 12px;
-                border-radius: 10px;
-                border: 1px solid rgba(255, 255, 255, 0.12);
-                background: rgba(0, 0, 0, 0.25);
-                color: #fff;
-                font-size: 13px;
-                outline: none;
-                transition: border-color 0.2s;
-            }
-            .widget-card.radio .wc-radio-input:focus {
-                border-color: rgba(108, 92, 231, 0.6);
-            }
-            .widget-card.radio .wc-radio-input::placeholder {
-                color: rgba(255, 255, 255, 0.35);
-            }
-            .widget-card.radio .wc-radio-search-btn {
-                width: 42px;
-                border-radius: 10px;
-                border: 1px solid rgba(108, 92, 231, 0.4);
-                background: rgba(108, 92, 231, 0.2);
-                color: #fff;
-                font-size: 16px;
-                cursor: pointer;
-                flex-shrink: 0;
-                transition: background 0.2s;
-            }
-            .widget-card.radio .wc-radio-search-btn:hover {
-                background: rgba(108, 92, 231, 0.4);
             }
 
             /* ─── Секции ─── */
@@ -801,26 +821,73 @@
                 flex-direction: column;
                 gap: 4px;
             }
+            .widget-card.radio .wc-radio-list-scroll {
+                max-height: 340px;
+                overflow-y: auto;
+                padding-right: 2px;
+                scrollbar-width: thin;
+                scrollbar-color: rgba(108,92,231,0.5) transparent;
+            }
+            .widget-card.radio .wc-radio-list-scroll::-webkit-scrollbar {
+                width: 4px;
+            }
+            .widget-card.radio .wc-radio-list-scroll::-webkit-scrollbar-track {
+                background: transparent;
+            }
+            .widget-card.radio .wc-radio-list-scroll::-webkit-scrollbar-thumb {
+                background: rgba(108,92,231,0.5);
+                border-radius: 2px;
+            }
+
+            /* ─── Фильтры ─── */
+            .widget-card.radio .wc-radio-filters {
+                display: flex;
+                gap: 6px;
+                margin-bottom: 8px;
+            }
+            .widget-card.radio .wc-radio-select {
+                flex: 1;
+                min-width: 0;
+                padding: 8px 10px;
+                border-radius: 10px;
+                border: 1px solid rgba(255,255,255,0.12);
+                background: rgba(0,0,0,0.35);
+                color: #fff;
+                font-size: 12px;
+                outline: none;
+                cursor: pointer;
+                -webkit-appearance: none;
+                appearance: none;
+                background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath fill='%23a78bfa' d='M0 0l5 6 5-6z'/%3E%3C/svg%3E");
+                background-repeat: no-repeat;
+                background-position: right 8px center;
+                padding-right: 24px;
+            }
+            .widget-card.radio .wc-radio-select:focus {
+                border-color: rgba(108,92,231,0.6);
+            }
+            .widget-card.radio .wc-radio-select option {
+                background: #1a1a2e;
+                color: #fff;
+            }
 
             /* ─── Строка станции ─── */
             .widget-card.radio .wc-radio-item {
                 display: flex;
                 align-items: center;
-                gap: 8px;
-                padding: 8px 10px;
+                gap: 6px;
+                padding: 7px 8px;
                 border-radius: 10px;
-                background: rgba(255, 255, 255, 0.03);
-                border: 1px solid rgba(255, 255, 255, 0.05);
+                background: rgba(255,255,255,0.03);
+                border: 1px solid rgba(255,255,255,0.05);
                 transition: background 0.15s, border-color 0.15s;
             }
             .widget-card.radio .wc-radio-item:hover {
-                background: rgba(255, 255, 255, 0.06);
+                background: rgba(255,255,255,0.06);
             }
             .widget-card.radio .wc-radio-item.active {
-                background: linear-gradient(135deg,
-                    rgba(108, 92, 231, 0.22),
-                    rgba(0, 184, 148, 0.12));
-                border-color: rgba(108, 92, 231, 0.45);
+                background: linear-gradient(135deg, rgba(108,92,231,0.22), rgba(0,184,148,0.12));
+                border-color: rgba(108,92,231,0.45);
             }
             .widget-card.radio .wc-radio-item-name {
                 flex: 1;
@@ -832,11 +899,15 @@
                 overflow: hidden;
                 text-overflow: ellipsis;
             }
+            .widget-card.radio .wc-radio-flag {
+                margin-right: 4px;
+                font-size: 13px;
+            }
             .widget-card.radio .wc-radio-item-tag {
                 font-size: 10px;
                 color: #888;
                 flex-shrink: 0;
-                max-width: 80px;
+                max-width: 90px;
                 overflow: hidden;
                 text-overflow: ellipsis;
                 white-space: nowrap;
@@ -845,8 +916,8 @@
                 width: 30px;
                 height: 30px;
                 border-radius: 8px;
-                border: 1px solid rgba(255, 255, 255, 0.1);
-                background: rgba(255, 255, 255, 0.04);
+                border: 1px solid rgba(255,255,255,0.1);
+                background: rgba(255,255,255,0.04);
                 color: #fff;
                 font-size: 13px;
                 cursor: pointer;
@@ -858,17 +929,17 @@
                 -webkit-tap-highlight-color: transparent;
             }
             .widget-card.radio .wc-radio-mini-btn:hover {
-                background: rgba(108, 92, 231, 0.3);
-                border-color: rgba(108, 92, 231, 0.5);
+                background: rgba(108,92,231,0.3);
+                border-color: rgba(108,92,231,0.5);
             }
             .widget-card.radio .wc-radio-mini-btn.starred {
-                background: rgba(254, 202, 87, 0.2);
-                border-color: rgba(254, 202, 87, 0.5);
+                background: rgba(254,202,87,0.2);
+                border-color: rgba(254,202,87,0.5);
                 color: #feca57;
             }
             .widget-card.radio .wc-radio-mini-btn.danger:hover {
-                background: rgba(255, 107, 107, 0.25);
-                border-color: rgba(255, 107, 107, 0.5);
+                background: rgba(255,107,107,0.25);
+                border-color: rgba(255,107,107,0.5);
                 color: #ff6b6b;
             }
             .widget-card.radio .wc-radio-empty {
@@ -883,10 +954,8 @@
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ПУНКТ В МОДАЛКЕ ВИДЖЕТОВ
+    //  МОДАЛКА ВИДЖЕТОВ
     // ═══════════════════════════════════════════════════════════
-    //  Если weather-модуль уже создал модалку — просто добавим
-    //  пункт «Радио» в список. Иначе создадим свой DOM.
     function injectRadioIntoPicker() {
         const list = document.getElementById('wpWidgetsList');
         if (!list) return;
@@ -900,7 +969,7 @@
             <div class="wp-widget-icon">📻</div>
             <div class="wp-widget-info">
                 <div class="wp-widget-name">Радио</div>
-                <div class="wp-widget-desc">Бесплатные станции, поиск, избранное</div>
+                <div class="wp-widget-desc">${STATIONS.length} станций · избранное · фильтры</div>
             </div>
             <div class="wp-widget-status">${isAdded ? '✓ Добавлен' : '+ Добавить'}</div>
         `;
@@ -921,11 +990,8 @@
         list.appendChild(el);
     }
 
-    // Следим за появлением модалки виджетов — weather-модуль её создаёт
     const pickerObserver = new MutationObserver(() => {
-        if (document.getElementById('wpWidgetsList')) {
-            injectRadioIntoPicker();
-        }
+        if (document.getElementById('wpWidgetsList')) injectRadioIntoPicker();
     });
     pickerObserver.observe(document.body, { childList: true, subtree: true });
 
@@ -935,12 +1001,8 @@
     ensureStyles();
     ensureAudio();
 
-    // Если виджет уже добавлен — при старте загружаем дефолты (если пусто)
     if (isRadioAdded()) {
-        setTimeout(() => {
-            seedDefaultsIfEmpty();
-            renderRadioCard();
-        }, 1500);
+        setTimeout(() => renderRadioCard(), 1500);
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -949,192 +1011,51 @@
     window.RadioWidget = {
         add: addRadioWidget,
         remove: removeRadioWidget,
-        play: (nameQuery) => {
-            searchStations(nameQuery).then(res => {
-                if (res[0]) playStation(res[0]);
-                else if (typeof showToast === 'function') showToast('❌ Станция не найдена', 2000);
-            });
+        play: (id) => {
+            const st = typeof id === 'string' ? getStationById(id) : id;
+            if (st) playStation(st);
+            else if (typeof showToast === 'function') showToast('❌ Станция не найдена', 2000);
+        },
+        playByName: (nameQuery) => {
+            const q = (nameQuery || '').toLowerCase();
+            const st = STATIONS.find(s => s.name.toLowerCase().includes(q));
+            if (st) playStation(st);
+            else if (typeof showToast === 'function') showToast('❌ Станция не найдена', 2000);
         },
         pause: pauseStation,
         toggle: togglePlay,
         volume: (v) => { setVolume(v); return _volume; },
-        search: async (q) => {
-            const res = await searchStations(q);
-            _searchResults = res;
-            _searchQuery = q;
-            renderRadioCard();
-            return res;
-        },
+        list: () => STATIONS.slice(),
         favorites: () => _favorites.slice(),
         clearFavorites: () => {
             _favorites = [];
             saveFavorites();
             renderRadioCard();
         },
-        seedDefaults: seedDefaultsIfEmpty,
+        filter: (genre, country) => {
+            if (genre !== undefined) _filterGenre = genre;
+            if (country !== undefined) _filterCountry = country;
+            renderRadioCard();
+        },
         debug: () => {
             const info = {
                 added: isRadioAdded(),
+                totalStations: STATIONS.length,
                 favorites: _favorites.length,
-                current: _current?.name || null,
+                current: getCurrentStation()?.name || null,
                 playing: _playing,
                 expanded: _expanded,
-                searchQuery: _searchQuery,
-                searchResults: _searchResults.length,
+                filterGenre: _filterGenre,
+                filterCountry: _filterCountry,
                 audioSrc: _audio?.src || null,
             };
-            console.log('=== RADIO WIDGET DEBUG ===');
+            console.log('=== RADIO WIDGET v2 DEBUG ===');
             console.table(info);
             return info;
         },
     };
 
-    console.log('📻 [Radio v1] Готово');
+    console.log('📻 [Radio v2] Готово ·', STATIONS.length, 'станций');
     console.log('Проверить: RadioWidget.debug()');
 
 })();
-
-// ═══════════════════════════════════════════════════════════
-//  ТОЧЕЧНЫЕ ОБНОВЛЕНИЯ (не пересобирают input, не сбрасывают клавиатуру)
-// ═══════════════════════════════════════════════════════════
-
-/** Полная перерисовка — только при первом рендере, развороте/сворачивании */
-function renderRadioCard() {
-    const container = document.getElementById('chatsList');
-    if (!container) return;
-    const oldCard = container.querySelector('.widget-card.radio');
-    if (!oldCard) return;
-
-    const newHtml = buildRadioCardHTML();
-    const temp = document.createElement('div');
-    temp.innerHTML = newHtml;
-    const newCard = temp.firstElementChild;
-    if (!newCard) return;
-
-    oldCard.replaceWith(newCard);
-}
-
-/** Обновить строку «сейчас играет» + кнопки play/pause/clear */
-function updateNowPlaying() {
-    const card = document.querySelector('.widget-card.radio');
-    if (!card) return;
-
-    const body = card.querySelector('.wc-radio-body');
-    if (!body) return;
-
-    const cur = _current;
-    const curName = cur ? cur.name : 'Не выбрано';
-    const status = _playing ? '▶️ Играет' : (cur ? '⏸ Пауза' : '—');
-
-    // Обновляем текст «сейчас играет»
-    const nameEl = body.querySelector('.wc-radio-now-name');
-    const statusEl = body.querySelector('.wc-radio-now-status');
-    if (nameEl) nameEl.textContent = curName;
-    if (statusEl) statusEl.textContent = status;
-
-    // Обновляем кнопку play/pause
-    const playBtn = body.querySelector('[data-radio-action="toggle"]');
-    if (playBtn) playBtn.textContent = _playing ? '⏸' : '▶️';
-
-    // Кнопка «clear» — есть/нет
-    const hasClear = !!body.querySelector('[data-radio-action="clear"]');
-    if (cur && !hasClear) {
-        const clearBtn = document.createElement('button');
-        clearBtn.className = 'wc-radio-btn';
-        clearBtn.dataset.radioAction = 'clear';
-        clearBtn.textContent = '✕';
-        body.querySelector('.wc-radio-controls').appendChild(clearBtn);
-    } else if (!cur && hasClear) {
-        body.querySelector('[data-radio-action="clear"]').remove();
-    }
-
-    // Подсветка активной станции в списке
-    card.querySelectorAll('.wc-radio-item').forEach(el => {
-        const key = el.dataset.stationKey;
-        if (!key) return;
-        const isActive = cur && stationKey(cur) === key;
-        el.classList.toggle('active', isActive);
-    });
-}
-
-/** Обновить только список избранного */
-function updateFavoritesList() {
-    const card = document.querySelector('.widget-card.radio');
-    if (!card) return;
-
-    const favSection = card.querySelector('.wc-radio-section:first-of-type .wc-radio-list');
-    if (!favSection) return;
-
-    if (_favorites.length === 0) {
-        favSection.innerHTML = '<div class="wc-radio-empty">Пока пусто. Найди станцию ниже и нажми ⭐</div>';
-        return;
-    }
-
-    const cur = _current;
-    favSection.innerHTML = _favorites.map(s => `
-        <div class="wc-radio-item ${cur && stationKey(cur) === stationKey(s) ? 'active' : ''}"
-             data-station-key="${escapeHtmlSafe(stationKey(s))}">
-            <span class="wc-radio-item-name">${escapeHtmlSafe(s.name)}</span>
-            <span class="wc-radio-item-tag">${escapeHtmlSafe((s.tags || '').split(',')[0] || s.country || '')}</span>
-            <button class="wc-radio-mini-btn" data-radio-action="play-fav" data-key="${escapeHtmlSafe(stationKey(s))}">▶️</button>
-            <button class="wc-radio-mini-btn danger" data-radio-action="remove-fav" data-key="${escapeHtmlSafe(stationKey(s))}">✕</button>
-        </div>
-    `).join('');
-}
-
-/** Обновить только блок результатов поиска */
-function updateSearchResults() {
-    const card = document.querySelector('.widget-card.radio');
-    if (!card) return;
-
-    // Находим или создаём секцию результатов
-    let resultsSection = card.querySelector('.wc-radio-section[data-radio-results]');
-
-    // Если результатов нет и запрос пуст — скрываем секцию
-    if (!_searchResults.length && !_searchQuery && !_searching) {
-        if (resultsSection) resultsSection.remove();
-        return;
-    }
-
-    // Если секции нет — создаём и вставляем после избранного
-    if (!resultsSection) {
-        resultsSection = document.createElement('div');
-        resultsSection.className = 'wc-radio-section';
-        resultsSection.dataset.radioResults = '1';
-        resultsSection.innerHTML = `
-            <div class="wc-radio-section-title">🔎 Результаты</div>
-            <div class="wc-radio-list"></div>
-        `;
-        const searchBlock = card.querySelector('.wc-radio-search');
-        if (searchBlock) searchBlock.after(resultsSection);
-    }
-
-    const listEl = resultsSection.querySelector('.wc-radio-list');
-    if (!listEl) return;
-
-    if (_searching) {
-        listEl.innerHTML = '<div class="wc-radio-empty">🔎 Ищу…</div>';
-        return;
-    }
-
-    if (_searchResults.length === 0 && _searchQuery) {
-        listEl.innerHTML = '<div class="wc-radio-empty">Ничего не найдено</div>';
-        return;
-    }
-
-    listEl.innerHTML = _searchResults.map(s => {
-        const inFav = isFavorite(s);
-        return `
-            <div class="wc-radio-item">
-                <span class="wc-radio-item-name">${escapeHtmlSafe(s.name)}</span>
-                <span class="wc-radio-item-tag">${escapeHtmlSafe(s.countrycode || '')} ${s.bitrate ? '· ' + s.bitrate + 'k' : ''}</span>
-                <button class="wc-radio-mini-btn" data-radio-action="play-search" data-key="${escapeHtmlSafe(stationKey(s))}">▶️</button>
-                <button class="wc-radio-mini-btn ${inFav ? 'starred' : ''}"
-                        data-radio-action="${inFav ? 'remove-fav' : 'add-fav'}"
-                        data-key="${escapeHtmlSafe(stationKey(s))}">
-                    ${inFav ? '★' : '⭐'}
-                </button>
-            </div>
-        `;
-    }).join('');
-}
