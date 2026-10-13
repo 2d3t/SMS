@@ -1,21 +1,23 @@
-
 // ═══════════════════════════════════════════════════════════════
-//  🧩 WIDGETS MODULE v6 — погода + прогноз + свайп по дням
+//  🧩 WIDGETS MODULE v7 — стабильная погода с прогнозом
 //  ─────────────────────────────────────────────────────────────
-//  Новое в v6:
-//   • Прогноз на 4 дня прямо в карточке (тап → развернуть)
-//   • Свайп влево/вправо по развёрнутой карточке = смена дня
-//   • Тап по дню в ленте = выбор дня
-//   • Точки-индикаторы + подсветка активного дня
-//   • Клавиши ← → на десктопе
-//   • Мягкие вибро-отклики на смене дня и на границах
-//   • Всё из кэша, без лишних запросов
+//  Что нового по сравнению с v6:
+//   • Убран свайп влево/вправо (все 4 дня и так видны)
+//   • Убрано дёрганье ячеек прогноза:
+//       – нет animation wcFadeIn
+//       – нет transform: scale на активной иконке
+//       – нет box-shadow на активном дне и точке
+//       – transition только на конкретные свойства
+//   • Фоновое обновление НЕ трогает DOM, если открыт прогноз
+//     (данные кэшируются тихо, UI подхватит при следующем тапе)
+//   • Оставлено: тап по дню, тап по карточке (развернуть/свернуть),
+//     долгое нажатие = удалить
 // ═══════════════════════════════════════════════════════════════
 
-(function installWidgetsModuleV6() {
+(function installWidgetsModuleV7() {
     'use strict';
 
-    console.log('🧩 [Widgets v6] Запуск…');
+    console.log('🧩 [Widgets v7] Запуск…');
 
     const CFG = {
         STORAGE_KEY: 'smschat_widgets',
@@ -23,13 +25,12 @@
         EXPANDED_KEY: 'smschat_weather_expanded',
         CACHE_TTL_MS: 30 * 60 * 1000,
         WEATHER_REFRESH_MS: 30 * 60 * 1000,
-        SWIPE_THRESHOLD: 50,
         LONG_PRESS_MS: 600,
         DEBUG: true,
     };
 
-    const log = (...a) => CFG.DEBUG && console.log('🧩 [Widgets v6]', ...a);
-    const warn = (...a) => console.warn('🧩 [Widgets v6]', ...a);
+    const log = (...a) => CFG.DEBUG && console.log('🧩 [Widgets v7]', ...a);
+    const warn = (...a) => console.warn('🧩 [Widgets v7]', ...a);
 
     const AVAILABLE_WIDGETS = [
         { id: 'weather', name: 'Погода', icon: '⛅', description: 'Текущая погода и прогноз на 4 дня' },
@@ -175,8 +176,6 @@
                 code: c.weather_code,
                 minTemp: d.temperature_2m_min?.[0],
                 maxTemp: d.temperature_2m_max?.[0],
-
-                // 🆕 Прогноз на 4 дня
                 forecast: (d.time || []).map((date, i) => ({
                     date,
                     code: d.weather_code?.[i],
@@ -404,7 +403,7 @@
         }
 
         const hint = _weatherExpanded
-            ? '<div class="wc-hint">👈 Свайп по дням · Тап — свернуть 👉</div>'
+            ? '<div class="wc-hint">👆 Тап — свернуть</div>'
             : '<div class="wc-hint">👆 Прогноз на 4 дня</div>';
 
         return `
@@ -485,11 +484,19 @@
                     (beforeData.temp !== afterData.temp ||
                      beforeData.code !== afterData.code);
 
-                if (wasSkeleton || changed) {
-                    log('Ререндер виджетов после загрузки погоды');
+                // 🎯 Если пользователь развернул прогноз и смотрит будущий день —
+                // НЕ трогаем DOM, чтобы не было дёрганья. Данные уже в кэше,
+                // UI подхватит их при следующем взаимодействии.
+                const userViewingForecast = _weatherExpanded && _weatherDayIndex > 0;
+
+                if (wasSkeleton) {
+                    log('Ререндер виджетов: был скелет');
+                    replaceWeatherCardInDom();
+                } else if (changed && !userViewingForecast) {
+                    log('Ререндер виджетов: данные изменились');
                     replaceWeatherCardInDom();
                 } else {
-                    log('Данные погоды актуальны, ререндер не нужен');
+                    log('Ререндер пропущен (пользователь смотрит прогноз / данные актуальны)');
                 }
 
                 return data;
@@ -625,8 +632,8 @@
     function installDelegatedHandlers() {
         const container = document.getElementById('chatsList');
         if (!container) { setTimeout(installDelegatedHandlers, 500); return; }
-        if (container._widgetsV6Handlers) return;
-        container._widgetsV6Handlers = true;
+        if (container._widgetsV7Handlers) return;
+        container._widgetsV7Handlers = true;
 
         // ─── Долгое нажатие (для удаления) ───
         let pressTimer = null, pressTarget = null, fired = false;
@@ -726,118 +733,7 @@
             }
         });
 
-        // ═══ СВАЙП ПО ДНЯМ (только для развёрнутой карточки) ═══
-        let swipeStartX = 0, swipeStartY = 0, swipeCard = null, swipeActive = false;
-
-        container.addEventListener('touchstart', (e) => {
-            const card = e.target.closest('.widget-card.weather.expanded');
-            if (!card) return;
-            if (e.touches.length !== 1) return;
-            const t = e.touches[0];
-            swipeStartX = t.clientX;
-            swipeStartY = t.clientY;
-            swipeCard = card;
-            swipeActive = false;
-            card._edgeBuzzed = false;
-        }, { passive: true });
-
-        container.addEventListener('touchmove', (e) => {
-            if (!swipeCard) return;
-            const t = e.touches[0];
-            const dx = t.clientX - swipeStartX;
-            const dy = t.clientY - swipeStartY;
-
-            if (!swipeActive) {
-                if (Math.abs(dx) > 12 && Math.abs(dx) > Math.abs(dy) * 1.5) {
-                    swipeActive = true;
-                } else if (Math.abs(dy) > 12) {
-                    swipeCard = null;
-                    return;
-                }
-            }
-
-            if (swipeActive) {
-                if (e.cancelable) e.preventDefault();
-
-                const strip = swipeCard.querySelector('.wc-strip');
-                if (strip) {
-                    const dayCount = swipeCard.querySelectorAll('.wc-day').length || 1;
-                    const maxIdx = dayCount - 1;
-                    const atEdgeLeft = _weatherDayIndex <= 0 && dx > 0;
-                    const atEdgeRight = _weatherDayIndex >= maxIdx && dx < 0;
-                    const resist = (atEdgeLeft || atEdgeRight) ? 0.3 : 1;
-
-                    strip.style.transform = `translateX(${dx * resist}px)`;
-                    strip.style.transition = 'none';
-
-                    // Вибро-«отказ» на границе — один раз за жест
-                    if ((atEdgeLeft || atEdgeRight) && navigator.vibrate && !swipeCard._edgeBuzzed) {
-                        swipeCard._edgeBuzzed = true;
-                        navigator.vibrate(5);
-                    }
-                }
-            }
-        }, { passive: false });
-
-        container.addEventListener('touchend', (e) => {
-            if (!swipeCard) return;
-            const t = e.changedTouches[0];
-            const dx = t.clientX - swipeStartX;
-
-            const strip = swipeCard.querySelector('.wc-strip');
-            if (strip) {
-                strip.style.transition = 'transform 0.25s ease';
-                strip.style.transform = '';
-            }
-
-            if (swipeActive) {
-                const dayCount = swipeCard.querySelectorAll('.wc-day').length || 1;
-                const maxIdx = dayCount - 1;
-
-                if (dx < -CFG.SWIPE_THRESHOLD && _weatherDayIndex < maxIdx) {
-                    _weatherDayIndex++;
-                    if (navigator.vibrate) navigator.vibrate(8);
-                    animateWeatherCardToggle(swipeCard);
-                } else if (dx > CFG.SWIPE_THRESHOLD && _weatherDayIndex > 0) {
-                    _weatherDayIndex--;
-                    if (navigator.vibrate) navigator.vibrate(8);
-                    animateWeatherCardToggle(swipeCard);
-                }
-            }
-
-            swipeCard = null;
-            swipeActive = false;
-        }, { passive: true });
-
-        container.addEventListener('touchcancel', () => {
-            if (swipeCard) {
-                const strip = swipeCard.querySelector('.wc-strip');
-                if (strip) {
-                    strip.style.transition = 'transform 0.25s ease';
-                    strip.style.transform = '';
-                }
-            }
-            swipeCard = null;
-            swipeActive = false;
-        });
-
-        // ─── Клавиатура (десктоп) ───
-        container.addEventListener('keydown', (e) => {
-            if (!_weatherExpanded) return;
-            const card = e.target.closest('.widget-card.weather');
-            if (!card) return;
-
-            const maxIdx = (card.querySelectorAll('.wc-day').length || 1) - 1;
-            if (e.key === 'ArrowRight' && _weatherDayIndex < maxIdx) {
-                _weatherDayIndex++;
-                animateWeatherCardToggle(card);
-            } else if (e.key === 'ArrowLeft' && _weatherDayIndex > 0) {
-                _weatherDayIndex--;
-                animateWeatherCardToggle(card);
-            }
-        });
-
-        log('✅ Обработчики установлены');
+        log('✅ Обработчики установлены (без свайпа)');
     }
 
     installDelegatedHandlers();
@@ -846,9 +742,9 @@
     //  СТИЛИ
     // ═══════════════════════════════════════════════════════════
     function ensureStyles() {
-        if (document.getElementById('widgetPickerStylesV6')) return;
+        if (document.getElementById('widgetPickerStylesV7')) return;
         const style = document.createElement('style');
-        style.id = 'widgetPickerStylesV6';
+        style.id = 'widgetPickerStylesV7';
         style.textContent = `
             .widget-card {
                 position: relative;
@@ -861,7 +757,7 @@
                     rgba(108, 92, 231, 0.20),
                     rgba(0, 184, 148, 0.12));
                 border: 1px solid rgba(108, 92, 231, 0.35);
-                transition: background 0.25s, border-color 0.25s, transform 0.15s, box-shadow 0.2s;
+                transition: background 0.25s, border-color 0.25s, box-shadow 0.2s;
                 -webkit-tap-highlight-color: transparent;
                 user-select: none;
                 -webkit-user-select: none;
@@ -871,12 +767,9 @@
                     rgba(108, 92, 231, 0.30),
                     rgba(0, 184, 148, 0.20));
                 border-color: rgba(108, 92, 231, 0.55);
-                transform: translateY(-1px);
                 box-shadow: 0 6px 22px rgba(108, 92, 231, 0.25);
             }
-            .widget-card:active { transform: scale(0.98); }
             .widget-card.pressing {
-                transform: scale(0.97);
                 box-shadow: 0 0 0 2px rgba(255, 159, 67, 0.5),
                             0 6px 22px rgba(255, 159, 67, 0.3);
             }
@@ -925,22 +818,15 @@
             .widget-card.weather .wc-weather-extra .wc-minmax { color: #feca57; font-weight: 700; }
             .widget-card.weather .wc-weather-extra .wc-feels { color: #a78bfa; }
 
-            /* ─── Лента дней ─── */
+            /* ─── Лента дней (без анимаций и теней — чтобы не дёргалась) ─── */
             .widget-card.weather .wc-strip-wrap {
                 margin-top: 12px;
                 padding-top: 12px;
                 border-top: 1px solid rgba(255, 255, 255, 0.08);
-                animation: wcFadeIn 0.25s ease;
-            }
-            @keyframes wcFadeIn {
-                from { opacity: 0; transform: translateY(-4px); }
-                to   { opacity: 1; transform: translateY(0); }
             }
             .widget-card.weather .wc-strip {
                 display: flex;
                 gap: 6px;
-                touch-action: pan-y;
-                will-change: transform;
             }
             .widget-card.weather .wc-day {
                 flex: 1;
@@ -950,9 +836,11 @@
                 border-radius: 10px;
                 background: rgba(255, 255, 255, 0.03);
                 border: 1px solid rgba(255, 255, 255, 0.05);
-                transition: background 0.2s, border-color 0.2s, transform 0.15s;
+                transition: background 0.2s, border-color 0.2s;
                 cursor: pointer;
                 -webkit-tap-highlight-color: transparent;
+                transform: translateZ(0);
+                backface-visibility: hidden;
             }
             .widget-card.weather .wc-day:hover {
                 background: rgba(255, 255, 255, 0.07);
@@ -962,7 +850,6 @@
                     rgba(108, 92, 231, 0.28),
                     rgba(0, 184, 148, 0.14));
                 border-color: rgba(108, 92, 231, 0.5);
-                box-shadow: 0 3px 12px rgba(108, 92, 231, 0.25);
             }
             .widget-card.weather .wc-day-label {
                 font-size: 10px;
@@ -980,10 +867,6 @@
                 font-size: 22px;
                 line-height: 1;
                 margin-bottom: 4px;
-                transition: transform 0.2s;
-            }
-            .widget-card.weather .wc-day.active .wc-day-icon {
-                transform: scale(1.1);
             }
             .widget-card.weather .wc-day-temp {
                 display: flex;
@@ -991,11 +874,12 @@
                 gap: 4px;
                 font-size: 12px;
                 font-variant-numeric: tabular-nums;
+                min-width: 0;
             }
             .widget-card.weather .wc-day-max { color: #fff; font-weight: 700; }
             .widget-card.weather .wc-day-min { color: #888; }
 
-            /* ─── Точки ─── */
+            /* ─── Точки (без box-shadow) ─── */
             .widget-card.weather .wc-dots {
                 display: flex;
                 justify-content: center;
@@ -1007,13 +891,12 @@
                 height: 6px;
                 border-radius: 50%;
                 background: rgba(255, 255, 255, 0.15);
-                transition: all 0.25s ease;
+                transition: width 0.2s ease, background 0.2s ease;
             }
             .widget-card.weather .wc-dot.active {
                 width: 18px;
                 border-radius: 3px;
                 background: linear-gradient(90deg, #6c5ce7, #00b894);
-                box-shadow: 0 0 8px rgba(108, 92, 231, 0.5);
             }
 
             /* ─── Подсказка ─── */
@@ -1143,7 +1026,7 @@
                     <div class="wp-hint">
                         Виджеты появляются над списком чатов.<br>
                         <strong style="color:#feca57;">Тап</strong> — прогноз на 4 дня,<br>
-                        <strong style="color:#feca57;">свайп</strong> по дням,<br>
+                        <strong style="color:#feca57;">тап по дню</strong> — выбрать день,<br>
                         <strong style="color:#feca57;">долгое нажатие</strong> — удалить.
                     </div>
                     <div id="wpWidgetsList"></div>
@@ -1338,7 +1221,7 @@
                 cacheAge: (Date.now() - readCacheTs('weather', 'location')) / 1000 + ' сек',
                 isFresh: isCacheFresh('weather', 'location'),
             };
-            console.log('=== WIDGETS DEBUG v6 ===');
+            console.log('=== WIDGETS DEBUG v7 ===');
             console.table(info);
             return info;
         },
@@ -1363,7 +1246,7 @@
         },
     };
 
-    console.log('🧩 [Widgets v6] Готово');
+    console.log('🧩 [Widgets v7] Готово');
     console.log('Проверить: Widgets.debug()');
 
 })();
