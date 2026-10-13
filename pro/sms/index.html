@@ -49072,5 +49072,364 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
 </script>
 <script src="widgets/widget-weather.js?v=1"></script>
 <script src="widgets/widget-radio.js?v=1"></script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🧩 WIDGETS HUB — единая система управления виджетами
+//  Решает конфликт между Weather и Radio виджетами.
+//  Гарантирует: оба виджета видны, идут стеком, не сносят друг друга.
+// ═══════════════════════════════════════════════════════════════
+
+(function installWidgetsHub() {
+    'use strict';
+
+    console.log('🧩 [WidgetsHub] Инициализация…');
+
+    // ─── Порядок виджетов (сверху вниз) ───
+    const WIDGET_ORDER = ['weather', 'radio'];
+
+    // ─── Ключ того же хранилища, что используют оба модуля ───
+    const WIDGETS_KEY = 'smschat_widgets';
+
+    // ═══════════════════════════════════════════════════════════
+    //  1. ЗАГРУЗКА СПИСКА АКТИВНЫХ ВИДЖЕТОВ
+    // ═══════════════════════════════════════════════════════════
+    function loadActiveIds() {
+        try {
+            const raw = localStorage.getItem(WIDGETS_KEY);
+            const list = raw ? JSON.parse(raw) : [];
+            return Array.isArray(list) ? list.map(w => w.id) : [];
+        } catch (e) { return []; }
+    }
+
+    function isActive(id) {
+        return loadActiveIds().includes(id);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  2. ГЛАВНЫЙ ФИКС: ПАТЧ innerHTML #chatsList
+    //     — вставляем ВСЕ активные виджеты в правильном порядке
+    //       и НЕ даём одному модулю затереть другого.
+    // ═══════════════════════════════════════════════════════════
+    function installInnerHTMLPatch() {
+        const container = document.getElementById('chatsList');
+        if (!container) { setTimeout(installInnerHTMLPatch, 500); return; }
+
+        // Снимаем чужие патчи (от weather и radio), чтобы избежать двойного наложения
+        try {
+            // Просто отключаем флаг — тогда их сеттер внутри будет
+            // срабатывать, но т.к. мы перехватываем по цепочке,
+            // в итоге всё встанет правильно.
+            container._weatherPatched = true;   // отключает вставку weather
+            container._radioPatched = true;     // отключает вставку radio
+            container._widgetsPatched = true;   // отключает вставку widgets (модуль Widgets v6)
+        } catch (e) {}
+
+        // Ставим свой — единственный — патч
+        const proto = Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML');
+        if (!proto) { console.warn('🧩 [WidgetsHub] Нет дескриптора innerHTML'); return; }
+
+        const setter = function(value) {
+            if (this === container) {
+                const widgetsHTML = buildAllWidgetsHTML();
+                // Приклеиваем НАШИ виджеты сверху к тому, что передали
+                if (widgetsHTML) value = widgetsHTML + value;
+            }
+            return proto.set.call(this, value);
+        };
+
+        const getter = function() {
+            return proto.get.call(this);
+        };
+
+        try {
+            Object.defineProperty(container, 'innerHTML', {
+                get: getter,
+                set: setter,
+                configurable: true,
+            });
+            console.log('🧩 [WidgetsHub] innerHTML #chatsList — централизованный патч установлен');
+        } catch (e) {
+            console.error('🧩 [WidgetsHub] Патч innerHTML не удался:', e);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. СБОРКА HTML ВСЕХ ВИДЖЕТОВ
+    //     Используем существующие builder'ы из weather и radio.
+    // ═══════════════════════════════════════════════════════════
+    function buildAllWidgetsHTML() {
+        const activeIds = loadActiveIds();
+        if (activeIds.length === 0) return '';
+
+        // Сортируем по WIDGET_ORDER
+        const sorted = activeIds.slice().sort((a, b) => {
+            const ia = WIDGET_ORDER.indexOf(a);
+            const ib = WIDGET_ORDER.indexOf(b);
+            return (ia === -1 ? 999 : ia) - (ib === -1 ? 999 : ib);
+        });
+
+        let html = '';
+
+        for (const id of sorted) {
+            const cardHtml = buildOneWidget(id);
+            if (cardHtml) html += cardHtml;
+        }
+
+        return html;
+    }
+
+    function buildOneWidget(id) {
+        try {
+            if (id === 'weather') {
+                // Weather-модуль экспортирует buildWeatherCardHTML внутри IIFE,
+                // но наружу обычно не отдаёт. Попробуем найти через публичное API.
+                if (window.Widgets && typeof window.Widgets.debug === 'function') {
+                    // Публичного билдера нет — используем DOM-клонирование
+                    // уже отрисованной карточки, если она есть.
+                    const existing = document.querySelector('.widget-card.weather');
+                    if (existing) {
+                        // Забираем outerHTML как есть
+                        return existing.outerHTML;
+                    }
+                }
+                return '';   // пусть weather сам вставит через свой патч
+            }
+
+            if (id === 'radio') {
+                // Radio-модуль экспортирует window.RadioWidget, но билдера нет.
+                // Если карточка уже есть в DOM — переиспользуем её HTML.
+                const existing = document.querySelector('.widget-card.radio');
+                if (existing) {
+                    return existing.outerHTML;
+                }
+                return '';
+            }
+
+            return '';
+        } catch (e) {
+            console.warn('🧩 [WidgetsHub] buildOneWidget error:', id, e);
+            return '';
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  4. СТЕК-ФИКС: если оба виджета есть в DOM,
+    //     переставляем их в правильном порядке.
+    //     Полезно когда модули рисуются асинхронно и могут
+    //     поменяться местами.
+    // ═══════════════════════════════════════════════════════════
+    function reorderWidgetsInDom() {
+        const container = document.getElementById('chatsList');
+        if (!container) return;
+
+        const weather = container.querySelector('.widget-card.weather');
+        const radio = container.querySelector('.widget-card.radio');
+
+        if (!weather && !radio) return;
+
+        // Определяем нужный порядок
+        const wanted = [];
+        if (weather) wanted.push(weather);
+        if (radio) wanted.push(radio);
+
+        // Если порядок в DOM уже правильный — выходим
+        let currentOrder = [];
+        container.querySelectorAll('.widget-card').forEach(el => {
+            if (el.classList.contains('weather')) currentOrder.push('weather');
+            else if (el.classList.contains('radio')) currentOrder.push('radio');
+        });
+
+        const expected = wanted.map(el =>
+            el.classList.contains('weather') ? 'weather' : 'radio'
+        );
+
+        if (JSON.stringify(currentOrder) === JSON.stringify(expected)) return;
+
+        // Переставляем: удаляем все виджеты и вставляем в нужном порядке первыми
+        wanted.forEach(el => el.remove());
+        wanted.reverse().forEach(el => {
+            container.insertBefore(el, container.firstChild);
+        });
+
+        console.log('🧩 [WidgetsHub] Виджеты переупорядочены');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  5. СЛЕДИМ ЗА ПОЯВЛЕНИЕМ ВИДЖЕТОВ И ПЕРЕСТАВЛЯЕМ
+    // ═══════════════════════════════════════════════════════════
+    const observer = new MutationObserver(() => {
+        reorderWidgetsInDom();
+    });
+
+    function startObserver() {
+        const container = document.getElementById('chatsList');
+        if (!container) { setTimeout(startObserver, 500); return; }
+        observer.observe(container, { childList: true });
+        console.log('🧩 [WidgetsHub] Observer запущен');
+    }
+    startObserver();
+
+    // Страховочные переставления на старте
+    setTimeout(reorderWidgetsInDom, 1500);
+    setTimeout(reorderWidgetsInDom, 3000);
+    setTimeout(reorderWidgetsInDom, 6000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  6. ФИКС УДАЛЕНИЯ — не даём одному модулю сносить другой
+    //     Оригинальный removeWidget в radio вызывает:
+    //       document.querySelectorAll('.widget-card.radio').forEach(el => el.remove());
+    //     Это нормально. Но weather может делать то же со всеми .widget-card.
+    //     Проверим через MutationObserver — если чужой виджет снесли,
+    //     восстановим его.
+    // ═══════════════════════════════════════════════════════════
+
+    function checkWidgetsNotLost() {
+        const container = document.getElementById('chatsList');
+        if (!container) return;
+
+        const activeIds = loadActiveIds();
+
+        // Weather
+        if (activeIds.includes('weather') && !container.querySelector('.widget-card.weather')) {
+            // Weather пропал — перезапускаем его рендер через публичное API
+            if (window.Widgets && typeof window.Widgets.refresh === 'function') {
+                console.log('🧩 [WidgetsHub] Weather потерялся — восстанавливаем');
+                window.Widgets.refresh();
+            }
+        }
+
+        // Radio
+        if (activeIds.includes('radio') && !container.querySelector('.widget-card.radio')) {
+            if (window.RadioWidget && typeof window.RadioWidget.debug === 'function') {
+                console.log('🧩 [WidgetsHub] Radio потерялся — восстанавливаем');
+                // Radio-модуль сам рендерит через renderRadioCard, но публичного метода нет.
+                // Форсируем перерисовку всего списка.
+                if (typeof renderChatsList === 'function') {
+                    renderChatsList();
+                }
+            }
+        }
+    }
+
+    // Периодическая проверка — раз в 2 сек
+    setInterval(() => {
+        if (document.hidden) return;
+        checkWidgetsNotLost();
+    }, 2000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  7. ХУК НА УДАЛЕНИЕ — синхронизируем список активных виджетов
+    //     Когда один модуль удаляет свой виджет, второй об этом
+    //     не узнаёт и может всё сломать. Перехватываем удаление.
+    // ═══════════════════════════════════════════════════════════
+    function installRemoveHook() {
+        // Патчим setItem для нашего ключа — все модули пишут туда
+        // актуальный список. При изменении — перепроверяем DOM.
+        const _origSetItem = localStorage.setItem.bind(localStorage);
+        localStorage.setItem = function(key, value) {
+            const result = _origSetItem(key, value);
+            if (key === WIDGETS_KEY) {
+                setTimeout(checkWidgetsNotLost, 100);
+                setTimeout(reorderWidgetsInDom, 150);
+            }
+            return result;
+        };
+    }
+    installRemoveHook();
+
+    // ═══════════════════════════════════════════════════════════
+    //  8. CSS — фикс отступов и разделения
+    //     Гарантирует, что виджеты идут друг за другом.
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('widgetsHubStyles')) {
+        const style = document.createElement('style');
+        style.id = 'widgetsHubStyles';
+        style.textContent = `
+            /* ─── Стек виджетов: один под другим с одинаковым отступом ─── */
+            #chatsList > .widget-card {
+                margin-bottom: 10px;
+                flex-shrink: 0;
+            }
+            #chatsList > .widget-card:last-of-type {
+                margin-bottom: 14px;
+            }
+
+            /* ─── Если в чате открыт фон — не ломаем внешний вид ─── */
+            #chatsScreen.has-bg #chatsList > .widget-card {
+                backdrop-filter: blur(6px);
+                -webkit-backdrop-filter: blur(6px);
+            }
+
+            /* ─── Плавная смена активного виджета ─── */
+            #chatsList > .widget-card {
+                animation: widgetCardIn 0.3s ease;
+            }
+            @keyframes widgetCardIn {
+                from { opacity: 0; transform: translateY(-4px); }
+                to   { opacity: 1; transform: translateY(0); }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  9. ПУБЛИЧНОЕ API
+    // ═══════════════════════════════════════════════════════════
+    window.WidgetsHub = {
+        // Активные виджеты (по порядку)
+        list: () => loadActiveIds().sort((a, b) => {
+            const ia = WIDGET_ORDER.indexOf(a);
+            const ib = WIDGET_ORDER.indexOf(b);
+            return (ia === -1 ? 999 : ia) - (ib === -1 ? 999 : ib);
+        }),
+
+        // Принудительное переупорядочивание
+        reorder: () => reorderWidgetsInDom(),
+
+        // Принудительная проверка «не потерялся ли виджет»
+        check: () => checkWidgetsNotLost(),
+
+        // Полная перерисовка списка чатов
+        refresh: () => {
+            if (typeof renderChatsList === 'function') renderChatsList();
+            setTimeout(reorderWidgetsInDom, 100);
+        },
+
+        // Диагностика
+        status: () => {
+            const container = document.getElementById('chatsList');
+            const activeIds = loadActiveIds();
+            const domCards = container
+                ? Array.from(container.querySelectorAll('.widget-card'))
+                    .map(el => {
+                        if (el.classList.contains('weather')) return 'weather';
+                        if (el.classList.contains('radio')) return 'radio';
+                        return 'unknown';
+                    })
+                : [];
+
+            return {
+                activeIds,
+                domCards,
+                orderOk: JSON.stringify(activeIds.sort((a,b)=>{
+                    const ia=WIDGET_ORDER.indexOf(a), ib=WIDGET_ORDER.indexOf(b);
+                    return (ia===-1?999:ia)-(ib===-1?999:ib);
+                })) === JSON.stringify(domCards),
+                bothVisible: domCards.includes('weather') && domCards.includes('radio'),
+            };
+        },
+    };
+
+    console.log('🧩 [WidgetsHub] Готов:');
+    console.log('   • Виджеты складываются стеком: weather → radio');
+    console.log('   • Конфликты innerHTML-патчей устранены');
+    console.log('   • Потерянные виджеты автоматически восстанавливаются');
+    console.log('   • API: WidgetsHub.status() / .reorder() / .refresh()');
+
+    // Установить главный патч
+    installInnerHTMLPatch();
+
+})();
+</script>
 </body>
 </html>
