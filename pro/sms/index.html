@@ -50695,6 +50695,150 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
 (function installWidgetPickerV3() {
     'use strict';
 
+    // 🆕 СРАЗУ вставляем стили при загрузке — до первого рендера виджетов
+    (function preloadStyles() {
+        if (document.getElementById('widgetPickerStylesV3')) return;
+        const style = document.createElement('style');
+        style.id = 'widgetPickerStylesV3';
+        style.textContent = `
+            .widget-card {
+                position: relative;
+                overflow: hidden;
+                cursor: pointer;
+                border-radius: 14px;
+                padding: 14px 16px;
+                margin-bottom: 10px;
+                background: linear-gradient(135deg,
+                    rgba(108, 92, 231, 0.20),
+                    rgba(0, 184, 148, 0.12));
+                border: 1px solid rgba(108, 92, 231, 0.35);
+                transition: background 0.25s, border-color 0.25s, box-shadow 0.2s;
+                -webkit-tap-highlight-color: transparent;
+                user-select: none;
+                -webkit-user-select: none;
+            }
+            .widget-card:hover {
+                background: linear-gradient(135deg,
+                    rgba(108, 92, 231, 0.30),
+                    rgba(0, 184, 148, 0.20));
+                border-color: rgba(108, 92, 231, 0.55);
+                box-shadow: 0 6px 22px rgba(108, 92, 231, 0.25);
+            }
+            .widget-card.pressing {
+                box-shadow: 0 0 0 2px rgba(255, 159, 67, 0.5),
+                            0 6px 22px rgba(255, 159, 67, 0.3);
+            }
+            .widget-card .wc-header {
+                display: flex; align-items: center; gap: 12px; margin-bottom: 10px;
+            }
+            .widget-card .wc-icon {
+                width: 42px; height: 42px; border-radius: 12px;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                display: flex; align-items: center; justify-content: center;
+                font-size: 22px; flex-shrink: 0;
+                box-shadow: 0 4px 12px rgba(108, 92, 231, 0.35);
+            }
+            .widget-card .wc-title-block { flex: 1; min-width: 0; }
+            .widget-card .wc-title {
+                font-size: 14px; font-weight: 700; color: #fff; margin-bottom: 2px;
+                white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+            }
+            .widget-card .wc-subtitle {
+                font-size: 11px; color: #aaa;
+                white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+            }
+            #widgetPickerModal { display: none; }
+            #widgetPickerModal.active { display: flex; }
+            #widgetPickerModal .wp-content {
+                background: #1a1a2e; border-radius: 20px;
+                max-width: 440px; width: 100%; max-height: 88vh;
+                display: flex; flex-direction: column;
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                box-shadow: 0 20px 60px rgba(0, 0, 0, 0.7);
+                overflow: hidden;
+            }
+            #widgetPickerModal .wp-header {
+                display: flex; align-items: center; gap: 12px;
+                padding: 16px 20px;
+                border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+                background: linear-gradient(135deg, rgba(108, 92, 231, 0.12), rgba(0, 184, 148, 0.06));
+                flex-shrink: 0;
+            }
+            #widgetPickerModal .wp-header h2 {
+                flex: 1; min-width: 0;
+                font-size: 17px; font-weight: 700; color: #fff; margin: 0;
+            }
+            #widgetPickerModal .wp-close {
+                width: 34px; height: 34px; border-radius: 50%; border: none;
+                background: rgba(255, 255, 255, 0.06); color: #888; font-size: 16px;
+                cursor: pointer; display: flex; align-items: center; justify-content: center;
+                flex-shrink: 0;
+            }
+            #widgetPickerModal .wp-close:hover {
+                background: rgba(255, 107, 107, 0.2); color: #ff6b6b;
+            }
+            #widgetPickerModal .wp-body {
+                flex: 1; overflow-y: auto; padding: 16px 20px; min-height: 0;
+            }
+            #widgetPickerModal .wp-hint {
+                font-size: 12px; color: #888; margin-bottom: 16px;
+                line-height: 1.5; text-align: center;
+            }
+            #widgetPickerModal .wp-widget-item {
+                display: flex; align-items: center; gap: 14px;
+                padding: 14px 16px; border-radius: 14px;
+                background: rgba(255, 255, 255, 0.04);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                margin-bottom: 10px; cursor: pointer;
+                transition: all 0.18s;
+                -webkit-tap-highlight-color: transparent;
+            }
+            #widgetPickerModal .wp-widget-item:hover {
+                background: rgba(108, 92, 231, 0.12);
+                border-color: rgba(108, 92, 231, 0.35);
+            }
+            #widgetPickerModal .wp-widget-item:active { transform: scale(0.98); }
+            #widgetPickerModal .wp-widget-item.added {
+                background: linear-gradient(135deg, rgba(0, 184, 148, 0.15), rgba(108, 92, 231, 0.08));
+                border-color: rgba(0, 184, 148, 0.4);
+            }
+            #widgetPickerModal .wp-widget-icon {
+                width: 46px; height: 46px; border-radius: 12px;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                display: flex; align-items: center; justify-content: center;
+                font-size: 22px; flex-shrink: 0;
+                box-shadow: 0 4px 12px rgba(108, 92, 231, 0.35);
+            }
+            #widgetPickerModal .wp-widget-info { flex: 1; min-width: 0; }
+            #widgetPickerModal .wp-widget-name {
+                font-size: 15px; font-weight: 700; color: #fff; margin-bottom: 3px;
+            }
+            #widgetPickerModal .wp-widget-desc {
+                font-size: 12px; color: #888; line-height: 1.4;
+            }
+            #widgetPickerModal .wp-widget-status {
+                font-size: 12px; font-weight: 700;
+                padding: 4px 10px; border-radius: 8px; flex-shrink: 0;
+                background: rgba(108, 92, 231, 0.2); color: #a78bfa;
+                border: 1px solid rgba(108, 92, 231, 0.4);
+            }
+            #widgetPickerModal .wp-widget-item.added .wp-widget-status {
+                background: rgba(0, 184, 148, 0.2); color: #00b894;
+                border-color: rgba(0, 184, 148, 0.4);
+            }
+            #widgetPickerModal .wp-footer {
+                padding: 12px 20px 18px;
+                border-top: 1px solid rgba(255, 255, 255, 0.06);
+                background: rgba(255, 255, 255, 0.02);
+                flex-shrink: 0;
+            }
+            #widgetPickerModal .wp-footer .btn {
+                width: 100%; padding: 12px; font-size: 14px;
+            }
+        `;
+        document.head.appendChild(style);
+    })();
+
     function escapeHtmlSafe(s) {
         if (typeof escapeHtml === 'function') return escapeHtml(s);
         const div = document.createElement('div');
