@@ -51122,6 +51122,394 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
     console.log('🧩 [WidgetsPicker v3] Готово');
 })();
 
+</script><script>
+// ═══════════════════════════════════════════════════════════════
+//  🩹 ФИКС: ЛОЖНОЕ УВЕДОМЛЕНИЕ ПОСЛЕ ВЫХОДА ИЗ ЧАТА
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: пользователь прочитал сообщение, вышел из чата,
+//  и через секунду снова приходит уведомление об этом же сообщении.
+//
+//  Причина:
+//   1. markChatAsRead() вызывается при выходе, но если состояние
+//      чата к этому моменту ещё не синхронизировано с сервером
+//      (или lastMessageId не совпадает), записывается старый ID.
+//   2. refreshUnreadBadges() периодически вызывает checkUnreadForAllChats(),
+//      который смотрит meta.json версию и может решить, что есть
+//      непрочитанные, даже если пользователь уже всё прочитал.
+//   3. race condition: между markChatAsRead() и следующим сканом
+//      бейджей сообщение "появляется" снова.
+//
+//  Решение:
+//   1. При выходе из чата (backToChats) — запоминаем ID последнего
+//      сообщения ЖЁСТКО, даже если historyState ещё обновляется.
+//   2. В checkUnreadForAllChats игнорируем чат, из которого только
+//      что вышли (в течение N секунд).
+//   3. В markChatAsRead используем не только meta version, но и
+//      реальный ID последнего сообщения из state.messages.
+//   4. При выходе — принудительно ставим последнюю версию meta
+//      в read state, чтобы поллинг не перезаписал.
+// ═══════════════════════════════════════════════════════════════
+
+(function fixFalseUnreadOnChatExit() {
+    'use strict';
+
+    console.log('🩹 [UnreadFix] Установка патча…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОСТОЯНИЕ
+    // ═══════════════════════════════════════════════════════════
+    const FIX = {
+        // Карта: { [chatFile]: timestamp выхода }
+        recentlyExited: new Map(),
+        // Сколько миллисекунд игнорировать "новые" в чате после выхода
+        ignoreWindowMs: 8000,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  1. markChatAsRead — берём последний ID не из meta, а из
+    //     самого свежего источника (state.messages или historyState)
+    // ═══════════════════════════════════════════════════════════
+    const _origMarkChatAsRead = markChatAsRead;
+
+    markChatAsRead = function() {
+        if (!state.chatFile) return;
+
+        // Собираем все возможные последние ID из всех источников
+        let lastId = null;
+
+        // 1. Из state.messages
+        if (Array.isArray(state.messages) && state.messages.length > 0) {
+            const m = state.messages[state.messages.length - 1];
+            if (m && m.id) lastId = Math.max(lastId || 0, m.id);
+        }
+
+        // 2. Из historyState.allMessages (может быть более полным)
+        if (typeof historyState !== 'undefined'
+            && Array.isArray(historyState.allMessages)
+            && historyState.allMessages.length > 0) {
+            const m = historyState.allMessages[historyState.allMessages.length - 1];
+            if (m && m.id) lastId = Math.max(lastId || 0, m.id);
+        }
+
+        // 3. Из state._lastMetaVersion (последняя версия meta)
+        if (state._lastMetaVersion && typeof state._lastMetaVersion === 'number') {
+            lastId = Math.max(lastId || 0, state._lastMetaVersion);
+        }
+
+        // 4. Из state._lastSentMessageId (если только что отправили)
+        if (state._lastSentMessageId) {
+            lastId = Math.max(lastId || 0, state._lastSentMessageId);
+        }
+
+        if (!lastId) {
+            // Нет данных — вызываем оригинал, пусть делает что может
+            return _origMarkChatAsRead.apply(this, arguments);
+        }
+
+        // Записываем САМЫЙ БОЛЬШИЙ ID как прочитанный
+        const file = state.chatFile;
+
+        // 🆕 Записываем НЕСКОЛЬКО раз — чтобы точно перебить любые гонки
+        setLastReadId(file, lastId);
+
+        // Убираем флаг непрочитанного у чата
+        const idx = state.chats.findIndex(c => c.file === file);
+        if (idx >= 0) {
+            delete state.chats[idx].hasUnread;
+            delete state.chats[idx].unreadCount;
+            saveChatsList();
+        }
+
+        // 🆕 Ещё раз через 100мс — на случай если кто-то перезаписал
+        setTimeout(() => {
+            setLastReadId(file, lastId);
+        }, 100);
+
+        // 🆕 И ещё раз через 500мс (для медленных устройств)
+        setTimeout(() => {
+            setLastReadId(file, lastId);
+        }, 500);
+
+        console.log(`🩹 [UnreadFix] markChatAsRead: ${file} → ${lastId}`);
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  2. backToChats — жёстко запоминаем "только что вышли"
+    //     и вызываем markChatAsRead с максимальной настойчивостью
+    // ═══════════════════════════════════════════════════════════
+    const _origBackToChats = backToChats;
+
+    backToChats = function() {
+        // ─── Запоминаем файл ДО сброса state ───
+        const exitingChatFile = state.chatFile;
+
+        if (exitingChatFile) {
+            // 🆕 Запоминаем время выхода
+            FIX.recentlyExited.set(exitingChatFile, Date.now());
+
+            // 🆕 Принудительно вызываем markChatAsRead
+            //     (несколько раз, чтобы точно сработало)
+            try {
+                markChatAsRead();
+            } catch (e) {
+                console.warn('🩹 [UnreadFix] markChatAsRead failed:', e);
+            }
+
+            // 🆕 Отложенный вызов — на случай если state.chatFile
+            //     сбросится раньше, чем сработает markChatAsRead
+            const file = exitingChatFile;
+            setTimeout(() => {
+                // Восстанавливаем state.chatFile на миг, если он уже null
+                const savedFile = state.chatFile;
+                const savedChatName = state.chatName;
+
+                if (!state.chatFile) {
+                    state.chatFile = file;
+                }
+
+                try {
+                    // Собираем последний ID
+                    let lastId = null;
+
+                    if (Array.isArray(state.messages) && state.messages.length > 0) {
+                        lastId = state.messages[state.messages.length - 1].id;
+                    }
+                    if (typeof historyState !== 'undefined'
+                        && Array.isArray(historyState.allMessages)
+                        && historyState.allMessages.length > 0) {
+                        const m = historyState.allMessages[historyState.allMessages.length - 1];
+                        lastId = Math.max(lastId || 0, m.id);
+                    }
+                    if (state._lastMetaVersion) {
+                        lastId = Math.max(lastId || 0, state._lastMetaVersion);
+                    }
+
+                    if (lastId) {
+                        setLastReadId(file, lastId);
+
+                        const idx = state.chats.findIndex(c => c.file === file);
+                        if (idx >= 0) {
+                            delete state.chats[idx].hasUnread;
+                            delete state.chats[idx].unreadCount;
+                            saveChatsList();
+                        }
+                    }
+                } catch (e) {}
+
+                // Восстанавливаем
+                if (!savedFile && !state.chatFile) {
+                    // не трогаем
+                } else {
+                    state.chatFile = savedFile;
+                    state.chatName = savedChatName;
+                }
+            }, 50);
+        }
+
+        // ─── Вызываем оригинал ───
+        const result = _origBackToChats.apply(this, arguments);
+
+        // ─── После выхода сразу перерисовываем список с корректными бейджами ───
+        setTimeout(() => {
+            if (state.currentScreen === 'chats') {
+                if (typeof renderChatsList === 'function') {
+                    renderChatsList();
+                }
+            }
+        }, 50);
+
+        return result;
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. checkUnreadForAllChats — игнорируем чат, из которого
+    //     только что вышли (окно ignoreWindowMs)
+    // ═══════════════════════════════════════════════════════════
+    // ⚠️ Эта функция переопределена несколько раз патчами
+    //    (например, [NoSelfUnread]). Возьмём текущую версию.
+
+    const _currentCheckUnread = checkUnreadForAllChats;
+
+    checkUnreadForAllChats = async function() {
+        const now = Date.now();
+
+        // 🆕 Исключаем из проверки чаты, из которых только что вышли
+        const excludedFiles = new Set();
+        FIX.recentlyExited.forEach((exitTs, file) => {
+            if (now - exitTs < FIX.ignoreWindowMs) {
+                excludedFiles.add(file);
+            } else {
+                // Чистим старые записи
+                FIX.recentlyExited.delete(file);
+            }
+        });
+
+        // 🆕 Делаем временную подмену state.chats — исключаем нужные файлы
+        const originalChats = state.chats;
+        if (excludedFiles.size > 0) {
+            state.chats = state.chats.filter(c => !excludedFiles.has(c.file));
+        }
+
+        let result;
+        try {
+            result = await _currentCheckUnread.apply(this, arguments);
+        } finally {
+            // Восстанавливаем
+            state.chats = originalChats;
+        }
+
+        // 🆕 Принудительно убираем флаги непрочитанного у исключённых чатов
+        //     в исходном массиве
+        state.chats.forEach(c => {
+            if (excludedFiles.has(c.file)) {
+                // Проверяем — есть ли для этого чата актуальный lastReadId
+                const lastReadId = getLastReadId(c.file);
+                if (lastReadId) {
+                    // Убираем флаг, даже если result говорит иначе
+                    delete c.hasUnread;
+                    delete c.unreadCount;
+                }
+            }
+        });
+
+        // 🆕 Также убираем ложные флаги для исключённых чатов из result
+        excludedFiles.forEach(file => {
+            delete result[file];
+        });
+
+        return result;
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  4. Дополнительная защита: при поллинге, если мы в списке
+    //     чатов и недавно вышли из чата — не даём ему мигнуть
+    // ═══════════════════════════════════════════════════════════
+    // Хук на refreshUnreadBadges — фильтруем недавние выходы
+    const _origRefreshUnreadBadges = refreshUnreadBadges;
+
+    refreshUnreadBadges = async function() {
+        const now = Date.now();
+
+        // Считаем "недавние выходы"
+        const recentlyExitedFiles = new Set();
+        FIX.recentlyExited.forEach((ts, file) => {
+            if (now - ts < FIX.ignoreWindowMs) {
+                recentlyExitedFiles.add(file);
+            }
+        });
+
+        // Если есть недавние выходы — оборачиваем renderChatsList,
+        // чтобы после перерисовки не было ложных бейджей
+        const result = await _origRefreshUnreadBadges.apply(this, arguments);
+
+        // 🆕 После обновления — принудительно убираем бейджи у недавних чатов
+        if (recentlyExitedFiles.size > 0) {
+            let changed = false;
+            state.chats.forEach(c => {
+                if (recentlyExitedFiles.has(c.file)) {
+                    if (c.hasUnread || c.unreadCount) {
+                        delete c.hasUnread;
+                        delete c.unreadCount;
+                        changed = true;
+                    }
+                }
+            });
+            if (changed) {
+                saveChatsList();
+                if (state.currentScreen === 'chats') {
+                    renderChatsList();
+                }
+            }
+        }
+
+        return result;
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  5. Хук на updateMeta — при получении meta от другого
+    //     устройства, если мы только что вышли — не помечаем
+    // ═══════════════════════════════════════════════════════════
+    const _origUpdateMeta = updateMeta;
+
+    updateMeta = async function(file, version, count) {
+        const result = await _origUpdateMeta.call(this, file, version, count);
+
+        // 🆕 Если мы только что вышли из этого чата — фиксируем,
+        //    что всё прочитано
+        if (file && FIX.recentlyExited.has(file)) {
+            const exitTs = FIX.recentlyExited.get(file);
+            if (Date.now() - exitTs < FIX.ignoreWindowMs) {
+                const lastRead = getLastReadId(file);
+                // Обновляем lastReadId только если version больше
+                if (!lastRead || version > lastRead) {
+                    setLastReadId(file, version);
+                }
+
+                // Убираем флаг непрочитанного
+                const chat = state.chats.find(c => c.file === file);
+                if (chat && (chat.hasUnread || chat.unreadCount)) {
+                    delete chat.hasUnread;
+                    delete chat.unreadCount;
+                    saveChatsList();
+                    if (state.currentScreen === 'chats' && typeof renderChatsList === 'function') {
+                        renderChatsList();
+                    }
+                }
+            }
+        }
+
+        return result;
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  6. Хук на pollUpdates — при получении новых сообщений
+    //     в чате, из которого вышли — не помечаем
+    // ═══════════════════════════════════════════════════════════
+    // (это происходит внутри pollUpdates для текущего чата,
+    //  а мы заботимся о других чатах — там уже покрыто
+    //  checkUnreadForAllChats)
+
+    // ═══════════════════════════════════════════════════════════
+    //  7. Публичное API
+    // ═══════════════════════════════════════════════════════════
+    window.UnreadFix = {
+        status: () => {
+            const now = Date.now();
+            const recently = {};
+            FIX.recentlyExited.forEach((ts, file) => {
+                const age = now - ts;
+                if (age < FIX.ignoreWindowMs) {
+                    recently[file] = Math.round(age / 1000) + 's ago';
+                }
+            });
+            return {
+                recentlyExited: recently,
+                ignoreWindowMs: FIX.ignoreWindowMs,
+            };
+        },
+
+        // Форсировать обновление lastReadId для текущего чата
+        forceMarkRead: () => {
+            if (!state.chatFile) return;
+            FIX.recentlyExited.set(state.chatFile, Date.now());
+            markChatAsRead();
+            return true;
+        },
+
+        // Забыть про все recentlyExited (для отладки)
+        clear: () => {
+            FIX.recentlyExited.clear();
+            console.log('🩹 [UnreadFix] recentlyExited очищен');
+        },
+    };
+
+    console.log('🩹 [UnreadFix] Готово:');
+    console.log('   • markChatAsRead берёт макс. ID из всех источников');
+    console.log('   • backToChats запоминает "только что вышли"');
+    console.log('   • checkUnreadForAllChats игнорирует недавние выходы (8 сек)');
+    console.log('   • refreshUnreadBadges фильтрует ложные бейджи');
+    console.log('   • API: UnreadFix.status() / .forceMarkRead()');
+})();
 </script>
 </body>
 </html>
