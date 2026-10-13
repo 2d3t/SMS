@@ -6602,7 +6602,65 @@ if (scrollState.isAtBottom && !_isUserScrolling
 }
 
 
+// ═══════════════════════════════════════════════════════════════
+//  🛡️ DEVICE FINGERPRINT — единый источник правды
+// ═══════════════════════════════════════════════════════════════
+let _deviceFingerprintCache = null;
 
+async function computeDeviceFingerprint() {
+    try {
+        const parts = [
+            navigator.userAgent || '',
+            navigator.platform || '',
+            (navigator.languages || [navigator.language || '']).join(','),
+            `${screen.width}x${screen.height}x${screen.colorDepth}`,
+            `dpr:${window.devicePixelRatio || 1}`,
+            `cores:${navigator.hardwareConcurrency || 0}`,
+            `tz:${Intl.DateTimeFormat().resolvedOptions().timeZone || ''}`,
+        ];
+
+        // Соль — стабильная между запусками
+        let salt = localStorage.getItem('smschat_device_salt_v2');
+        if (!salt) {
+            salt = Array.from(crypto.getRandomValues(new Uint8Array(16)))
+                .map(b => b.toString(16).padStart(2, '0')).join('');
+            localStorage.setItem('smschat_device_salt_v2', salt);
+        }
+
+        const raw = parts.join('|') + '|' + salt;
+        const buf = await crypto.subtle.digest('SHA-256',
+            new TextEncoder().encode(raw));
+        const full = Array.from(new Uint8Array(buf))
+            .map(b => b.toString(16).padStart(2, '0')).join('');
+
+        return {
+            full,
+            short: full.slice(0, 8).toUpperCase(),
+        };
+    } catch (e) {
+        console.error('🛡️ [FP] Ошибка создания отпечатка:', e);
+        return null;
+    }
+}
+
+function getDeviceFingerprint() {
+    // Возвращаем синхронный кэш — сама инициализация идёт в фоне
+    return _deviceFingerprintCache;
+}
+
+// Инициализация при загрузке
+(async () => {
+    _deviceFingerprintCache = await computeDeviceFingerprint();
+    if (_deviceFingerprintCache) {
+        console.log(`🛡️ [FP] Устройство: ${_deviceFingerprintCache.short}`);
+        localStorage.setItem('smschat_device_id_v2', JSON.stringify({
+            id: _deviceFingerprintCache.full,
+            short: _deviceFingerprintCache.short,
+            v: 2,
+            createdAt: Date.now(),
+        }));
+    }
+})();
 
                     
 
@@ -6611,10 +6669,20 @@ if (scrollState.isAtBottom && !_isUserScrolling
 // ===================================================================
 
 
-
-
 async function encryptMessage(msg) {
+    // 🛡️ [FIX] Добавляем отпечаток устройства
+    const fingerprint = getDeviceFingerprint();
+    if (fingerprint) {
+        msg._deviceId = fingerprint.full;
+        msg._deviceShort = fingerprint.short;
+        console.log(`🛡️ [FP] Добавлен отпечаток в сообщение: ${fingerprint.short}`);
+    }
+
     const payload = { username: msg.username, text: msg.text || '' };
+
+    if (msg._deviceId) payload._deviceId = msg._deviceId;
+    if (msg._deviceShort) payload._deviceShort = msg._deviceShort;
+
     if (msg.reactions && Object.keys(msg.reactions).length > 0) {
         payload.reactions = msg.reactions;
     }
@@ -6623,14 +6691,13 @@ async function encryptMessage(msg) {
     }
     if (msg.image) payload.image = msg.image;
 
-if (msg.audio) {
-    payload.audio = msg.audio;
-    payload.audioDuration = msg.audioDuration || 0;
-    payload.audioMime = msg.audioMime || 'audio/webm';
-    if (msg.audioName) payload.audioName = msg.audioName;
-    if (msg.audioCover) payload.audioCover = msg.audioCover;  // 🆕
-}
-
+    if (msg.audio) {
+        payload.audio = msg.audio;
+        payload.audioDuration = msg.audioDuration || 0;
+        payload.audioMime = msg.audioMime || 'audio/webm';
+        if (msg.audioName) payload.audioName = msg.audioName;
+        if (msg.audioCover) payload.audioCover = msg.audioCover;
+    }
 
     if (msg.file) {
         payload.file = msg.file;
@@ -6644,39 +6711,46 @@ if (msg.audio) {
         payload.batchTotal = msg.batchTotal;
     }
     if (replyContext) {
-    const replied = historyState.allMessages.find(m => m.id === replyContext.id)
-        || state.messages.find(m => m.id === replyContext.id);
+        const replied = historyState.allMessages.find(m => m.id === replyContext.id)
+            || state.messages.find(m => m.id === replyContext.id);
 
-
-    plainMsg.replyTo = {
-        id: replyContext.id,
-        username: replyContext.username,
-        previewText: replyContext.previewText || '',
-        attachKind: replyContext.attachKind || null,
-        attachName: replyContext.attachName || null,
-        thumbAttachName: replyContext.thumbAttachName || null,
-        // 🆕 Локальный blob:URL для мгновенного показа (не шифруется, не уходит на сервер)
-        _localThumbUrl: replyContext.thumbUrl || null,
-        hasImage: replied?.image ? true : undefined,
-        hasAudio: replied?.audio ? true : undefined,
-        hasFile: replied?.file ? true : undefined,
-        fileName: replied?.fileName || undefined,
-    };
-}
+        plainMsg.replyTo = {
+            id: replyContext.id,
+            username: replyContext.username,
+            previewText: replyContext.previewText || '',
+            attachKind: replyContext.attachKind || null,
+            attachName: replyContext.attachName || null,
+            thumbAttachName: replyContext.thumbAttachName || null,
+            _localThumbUrl: replyContext.thumbUrl || null,
+            hasImage: replied?.image ? true : undefined,
+            hasAudio: replied?.audio ? true : undefined,
+            hasFile: replied?.file ? true : undefined,
+            fileName: replied?.fileName || undefined,
+        };
+    }
     const encrypted = await encryptObject(payload, CRYPTO._key);
     return { id: msg.id, time: msg.time, iv: encrypted.iv, data: encrypted.data };
 }
 
 
 
-
-
-
-
 async function decryptMessage(encMsg) {
     try {
         const payload = await decryptObject(encMsg.iv, encMsg.data, CRYPTO._key);
-        const msg = { id: encMsg.id, time: encMsg.time, username: payload.username, text: payload.text || '' };
+        const msg = {
+            id: encMsg.id,
+            time: encMsg.time,
+            username: payload.username,
+            text: payload.text || ''
+        };
+
+        // 🛡️ [FIX] Восстанавливаем отпечаток устройства
+        if (payload._deviceId) {
+            msg._deviceId = payload._deviceId;
+            msg._deviceShort = payload._deviceShort ||
+                payload._deviceId.slice(0, 8).toUpperCase();
+        }
+
         if (payload.reactions && typeof payload.reactions === 'object') {
             msg.reactions = payload.reactions;
         }
@@ -6684,16 +6758,13 @@ async function decryptMessage(encMsg) {
             msg.comments = payload.comments;
         }
         if (payload.image) msg.image = payload.image;
-if (payload.audio) {
-    msg.audio = payload.audio;
-    msg.audioDuration = payload.audioDuration || 0;
-    msg.audioMime = payload.audioMime || 'audio/webm';
-    msg.audioName = payload.audioName || '';
-    msg.audioCover = payload.audioCover || '';  // 🆕
-}
-
-
-
+        if (payload.audio) {
+            msg.audio = payload.audio;
+            msg.audioDuration = payload.audioDuration || 0;
+            msg.audioMime = payload.audioMime || 'audio/webm';
+            msg.audioName = payload.audioName || '';
+            msg.audioCover = payload.audioCover || '';
+        }
         if (payload.file) {
             msg.file = payload.file;
             msg.fileName = payload.fileName || 'file.bin';
@@ -6706,19 +6777,18 @@ if (payload.audio) {
             msg.batchTotal = payload.batchTotal;
         }
         if (payload.replyTo) {
-    msg.replyTo = payload.replyTo;
-    if (payload.replyTo.thumbAttachName && isAttachmentRef(payload.replyTo.thumbAttachName)) {
-        msg.replyTo._needsThumbLoad = true;
-    }
-}
+            msg.replyTo = payload.replyTo;
+            if (payload.replyTo.thumbAttachName &&
+                isAttachmentRef(payload.replyTo.thumbAttachName)) {
+                msg.replyTo._needsThumbLoad = true;
+            }
+        }
         return msg;
     } catch (e) {
         console.error('Не удалось расшифровать', encMsg.id, e);
         return null;
     }
 }
-
-
 
 
 
@@ -49283,6 +49353,1363 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
 })();
 
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🛡️ DEVICE FINGERPRINT v2 — ТИХИЙ МОНИТОРИНГ
+//  ─────────────────────────────────────────────────────────────
+//  • Никаких визуальных элементов на сообщениях
+//  • Отслеживаем все устройства каждого имени (накопительно)
+//  • При первом сообщении с НОВОГО устройства от ИЗВЕСТНОГО имени
+//    → показываем плавающую кнопку
+//  • Клик по кнопке → всплывающее окно с деталями
+//  • Принял → флаг снят, для этого имени/устройства больше не беспокоит
+// ═══════════════════════════════════════════════════════════════
 
+(function installDeviceFingerprintV2() {
+    'use strict';
+
+    // ═══════════════════════════════════════════════════════════
+    //  КОНФИГ
+    // ═══════════════════════════════════════════════════════════
+    const CFG = {
+        FP_VERSION: 2,
+        DEVICE_KEY:   'smschat_device_id_v2',
+        SALT_KEY:     'smschat_device_salt_v2',
+        TRUST_KEY:    'smschat_device_trust_v2',   // карта {username: {devices, alerts}}
+        LOG: true,
+    };
+
+    const log = (...a) => CFG.LOG && console.log('🛡️ [DevFP2]', ...a);
+
+    // ═══════════════════════════════════════════════════════════
+    //  1. СОЗДАНИЕ / ЗАГРУЗКА ID УСТРОЙСТВА
+    // ═══════════════════════════════════════════════════════════
+    let _deviceId = null;
+    let _deviceShort = null;
+
+    function collectRaw() {
+        const parts = [];
+        try {
+            parts.push(navigator.userAgent || '');
+            parts.push(navigator.platform || '');
+            parts.push((navigator.languages || [navigator.language || '']).join(','));
+            try { parts.push(Intl.DateTimeFormat().resolvedOptions().timeZone || ''); } catch (e) {}
+            try { parts.push(Intl.DateTimeFormat().resolvedOptions().locale || ''); } catch (e) {}
+            parts.push(`${screen.width}x${screen.height}x${screen.colorDepth}`);
+            parts.push(`${screen.availWidth}x${screen.availHeight}`);
+            parts.push(`dpr:${window.devicePixelRatio || 1}`);
+            parts.push(`cores:${navigator.hardwareConcurrency || 0}`);
+            parts.push(`mem:${navigator.deviceMemory || 0}`);
+            parts.push(`touch:${navigator.maxTouchPoints || 0}`);
+        } catch (e) {}
+        return parts.join('|');
+    }
+
+    async function sha256Hex(text) {
+        const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+        return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    async function initDeviceId() {
+        try {
+            const raw = localStorage.getItem(CFG.DEVICE_KEY);
+            if (raw) {
+                const data = JSON.parse(raw);
+                if (data && data.id) {
+                    _deviceId = data.id;
+                    _deviceShort = data.short || data.id.slice(0, 8).toUpperCase();
+                    return;
+                }
+            }
+        } catch (e) {}
+
+        // Генерируем
+        let salt = '';
+        try {
+            salt = localStorage.getItem(CFG.SALT_KEY) || '';
+            if (!salt) {
+                salt = Array.from(crypto.getRandomValues(new Uint8Array(16)))
+                    .map(b => b.toString(16).padStart(2, '0')).join('');
+                localStorage.setItem(CFG.SALT_KEY, salt);
+            }
+        } catch (e) { salt = 'no-salt-' + Date.now(); }
+
+        const full = await sha256Hex(collectRaw() + '|' + salt);
+        _deviceId = full;
+        _deviceShort = full.slice(0, 8).toUpperCase();
+
+        try {
+            localStorage.setItem(CFG.DEVICE_KEY, JSON.stringify({
+                id: _deviceId,
+                short: _deviceShort,
+                v: CFG.FP_VERSION,
+                createdAt: Date.now(),
+            }));
+        } catch (e) {}
+
+        log('Новое устройство:', _deviceShort);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  2. КАРТА ДОВЕРИЯ (устройства по именам)
+    //  {
+    //    "Ваня": {
+    //       devices: {
+    //          "X1SHORT": {
+    //             fullId, firstSeen, lastSeen, msgCount,
+    //             isAccepted: true   // был ли алерт принят
+    //          },
+    //          "X2SHORT": { ... }
+    //       },
+    //       pendingAlerts: [       // очередь неподтверждённых смен
+    //          { deviceShort, firstSeen, msgId, preview, accepted: false }
+    //       ]
+    //    }
+    //  }
+    // ═══════════════════════════════════════════════════════════
+    let _trust = {};
+
+    function loadTrust() {
+        try {
+            const raw = localStorage.getItem(CFG.TRUST_KEY);
+            _trust = raw ? JSON.parse(raw) : {};
+        } catch (e) { _trust = {}; }
+    }
+
+    function saveTrust() {
+        try {
+            localStorage.setItem(CFG.TRUST_KEY, JSON.stringify(_trust));
+        } catch (e) {
+            if (e.name === 'QuotaExceededError') {
+                // Чистим старые записи
+                const keys = Object.keys(_trust);
+                keys.forEach(k => {
+                    const entry = _trust[k];
+                    if (entry.devices) {
+                        Object.keys(entry.devices).forEach(d => {
+                            if (Date.now() - entry.devices[d].lastSeen > 60 * 24 * 3600 * 1000) {
+                                delete entry.devices[d];
+                            }
+                        });
+                    }
+                });
+                try { localStorage.setItem(CFG.TRUST_KEY, JSON.stringify(_trust)); } catch (e2) {}
+            }
+        }
+    }
+
+    function ensureUserEntry(username) {
+        if (!_trust[username]) {
+            _trust[username] = { devices: {}, pendingAlerts: [] };
+        }
+        if (!_trust[username].devices) _trust[username].devices = {};
+        if (!_trust[username].pendingAlerts) _trust[username].pendingAlerts = [];
+        return _trust[username];
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. ОБРАБОТКА СООБЩЕНИЯ
+    //  Возвращает true, если сработал триггер нового устройства
+    // ═══════════════════════════════════════════════════════════
+    const _processedIds = new Set();
+
+    function processMessage(msg) {
+        if (!msg || !msg.username || !msg._deviceShort) return false;
+        if (_processedIds.has(msg.id)) return false;
+        _processedIds.add(msg.id);
+
+        // Чистим множество
+        if (_processedIds.size > 5000) {
+            Array.from(_processedIds).slice(0, 3000).forEach(id => _processedIds.delete(id));
+        }
+
+        const username = msg.username;
+        const deviceShort = msg._deviceShort;
+        const deviceFull = msg._deviceId || deviceShort;
+        const now = Date.now();
+
+        const entry = ensureUserEntry(username);
+        const existing = entry.devices[deviceShort];
+
+        // ─── Случай А: устройство уже известно ───
+        if (existing) {
+            existing.lastSeen = now;
+            existing.msgCount++;
+            saveTrust();
+            return false;
+        }
+
+        // ─── Случай Б: новое устройство ───
+
+        // Есть ли уже другие устройства у этого имени?
+        const knownDevices = Object.keys(entry.devices);
+        const isFirstEver = knownDevices.length === 0;
+
+        // Регистрируем новое устройство
+        entry.devices[deviceShort] = {
+            fullId: deviceFull,
+            firstSeen: now,
+            lastSeen: now,
+            msgCount: 1,
+            isAccepted: isFirstEver,   // первое устройство автоматически "принято"
+        };
+
+        // ─── Если это ПЕРВОЕ устройство — не алертим ───
+        if (isFirstEver) {
+            saveTrust();
+            log(`Первое устройство для ${username}: ${deviceShort}`);
+            return false;
+        }
+
+        // ─── Иначе — это смена устройства. Проверяем ───
+        // Не дублируем ли алерт?
+        const alreadyPending = entry.pendingAlerts.some(a => a.deviceShort === deviceShort);
+        const alreadyAcceptedHistory = entry.devices[deviceShort].isAccepted;
+
+        if (alreadyPending) {
+            saveTrust();
+            return false;
+        }
+
+        // Добавляем алерт
+        const alert = {
+            deviceShort,
+            deviceFull,
+            username,
+            firstSeen: now,
+            msgId: msg.id,
+            preview: (msg.text || '').trim().slice(0, 100) ||
+                     (msg.image ? '[фото]' : '') ||
+                     (msg.audio ? '[аудио]' : '') ||
+                     (msg.file ? '[файл]' : '') ||
+                     '[сообщение]',
+        };
+        entry.pendingAlerts.push(alert);
+        saveTrust();
+
+        log(`⚠️ Смена устройства: ${username} → ${deviceShort}`);
+
+        // Показываем кнопку
+        showFloatingButton();
+
+        return true;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  4. ПАТЧ encryptMessage / decryptMessage
+    // ═══════════════════════════════════════════════════════════
+    if (typeof encryptMessage === 'function') {
+        const _origEncrypt = encryptMessage;
+        encryptMessage = async function(msg) {
+            if (_deviceId) {
+                msg._deviceId = _deviceId;
+                msg._deviceShort = _deviceShort;
+            }
+            return _origEncrypt.call(this, msg);
+        };
+        log('patched: encryptMessage');
+    }
+
+    if (typeof decryptMessage === 'function') {
+        const _origDecrypt = decryptMessage;
+        decryptMessage = async function(encMsg) {
+            const msg = await _origDecrypt.call(this, encMsg);
+            if (!msg) return msg;
+            if (!msg._deviceShort && msg._deviceId) {
+                msg._deviceShort = msg._deviceId.slice(0, 8).toUpperCase();
+            }
+            return msg;
+        };
+        log('patched: decryptMessage');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  5. ХУКИ НА ПОСТУПЛЕНИЕ СООБЩЕНИЙ
+    // ═══════════════════════════════════════════════════════════
+
+    // ─── appendMessages (новые в текущем чате) ───
+    if (typeof appendMessages === 'function') {
+        const _origAppend = appendMessages;
+        appendMessages = function(newMsgs) {
+            if (Array.isArray(newMsgs)) {
+                for (const m of newMsgs) {
+                    try { processMessage(m); } catch (e) {}
+                }
+            }
+            return _origAppend.apply(this, arguments);
+        };
+    }
+
+    // ─── renderMessages / renderHistory (загрузка истории) ───
+    if (typeof renderMessages === 'function') {
+        const _orig = renderMessages;
+        renderMessages = function(messages) {
+            if (Array.isArray(messages)) {
+                // Сортируем по времени (старые → новые), чтобы корректно
+                // обработать порядок появления устройств
+                const sorted = messages.slice().sort((a, b) =>
+                    new Date(a.time).getTime() - new Date(b.time).getTime()
+                );
+                for (const m of sorted) {
+                    try { processMessage(m); } catch (e) {}
+                }
+            }
+            return _orig.apply(this, arguments);
+        };
+    }
+
+    if (typeof renderHistory === 'function') {
+        const _orig = renderHistory;
+        renderHistory = function() {
+            if (historyState && Array.isArray(historyState.allMessages)) {
+                // Сортируем по времени
+                const sorted = historyState.allMessages.slice().sort((a, b) =>
+                    new Date(a.time).getTime() - new Date(b.time).getTime()
+                );
+                for (const m of sorted) {
+                    try { processMessage(m); } catch (e) {}
+                }
+            }
+            return _orig.apply(this, arguments);
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  6. ПЛАВАЮЩАЯ КНОПКА "⚠️ СМЕНА УСТРОЙСТВА"
+    // ═══════════════════════════════════════════════════════════
+    let _floatBtnEl = null;
+    let _panelEl = null;
+
+    function getTotalPendingAlerts() {
+        let total = 0;
+        for (const u of Object.keys(_trust)) {
+            const entry = _trust[u];
+            if (entry && Array.isArray(entry.pendingAlerts)) {
+                total += entry.pendingAlerts.length;
+            }
+        }
+        return total;
+    }
+
+    function ensureFloatBtn() {
+        if (_floatBtnEl && _floatBtnEl.isConnected) return _floatBtnEl;
+
+        const btn = document.createElement('button');
+        btn.id = 'deviceAlertBtn';
+        btn.type = 'button';
+        btn.innerHTML = `
+            <span class="dab-icon">🛡️</span>
+            <span class="dab-text">Смена устройства</span>
+            <span class="dab-badge" id="dabBadge">1</span>
+        `;
+        document.body.appendChild(btn);
+        _floatBtnEl = btn;
+
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            openPanel();
+        });
+
+        return btn;
+    }
+
+    function showFloatingButton() {
+        ensureFloatBtn();
+        updateFloatBtnBadge();
+
+        // Плавное появление
+        requestAnimationFrame(() => {
+            _floatBtnEl.classList.add('show');
+        });
+
+        // Вибрация
+        if (navigator.vibrate) navigator.vibrate([60, 40, 60]);
+    }
+
+    function updateFloatBtnBadge() {
+        if (!_floatBtnEl) return;
+        const total = getTotalPendingAlerts();
+        const badge = _floatBtnEl.querySelector('#dabBadge');
+
+        if (total > 0) {
+            badge.textContent = total > 99 ? '99+' : String(total);
+            badge.style.display = 'flex';
+            _floatBtnEl.classList.add('show');
+        } else {
+            badge.style.display = 'none';
+            _floatBtnEl.classList.remove('show');
+        }
+    }
+
+    function hideFloatingButton() {
+        if (_floatBtnEl) _floatBtnEl.classList.remove('show');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  7. ПАНЕЛЬ ДЕТАЛЕЙ
+    // ═══════════════════════════════════════════════════════════
+    function ensurePanel() {
+        if (_panelEl && _panelEl.isConnected) return _panelEl;
+
+        const panel = document.createElement('div');
+        panel.id = 'deviceAlertPanel';
+        panel.innerHTML = `
+            <div class="dap-backdrop"></div>
+            <div class="dap-content" onclick="event.stopPropagation()">
+                <div class="dap-header">
+                    <div class="dap-icon">🛡️</div>
+                    <div class="dap-title-box">
+                        <div class="dap-title">Смена устройства</div>
+                        <div class="dap-sub" id="dapSub">—</div>
+                    </div>
+                    <button class="dap-close" id="dapClose">✕</button>
+                </div>
+                <div class="dap-body" id="dapBody"></div>
+                <div class="dap-footer">
+                    <button class="dap-btn dap-btn-accept" id="dapAcceptAll">
+                        ✅ Принять все
+                    </button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(panel);
+        _panelEl = panel;
+
+        panel.querySelector('#dapClose').addEventListener('click', closePanel);
+        panel.querySelector('.dap-backdrop').addEventListener('click', closePanel);
+        panel.querySelector('#dapAcceptAll').addEventListener('click', acceptAllAlerts);
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && panel.classList.contains('show')) {
+                e.preventDefault();
+                e.stopPropagation();
+                closePanel();
+            }
+        }, true);
+
+        return panel;
+    }
+
+    function openPanel() {
+        const panel = ensurePanel();
+        renderPanelBody();
+        panel.classList.add('show');
+    }
+
+    function closePanel() {
+        if (_panelEl) _panelEl.classList.remove('show');
+    }
+
+    function renderPanelBody() {
+        const panel = _panelEl;
+        const body = panel.querySelector('#dapBody');
+        const sub = panel.querySelector('#dapSub');
+
+        // Собираем все pending алерты
+        const allAlerts = [];
+        for (const username of Object.keys(_trust)) {
+            const entry = _trust[username];
+            if (!entry || !Array.isArray(entry.pendingAlerts)) continue;
+            for (const alert of entry.pendingAlerts) {
+                allAlerts.push({ ...alert, username });
+            }
+        }
+
+        // Сортируем: самые свежие сверху
+        allAlerts.sort((a, b) => b.firstSeen - a.firstSeen);
+
+        if (allAlerts.length === 0) {
+            sub.textContent = 'Нет новых смен устройств';
+            body.innerHTML = `
+                <div class="dap-empty">
+                    <div class="dap-empty-icon">✅</div>
+                    <div class="dap-empty-title">Всё чисто</div>
+                    <div class="dap-empty-sub">Никто не менял устройство</div>
+                </div>
+            `;
+            panel.querySelector('#dapAcceptAll').disabled = true;
+            return;
+        }
+
+        sub.textContent = `${allAlerts.length} ${pluralize(allAlerts.length, 'событие', 'события', 'событий')}`;
+        panel.querySelector('#dapAcceptAll').disabled = false;
+
+        body.innerHTML = allAlerts.map((alert, idx) => {
+            const time = new Date(alert.firstSeen).toLocaleString('ru-RU', {
+                day: 'numeric', month: 'short',
+                hour: '2-digit', minute: '2-digit'
+            });
+
+            // Известные устройства этого пользователя (кроме нового)
+            const userEntry = _trust[alert.username];
+            const otherDevices = Object.keys(userEntry.devices)
+                .filter(d => d !== alert.deviceShort);
+
+            const otherDevicesText = otherDevices.length > 0
+                ? `Ранее писал с: ${otherDevices.map(d => `<code>${escapeHtml(d)}</code>`).join(', ')}`
+                : 'Ранее устройств не было';
+
+            return `
+                <div class="dap-item" data-alert-idx="${idx}" data-username="${escapeHtml(alert.username)}" data-device-short="${escapeHtml(alert.deviceShort)}">
+                    <div class="dap-item-user">
+                        <div class="dap-item-avatar">${escapeHtml(alert.username.charAt(0).toUpperCase())}</div>
+                        <div class="dap-item-info">
+                            <div class="dap-item-name">${escapeHtml(alert.username)}</div>
+                            <div class="dap-item-time">🕐 ${escapeHtml(time)}</div>
+                        </div>
+                    </div>
+                    <div class="dap-item-device">
+                        <span class="dap-device-label">Новое устройство:</span>
+                        <code class="dap-device-code">${escapeHtml(alert.deviceShort)}</code>
+                    </div>
+                    <div class="dap-item-other">
+                        ${escapeHtml(otherDevicesText).replace(/&lt;code&gt;/g, '<code>').replace(/&lt;\/code&gt;/g, '</code>')}
+                    </div>
+                    <div class="dap-item-preview">
+                        <span class="dap-preview-label">📝</span>
+                        <span class="dap-preview-text">${escapeHtml(alert.preview || '—')}</span>
+                    </div>
+                    <button class="dap-item-btn"
+                            data-action="accept"
+                            data-username="${escapeHtml(alert.username)}"
+                            data-device-short="${escapeHtml(alert.deviceShort)}">
+                        ✅ Принять
+                    </button>
+                </div>
+            `;
+        }).join('');
+
+        // Обработчики кнопок "Принять"
+        body.querySelectorAll('.dap-item-btn[data-action="accept"]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                acceptAlert(btn.dataset.username, btn.dataset.deviceShort);
+            });
+        });
+    }
+
+    function acceptAlert(username, deviceShort) {
+        const entry = _trust[username];
+        if (!entry) return;
+
+        // Помечаем устройство как принятое
+        if (entry.devices[deviceShort]) {
+            entry.devices[deviceShort].isAccepted = true;
+            entry.devices[deviceShort].acceptedAt = Date.now();
+        }
+
+        // Убираем из pending
+        entry.pendingAlerts = (entry.pendingAlerts || [])
+            .filter(a => a.deviceShort !== deviceShort);
+
+        saveTrust();
+        updateFloatBtnBadge();
+
+        // Перерисовываем панель
+        if (_panelEl && _panelEl.classList.contains('show')) {
+            renderPanelBody();
+        }
+
+        // Если всё принято — закрываем панель
+        if (getTotalPendingAlerts() === 0) {
+            setTimeout(closePanel, 400);
+        }
+
+        if (navigator.vibrate) navigator.vibrate(20);
+        if (typeof soundManager !== 'undefined') {
+            try { soundManager.play('click'); } catch (e) {}
+        }
+    }
+
+    function acceptAllAlerts() {
+        let count = 0;
+        for (const username of Object.keys(_trust)) {
+            const entry = _trust[username];
+            if (!entry || !Array.isArray(entry.pendingAlerts)) continue;
+
+            for (const alert of entry.pendingAlerts) {
+                if (entry.devices[alert.deviceShort]) {
+                    entry.devices[alert.deviceShort].isAccepted = true;
+                    entry.devices[alert.deviceShort].acceptedAt = Date.now();
+                }
+                count++;
+            }
+            entry.pendingAlerts = [];
+        }
+
+        saveTrust();
+        updateFloatBtnBadge();
+        closePanel();
+
+        if (count > 0 && typeof showToast === 'function') {
+            showToast(`✅ Принято: ${count} ${pluralize(count, 'событие', 'события', 'событий')}`, 1500);
+        }
+
+        if (navigator.vibrate) navigator.vibrate(20);
+    }
+
+    function pluralize(n, one, two, five) {
+        const m10 = n % 10, m100 = n % 100;
+        if (m10 === 1 && m100 !== 11) return one;
+        if (m10 >= 2 && m10 <= 4 && (m100 < 10 || m100 >= 20)) return two;
+        return five;
+    }
+
+    function escapeHtml(s) {
+        const div = document.createElement('div');
+        div.textContent = s == null ? '' : String(s);
+        return div.innerHTML;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  8. СТИЛИ
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('devFP2Styles')) {
+        const style = document.createElement('style');
+        style.id = 'devFP2Styles';
+        style.textContent = `
+            /* ═══════════════════════════════════════════════════
+               ПЛАВАЮЩАЯ КНОПКА
+               ═══════════════════════════════════════════════════ */
+            #deviceAlertBtn {
+                position: fixed;
+                top: calc(12px + env(safe-area-inset-top, 0px));
+                left: 50%;
+                transform: translateX(-50%) translateY(-120%);
+                z-index: 7000;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                padding: 10px 16px 10px 12px;
+                border: none;
+                border-radius: 24px;
+                background: linear-gradient(135deg, #ff9f43, #feca57);
+                color: #1a1a2e;
+                font-family: inherit;
+                font-size: 13px;
+                font-weight: 700;
+                cursor: pointer;
+                box-shadow:
+                    0 8px 28px rgba(255, 159, 67, 0.55),
+                    0 0 0 0 rgba(255, 159, 67, 0.5);
+                transition:
+                    transform 0.35s cubic-bezier(0.22, 0.61, 0.36, 1),
+                    opacity 0.3s ease,
+                    box-shadow 0.3s;
+                opacity: 0;
+                pointer-events: none;
+                -webkit-tap-highlight-color: transparent;
+                animation: dabPulse 2.4s ease-in-out infinite;
+            }
+            #deviceAlertBtn.show {
+                transform: translateX(-50%) translateY(0);
+                opacity: 1;
+                pointer-events: auto;
+            }
+            #deviceAlertBtn:active {
+                transform: translateX(-50%) translateY(0) scale(0.95);
+            }
+            @keyframes dabPulse {
+                0%, 100% {
+                    box-shadow:
+                        0 8px 28px rgba(255, 159, 67, 0.55),
+                        0 0 0 0 rgba(255, 159, 67, 0.6);
+                }
+                50% {
+                    box-shadow:
+                        0 8px 28px rgba(255, 159, 67, 0.55),
+                        0 0 0 10px rgba(255, 159, 67, 0);
+                }
+            }
+            #deviceAlertBtn .dab-icon {
+                font-size: 16px;
+                line-height: 1;
+            }
+            #deviceAlertBtn .dab-text {
+                white-space: nowrap;
+                letter-spacing: 0.2px;
+            }
+            #deviceAlertBtn .dab-badge {
+                min-width: 20px;
+                height: 20px;
+                padding: 0 6px;
+                border-radius: 10px;
+                background: rgba(0, 0, 0, 0.25);
+                color: #fff;
+                font-size: 11px;
+                font-weight: 800;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                line-height: 1;
+            }
+
+            /* ═══════════════════════════════════════════════════
+               ПАНЕЛЬ ДЕТАЛЕЙ
+               ═══════════════════════════════════════════════════ */
+            #deviceAlertPanel {
+                position: fixed;
+                inset: 0;
+                z-index: 7500;
+                display: none;
+                align-items: center;
+                justify-content: center;
+                padding: 20px;
+                font-family: inherit;
+            }
+            #deviceAlertPanel.show {
+                display: flex;
+            }
+            #deviceAlertPanel .dap-backdrop {
+                position: absolute;
+                inset: 0;
+                background: rgba(0, 0, 0, 0.7);
+                backdrop-filter: blur(8px);
+                -webkit-backdrop-filter: blur(8px);
+                animation: dapFadeIn 0.25s ease;
+            }
+            @keyframes dapFadeIn {
+                from { opacity: 0; }
+                to   { opacity: 1; }
+            }
+            #deviceAlertPanel .dap-content {
+                position: relative;
+                z-index: 1;
+                background: #1a1a2e;
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                border-radius: 22px;
+                max-width: 480px;
+                width: 100%;
+                max-height: 88vh;
+                display: flex;
+                flex-direction: column;
+                overflow: hidden;
+                box-shadow: 0 24px 72px rgba(0, 0, 0, 0.75);
+                animation: dapSlideUp 0.3s cubic-bezier(0.22, 0.61, 0.36, 1);
+            }
+            @keyframes dapSlideUp {
+                from { transform: scale(0.94) translateY(20px); opacity: 0; }
+                to   { transform: scale(1) translateY(0); opacity: 1; }
+            }
+
+            #deviceAlertPanel .dap-header {
+                display: flex;
+                align-items: center;
+                gap: 12px;
+                padding: 16px 20px;
+                border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+                background: linear-gradient(135deg,
+                    rgba(255, 159, 67, 0.15),
+                    rgba(254, 202, 87, 0.08));
+                flex-shrink: 0;
+            }
+            #deviceAlertPanel .dap-icon {
+                width: 44px;
+                height: 44px;
+                border-radius: 14px;
+                background: linear-gradient(135deg, #ff9f43, #feca57);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 22px;
+                flex-shrink: 0;
+                box-shadow: 0 4px 14px rgba(255, 159, 67, 0.4);
+            }
+            #deviceAlertPanel .dap-title-box {
+                flex: 1;
+                min-width: 0;
+            }
+            #deviceAlertPanel .dap-title {
+                font-size: 17px;
+                font-weight: 800;
+                color: #fff;
+                margin-bottom: 2px;
+                line-height: 1.2;
+            }
+            #deviceAlertPanel .dap-sub {
+                font-size: 12px;
+                color: #aaa;
+            }
+            #deviceAlertPanel .dap-close {
+                width: 34px;
+                height: 34px;
+                border-radius: 50%;
+                border: none;
+                background: rgba(255, 255, 255, 0.08);
+                color: #ccc;
+                font-size: 15px;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                flex-shrink: 0;
+                transition: all 0.15s;
+            }
+            #deviceAlertPanel .dap-close:hover {
+                background: rgba(255, 107, 107, 0.25);
+                color: #ff6b6b;
+            }
+
+            #deviceAlertPanel .dap-body {
+                flex: 1;
+                overflow-y: auto;
+                padding: 16px 18px;
+                min-height: 0;
+            }
+
+            #deviceAlertPanel .dap-item {
+                background: rgba(255, 255, 255, 0.04);
+                border: 1px solid rgba(255, 159, 67, 0.25);
+                border-radius: 16px;
+                padding: 14px 16px;
+                margin-bottom: 12px;
+                position: relative;
+            }
+            #deviceAlertPanel .dap-item:last-child { margin-bottom: 0; }
+
+            #deviceAlertPanel .dap-item-user {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                margin-bottom: 10px;
+            }
+            #deviceAlertPanel .dap-item-avatar {
+                width: 40px;
+                height: 40px;
+                border-radius: 50%;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                color: #fff;
+                font-weight: 800;
+                font-size: 16px;
+                flex-shrink: 0;
+                box-shadow: 0 3px 10px rgba(108, 92, 231, 0.35);
+            }
+            #deviceAlertPanel .dap-item-info {
+                flex: 1;
+                min-width: 0;
+            }
+            #deviceAlertPanel .dap-item-name {
+                font-size: 16px;
+                font-weight: 700;
+                color: #fff;
+                margin-bottom: 3px;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            #deviceAlertPanel .dap-item-time {
+                font-size: 11px;
+                color: #feca57;
+                font-weight: 600;
+            }
+
+            #deviceAlertPanel .dap-item-device {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                padding: 8px 12px;
+                background: rgba(254, 202, 87, 0.08);
+                border: 1px solid rgba(254, 202, 87, 0.2);
+                border-radius: 10px;
+                margin-bottom: 8px;
+                flex-wrap: wrap;
+            }
+            #deviceAlertPanel .dap-device-label {
+                font-size: 11px;
+                color: #aaa;
+            }
+            #deviceAlertPanel .dap-device-code {
+                font-family: 'SF Mono', 'Courier New', monospace;
+                font-size: 13px;
+                font-weight: 800;
+                color: #feca57;
+                background: rgba(0, 0, 0, 0.3);
+                padding: 2px 8px;
+                border-radius: 6px;
+                letter-spacing: 0.5px;
+            }
+
+            #deviceAlertPanel .dap-item-other {
+                font-size: 11px;
+                color: #888;
+                margin-bottom: 8px;
+                line-height: 1.5;
+            }
+            #deviceAlertPanel .dap-item-other code {
+                font-family: 'SF Mono', 'Courier New', monospace;
+                color: #a78bfa;
+                background: rgba(108, 92, 231, 0.15);
+                padding: 1px 6px;
+                border-radius: 4px;
+                font-size: 10px;
+            }
+
+            #deviceAlertPanel .dap-item-preview {
+                display: flex;
+                align-items: flex-start;
+                gap: 8px;
+                padding: 8px 10px;
+                background: rgba(0, 0, 0, 0.25);
+                border-radius: 10px;
+                margin-bottom: 12px;
+                border-left: 3px solid rgba(254, 202, 87, 0.5);
+            }
+            #deviceAlertPanel .dap-preview-label {
+                font-size: 12px;
+                flex-shrink: 0;
+                opacity: 0.7;
+            }
+            #deviceAlertPanel .dap-preview-text {
+                font-size: 12px;
+                color: #ccc;
+                line-height: 1.4;
+                word-break: break-word;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                display: -webkit-box;
+                -webkit-line-clamp: 2;
+                -webkit-box-orient: vertical;
+            }
+
+            #deviceAlertPanel .dap-item-btn {
+                width: 100%;
+                padding: 10px 14px;
+                border-radius: 12px;
+                border: 1px solid rgba(0, 184, 148, 0.4);
+                background: linear-gradient(135deg,
+                    rgba(0, 184, 148, 0.25),
+                    rgba(108, 92, 231, 0.2));
+                color: #fff;
+                font-size: 13px;
+                font-weight: 700;
+                cursor: pointer;
+                font-family: inherit;
+                transition: all 0.15s;
+                -webkit-tap-highlight-color: transparent;
+            }
+            #deviceAlertPanel .dap-item-btn:hover {
+                background: linear-gradient(135deg,
+                    rgba(0, 184, 148, 0.4),
+                    rgba(108, 92, 231, 0.3));
+                border-color: rgba(0, 184, 148, 0.7);
+            }
+            #deviceAlertPanel .dap-item-btn:active {
+                transform: scale(0.97);
+            }
+
+            #deviceAlertPanel .dap-empty {
+                text-align: center;
+                padding: 50px 20px;
+                color: #666;
+            }
+            #deviceAlertPanel .dap-empty-icon {
+                font-size: 56px;
+                margin-bottom: 12px;
+                opacity: 0.6;
+            }
+            #deviceAlertPanel .dap-empty-title {
+                font-size: 15px;
+                color: #aaa;
+                margin-bottom: 6px;
+                font-weight: 700;
+            }
+            #deviceAlertPanel .dap-empty-sub {
+                font-size: 12px;
+                color: #666;
+                line-height: 1.5;
+            }
+
+            #deviceAlertPanel .dap-footer {
+                padding: 12px 18px 16px;
+                border-top: 1px solid rgba(255, 255, 255, 0.06);
+                background: rgba(255, 255, 255, 0.02);
+                flex-shrink: 0;
+            }
+            #deviceAlertPanel .dap-btn-accept {
+                width: 100%;
+                padding: 12px 16px;
+                border-radius: 14px;
+                border: none;
+                background: linear-gradient(135deg, #00b894, #00cfa4);
+                color: #fff;
+                font-size: 14px;
+                font-weight: 700;
+                cursor: pointer;
+                font-family: inherit;
+                transition: all 0.15s;
+                box-shadow: 0 4px 14px rgba(0, 184, 148, 0.35);
+                -webkit-tap-highlight-color: transparent;
+            }
+            #deviceAlertPanel .dap-btn-accept:hover {
+                background: linear-gradient(135deg, #00cfa4, #00e5b8);
+            }
+            #deviceAlertPanel .dap-btn-accept:active {
+                transform: scale(0.98);
+            }
+            #deviceAlertPanel .dap-btn-accept:disabled {
+                opacity: 0.4;
+                cursor: not-allowed;
+                transform: none;
+                box-shadow: none;
+            }
+
+            @media (max-width: 480px) {
+                #deviceAlertBtn {
+                    font-size: 12px;
+                    padding: 8px 14px 8px 10px;
+                    gap: 6px;
+                }
+                #deviceAlertBtn .dab-icon { font-size: 14px; }
+                #deviceAlertBtn .dab-badge { min-width: 18px; height: 18px; font-size: 10px; }
+
+                #deviceAlertPanel {
+                    padding: 10px;
+                }
+                #deviceAlertPanel .dap-content {
+                    max-height: 92vh;
+                    border-radius: 18px;
+                }
+                #deviceAlertPanel .dap-header { padding: 14px 16px; }
+                #deviceAlertPanel .dap-body { padding: 12px 14px; }
+                #deviceAlertPanel .dap-item { padding: 12px 14px; }
+                #deviceAlertPanel .dap-item-avatar { width: 36px; height: 36px; font-size: 14px; }
+                #deviceAlertPanel .dap-item-name { font-size: 15px; }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  9. ВОССТАНОВЛЕНИЕ СОСТОЯНИЯ ПРИ СТАРТЕ
+    // ═══════════════════════════════════════════════════════════
+    function restoreState() {
+        loadTrust();
+        const total = getTotalPendingAlerts();
+        if (total > 0) {
+            log(`Восстановлено ${total} непрочитанных алертов`);
+            showFloatingButton();
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  10. ПУБЛИЧНОЕ API
+    // ═══════════════════════════════════════════════════════════
+    window.DeviceGuard = {
+        myId:        () => _deviceShort,
+        myFullId:    () => _deviceId,
+        status:      () => ({
+            initialized: !!_deviceId,
+            myId: _deviceShort,
+            trackedUsers: Object.keys(_trust).length,
+            pendingAlerts: getTotalPendingAlerts(),
+        }),
+        getTrust:    () => JSON.parse(JSON.stringify(_trust)),
+        getUserDevices: (u) => _trust[u] ? Object.keys(_trust[u].devices) : [],
+        getPendingAlerts: () => {
+            const out = [];
+            for (const u of Object.keys(_trust)) {
+                (_trust[u].pendingAlerts || []).forEach(a => out.push({ ...a, username: u }));
+            }
+            return out;
+        },
+        acceptAlert: (username, deviceShort) => acceptAlert(username, deviceShort),
+        acceptAll:   () => acceptAllAlerts(),
+        openPanel:   () => openPanel(),
+        closePanel:  () => closePanel(),
+        // Для отладки
+        _processMessage: (msg) => processMessage(msg),
+        reset: () => {
+            try {
+                localStorage.removeItem(CFG.DEVICE_KEY);
+                localStorage.removeItem(CFG.TRUST_KEY);
+                localStorage.removeItem(CFG.SALT_KEY);
+                _trust = {};
+                _processedIds.clear();
+                hideFloatingButton();
+                if (_panelEl) _panelEl.classList.remove('show');
+                log('Полный сброс');
+            } catch (e) {}
+        },
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  11. ЗАПУСК
+    // ═══════════════════════════════════════════════════════════
+    (async () => {
+        try {
+            await initDeviceId();
+            restoreState();
+            log(`✅ Готово. Моё устройство: ${_deviceShort}`);
+            log('API: DeviceGuard.status() / .getPendingAlerts() / .acceptAll()');
+        } catch (e) {
+            console.warn('🛡️ [DevFP2] init error:', e);
+        }
+    })();
+
+    // Периодическая проверка (страховка на случай пропущенных сообщений)
+    setInterval(() => {
+        if (typeof state === 'undefined') return;
+        if (state.currentScreen !== 'chat') return;
+        if (!historyState || !Array.isArray(historyState.allMessages)) return;
+
+        // Берём последние 100 сообщений и обрабатываем те, что ещё не видели
+        const recent = historyState.allMessages.slice(-100);
+        for (const m of recent) {
+            if (m && m._deviceShort && !_processedIds.has(m.id)) {
+                try { processMessage(m); } catch (e) {}
+            }
+        }
+    }, 4000);
+
+    // При смене экрана — обновляем бейдж (на случай если алерты появились в фоне)
+    window.addEventListener('focus', () => updateFloatBtnBadge());
+
+})();
+</script><script>
+// ═══════════════════════════════════════════════════════════════
+//  🛡️ ПАТЧ: ТЕХНИЧЕСКИЕ СООБЩЕНИЯ О СМЕНЕ УСТРОЙСТВА В ЧАТЕ
+//  ─────────────────────────────────────────────────────────────
+//  • При обнаружении смены устройства от известного имени
+//    в чат добавляется системное сообщение.
+//  • Сообщение нельзя удалить, на него нельзя ответить или
+//    поставить реакцию.
+//  • Плавающая кнопка "Смена устройства" продолжает работать
+//    для детального просмотра.
+// ═══════════════════════════════════════════════════════════════
+
+(function installDeviceChangeChatNotifier() {
+    'use strict';
+
+    console.log('🛡️ [DeviceNotifier] Установка патча...');
+
+    // Проверяем, что необходимые модули на месте
+    if (typeof DeviceGuard === 'undefined') {
+        console.error('❌ [DeviceNotifier] Модуль DeviceGuard не найден.');
+        return;
+    }
+    if (typeof appendMessages !== 'function' || typeof buildMessageHTML !== 'function') {
+        console.error('❌ [DeviceNotifier] Не найдены базовые функции чата.');
+        return;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХРАНИЛИЩЕ УЖЕ ПОКАЗАННЫХ УВЕДОМЛЕНИЙ
+    //  Чтобы не спамить одним и тем же событием.
+    // ═══════════════════════════════════════════════════════════
+    const NOTIFIED_KEY = 'smschat_device_notified_v1';
+    let _notifiedEvents = new Set();
+
+    function loadNotifiedEvents() {
+        try {
+            const raw = localStorage.getItem(NOTIFIED_KEY);
+            const arr = raw ? JSON.parse(raw) : [];
+            _notifiedEvents = new Set(arr);
+        } catch (e) {
+            _notifiedEvents = new Set();
+        }
+    }
+    function saveNotifiedEvents() {
+        try {
+            // Храним не более 200 последних записей
+            const arr = Array.from(_notifiedEvents).slice(-200);
+            localStorage.setItem(NOTIFIED_KEY, JSON.stringify(arr));
+        } catch (e) {}
+    }
+    loadNotifiedEvents();
+
+    /**
+     * Формирует "виртуальное" сообщение, которое выглядит как системное,
+     * но содержит детали смены устройства.
+     */
+    function createDeviceChangeMessage(alert) {
+        const now = Date.now();
+        const eventKey = `${alert.username}|${alert.deviceShort}|${alert.firstSeen}`;
+
+        // Если мы уже показывали это уведомление — не создаём новое
+        if (_notifiedEvents.has(eventKey)) {
+            return null;
+        }
+
+        const time = new Date(alert.firstSeen).toLocaleString('ru-RU', {
+            day: 'numeric', month: 'short',
+            hour: '2-digit', minute: '2-digit'
+        });
+
+        // Получаем список известных устройств для этого пользователя
+        const userDevices = DeviceGuard.getUserDevices(alert.username);
+        const otherDevices = userDevices.filter(d => d !== alert.deviceShort);
+        const otherDevicesText = otherDevices.length > 0
+            ? `Ранее писал с: <code style="background:rgba(255,255,255,0.08);padding:1px 4px;border-radius:3px;font-size:10px;">${otherDevices.join(', ')}</code>`
+            : 'Ранее устройств не было';
+
+        return {
+            // Специальный ID для технического сообщения
+            id: `device-change-${eventKey}`,
+            username: '🛡️ Система',
+            text: `
+                <div style="text-align:left;line-height:1.5;">
+                    <div style="font-size:14px;font-weight:700;color:#feca57;margin-bottom:6px;">
+                        ⚠️ Смена устройства
+                    </div>
+                    <div style="font-size:12px;color:#ccc;margin-bottom:4px;">
+                        Пользователь <strong style="color:#a78bfa;">${alert.username}</strong> начал писать с нового устройства.
+                    </div>
+                    <div style="font-size:11px;color:#888;">
+                        <div style="margin:2px 0;">🕐 ${time}</div>
+                        <div style="margin:2px 0;">📱 Новое устройство: <code style="background:rgba(254,202,87,0.15);color:#feca57;padding:1px 5px;border-radius:4px;font-size:10px;">${alert.deviceShort}</code></div>
+                        <div style="margin:2px 0;">${otherDevicesText}</div>
+                    </div>
+                </div>
+            `,
+            time: new Date(alert.firstSeen).toISOString(),
+            // Флаги для стилизации и защиты
+            _isSystemTechnical: true,
+            _isDeviceChange: true,
+            _deviceAlertKey: eventKey,
+        };
+    }
+
+    /**
+     * Добавляет техническое сообщение в текущий чат.
+     */
+    function displayDeviceChangeMessage(alert) {
+        // Показываем только если пользователь находится в этом чате
+        // (в остальных случаях уже есть плавающая кнопка)
+        if (state.currentScreen !== 'chat' || !state.chatFile) {
+            return;
+        }
+
+        const msg = createDeviceChangeMessage(alert);
+        if (!msg) return; // Уже показывали
+
+        _notifiedEvents.add(msg._deviceAlertKey);
+        saveNotifiedEvents();
+
+        // Добавляем в историю и на экран
+        historyState.allMessages.push(msg);
+        appendMessages([msg]);
+
+        // Если пользователь был у низа — скроллим вниз
+        if (typeof scrollState !== 'undefined' && scrollState.isAtBottom) {
+            if (typeof scrollToBottom === 'function') {
+                // Разрешаем скролл через Nuke-патч, если он есть
+                if (typeof window.allowScrollToBottom === 'function') {
+                    window.allowScrollToBottom(2000, 'device-change-msg');
+                }
+                scrollToBottom(true);
+            }
+        }
+
+        if (navigator.vibrate) navigator.vibrate([40, 30, 40]);
+        if (typeof soundManager !== 'undefined') {
+            soundManager.play('notification');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ ОБНАРУЖЕНИЯ СМЕНЫ УСТРОЙСТВА
+    //  ─────────────────────────────────────────────────────────
+    //  Патчим приватный метод processMessage через "мостик":
+    //  DeviceGuard экспортирует DeviceGuard._processMessage —
+    //  оборачиваем его, чтобы отлавливать момент алерта.
+    // ═══════════════════════════════════════════════════════════
+    if (typeof DeviceGuard._processMessage === 'function') {
+        const _origProcess = DeviceGuard._processMessage;
+
+        DeviceGuard._processMessage = function(msg) {
+            const isAlert = _origProcess.call(this, msg);
+
+            if (isAlert) {
+                // Находим только что созданный алерт
+                const pending = DeviceGuard.getPendingAlerts();
+                const latestAlert = pending[pending.length - 1];
+
+                if (latestAlert && latestAlert.msgId === msg.id) {
+                    console.log('🛡️ [DeviceNotifier] Обнаружена смена устройства, показываю в чате.');
+                    displayDeviceChangeMessage(latestAlert);
+                }
+            }
+            return isAlert;
+        };
+        console.log('✅ [DeviceNotifier] Хук на DeviceGuard._processMessage установлен.');
+    } else {
+        console.warn('⚠️ [DeviceNotifier] Не удалось найти DeviceGuard._processMessage. Патч может не сработать.');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СТИЛИЗАЦИЯ И ЗАЩИТА ТЕХНИЧЕСКОГО СООБЩЕНИЯ
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('deviceTechnicalMsgStyles')) {
+        const style = document.createElement('style');
+        style.id = 'deviceTechnicalMsgStyles';
+        style.textContent = `
+            /* ═══ Стиль технического сообщения ═══ */
+            .message-wrapper[data-msg-id^="device-change-"] .message.system {
+                background: rgba(40, 40, 60, 0.9) !important;
+                border: 1px solid rgba(254, 202, 87, 0.35) !important;
+                color: #ccc !important;
+                max-width: 95% !important;
+                border-radius: 14px !important;
+                padding: 10px 14px !important;
+                box-shadow: 0 2px 10px rgba(0, 0, 0, 0.3);
+                backdrop-filter: blur(8px);
+                -webkit-backdrop-filter: blur(8px);
+            }
+
+            /* ═══ Убираем всё, что не должно быть на техническом сообщении ═══ */
+            .message-wrapper[data-msg-id^="device-change-"] .delete-btn,
+            .message-wrapper[data-msg-id^="device-change-"] .reaction-add-btn,
+            .message-wrapper[data-msg-id^="device-change-"] .image-comment-bar,
+            .message-wrapper[data-msg-id^="device-change-"] .swipe-reply-hint,
+            .message-wrapper[data-msg-id^="device-change-"] .message .sender {
+                display: none !important;
+            }
+
+            /* Полностью блокируем взаимодействие */
+            .message-wrapper[data-msg-id^="device-change-"] .message {
+                cursor: default;
+                user-select: text; /* Разрешаем скопировать ID устройства */
+                -webkit-user-select: text;
+            }
+
+            .message-wrapper[data-msg-id^="device-change-"] .message code {
+                user-select: all !important;
+                -webkit-user-select: all !important;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ФИНАЛЬНАЯ ЗАЩИТА: перехват попыток удалить/ответить
+    // ═══════════════════════════════════════════════════════════
+    // Патчим showMessageMenu, чтобы на технические сообщения
+    // не показывалось меню действий (ответ, копировать, удалить).
+    if (typeof showMessageMenu === 'function') {
+        const _origShowMenu = showMessageMenu;
+        showMessageMenu = function(x, y, msgId, isOwn) {
+            const msg = historyState.allMessages.find(m => m.id === msgId);
+            if (msg && msg._isSystemTechnical) {
+                // Разрешаем только копирование
+                const canCopy = msg.text && !msg._isDeviceChange; // ID устройства уже копируется через code
+
+                if (!canCopy) {
+                    return; // Полностью блокируем меню
+                }
+            }
+            return _origShowMenu.apply(this, arguments);
+        };
+        console.log('✅ [DeviceNotifier] showMessageMenu защищён от технических сообщений.');
+    }
+
+    console.log('🛡️ [DeviceNotifier] Патч установлен:');
+    console.log('   • Смена устройства теперь появляется как техническое сообщение в чате.');
+    console.log('   • Сообщение нельзя удалить, ответить или поставить реакцию.');
+    console.log('   • Уведомление показывается один раз для каждого события.');
+})();
+</script>
 </body>
 </html>
