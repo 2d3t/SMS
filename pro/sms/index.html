@@ -49579,17 +49579,19 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
         const status = _playing ? '▶️ Играет' : (cur ? '⏸ Пауза' : '—');
 
         const collapsedBody = `
-            <div class="wc-radio-now">
-                <div class="wc-radio-now-name">${escapeHtmlSafe(curName)}</div>
-                <div class="wc-radio-now-status">${status}</div>
-            </div>
-            <div class="wc-radio-controls">
-                <button class="wc-radio-btn wc-radio-play" data-radio-action="toggle">
-                    ${_playing ? '⏸' : '▶️'}
-                </button>
-                ${cur ? `<button class="wc-radio-btn" data-radio-action="clear">✕</button>` : ''}
-            </div>
-        `;
+    <div class="wc-radio-now">
+        <div class="wc-radio-now-name">${escapeHtmlSafe(curName)}</div>
+        <div class="wc-radio-now-status">${status}</div>
+    </div>
+    <div class="wc-radio-controls">
+        <button class="wc-radio-btn wc-radio-prev" data-radio-action="prev" ${_favorites.length < 1 ? 'disabled style="opacity:0.3"' : ''} title="Предыдущая из избранного">⏮</button>
+        <button class="wc-radio-btn wc-radio-play" data-radio-action="toggle">
+            ${_playing ? '⏸' : '▶️'}
+        </button>
+        <button class="wc-radio-btn wc-radio-next" data-radio-action="next" ${_favorites.length < 1 ? 'disabled style="opacity:0.3"' : ''} title="Следующая из избранного">⏭</button>
+        ${cur ? `<button class="wc-radio-btn" data-radio-action="clear">✕</button>` : ''}
+    </div>
+`;
 
         let expandedBody = '';
         if (_expanded) {
@@ -49735,7 +49737,23 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
                 const action = actionEl.dataset.radioAction;
                 const id = actionEl.dataset.id;
                 switch (action) {
-                    case 'toggle': togglePlay(); return;
+    case 'prev': {
+        const favs = _favorites.map(getStationById).filter(Boolean);
+        if (favs.length === 0) return;
+        const curIdx = favs.findIndex(s => s.id === _currentId);
+        const prevIdx = curIdx <= 0 ? favs.length - 1 : curIdx - 1;
+        playStation(favs[prevIdx]);
+        return;
+    }
+    case 'next': {
+        const favs = _favorites.map(getStationById).filter(Boolean);
+        if (favs.length === 0) return;
+        const curIdx = favs.findIndex(s => s.id === _currentId);
+        const nextIdx = curIdx === -1 ? 0 : (curIdx + 1) % favs.length;
+        playStation(favs[nextIdx]);
+        return;
+    }
+    case 'toggle': togglePlay(); return;
                     case 'clear':
                         _currentId = null; saveCurrent();
                         if (_audio) { _audio.pause(); _audio.src = ''; }
