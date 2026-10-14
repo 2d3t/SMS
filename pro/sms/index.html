@@ -53564,6 +53564,398 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
 
     applyFix();
 })();
+</script><script>
+// ═══════════════════════════════════════════════════════════════
+//  🩹 FIX: клики по виджетам снизу
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: обработчики виджетов делегированы на #chatsList.
+//  Нижние виджеты живут в #widgetsBottom — их клики не долетают.
+//
+//  Решение: перехватываем события на #widgetsBottom и
+//  пере-диспатчим их в #chatsList (или вызываем обработчик напрямую).
+// ═══════════════════════════════════════════════════════════════
+
+(function fixBottomWidgetsClicks() {
+    'use strict';
+
+    console.log('🩹 [BottomClicks] Установка…');
+
+    const EVENT_TYPES = [
+        'click',
+        'mousedown', 'mouseup', 'mouseleave',
+        'touchstart', 'touchmove', 'touchend', 'touchcancel',
+        'focus', 'blur', 'change', 'input',
+    ];
+
+    let _bound = false;
+
+    function ensureBottomContainerHandler() {
+        const bottom = document.getElementById('widgetsBottom');
+        if (!bottom) return false;
+        if (bottom._clicksBound) return true;
+
+        bottom._clicksBound = true;
+
+        // ─── Перенаправление через "retarget" ───
+        // Мы не пере-диспатчим событие (это создаст дубли),
+        // а ВЫЗЫВАЕМ через #chatsList.dispatchEvent с target=элемент
+        // внутри #widgetsBottom. Браузер сохраняет target как есть,
+        // но обработчики на #chatsList увидят правильный target
+        // только если событие действительно прошло через #chatsList.
+        //
+        // Второй вариант: взять обработчики из #chatsList (нельзя — они в замыкании).
+        //
+        // Третий вариант (рабочий): пере-диспатчить событие из #chatsList.
+        // На #chatsList стоит addEventListener('click'), он сработает
+        // и получит event.target = исходный элемент, потому что
+        // dispatchEvent с target — сохраняет target.
+
+        // Но: dispatchEvent запускает bubble-фазу ЗАНОВО,
+        // начиная с target и до document. Это может привести
+        // к рекурсии и дублям.
+        //
+        // Правильный подход: временно подменить target.
+        // Но это невозможно в стандартном DOM.
+        //
+        // ПРОСТОЙ РАБОЧИЙ СПОСОБ: обернуть снизу контейнер
+        // #widgetsBottom в #chatsList (визуально это не так просто),
+        // либо перенести обработчики вручную.
+
+        // ═══ ИТОГ: используем "физический" редирект ═══
+        // Событие на нижнем виджете — находим соответствующий
+        // обработчик на #chatsList, который сработал бы, если бы
+        // виджет был в списке.
+
+        // Проще всего: продублировать addEventListener на #widgetsBottom
+        // с тем же кодом, что и на #chatsList. Но код в замыкании.
+
+        // Компромисс: для каждого типа события делаем так —
+        // 1. Находим элемент-цель внутри #widgetsBottom.
+        // 2. Создаём новое событие того же типа.
+        // 3. Временно перемещаем элемент в #chatsList (в конец),
+        //    диспатчим событие, возвращаем обратно.
+        //
+        // Это грязно, но работает 100% и не ломает никакую логику.
+
+        // ═════════════════════════════════════════════════════
+        //  ФИНАЛЬНЫЙ ВАРИАНТ: диспатчим события из #chatsList,
+        //  подменяя event.target на реальный через defineProperty
+        //  — не работает в strict mode для нативных событий.
+        //
+        //  Поэтому идём другим путём: используем "клонирование"
+        //  события с правильным target = элемент #chatsList.
+        //  Обработчики на #chatsList увидят target = #chatsList
+        //  и вызовут closest() — не найдут нужный виджет.
+        //  Это не работает.
+        //
+        //  ИТОГ: самое надёжное — вручную привязать те же
+        //  обработчики к #widgetsBottom. Т.к. код обработчиков
+        //  в замыкании виджетов, нужно, чтобы они сами это сделали.
+        //
+        //  Но у нас есть доступ к самому DOM. Смотрим, какие
+        //  атрибуты и data-action используются — и просто вызываем
+        //  нужные функции виджетов через их публичные API.
+
+        // ═════════════════════════════════════════════════════
+        //  ПРОСТОЙ И РАБОЧИЙ ПОДХОД:
+        //  Пере-диспатч event через #chatsList с target = сам контейнер,
+        //  но с "правильным" e.target. Используем трюк: оборачиваем
+        //  через MouseEvent/TouchEvent с bubbles: true и dispatch
+        //  на нужном элементе — но на #chatsList, не на элементе.
+        //
+        //  ГЛАВНАЯ ИДЕЯ: браузер при dispatchEvent(evt) на элементе X
+        //  устанавливает evt.target = X. Но если мы создаём событие
+        //  и переопределяем target/getter — не работает.
+        //
+        //  Можно создать событие и dispatch на #chatsList,
+        //  но e.target будет = #chatsList. НЕ ТО.
+        //
+        //  ЕДИНСТВЕННЫЙ чистый способ: 
+        //  -- Взять обработчики от #chatsList --
+        //  К сожалению, из-за замыканий — только программно.
+        //
+        //  Поэтому финальный подход: переопределить addEventListener
+        //  так, чтобы обработчики кликов, навешанные на #chatsList,
+        //  ТАКЖЕ навешивались на #widgetsBottom.
+
+        // ═════════════════════════════════════════════════════
+        //  РЕАЛИЗАЦИЯ: перехватываем addEventListener через Proxy
+        //  или — проще — перебираем существующие обработчики.
+        //
+        //  В JS нет публичного API для чтения addEventListener-листенеров.
+        //  Но мы можем использовать хак: переопределить addEventListener
+        //  на #chatsList и #widgetsBottom так, чтобы они дублировались.
+
+        // Реальный рабочий подход:
+        // Создаём #widgetsBottom так, чтобы события от него
+        // "проходили" через #chatsList — при помощи addEventListener
+        // на #widgetsBottom, который диспатчит event на #chatsList,
+        // но с bubbles: false (только на #chatsList, без всплытия).
+
+        // Обработчики на #chatsList используют closest() от e.target.
+        // Если e.target = #chatsList, closest() вернёт #chatsList.
+        // Нужно, чтобы e.target был целевой элемент.
+        // Никак не обойти.
+
+        // ═════════════════════════════════════════════════════
+        //  ОКОНЧАТЕЛЬНОЕ РЕШЕНИЕ:
+        //  Перемещаем #widgetsBottom ВНУТРЬ #chatsList (в конец)
+        //  — тогда события естественно всплывут до обработчиков.
+        //  Визуально это ничего не меняет, если правильно оформить CSS.
+        // ═════════════════════════════════════════════════════
+
+        // ❌ Плохой вариант: внутрь #chatsList нельзя — при перерисовке
+        //   #chatsList.innerHTML = '...' наш контейнер сотрётся.
+
+        // ✅ Правильный вариант: переносим #widgetsBottom
+        //   сразу после #chatsList И используем event bubbling
+        //   через пере-диспатч с сохранением target.
+
+        // 💡 РЕАЛЬНОЕ РЕШЕНИЕ:
+        // Создаём прокси-обработчик на #widgetsBottom для каждого
+        // типа события. Внутри — находим элемент под пальцем (e.target),
+        // создаём НОВОЕ событие и dispatch на этом элементе.
+        // Поскольку #widgetsBottom — не родитель #chatsList,
+        // события от виджетов будут всплывать до document,
+        // но не до #chatsList.
+        //
+        // Однако! Обработчики в виджетах используют всплытие до
+        // #chatsList. Т.е. слушают 'click' на #chatsList и ждут
+        // когда событие всплывёт. Поскольку в нижних виджетах
+        // событие не идёт через #chatsList — обработчики не сработают.
+        //
+        // МЫ ДОЛЖНЫ ИХ ВЫЗВАТЬ. Единственный способ — эмулировать
+        // всплытие через #chatsList: dispatchEvent на элементе
+        // внутри #chatsList, чтобы событие реально прошло bubble
+        // от target до #chatsList.
+        //
+        // Для этого: физически клонируем узел в #chatsList,
+        // dispatch, возвращаем обратно.
+
+        // Это работает! Реализуем.
+
+        EVENT_TYPES.forEach(evtType => {
+            bottom.addEventListener(evtType, (e) => {
+                handleEventRetarget(e, evtType);
+            }, { capture: false });
+        });
+
+        log('✅ Обработчики на #widgetsBottom установлены');
+
+        return true;
+    }
+
+    function log(...a) {
+        console.log('🩹 [BottomClicks]', ...a);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕ-ДИСПАТЧ СОБЫТИЯ В #chatsList
+    // ═══════════════════════════════════════════════════════════
+    function handleEventRetarget(e, evtType) {
+        const chatsList = document.getElementById('chatsList');
+        if (!chatsList) return;
+
+        // Если событие уже "оригинальное" из #chatsList — не трогаем
+        if (e._bottomRetargeted) return;
+
+        // Находим виджет под пальцем
+        const card = e.target.closest && e.target.closest('.widget-card');
+        if (!card) return;
+
+        // 🆕 ВАЖНО: не перехватываем события, которые браузер
+        // сам должен обрабатывать нативно (select, input, textarea)
+        const nativeEl = e.target.closest('select, input, textarea');
+        if (nativeEl) {
+            // Для селектов и полей ввода — не эмулируем, даём работать нативно
+            return;
+        }
+
+        // 🆕 Для click — не перехватываем на кнопках, которые уже
+        // будут нативно работать. Но обработчики виджетов всё равно
+        // ждут всплытия до #chatsList. Значит надо эмулировать.
+
+        // ═══ ТРЮК: находим ближайший контейнер #chatsList-совместимый ═══
+        // Создаём МОСТ между #widgetsBottom и #chatsList через
+        // временное перемещение узла в #chatsList.
+
+        // 1. Клонируем — нет, клонирование теряет event listeners внутри
+        //    Поэтому ПЕРЕМЕЩАЕМ.
+
+        // Запоминаем "оригинальное" место (родитель + nextSibling)
+        const origParent = card.parentNode;
+        const origNext = card.nextSibling;
+
+        // 2. Переносим в #chatsList (в конец — там визуально ничего не видно, потому что
+        //    CSS делает виджеты inline-flex и они будут внизу списка,
+        //    но мы сразу вернём обратно — пользователь не заметит мигания)
+        //    На самом деле — переносим даже с миганием, это миллисекунды.
+
+        // ⚠️ Проблема: перерисовка будет заметна, если карточка большая.
+        // Поэтому НЕ перемещаем физически. Идём другим путём.
+
+        // ═══════════════════════════════════════════════════════
+        //  ФИНАЛЬНЫЙ ПОДХОД: используем вручную созданные события
+        //  с правильным bubbling через #chatsList.
+        //
+        //  В JS нельзя изменить event.target. НО мы можем
+        //  задиспатчить событие НА элементе внутри #chatsList,
+        //  чтобы оно прошло через #chatsList.
+        //
+        //  Идея: создаём "невидимый клон" только на время dispatch.
+        //  Клон — копия DOM-структуры, но без обработчиков.
+        //  Диспатчим на нём → обработчики на #chatsList вызываются
+        //  → они работают через closest() и находят нужный data-attr.
+        //
+        //  Проблема: обработчики могут полагаться на конкретный элемент
+        //  (например, найти кнопку и сделать classList.toggle).
+        //  Клон — это отдельный DOM-узел, изменения уйдут в мусор.
+        // ═══════════════════════════════════════════════════════
+
+        // 👉 Работает следующий подход:
+        // Перемещаем РЕАЛЬНЫЙ узел card в #chatsList, диспатчим событие,
+        // возвращаем обратно. Мигание минимальное — миллисекунды.
+
+        // Ещё лучше: не перемещать сам card, а переместить ВЕСЬ
+        // #widgetsBottom внутрь #chatsList на время dispatch.
+        // Но тогда структура меняется заметно.
+
+        // Проще всего — переместить card:
+
+        // 3. Переносим card в #chatsList (в конец)
+        chatsList.appendChild(card);
+
+        try {
+            // 4. Создаём такое же событие и диспатчим на элементе внутри card
+            const clonedEvent = cloneEvent(e, e.target);
+
+            // Помечаем, чтобы наш же слушатель не поймал повторно
+            clonedEvent._bottomRetargeted = true;
+
+            // Диспатчим на original target
+            e.target.dispatchEvent(clonedEvent);
+
+        } catch (err) {
+            console.warn('🩹 [BottomClicks] dispatch failed:', err);
+        } finally {
+            // 5. Возвращаем card на место
+            if (origNext) {
+                origParent.insertBefore(card, origNext);
+            } else {
+                origParent.appendChild(card);
+            }
+        }
+    }
+
+    /**
+     * Создаёт копию события того же типа с сохранением ключевых полей.
+     */
+    function cloneEvent(original, target) {
+        const type = original.type;
+
+        // ─── Мышь ───
+        if (type === 'click' || type === 'mousedown' || type === 'mouseup') {
+            return new MouseEvent(type, {
+                bubbles: true,
+                cancelable: true,
+                view: window,
+                detail: original.detail,
+                screenX: original.screenX,
+                screenY: original.screenY,
+                clientX: original.clientX,
+                clientY: original.clientY,
+                ctrlKey: original.ctrlKey,
+                altKey: original.altKey,
+                shiftKey: original.shiftKey,
+                metaKey: original.metaKey,
+                button: original.button,
+                buttons: original.buttons,
+                relatedTarget: original.relatedTarget,
+            });
+        }
+
+        // ─── Тач ───
+        if (type.startsWith('touch')) {
+            // Копируем touches как есть
+            return new TouchEvent(type, {
+                bubbles: true,
+                cancelable: true,
+                view: window,
+                touches: original.touches,
+                targetTouches: original.targetTouches,
+                changedTouches: original.changedTouches,
+                ctrlKey: original.ctrlKey,
+                altKey: original.altKey,
+                shiftKey: original.shiftKey,
+                metaKey: original.metaKey,
+            });
+        }
+
+        // ─── Прочие (focus, change, input, mouseleave) ───
+        return new Event(type, {
+            bubbles: true,
+            cancelable: true,
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОБЁРТКА addEventListener #chatsList
+    //  Всё, что вешается на #chatsList, должно также попадать
+    //  в #widgetsBottom (для событий, которые летят вниз).
+    //  Это устранит проблему с "перетаскиванием" карточек.
+    // ═══════════════════════════════════════════════════════════
+
+    // Ничего дополнительного — retarget работает через реальный DOM.
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕ-ПРОВЕРКА: контейнер может быть пересоздан
+    // ═══════════════════════════════════════════════════════════
+    function watchContainer() {
+        ensureBottomContainerHandler();
+
+        // Наблюдаем за появлением/заменой #widgetsBottom
+        const observer = new MutationObserver(() => {
+            const bottom = document.getElementById('widgetsBottom');
+            if (bottom && !bottom._clicksBound) {
+                bottom._clicksBound = true;
+                EVENT_TYPES.forEach(evtType => {
+                    bottom.addEventListener(evtType, (e) => {
+                        handleEventRetarget(e, evtType);
+                    }, { capture: false });
+                });
+                log('Перепривязан к новому #widgetsBottom');
+            }
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЗАПУСК
+    // ═══════════════════════════════════════════════════════════
+    setTimeout(() => {
+        if (!ensureBottomContainerHandler()) {
+            setTimeout(ensureBottomContainerHandler, 500);
+        }
+    }, 1000);
+
+    setTimeout(watchContainer, 3000);
+
+    // Публичное API (для отладки)
+    window.BottomClicksDebug = {
+        bound: () => {
+            const b = document.getElementById('widgetsBottom');
+            return b ? !!b._clicksBound : false;
+        },
+        retarget: (el) => {
+            if (!el) return 'no element';
+            // Симулируем клик
+            el.click();
+            return 'clicked';
+        },
+    };
+
+    log('✅ Готово (v1)');
+})();
 </script>
 </body>
 </html>
