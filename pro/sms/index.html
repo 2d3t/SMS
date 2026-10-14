@@ -53207,6 +53207,142 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
 
     console.log('📻 [RadioFlag] Готово — флаг страны появится в свёрнутом радио-виджете');
 })();
+</script><script>
+// ═══════════════════════════════════════════════════════════════
+//  🩹 ПАТЧ v2: ОТПРАВКА НЕСКОЛЬКИХ ФОТО ПО ОДНОЙ (С ОЖИДАНИЕМ)
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: handleFileUpload не возвращает промис завершения
+//  отправки. Цикл for-await не ждёт и запускает все фото сразу,
+//  в итоге уходит только первое (срабатывает state.isSending).
+//
+//  Решение: после вызова handleFileUpload ждём реального
+//  завершения через polling state.isSending + SendQueue.isBusy().
+// ═══════════════════════════════════════════════════════════════
+
+(function fixMultipleImageUploadV2() {
+    'use strict';
+
+    console.log('🩹 [MultiImageFix v2] Установка патча…');
+
+    // ─── Ждём завершения текущей отправки ───
+    // Опрашиваем состояние каждые 200 мс, пока не убедимся,
+    // что отправка завершилась и очередь пуста.
+    function waitForSendComplete(timeoutMs = 120000) {
+        return new Promise((resolve) => {
+            const startedAt = Date.now();
+            let sawActivity = false;
+
+            const tick = () => {
+                // Проверяем — идёт ли отправка
+                const isSending = (typeof state !== 'undefined' && state.isSending);
+
+                const queueBusy = (typeof SendQueue !== 'undefined'
+                    && typeof SendQueue.isBusy === 'function'
+                    && SendQueue.isBusy());
+
+                const outboxBusy = (typeof AutoOutbox !== 'undefined'
+                    && typeof AutoOutbox.status === 'function'
+                    && AutoOutbox.status().processing);
+
+                const busy = isSending || queueBusy || outboxBusy;
+
+                if (busy) {
+                    sawActivity = true;
+                }
+
+                // Считаем завершённым, если:
+                //   • видели активность
+                //   • она закончилась
+                if (sawActivity && !busy) {
+                    resolve(true);
+                    return;
+                }
+
+                // Таймаут
+                if (Date.now() - startedAt > timeoutMs) {
+                    console.warn('🩹 [MultiImageFix v2] Таймаут ожидания отправки');
+                    resolve(false);
+                    return;
+                }
+
+                setTimeout(tick, 200);
+            };
+
+            // Небольшая стартовая задержка — чтобы отправка точно началась
+            setTimeout(tick, 300);
+        });
+    }
+
+    // ─── Перезаписываем openFilePicker ───
+    const _origOpenFilePicker = openFilePicker;
+
+    openFilePicker = function(mode) {
+        // Для всех режимов, кроме 'image' — стандартная логика
+        if (mode !== 'image') {
+            return _origOpenFilePicker.call(this, mode);
+        }
+
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = 'image/*';
+        input.multiple = true;
+
+        input.onchange = async (e) => {
+            const files = Array.from(e.target.files || []);
+            input.remove();
+
+            if (files.length === 0) return;
+
+            // Один файл — стандартная логика
+            if (files.length === 1) {
+                handleFileUpload(files[0]);
+                return;
+            }
+
+            // ─── Несколько файлов — по одному, с ожиданием ───
+            console.log(`📸 [MultiImageFix v2] ${files.length} фото, отправляем по одному…`);
+            showToast(`📸 Отправка ${files.length} фото по одному…`, 2500);
+
+            let sentCount = 0;
+            let failedCount = 0;
+
+            for (let i = 0; i < files.length; i++) {
+                const file = files[i];
+                if (!file) continue;
+
+                try {
+                    showToast(`📸 Отправка ${i + 1}/${files.length}: ${file.name}`, 2000);
+
+                    // Запускаем отправку (не ждём — она не возвращает промис)
+                    handleFileUpload(file);
+
+                    // 🆕 Ждём, пока отправка реально завершится
+                    await waitForSendComplete();
+
+                    // Небольшая пауза между фото — чтобы GitHub успел
+                    await new Promise(r => setTimeout(r, 400));
+
+                    sentCount++;
+                } catch (error) {
+                    console.error(`[MultiImageFix v2] Ошибка ${file.name}:`, error);
+                    showToast(`❌ Ошибка: ${file.name}`, 3000);
+                    failedCount++;
+                }
+            }
+
+            if (failedCount === 0) {
+                showToast(`✅ Отправлено ${sentCount} фото`, 2500);
+            } else {
+                showToast(`✅ ${sentCount} · ❌ ${failedCount}`, 3000);
+            }
+        };
+
+        input.click();
+    };
+
+    console.log('🩹 [MultiImageFix v2] Патч установлен.');
+    console.log('   • Отправка теперь ждёт реального завершения каждого фото.');
+})();
 </script>
 </body>
 </html>
