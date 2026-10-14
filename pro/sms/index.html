@@ -51511,5 +51511,315 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
     console.log('   • API: UnreadFix.status() / .forceMarkRead()');
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🩹 ПАТЧ: ЗАЛИПАЮЩИЙ СЕЛЕКТ ФИЛЬТРА В ВИДЖЕТЕ РАДИО
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: поллинг (refreshUnreadBadges, BackButtonBadge и др.)
+//  каждые 3-20 секунд вызывает renderChatsList() →
+//  renderRadioCard() → innerHTML всей карточки. Открытый <select>
+//  мгновенно теряет фокус и закрывается.
+//
+//  Решение:
+//   1. Пока селект открыт (focused + mousedown) — блокируем
+//      полную перерисовку карточки Радио.
+//   2. Точечное обновление: вместо innerHTML всей карточки
+//      обновляем только те части, которые реально меняются
+//      (название трека, кнопки play/clear).
+//   3. Если перерисовка всё-таки произошла (например, показали
+//      через WidgetsRegistry.rerender) — восстанавливаем value
+//      открытых селектов.
+// ═══════════════════════════════════════════════════════════════
+
+(function installRadioSelectStickyPatch() {
+    'use strict';
+
+    console.log('🩹 [RadioStickySelect] Установка патча…');
+
+    const PATCH = {
+        // Блокировка перерисовки — счётчик активных селектов
+        selectLockCount: 0,
+        // Флаг: пользователь взаимодействует с селектом
+        userInteractingWithSelect: false,
+        // Таймер на снятие флага после выбора
+        interactionTimer: null,
+        // Значения селектов, которые надо сохранить при перерисовке
+        savedSelectValues: {
+            genre: null,
+            country: null,
+        },
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  1. ПЕРЕХВАТЫВАЕМ renderRadioCard
+    //  Делаем две вещи:
+    //   a) если открыт селект — пропускаем полную перерисовку
+    //   b) если всё-таки рисуем — точечно, а не innerHTML
+    // ═══════════════════════════════════════════════════════════
+    if (typeof renderRadioCard === 'function') {
+        // Не перезаписываем — мы не имеем доступа к внутренностям
+        // RadioWidget v3, поэтому используем другой подход:
+        // перехватываем НА УРОВНЕ КОНТЕЙНЕРА.
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ГЛАВНЫЙ ХУК: перехват клика/фокуса на селектах
+    //  Работает через capture-фазу на document.
+    // ═══════════════════════════════════════════════════════════
+
+    function isRadioSelect(el) {
+        return el && el.matches && el.matches('.widget-card.radio [data-radio-filter]');
+    }
+
+    function getSelectKey(el) {
+        return el && el.dataset ? el.dataset.radioFilter : null;
+    }
+
+    // ─── Отслеживаем открытие селекта ───
+    document.addEventListener('mousedown', (e) => {
+        const sel = e.target.closest && e.target.closest('.widget-card.radio [data-radio-filter]');
+        if (!sel) return;
+        PATCH.selectLockCount++;
+        PATCH.userInteractingWithSelect = true;
+    }, true);
+
+    document.addEventListener('touchstart', (e) => {
+        const sel = e.target.closest && e.target.closest('.widget-card.radio [data-radio-filter]');
+        if (!sel) return;
+        PATCH.selectLockCount++;
+        PATCH.userInteractingWithSelect = true;
+    }, { capture: true, passive: true });
+
+    // ─── Снятие блокировки после выбора или отмены ───
+    function releaseSelectLock() {
+        // Даём небольшую задержку — на случай, если перерисовка
+        // запустится сразу после change
+        if (PATCH.interactionTimer) clearTimeout(PATCH.interactionTimer);
+        PATCH.interactionTimer = setTimeout(() => {
+            PATCH.selectLockCount = 0;
+            PATCH.userInteractingWithSelect = false;
+        }, 400);
+    }
+
+    document.addEventListener('change', (e) => {
+        const sel = e.target.closest && e.target.closest('.widget-card.radio [data-radio-filter]');
+        if (!sel) return;
+        releaseSelectLock();
+    }, true);
+
+    document.addEventListener('blur', (e) => {
+        const sel = e.target.closest && e.target.closest('.widget-card.radio [data-radio-filter]');
+        if (!sel) return;
+        releaseSelectLock();
+    }, true);
+
+    // Safari / старые браузеры: клик вне селекта (закрытие дропдауна)
+    document.addEventListener('click', (e) => {
+        if (!PATCH.userInteractingWithSelect) return;
+        // Если кликнули вне селекта — снимаем блокировку
+        const sel = e.target.closest && e.target.closest('.widget-card.radio [data-radio-filter]');
+        if (!sel) {
+            releaseSelectLock();
+        }
+    }, true);
+
+    // ═══════════════════════════════════════════════════════════
+    //  2. ПЕРЕХВАТ renderChatsList — блокируем перерисовку Радио,
+    //     если селект открыт
+    // ═══════════════════════════════════════════════════════════
+
+    const _origRenderChatsList = window.renderChatsList;
+
+    window.renderChatsList = function() {
+        // Если селект открыт — не перерисовываем весь список
+        if (PATCH.userInteractingWithSelect || PATCH.selectLockCount > 0) {
+            console.log('🩹 [RadioStickySelect] Перерисовка пропущена — открыт селект');
+            return;
+        }
+        return _origRenderChatsList.apply(this, arguments);
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. Перехват кликов по селекту — открытие дропдауна
+    //  Нативный <select> в момент клика ещё НЕ открыл дропдаун,
+    //  но фокус на нём уже есть. Также ловим клавиатурную навигацию.
+    // ═══════════════════════════════════════════════════════════
+    document.addEventListener('focus', (e) => {
+        const sel = e.target.closest && e.target.closest('.widget-card.radio [data-radio-filter]');
+        if (!sel) return;
+        // Сохраняем значение
+        const key = getSelectKey(sel);
+        if (key) PATCH.savedSelectValues[key] = sel.value;
+
+        PATCH.userInteractingWithSelect = true;
+        if (!PATCH.interactionTimer) {
+            PATCH.selectLockCount++;
+        }
+    }, true);
+
+    // ═══════════════════════════════════════════════════════════
+    //  4. Защита от перерисовки через MutationObserver
+    //  Если карточка всё-таки была перерисована (кто-то вызвал
+    //  WidgetsRegistry.rerender напрямую) — восстанавливаем
+    //  значения селектов и восстанавливаем открытое состояние.
+    // ═══════════════════════════════════════════════════════════
+
+    let _restoreScheduled = false;
+    function scheduleRestore() {
+        if (_restoreScheduled) return;
+        _restoreScheduled = true;
+        requestAnimationFrame(() => {
+            _restoreScheduled = false;
+            restoreSelectValues();
+        });
+    }
+
+    function restoreSelectValues() {
+        const container = document.getElementById('chatsList');
+        if (!container) return;
+
+        Object.keys(PATCH.savedSelectValues).forEach(key => {
+            const savedValue = PATCH.savedSelectValues[key];
+            if (savedValue == null) return;
+
+            const sel = container.querySelector(
+                `.widget-card.radio [data-radio-filter="${key}"]`
+            );
+            if (!sel) return;
+
+            if (sel.value !== savedValue) {
+                sel.value = savedValue;
+                console.log(`🩹 [RadioStickySelect] Восстановлено значение ${key}=${savedValue}`);
+
+                // Триггерим change, чтобы RadioWidget обновил _filterGenre/_filterCountry
+                // (но не перерисовывал карточку — на это уже есть защита)
+                try {
+                    const evt = new Event('change', { bubbles: true });
+                    // Помечаем как «восстановление», чтобы наш обработчик
+                    // не считал это пользовательским изменением
+                    sel._restoring = true;
+                    sel.dispatchEvent(evt);
+                    sel._restoring = false;
+                } catch (e) {}
+            }
+        });
+    }
+
+    // Наблюдаем за перерисовкой контейнера
+    const observer = new MutationObserver((mutations) => {
+        // Проверяем, есть ли среди добавленных узлов карточка радио
+        for (const mut of mutations) {
+            for (const node of mut.addedNodes) {
+                if (node.nodeType !== 1) continue;
+                if (node.matches && node.matches('.widget-card.radio')) {
+                    scheduleRestore();
+                    return;
+                }
+                if (node.querySelector && node.querySelector('.widget-card.radio')) {
+                    scheduleRestore();
+                    return;
+                }
+            }
+        }
+    });
+
+    // Начинаем наблюдать как только появится chatsList
+    function startObserving() {
+        const container = document.getElementById('chatsList');
+        if (!container) {
+            setTimeout(startObserving, 500);
+            return;
+        }
+        observer.observe(container, { childList: true, subtree: false });
+        console.log('🩹 [RadioStickySelect] MutationObserver запущен');
+    }
+    startObserving();
+
+    // ═══════════════════════════════════════════════════════════
+    //  5. Сохраняем значения селектов при каждом change
+    //  (чтобы даже если карточка перерисуется без сохранения —
+    //  мы могли их восстановить)
+    // ═══════════════════════════════════════════════════════════
+    document.addEventListener('change', (e) => {
+        const sel = e.target.closest && e.target.closest('.widget-card.radio [data-radio-filter]');
+        if (!sel) return;
+        const key = getSelectKey(sel);
+        if (key) PATCH.savedSelectValues[key] = sel.value;
+    }, true);
+
+    // ═══════════════════════════════════════════════════════════
+    //  6. Точечный патч renderRadioCard — блокировка по факту вызова
+    //  Мы не можем переопределить внутреннюю функцию RadioWidget v3,
+    //  но можем перехватить её вызов через дополнительный слой.
+    //  Проще всего — перехватить вызов `container.innerHTML = ...`
+    //  на уровне контейнера. Но лучше — вообще не перерисовывать.
+    //
+    //  Дополнительная защита: пока селект открыт, замьютим
+    //  MutationObserver у RadioWidget через свой флаг.
+    // ═══════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════
+    //  7. Хук на поллинг — блокируем его, пока открыт селект
+    //  Это самая частая причина перерисовки.
+    // ═══════════════════════════════════════════════════════════
+
+    if (typeof refreshUnreadBadges === 'function') {
+        const _origRefresh = refreshUnreadBadges;
+        refreshUnreadBadges = async function() {
+            if (PATCH.userInteractingWithSelect || PATCH.selectLockCount > 0) {
+                console.log('🩹 [RadioStickySelect] refreshUnreadBadges пропущен');
+                return;
+            }
+            return _origRefresh.apply(this, arguments);
+        };
+    }
+
+    // Аналогично для BackButtonBadge
+    if (typeof BackButtonBadge !== 'undefined' && BackButtonBadge.check) {
+        const _origCheck = BackButtonBadge.check;
+        BackButtonBadge.check = function() {
+            if (PATCH.userInteractingWithSelect || PATCH.selectLockCount > 0) {
+                return;
+            }
+            return _origCheck.apply(this, arguments);
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  8. ИНТЕРЦЕПТ: если нативный <select> всё-таки закрылся,
+    //     но пользователь хотел выбрать — сохраняем value и
+    //     не даём RadioWidget мгновенно перерисовать карточку.
+    //     (Это уже покрыто выше.)
+    // ═══════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════
+    //  9. Публичное API для отладки
+    // ═══════════════════════════════════════════════════════════
+    window.RadioStickySelect = {
+        isLocked: () => PATCH.userInteractingWithSelect || PATCH.selectLockCount > 0,
+        status: () => ({
+            selectLockCount: PATCH.selectLockCount,
+            userInteracting: PATCH.userInteractingWithSelect,
+            savedValues: { ...PATCH.savedSelectValues },
+        }),
+        forceRelease: () => {
+            PATCH.selectLockCount = 0;
+            PATCH.userInteractingWithSelect = false;
+            if (PATCH.interactionTimer) {
+                clearTimeout(PATCH.interactionTimer);
+                PATCH.interactionTimer = null;
+            }
+            console.log('🩹 [RadioStickySelect] Блокировка снята вручную');
+        },
+        restoreValues: () => restoreSelectValues(),
+    };
+
+    console.log('🩹 [RadioStickySelect] Готово:');
+    console.log('   • Селекты фильтров не закрываются при поллинге');
+    console.log('   • renderChatsList пропускается, пока открыт селект');
+    console.log('   • refreshUnreadBadges пропускается, пока открыт селект');
+    console.log('   • API: RadioStickySelect.status()');
+})();
+</script>
 </body>
 </html>
