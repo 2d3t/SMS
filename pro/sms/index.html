@@ -53087,5 +53087,126 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
     console.log('   • API: RadioStickySelect.status()');
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  📻 ПАТЧ: ФЛАЖОК СТРАНЫ В СВЁРНУТОМ РАДИО-ВИДЖЕТЕ
+//  ─────────────────────────────────────────────────────────────
+//  Добавляет флаг страны рядом с названием радиостанции
+//  в свёрнутом виде виджета.
+// ═══════════════════════════════════════════════════════════════
+
+(function addCountryFlagToCollapsedRadio() {
+    'use strict';
+
+    console.log('📻 [RadioFlag] Установка патча…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  Патчим buildRadioCardHTML — добавляем флаг в collapsedBody
+    // ═══════════════════════════════════════════════════════════
+    // Функция buildRadioCardHTML определена внутри IIFE RadioWidget v3
+    // и недоступна снаружи. Поэтому мы пойдём другим путём:
+    // перехватим renderRadioCard через MutationObserver и
+    // вставим флажок в уже отрисованный DOM.
+
+    // ═══════════════════════════════════════════════════════════
+    //  Функция получения флага по ID станции
+    // ═══════════════════════════════════════════════════════════
+    // Мы можем получить станцию через RadioWidget.list()
+    function getStationById(id) {
+        if (typeof RadioWidget === 'undefined') return null;
+        if (typeof RadioWidget.list !== 'function') return null;
+        const stations = RadioWidget.list();
+        return stations.find(s => s.id === id) || null;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Вставка флага в свёрнутый виджет
+    // ═══════════════════════════════════════════════════════════
+    function injectFlagIntoCollapsed() {
+        const container = document.getElementById('chatsList');
+        if (!container) return;
+
+        // Ищем свёрнутую карточку радио
+        const card = container.querySelector('.widget-card.radio:not(.expanded)');
+        if (!card) return;
+
+        // Ищем name-элемент
+        const nameEl = card.querySelector('.wc-radio-now-name');
+        if (!nameEl) return;
+
+        // Проверяем, есть ли уже флаг
+        if (nameEl.querySelector('.wc-radio-flag-badge')) return;
+
+        // Получаем текущую станцию
+        const currentName = nameEl.textContent.trim();
+
+        // Если ничего не играет ("Не выбрано") — не добавляем флаг
+        if (currentName === 'Не выбрано' || !currentName) return;
+
+        // Ищем станцию по имени
+        let station = null;
+        if (typeof RadioWidget !== 'undefined' && typeof RadioWidget.list === 'function') {
+            const stations = RadioWidget.list();
+            station = stations.find(s => s.name === currentName);
+        }
+
+        if (!station || !station.country) return;
+
+        // Вставляем флаг
+        const flagEl = document.createElement('span');
+        flagEl.className = 'wc-radio-flag-badge';
+        flagEl.textContent = station.country;
+        flagEl.style.cssText = `
+            margin-right: 6px;
+            font-size: 15px;
+            vertical-align: middle;
+            line-height: 1;
+        `;
+
+        // Оборачиваем текущее содержимое, чтобы флаг был перед названием
+        const originalText = nameEl.textContent;
+        nameEl.textContent = '';
+        nameEl.appendChild(flagEl);
+        nameEl.appendChild(document.createTextNode(originalText));
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Наблюдаем за изменениями в DOM
+    // ═══════════════════════════════════════════════════════════
+    const observer = new MutationObserver((mutations) => {
+        let shouldUpdate = false;
+
+        for (const mut of mutations) {
+            // Изменился #chatsList или его содержимое
+            for (const node of mut.addedNodes) {
+                if (node.nodeType !== 1) continue;
+                if (node.id === 'chatsList' ||
+                    (node.classList && node.classList.contains('widget-card')) ||
+                    (node.querySelector && node.querySelector('.widget-card.radio'))) {
+                    shouldUpdate = true;
+                    break;
+                }
+            }
+            if (shouldUpdate) break;
+        }
+
+        if (shouldUpdate) {
+            // Ждём следующего кадра — DOM уже точно обновлён
+            requestAnimationFrame(injectFlagIntoCollapsed);
+        }
+    });
+
+    // Начинаем наблюдать за body
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    // Периодическая проверка — раз в 1.5 секунды (страховка)
+    setInterval(injectFlagIntoCollapsed, 1500);
+
+    // Первичная инъекция через 3 секунды
+    setTimeout(injectFlagIntoCollapsed, 3000);
+
+    console.log('📻 [RadioFlag] Готово — флаг страны появится в свёрнутом радио-виджете');
+})();
+</script>
 </body>
 </html>
