@@ -51839,5 +51839,1731 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
     console.log('   • API: RadioStickySelect.status()');
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  ⏰ REMINDER WIDGET v1 — Умный планировщик напоминаний
+//  ─────────────────────────────────────────────────────────────
+//  • Виджет в общем реестре (WidgetsRegistry)
+//  • Создание напоминаний: чат + дата/время + текст
+//  • Фоновая проверка раз в минуту
+//  • Автоматическая отправка через существующий sendMessage
+//  • Хранение в localStorage
+// ═══════════════════════════════════════════════════════════════
+
+(function installReminderWidgetV1() {
+    'use strict';
+
+    const CFG = {
+        STORAGE_KEY: 'smschat_reminders',
+        CHECK_INTERVAL_MS: 60 * 1000, // раз в минуту
+        DEBUG: true,
+    };
+    const log = (...a) => CFG.DEBUG && console.log('⏰ [Reminder]', ...a);
+    const warn = (...a) => console.warn('⏰ [Reminder]', ...a);
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОСТОЯНИЕ
+    // ═══════════════════════════════════════════════════════════
+    let _reminders = [];
+    let _expanded = (() => {
+        try { return localStorage.getItem('smschat_reminders_expanded') === '1'; }
+        catch (e) { return false; }
+    })();
+    let _checkTimer = null;
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХРАНИЛИЩЕ
+    // ═══════════════════════════════════════════════════════════
+    function loadReminders() {
+        try {
+            const raw = localStorage.getItem(CFG.STORAGE_KEY);
+            const arr = raw ? JSON.parse(raw) : [];
+            if (!Array.isArray(arr)) return [];
+            // Валидируем и оставляем только будущие + непогашенные
+            const now = Date.now();
+            _reminders = arr.filter(r => {
+                if (!r || !r.id || !r.chatFile || !r.message || !r.timestamp) return false;
+                // Оставляем: либо будущие, либо уже просроченные, но не отправленные
+                return r.timestamp > now || !r.sent;
+            });
+            return _reminders;
+        } catch (e) {
+            _reminders = [];
+            return [];
+        }
+    }
+
+    function saveReminders() {
+        try {
+            localStorage.setItem(CFG.STORAGE_KEY, JSON.stringify(_reminders));
+        } catch (e) {
+            warn('saveReminders failed:', e);
+        }
+    }
+
+    function genId() {
+        return 'rem_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  УТИЛИТЫ
+    // ═══════════════════════════════════════════════════════════
+    function escapeHtmlSafe(s) {
+        if (typeof escapeHtml === 'function') return escapeHtml(s);
+        const div = document.createElement('div');
+        div.textContent = s == null ? '' : String(s);
+        return div.innerHTML;
+    }
+
+    function formatDateTime(ts) {
+        const d = new Date(ts);
+        const now = new Date();
+        const tomorrow = new Date(now);
+        tomorrow.setDate(tomorrow.getDate() + 1);
+        const todayStr = now.toDateString();
+        const tomorrowStr = tomorrow.toDateString();
+        const dStr = d.toDateString();
+
+        const timeStr = d.toLocaleTimeString('ru-RU', {
+            hour: '2-digit',
+            minute: '2-digit'
+        });
+
+        if (dStr === todayStr) return `Сегодня, ${timeStr}`;
+        if (dStr === tomorrowStr) return `Завтра, ${timeStr}`;
+        return d.toLocaleString('ru-RU', {
+            day: 'numeric',
+            month: 'short',
+            hour: '2-digit',
+            minute: '2-digit'
+        });
+    }
+
+    function timeUntil(ts) {
+        const diff = ts - Date.now();
+        if (diff < 0) return 'просрочено';
+        const sec = Math.floor(diff / 1000);
+        if (sec < 60) return `через ${sec} сек`;
+        const min = Math.floor(sec / 60);
+        if (min < 60) return `через ${min} мин`;
+        const hours = Math.floor(min / 60);
+        if (hours < 24) return `через ${hours} ч`;
+        const days = Math.floor(hours / 24);
+        return `через ${days} дн`;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОТПРАВКА НАПОМИНАНИЯ
+    // ═══════════════════════════════════════════════════════════
+    async function sendReminder(reminder) {
+        const { chatFile, message } = reminder;
+
+        log(`Отправка напоминания в ${chatFile}: "${message.slice(0, 40)}"`);
+
+        // Проверки
+        if (!state.isAuthorized || !state.token) {
+            warn('Не авторизован — напоминание отложено');
+            return false;
+        }
+
+        const password = state.savedPasswords[chatFile];
+        if (!password) {
+            warn(`Нет пароля для чата ${chatFile}`);
+            reminder.error = 'Нет пароля чата';
+            reminder.sent = false;
+            return false;
+        }
+
+        // Сохраняем текущее состояние
+        const savedChatFile = state.chatFile;
+        const savedChatPassword = state.chatPassword;
+        const savedSalt = state.salt;
+        const savedKey = CRYPTO._key;
+        const savedScreen = state.currentScreen;
+
+        // Временно переключаемся на целевой чат
+        state.chatFile = chatFile;
+        state.chatPassword = password;
+        state.salt = null;
+        CRYPTO._key = null;
+
+        try {
+            // Отправляем через sendMessage с особым флагом
+            // (мы отправим в целевой чат, потом вернёмся)
+            await sendReminderMessage(chatFile, password, message);
+
+            reminder.sent = true;
+            reminder.sentAt = Date.now();
+            delete reminder.error;
+
+            log(`✅ Отправлено: ${reminder.id}`);
+
+            // Уведомление пользователю (если мы не в этом чате)
+            if (savedChatFile !== chatFile) {
+                showToastSafe(`⏰ Напоминание отправлено в «${getChatName(chatFile)}»`, 3000);
+            }
+
+            return true;
+
+        } catch (e) {
+            warn('Ошибка отправки:', e);
+            reminder.error = e.message || 'Ошибка';
+            reminder.sent = false;
+            reminder.retries = (reminder.retries || 0) + 1;
+            return false;
+
+        } finally {
+            // Восстанавливаем состояние
+            state.chatFile = savedChatFile;
+            state.chatPassword = savedChatPassword;
+            state.salt = savedSalt;
+            CRYPTO._key = savedKey;
+        }
+    }
+
+    /**
+     * Отправляет сообщение напрямую в указанный чат.
+     * НЕ использует глобальный state — работает автономно.
+     */
+    async function sendReminderMessage(chatFile, password, text) {
+        const path = getChatPath(chatFile);
+
+        // Загружаем файл чата
+        const result = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
+
+        let fileContent, sha;
+        if (!result.exists) {
+            throw new Error('Чат не найден');
+        }
+
+        fileContent = result.content;
+        sha = result.sha;
+
+        if (fileContent.v !== CRYPTO.VERSION) {
+            throw new Error('Неверный формат чата');
+        }
+
+        // Деривим ключ
+        const key = await deriveKey(password, fileContent.salt);
+
+        // Создаём сообщение
+        const messageId = Date.now();
+        const plainMsg = {
+            id: messageId,
+            username: state.username,
+            text: `⏰ ${text}`,
+            time: new Date().toISOString(),
+            _isReminder: true,
+        };
+
+        // Шифруем
+        const iv = generateIV();
+        const plaintext = new TextEncoder().encode(JSON.stringify(plainMsg));
+        const ciphertext = await crypto.subtle.encrypt(
+            { name: 'AES-GCM', iv },
+            key,
+            plaintext
+        );
+
+        const encMsg = {
+            id: messageId,
+            time: plainMsg.time,
+            iv: arrayBufferToBase64(iv),
+            data: arrayBufferToBase64(ciphertext),
+        };
+
+        // Добавляем в файл
+        fileContent.messages.push(encMsg);
+        if (fileContent.messages.length > CONFIG.maxMessages) {
+            fileContent.messages = fileContent.messages.slice(-CONFIG.maxMessages);
+        }
+
+        // Сохраняем с retry
+        const saved = await saveFile(
+            state.token, CONFIG.repoOwner, CONFIG.repoName,
+            path, fileContent, sha,
+            { messageId, message: `⏰ Напоминание` }
+        );
+
+        // Обновляем meta
+        try {
+            await updateMeta(chatFile, messageId, fileContent.messages.length);
+        } catch (e) {
+            warn('meta update failed:', e);
+        }
+
+        // Если сейчас открыт именно этот чат — добавляем в UI
+        if (state.chatFile === chatFile && state.currentScreen === 'chat') {
+            // Восстанавливаем ключ для state (потому что мы в finally восстановим)
+            // — но сейчас state.chatFile ещё наш
+            const currentKey = CRYPTO._key;
+            CRYPTO._key = key;
+
+            state.messages.push(plainMsg);
+            state.sha = saved.blobSha;
+            state._lastCommitSha = saved.commitSha;
+            state.lastMessageCount = fileContent.messages.length;
+
+            if (typeof appendMessages === 'function') {
+                appendMessages([plainMsg]);
+                if (typeof scrollToBottom === 'function') scrollToBottom(true);
+            }
+
+            CRYPTO._key = currentKey;
+        }
+
+        return { messageId };
+    }
+
+    function getChatName(chatFile) {
+        const chat = state.chats.find(c => c.file === chatFile);
+        return chat ? (chat.name || chatFile) : chatFile;
+    }
+
+    function showToastSafe(msg, dur) {
+        if (typeof showToast === 'function') showToast(msg, dur || 2000);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ФОНОВАЯ ПРОВЕРКА
+    // ═══════════════════════════════════════════════════════════
+    async function checkReminders() {
+        if (!state.isAuthorized) return;
+        if (_reminders.length === 0) return;
+
+        const now = Date.now();
+        let changed = false;
+        let hadSend = false;
+
+        for (const r of _reminders) {
+            // Пропускаем уже отправленные
+            if (r.sent) continue;
+
+            // Пропускаем будущие
+            if (r.timestamp > now) continue;
+
+            // Пропускаем те, у которых уже много ошибок
+            if (r.retries && r.retries >= 5) {
+                r.error = 'Превышено число попыток';
+                changed = true;
+                continue;
+            }
+
+            // Отправляем!
+            log(`⏰ Сработало напоминание ${r.id}`);
+            const ok = await sendReminder(r);
+            changed = true;
+            if (ok) hadSend = true;
+
+            // Небольшая пауза между отправками
+            await new Promise(res => setTimeout(res, 500));
+        }
+
+        // Чистим отправленные старше суток
+        const cutoff = now - 24 * 60 * 60 * 1000;
+        const before = _reminders.length;
+        _reminders = _reminders.filter(r => {
+            if (r.sent && r.sentAt && r.sentAt < cutoff) return false;
+            return true;
+        });
+        if (_reminders.length !== before) changed = true;
+
+        if (changed) {
+            saveReminders();
+            renderReminderCard();
+        }
+
+        // Обновляем UI виджета раз в минуту (для "через X мин")
+        if (_reminders.some(r => !r.sent)) {
+            renderReminderCard();
+        }
+    }
+
+    function startChecking() {
+        if (_checkTimer) clearInterval(_checkTimer);
+        // Первая проверка через 10 сек
+        setTimeout(() => checkReminders(), 10000);
+        _checkTimer = setInterval(checkReminders, CFG.CHECK_INTERVAL_MS);
+        log('Фоновая проверка запущена (интервал', CFG.CHECK_INTERVAL_MS / 1000, 'сек)');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  HTML ВИДЖЕТА
+    // ═══════════════════════════════════════════════════════════
+    function buildReminderCardHTML() {
+        const active = _reminders.filter(r => !r.sent);
+        const failed = _reminders.filter(r => !r.sent && r.error);
+        const activeCount = active.length;
+
+        // Сортируем: сначала ближайшие
+        const sorted = active.slice().sort((a, b) => a.timestamp - b.timestamp);
+
+        let bodyCollapsed = '';
+        if (activeCount === 0) {
+            bodyCollapsed = `
+                <div class="wc-rem-empty">
+                    Нет напоминаний. Нажмите <strong>＋</strong> чтобы создать.
+                </div>
+            `;
+        } else {
+            const next = sorted[0];
+            bodyCollapsed = `
+                <div class="wc-rem-next">
+                    <div class="wc-rem-next-time">${escapeHtmlSafe(formatDateTime(next.timestamp))}</div>
+                    <div class="wc-rem-next-msg">${escapeHtmlSafe(next.message.slice(0, 80))}</div>
+                    <div class="wc-rem-next-chat">→ ${escapeHtmlSafe(getChatName(next.chatFile))}</div>
+                    <div class="wc-rem-next-eta">⏳ ${escapeHtmlSafe(timeUntil(next.timestamp))}</div>
+                </div>
+            `;
+        }
+
+        let expandedBody = '';
+        if (_expanded) {
+            expandedBody = `
+                <div class="wc-rem-section">
+                    <div class="wc-rem-section-title">📋 Все напоминания (${activeCount})</div>
+                    <div class="wc-rem-list">
+                        ${sorted.length === 0
+                            ? '<div class="wc-rem-empty-small">Пусто</div>'
+                            : sorted.map(r => {
+                                const hasError = !!r.error;
+                                return `
+                                    <div class="wc-rem-item ${hasError ? 'has-error' : ''}">
+                                        <div class="wc-rem-item-main">
+                                            <div class="wc-rem-item-time">${escapeHtmlSafe(formatDateTime(r.timestamp))}</div>
+                                            <div class="wc-rem-item-msg">${escapeHtmlSafe(r.message)}</div>
+                                            <div class="wc-rem-item-chat">→ ${escapeHtmlSafe(getChatName(r.chatFile))}</div>
+                                            ${hasError
+                                                ? `<div class="wc-rem-item-error">⚠️ ${escapeHtmlSafe(r.error)}</div>`
+                                                : `<div class="wc-rem-item-eta">⏳ ${escapeHtmlSafe(timeUntil(r.timestamp))}</div>`}
+                                        </div>
+                                        <button class="wc-rem-del" data-rem-action="delete" data-id="${escapeHtmlSafe(r.id)}" title="Удалить">✕</button>
+                                    </div>
+                                `;
+                            }).join('')
+                        }
+                    </div>
+                </div>
+            `;
+        }
+
+        return `
+            <div class="widget-card reminder ${_expanded ? 'expanded' : ''}" data-widget-id="reminder">
+                <div class="wc-header">
+                    <div class="wc-icon">⏰</div>
+                    <div class="wc-title-block">
+                        <div class="wc-title">Напоминания${activeCount > 0 ? ` · ${activeCount}` : ''}</div>
+                        <div class="wc-subtitle">
+                            ${activeCount === 0
+                                ? 'Планировщик сообщений'
+                                : `${activeCount} запланировано${failed.length > 0 ? ` · ⚠️ ${failed.length} с ошибкой` : ''}`}
+                        </div>
+                    </div>
+                    <button class="wc-rem-add" data-rem-action="add" title="Создать напоминание">＋</button>
+                </div>
+                <div class="wc-body wc-rem-body">
+                    ${bodyCollapsed}
+                </div>
+                ${expandedBody}
+                <div class="wc-hint">
+                    ${_expanded
+                        ? '👆 Тап по пустому месту — свернуть'
+                        : '👆 Развернуть список'}
+                </div>
+            </div>
+        `;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  РЕРЕНДЕР
+    // ═══════════════════════════════════════════════════════════
+    function renderReminderCard() {
+        const container = document.getElementById('chatsList');
+        if (!container) return;
+        const oldCard = container.querySelector('.widget-card.reminder');
+        if (!oldCard) return;
+
+        const newHtml = buildReminderCardHTML();
+        const temp = document.createElement('div');
+        temp.innerHTML = newHtml;
+        const newCard = temp.firstElementChild;
+        if (!newCard) return;
+
+        // Сохраняем скролл
+        const oldScroll = oldCard.querySelector('.wc-rem-list-scroll');
+        const scrollTop = oldScroll ? oldScroll.scrollTop : 0;
+
+        oldCard.replaceWith(newCard);
+
+        const newScroll = newCard.querySelector('.wc-rem-list-scroll');
+        if (newScroll && scrollTop > 0) newScroll.scrollTop = scrollTop;
+    }
+
+    function setExpanded(v) {
+        _expanded = !!v;
+        try { localStorage.setItem('smschat_reminders_expanded', _expanded ? '1' : '0'); } catch (e) {}
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  МОДАЛКА СОЗДАНИЯ НАПОМИНАНИЯ
+    // ═══════════════════════════════════════════════════════════
+    function openCreateReminderModal() {
+        // Убираем старую
+        const existing = document.getElementById('createReminderModal');
+        if (existing) existing.remove();
+
+        // Формируем список чатов с сохранёнными паролями
+        const availableChats = state.chats.filter(c =>
+            state.savedPasswords && state.savedPasswords[c.file]
+        );
+
+        if (availableChats.length === 0) {
+            showToastSafe('❌ Нет чатов с сохранённым паролем', 3000);
+            return;
+        }
+
+        // Дефолтное время: +5 минут, округлённое до минут
+        const now = new Date();
+        now.setMinutes(now.getMinutes() + 5);
+        now.setSeconds(0);
+        now.setMilliseconds(0);
+
+        const year = now.getFullYear();
+        const month = String(now.getMonth() + 1).padStart(2, '0');
+        const day = String(now.getDate()).padStart(2, '0');
+        const hours = String(now.getHours()).padStart(2, '0');
+        const minutes = String(now.getMinutes()).padStart(2, '0');
+        const defaultDate = `${year}-${month}-${day}`;
+        const defaultTime = `${hours}:${minutes}`;
+
+        const defaultChatFile = state.chatFile || availableChats[0].file;
+
+        const modal = document.createElement('div');
+        modal.id = 'createReminderModal';
+        modal.className = 'image-modal active';
+        modal.innerHTML = `
+            <div class="form-modal-content crm-content" onclick="event.stopPropagation()">
+                <h2>⏰ Новое напоминание</h2>
+
+                <label>📱 Чат</label>
+                <select id="crmChatSelect" class="crm-input crm-select">
+                    ${availableChats.map(c => `
+                        <option value="${escapeHtmlSafe(c.file)}" ${c.file === defaultChatFile ? 'selected' : ''}>
+                            ${escapeHtmlSafe(c.name || c.file)}
+                        </option>
+                    `).join('')}
+                </select>
+
+                <label>📅 Дата</label>
+                <input type="date" id="crmDateInput" class="crm-input" value="${defaultDate}">
+
+                <label>🕐 Время</label>
+                <input type="time" id="crmTimeInput" class="crm-input" value="${defaultTime}">
+
+                <div class="crm-quick-times">
+                    <button type="button" class="crm-quick" data-quick="5">+5 мин</button>
+                    <button type="button" class="crm-quick" data-quick="15">+15 мин</button>
+                    <button type="button" class="crm-quick" data-quick="30">+30 мин</button>
+                    <button type="button" class="crm-quick" data-quick="60">+1 час</button>
+                    <button type="button" class="crm-quick" data-quick="180">+3 часа</button>
+                </div>
+
+                <label>💬 Текст напоминания</label>
+                <textarea id="crmMessageInput" class="crm-input crm-textarea"
+                          placeholder="Например: Позвонить маме"
+                          maxlength="500"
+                          rows="3"></textarea>
+
+                <div class="crm-preview" id="crmPreview">
+                    ⏰ Отправится: <span id="crmPreviewTime">—</span>
+                </div>
+
+                <div class="modal-actions">
+                    <button class="btn btn-secondary" id="crmCancelBtn">Отмена</button>
+                    <button class="btn" id="crmSaveBtn">💾 Сохранить</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+
+        const chatSelect = modal.querySelector('#crmChatSelect');
+        const dateInput = modal.querySelector('#crmDateInput');
+        const timeInput = modal.querySelector('#crmTimeInput');
+        const messageInput = modal.querySelector('#crmMessageInput');
+        const previewEl = modal.querySelector('#crmPreviewTime');
+
+        // Обновление превью
+        function updatePreview() {
+            try {
+                const dt = new Date(`${dateInput.value}T${timeInput.value}:00`);
+                if (isNaN(dt.getTime())) {
+                    previewEl.textContent = '⚠️ Укажите корректную дату и время';
+                    previewEl.parentElement.style.color = '#ff6b6b';
+                    return;
+                }
+                const diff = dt.getTime() - Date.now();
+                if (diff <= 0) {
+                    previewEl.textContent = '⚠️ Время уже прошло';
+                    previewEl.parentElement.style.color = '#ff6b6b';
+                } else {
+                    previewEl.textContent = `${formatDateTime(dt.getTime())} (${timeUntil(dt.getTime())})`;
+                    previewEl.parentElement.style.color = '#00b894';
+                }
+            } catch (e) {}
+        }
+
+        dateInput.addEventListener('input', updatePreview);
+        timeInput.addEventListener('input', updatePreview);
+        updatePreview();
+
+        // Быстрые кнопки времени
+        modal.querySelectorAll('.crm-quick').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const mins = parseInt(btn.dataset.quick, 10);
+                const dt = new Date(Date.now() + mins * 60 * 1000);
+                dt.setSeconds(0);
+                dt.setMilliseconds(0);
+                dateInput.value = `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`;
+                timeInput.value = `${String(dt.getHours()).padStart(2, '0')}:${String(dt.getMinutes()).padStart(2, '0')}`;
+                updatePreview();
+                if (navigator.vibrate) navigator.vibrate(8);
+            });
+        });
+
+        // Автофокус на текст
+        setTimeout(() => messageInput.focus(), 150);
+
+        // Закрытие
+        function close() {
+            modal.style.transition = 'opacity 0.2s';
+            modal.style.opacity = '0';
+            setTimeout(() => modal.remove(), 200);
+        }
+
+        modal.querySelector('#crmCancelBtn').addEventListener('click', close);
+        modal.addEventListener('click', (e) => { if (e.target === modal) close(); });
+
+        // Сохранение
+        modal.querySelector('#crmSaveBtn').addEventListener('click', () => {
+            const chatFile = chatSelect.value;
+            const message = messageInput.value.trim();
+
+            if (!message) {
+                showToastSafe('❌ Введите текст напоминания', 2000);
+                messageInput.focus();
+                return;
+            }
+
+            let dt;
+            try {
+                dt = new Date(`${dateInput.value}T${timeInput.value}:00`);
+            } catch (e) {
+                showToastSafe('❌ Неверная дата или время', 2000);
+                return;
+            }
+
+            if (isNaN(dt.getTime())) {
+                showToastSafe('❌ Неверная дата или время', 2000);
+                return;
+            }
+
+            if (dt.getTime() <= Date.now()) {
+                showToastSafe('❌ Время уже прошло', 2000);
+                return;
+            }
+
+            if (!state.savedPasswords[chatFile]) {
+                showToastSafe('❌ Нет пароля для этого чата', 2500);
+                return;
+            }
+
+            const reminder = {
+                id: genId(),
+                chatFile,
+                message,
+                timestamp: dt.getTime(),
+                createdAt: Date.now(),
+                sent: false,
+                retries: 0,
+            };
+
+            _reminders.push(reminder);
+            saveReminders();
+            renderReminderCard();
+
+            showToastSafe(`✅ Напоминание создано: ${formatDateTime(dt.getTime())}`, 2500);
+            if (typeof soundManager !== 'undefined') {
+                try { soundManager.play('send'); } catch (e) {}
+            }
+
+            close();
+            log('Создано напоминание:', reminder);
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОБРАБОТЧИКИ
+    // ═══════════════════════════════════════════════════════════
+    function installHandlers() {
+        const container = document.getElementById('chatsList');
+        if (!container) { setTimeout(installHandlers, 500); return; }
+        if (container._reminderV1Handlers) return;
+        container._reminderV1Handlers = true;
+
+        let pressTimer = null, pressTarget = null, fired = false;
+        let startX = 0, startY = 0;
+
+        function cancelPress() {
+            if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
+            if (pressTarget) { pressTarget.classList.remove('pressing'); pressTarget = null; }
+        }
+        function startPress(card) {
+            cancelPress();
+            fired = false;
+            pressTarget = card;
+            card.classList.add('pressing');
+            pressTimer = setTimeout(() => {
+                fired = true;
+                pressTimer = null;
+                card.classList.remove('pressing');
+                pressTarget = null;
+                if (navigator.vibrate) navigator.vibrate(30);
+                if (confirm('Удалить виджет «Напоминания»?\n\n(все запланированные напоминания сохранятся)')) {
+                    if (window.WidgetsRegistry) window.WidgetsRegistry.remove('reminder');
+                }
+            }, 600);
+        }
+
+        container.addEventListener('click', (e) => {
+            const card = e.target.closest('.widget-card.reminder');
+            if (!card) return;
+
+            const actionEl = e.target.closest('[data-rem-action]');
+            if (actionEl) {
+                e.stopPropagation();
+                const action = actionEl.dataset.remAction;
+                const id = actionEl.dataset.id;
+
+                if (action === 'add') {
+                    openCreateReminderModal();
+                    return;
+                }
+                if (action === 'delete' && id) {
+                    const idx = _reminders.findIndex(r => r.id === id);
+                    if (idx >= 0) {
+                        const r = _reminders[idx];
+                        if (confirm(`Удалить напоминание?\n\n"${r.message.slice(0, 60)}"`)) {
+                            _reminders.splice(idx, 1);
+                            saveReminders();
+                            renderReminderCard();
+                            showToastSafe('🗑️ Удалено', 1200);
+                            if (typeof soundManager !== 'undefined') {
+                                try { soundManager.play('delete'); } catch (err) {}
+                            }
+                        }
+                    }
+                    return;
+                }
+                return;
+            }
+
+            if (fired) { fired = false; return; }
+            if (e.target.closest('button, select, input, textarea')) return;
+
+            setExpanded(!_expanded);
+            renderReminderCard();
+        });
+
+        container.addEventListener('touchstart', (e) => {
+            const card = e.target.closest('.widget-card.reminder');
+            if (!card) return;
+            if (e.target.closest('button, select, input, textarea')) return;
+            const t = e.touches[0];
+            startX = t.clientX; startY = t.clientY;
+            startPress(card);
+        }, { passive: true });
+
+        container.addEventListener('touchmove', (e) => {
+            if (!pressTimer) return;
+            const t = e.touches[0];
+            if (Math.abs(t.clientX - startX) > 10 || Math.abs(t.clientY - startY) > 10) cancelPress();
+        }, { passive: true });
+
+        container.addEventListener('touchend', cancelPress);
+        container.addEventListener('touchcancel', cancelPress);
+
+        container.addEventListener('mousedown', (e) => {
+            if (e.button !== 0) return;
+            const card = e.target.closest('.widget-card.reminder');
+            if (!card) return;
+            if (e.target.closest('button, select, input, textarea')) return;
+            startX = e.clientX; startY = e.clientY;
+            startPress(card);
+        });
+        container.addEventListener('mouseup', cancelPress);
+        container.addEventListener('mouseleave', cancelPress);
+    }
+    installHandlers();
+
+    // ═══════════════════════════════════════════════════════════
+    //  СТИЛИ
+    // ═══════════════════════════════════════════════════════════
+    function ensureStyles() {
+        if (document.getElementById('reminderWidgetStylesV1')) return;
+        const style = document.createElement('style');
+        style.id = 'reminderWidgetStylesV1';
+        style.textContent = `
+            /* ─── Виджет ─── */
+            .widget-card.reminder .wc-rem-add {
+                width: 40px; height: 40px; border-radius: 50%;
+                border: 1px solid rgba(0, 184, 148, 0.5);
+                background: linear-gradient(135deg, rgba(0, 184, 148, 0.25), rgba(108, 92, 231, 0.2));
+                color: #00b894; font-size: 22px; font-weight: 700;
+                cursor: pointer; flex-shrink: 0;
+                display: flex; align-items: center; justify-content: center;
+                transition: all 0.15s;
+                -webkit-tap-highlight-color: transparent;
+                padding: 0; line-height: 1;
+            }
+            .widget-card.reminder .wc-rem-add:hover {
+                background: linear-gradient(135deg, rgba(0, 184, 148, 0.5), rgba(108, 92, 231, 0.35));
+                color: #fff;
+                transform: scale(1.08);
+            }
+            .widget-card.reminder .wc-rem-add:active { transform: scale(0.92); }
+
+            .widget-card.reminder .wc-rem-body {
+                padding-top: 4px;
+            }
+            .widget-card.reminder .wc-rem-empty {
+                text-align: center; padding: 12px 8px;
+                font-size: 12px; color: #888; line-height: 1.5;
+            }
+            .widget-card.reminder .wc-rem-empty-small {
+                text-align: center; padding: 8px;
+                font-size: 11px; color: #666; font-style: italic;
+            }
+            .widget-card.reminder .wc-rem-empty strong {
+                color: #00b894; font-weight: 700;
+            }
+
+            /* ─── Ближайшее напоминание ─── */
+            .widget-card.reminder .wc-rem-next {
+                display: flex; flex-direction: column; gap: 4px;
+                padding: 10px 12px;
+                background: linear-gradient(135deg, rgba(0, 184, 148, 0.12), rgba(108, 92, 231, 0.08));
+                border: 1px solid rgba(0, 184, 148, 0.3);
+                border-radius: 10px;
+            }
+            .widget-card.reminder .wc-rem-next-time {
+                font-size: 12px; font-weight: 700; color: #00b894;
+                letter-spacing: 0.2px;
+            }
+            .widget-card.reminder .wc-rem-next-msg {
+                font-size: 14px; color: #fff; font-weight: 600;
+                white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+                line-height: 1.3;
+            }
+            .widget-card.reminder .wc-rem-next-chat {
+                font-size: 11px; color: #a78bfa;
+                white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+            }
+            .widget-card.reminder .wc-rem-next-eta {
+                font-size: 11px; color: #feca57; font-weight: 700;
+                margin-top: 2px;
+            }
+
+            /* ─── Секция всех напоминаний ─── */
+            .widget-card.reminder .wc-rem-section {
+                margin-top: 14px;
+            }
+            .widget-card.reminder .wc-rem-section-title {
+                font-size: 11px; font-weight: 700; color: #888;
+                text-transform: uppercase; letter-spacing: 0.5px;
+                margin-bottom: 8px;
+            }
+            .widget-card.reminder .wc-rem-list {
+                display: flex; flex-direction: column; gap: 6px;
+                max-height: 320px; overflow-y: auto;
+                padding-right: 2px;
+                scrollbar-width: thin;
+                scrollbar-color: rgba(108, 92, 231, 0.5) transparent;
+            }
+            .widget-card.reminder .wc-rem-list::-webkit-scrollbar { width: 4px; }
+            .widget-card.reminder .wc-rem-list::-webkit-scrollbar-thumb {
+                background: rgba(108, 92, 231, 0.5); border-radius: 2px;
+            }
+
+            .widget-card.reminder .wc-rem-item {
+                display: flex; gap: 8px; padding: 9px 10px;
+                background: rgba(255, 255, 255, 0.04);
+                border: 1px solid rgba(255, 255, 255, 0.06);
+                border-radius: 10px;
+                transition: background 0.15s;
+            }
+            .widget-card.reminder .wc-rem-item.has-error {
+                background: rgba(255, 107, 107, 0.08);
+                border-color: rgba(255, 107, 107, 0.3);
+            }
+            .widget-card.reminder .wc-rem-item-main {
+                flex: 1; min-width: 0;
+                display: flex; flex-direction: column; gap: 2px;
+            }
+            .widget-card.reminder .wc-rem-item-time {
+                font-size: 11px; color: #00b894; font-weight: 700;
+            }
+            .widget-card.reminder .wc-rem-item-msg {
+                font-size: 13px; color: #fff; font-weight: 600;
+                white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+            }
+            .widget-card.reminder .wc-rem-item-chat {
+                font-size: 10px; color: #a78bfa;
+                white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+            }
+            .widget-card.reminder .wc-rem-item-eta {
+                font-size: 10px; color: #feca57; margin-top: 2px;
+            }
+            .widget-card.reminder .wc-rem-item-error {
+                font-size: 10px; color: #ff8a8a; margin-top: 2px;
+                font-weight: 600;
+            }
+            .widget-card.reminder .wc-rem-del {
+                width: 28px; height: 28px; border-radius: 50%;
+                border: 1px solid rgba(255, 107, 107, 0.25);
+                background: rgba(255, 107, 107, 0.08);
+                color: #ff6b6b; font-size: 12px; cursor: pointer;
+                flex-shrink: 0; align-self: center;
+                display: flex; align-items: center; justify-content: center;
+                transition: all 0.15s; padding: 0; line-height: 1;
+            }
+            .widget-card.reminder .wc-rem-del:hover {
+                background: rgba(255, 107, 107, 0.25);
+                border-color: rgba(255, 107, 107, 0.5);
+                color: #fff;
+            }
+            .widget-card.reminder .wc-rem-del:active { transform: scale(0.88); }
+
+            /* ─── Модалка создания ─── */
+            #createReminderModal .crm-content {
+                max-width: 440px;
+                max-height: 92vh;
+                overflow-y: auto;
+            }
+            #createReminderModal h2 {
+                font-size: 18px;
+                margin-bottom: 16px;
+                color: #fff;
+            }
+            #createReminderModal label {
+                display: block; font-size: 12px; color: #999;
+                font-weight: 600; margin-bottom: 6px;
+                text-transform: uppercase; letter-spacing: 0.3px;
+            }
+            #createReminderModal .crm-input {
+                width: 100%; padding: 12px 14px;
+                background: rgba(255, 255, 255, 0.06);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 12px; color: #fff; font-size: 15px;
+                margin-bottom: 14px; outline: none;
+                font-family: inherit;
+                transition: all 0.2s;
+                box-sizing: border-box;
+            }
+            #createReminderModal .crm-input:focus {
+                border-color: #6c5ce7;
+                background: rgba(255, 255, 255, 0.08);
+                box-shadow: 0 0 0 3px rgba(108, 92, 231, 0.15);
+            }
+            #createReminderModal .crm-select {
+                -webkit-appearance: none; appearance: none;
+                background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath fill='%23a78bfa' d='M0 0l5 6 5-6z'/%3E%3C/svg%3E");
+                background-repeat: no-repeat;
+                background-position: right 14px center;
+                padding-right: 36px;
+                cursor: pointer;
+            }
+            #createReminderModal .crm-select option {
+                background: #1a1a2e; color: #fff;
+            }
+            #createReminderModal .crm-textarea {
+                resize: vertical;
+                min-height: 70px;
+                max-height: 200px;
+                line-height: 1.5;
+            }
+            #createReminderModal .crm-quick-times {
+                display: flex; gap: 6px; flex-wrap: wrap;
+                margin-bottom: 14px;
+            }
+            #createReminderModal .crm-quick {
+                flex: 1; min-width: 60px;
+                padding: 7px 10px;
+                border-radius: 10px;
+                border: 1px solid rgba(108, 92, 231, 0.3);
+                background: rgba(108, 92, 231, 0.1);
+                color: #a78bfa; font-size: 11px; font-weight: 600;
+                cursor: pointer; font-family: inherit;
+                transition: all 0.15s;
+                -webkit-tap-highlight-color: transparent;
+                white-space: nowrap;
+            }
+            #createReminderModal .crm-quick:hover {
+                background: rgba(108, 92, 231, 0.25);
+                border-color: rgba(108, 92, 231, 0.5);
+                color: #fff;
+            }
+            #createReminderModal .crm-quick:active {
+                transform: scale(0.95);
+            }
+            #createReminderModal .crm-preview {
+                padding: 10px 12px;
+                background: rgba(0, 184, 148, 0.08);
+                border: 1px solid rgba(0, 184, 148, 0.25);
+                border-radius: 10px;
+                font-size: 12px;
+                color: #00b894;
+                margin-bottom: 16px;
+                text-align: center;
+                line-height: 1.4;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  РЕГИСТРАЦИЯ В WIDGETSREGISTRY
+    // ═══════════════════════════════════════════════════════════
+    function register() {
+        if (!window.WidgetsRegistry) {
+            setTimeout(register, 300);
+            return;
+        }
+        ensureStyles();
+        loadReminders();
+
+        window.WidgetsRegistry.register({
+            id: 'reminder',
+            position: 15,   // между Радио (10) и Погодой (20)
+            name: 'Напоминания',
+            icon: '⏰',
+            description: 'Планировщик сообщений в чаты',
+            buildHtml: () => buildReminderCardHTML(),
+            onMount: () => { /* обработчики делегированы */ },
+            onRemove: () => {
+                // При удалении виджета — НЕ удаляем сами напоминания,
+                // только останавливаем проверку
+                log('Виджет удалён — напоминания сохранены');
+            },
+        });
+
+        log('✅ Зарегистрирован');
+        startChecking();
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПРИ СТАРТЕ — если виджет был активен, но триггерим проверку
+    // ═══════════════════════════════════════════════════════════
+    setTimeout(() => {
+        if (window.WidgetsRegistry && window.WidgetsRegistry.isActive('reminder')) {
+            // Перерисовываем карточку, чтобы отобразить актуальные данные
+            renderReminderCard();
+        }
+    }, 3000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API
+    // ═══════════════════════════════════════════════════════════
+    window.ReminderWidget = {
+        add: () => window.WidgetsRegistry && window.WidgetsRegistry.add('reminder'),
+        remove: () => window.WidgetsRegistry && window.WidgetsRegistry.remove('reminder'),
+        create: openCreateReminderModal,
+
+        list: () => _reminders.slice(),
+        active: () => _reminders.filter(r => !r.sent),
+
+        // Программно создать напоминание
+        schedule: (chatFile, message, timestamp) => {
+            if (!chatFile || !message || !timestamp) {
+                showToastSafe('❌ Нужны: chatFile, message, timestamp', 2500);
+                return null;
+            }
+            if (!state.savedPasswords[chatFile]) {
+                showToastSafe('❌ Нет пароля чата', 2500);
+                return null;
+            }
+            const r = {
+                id: genId(),
+                chatFile,
+                message,
+                timestamp,
+                createdAt: Date.now(),
+                sent: false,
+                retries: 0,
+            };
+            _reminders.push(r);
+            saveReminders();
+            renderReminderCard();
+            return r;
+        },
+
+        // Через сколько минут
+        scheduleIn: (chatFile, message, minutes) => {
+            const ts = Date.now() + minutes * 60 * 1000;
+            return window.ReminderWidget.schedule(chatFile, message, ts);
+        },
+
+        cancel: (id) => {
+            const idx = _reminders.findIndex(r => r.id === id);
+            if (idx >= 0) {
+                _reminders.splice(idx, 1);
+                saveReminders();
+                renderReminderCard();
+                return true;
+            }
+            return false;
+        },
+
+        cancelAll: () => {
+            const count = _reminders.filter(r => !r.sent).length;
+            if (count === 0) return 0;
+            if (!confirm(`Удалить все напоминания (${count})?`)) return 0;
+            _reminders = _reminders.filter(r => r.sent);
+            saveReminders();
+            renderReminderCard();
+            return count;
+        },
+
+        // Форсировать проверку
+        checkNow: () => checkReminders(),
+
+        // Диагностика
+        status: () => {
+            const active = _reminders.filter(r => !r.sent);
+            const failed = active.filter(r => r.error);
+            return {
+                total: _reminders.length,
+                active: active.length,
+                failed: failed.length,
+                next: active.length > 0
+                    ? {
+                        id: active[0].id,
+                        chat: getChatName(active[0].chatFile),
+                        time: new Date(active[0].timestamp).toLocaleString('ru-RU'),
+                        in: timeUntil(active[0].timestamp),
+                    }
+                    : null,
+                checkTimerActive: !!_checkTimer,
+            };
+        },
+
+        // Отладка: показать все напоминания
+        debug: () => {
+            console.log('⏰ Все напоминания:');
+            _reminders.forEach(r => {
+                console.log(`  ${r.sent ? '✅' : '⏳'} [${r.id}] ${formatDateTime(r.timestamp)} → ${getChatName(r.chatFile)}: "${r.message}"`);
+                if (r.error) console.log(`     ⚠️ ${r.error}`);
+            });
+            return _reminders;
+        },
+    };
+
+    register();
+
+    console.log('⏰ [Reminder v1] Готово:');
+    console.log('   • Виджет: позиция 15 (между Радио и Погодой)');
+    console.log('   • Проверка раз в минуту');
+    console.log('   • API: ReminderWidget.create() / .scheduleIn(chat, msg, mins)');
+    console.log('   • Тест: ReminderWidget.scheduleIn(state.chatFile, "Тест", 1)');
+})();
+</script><script>
+// ═══════════════════════════════════════════════════════════════
+//  🧩 WIDGETS PLACEMENT v2 — надёжная настройка позиции виджетов
+//  ─────────────────────────────────────────────────────────────
+//  Позволяет каждому виджету быть над ИЛИ под списком чатов.
+//
+//  Ключевое отличие от v1:
+//   • Контейнер #widgetsBottom вставляется СРАЗУ после #chatsList
+//     и ПЕРЕД #chatsBottomButtons (кнопки «Создать чат» и т.д.)
+//   • Полная перерисовка #widgetsBottom при каждом renderChatsList
+//   • Патч innerHTML #chatsList фильтрует только top-виджеты
+//   • Раскладка сохраняется в localStorage
+// ═══════════════════════════════════════════════════════════════
+
+(function installWidgetsPlacementV2() {
+    'use strict';
+
+    console.log('🧩 [WidgetsPlacement v2] Установка…');
+
+    const CFG = {
+        STORAGE_KEY: 'smschat_widgets_placement_v2',
+        DEBUG: true,
+    };
+    const log = (...a) => CFG.DEBUG && console.log('🧩 [Placement v2]', ...a);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХРАНИЛИЩЕ: { widgetId: 'top' | 'bottom' }
+    // ═══════════════════════════════════════════════════════════
+    let _placement = {};
+
+    function loadPlacement() {
+        try {
+            const raw = localStorage.getItem(CFG.STORAGE_KEY);
+            _placement = raw ? JSON.parse(raw) : {};
+            if (typeof _placement !== 'object' || Array.isArray(_placement)) {
+                _placement = {};
+            }
+        } catch (e) { _placement = {}; }
+    }
+
+    function savePlacement() {
+        try {
+            localStorage.setItem(CFG.STORAGE_KEY, JSON.stringify(_placement));
+        } catch (e) {
+            console.warn('🧩 [Placement v2] save failed:', e);
+        }
+    }
+
+    function getWidgetPosition(id) {
+        return _placement[id] === 'bottom' ? 'bottom' : 'top';
+    }
+
+    function setWidgetPosition(id, position) {
+        if (position !== 'top' && position !== 'bottom') return false;
+        _placement[id] = position;
+        savePlacement();
+        // Полная перерисовка виджетов
+        rerenderAllWidgets();
+        return true;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  КОНТЕЙНЕР #widgetsBottom
+    //  Идёт СРАЗУ ПОСЛЕ #chatsList и ПЕРЕД #chatsBottomButtons
+    // ═══════════════════════════════════════════════════════════
+    function ensureBottomContainer() {
+        const chatsList = document.getElementById('chatsList');
+        if (!chatsList) return null;
+
+        let container = document.getElementById('widgetsBottom');
+
+        // Контейнер уже есть — проверяем, что стоит на нужном месте
+        if (container) {
+            // Идеальное место: сразу после #chatsList
+            if (container.previousSibling === chatsList) return container;
+            // Не на месте — удалим и пересоздадим
+            container.remove();
+            container = null;
+        }
+
+        container = document.createElement('div');
+        container.id = 'widgetsBottom';
+        container.className = 'widgets-bottom-container';
+
+        // Вставляем СРАЗУ после #chatsList (перед любыми другими элементами)
+        if (chatsList.nextSibling) {
+            chatsList.parentNode.insertBefore(container, chatsList.nextSibling);
+        } else {
+            chatsList.parentNode.appendChild(container);
+        }
+
+        // Стили
+        if (!document.getElementById('widgetsBottomStylesV2')) {
+            const style = document.createElement('style');
+            style.id = 'widgetsBottomStylesV2';
+            style.textContent = `
+                #widgetsBottom {
+                    width: 100%;
+                    max-width: 420px;
+                    margin-top: 12px;
+                    display: none;
+                }
+                #widgetsBottom.has-widgets {
+                    display: block;
+                }
+                #widgetsBottom .widget-card {
+                    margin-bottom: 10px;
+                }
+                #widgetsBottom .widget-card:last-child {
+                    margin-bottom: 0;
+                }
+            `;
+            document.head.appendChild(style);
+        }
+
+        log('Создан контейнер #widgetsBottom после #chatsList');
+        return container;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СБОРКА HTML ВИДЖЕТОВ ПО ГРУППАМ
+    // ═══════════════════════════════════════════════════════════
+    function getAllActiveDefs() {
+        if (!window.WidgetsRegistry) return [];
+        const activeIds = window.WidgetsRegistry.getActiveIds();
+
+        // Безопасно достаём реестр через available()
+        const allDefs = window.WidgetsRegistry.available();
+        const map = new Map(allDefs.map(d => [d.id, d]));
+
+        return activeIds
+            .map(id => map.get(id))
+            .filter(Boolean);
+    }
+
+    function buildTopHtml() {
+        const defs = getAllActiveDefs()
+            .filter(def => getWidgetPosition(def.id) === 'top')
+            .sort((a, b) => (a.position ?? 100) - (b.position ?? 100));
+        return defs.map(def => {
+            try { return def.buildHtml(); }
+            catch (e) { console.warn('buildTopHtml error for', def.id, e); return ''; }
+        }).join('');
+    }
+
+    function buildBottomHtml() {
+        const defs = getAllActiveDefs()
+            .filter(def => getWidgetPosition(def.id) === 'bottom')
+            .sort((a, b) => (a.position ?? 100) - (b.position ?? 100));
+        return defs.map(def => {
+            try { return def.buildHtml(); }
+            catch (e) { console.warn('buildBottomHtml error for', def.id, e); return ''; }
+        }).join('');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  РЕНДЕР: список чатов + нижние виджеты
+    // ═══════════════════════════════════════════════════════════
+    function renderBottomWidgets() {
+        const container = ensureBottomContainer();
+        if (!container) return;
+
+        const bottomDefs = getAllActiveDefs()
+            .filter(def => getWidgetPosition(def.id) === 'bottom')
+            .sort((a, b) => (a.position ?? 100) - (b.position ?? 100));
+
+        if (bottomDefs.length === 0) {
+            container.innerHTML = '';
+            container.classList.remove('has-widgets');
+            return;
+        }
+
+        container.innerHTML = bottomDefs.map(def => {
+            try { return def.buildHtml(); }
+            catch (e) { return ''; }
+        }).join('');
+        container.classList.add('has-widgets');
+
+        // onMount для нижних виджетов
+        bottomDefs.forEach(def => {
+            if (!def.onMount) return;
+            const el = container.querySelector(
+                `.widget-card[data-widget-id="${def.id}"]`
+            );
+            if (el) {
+                try { def.onMount(el); }
+                catch (e) { console.warn('onMount error for', def.id, e); }
+            }
+        });
+    }
+
+    /**
+     * Полная перерисовка: и верхних, и нижних виджетов.
+     */
+    function rerenderAllWidgets() {
+        // 1. Перерисовываем список чатов
+        // (патч innerHTML вставит актуальные top-виджеты)
+        if (typeof renderChatsList === 'function') {
+            renderChatsList();
+        }
+
+        // 2. После этого рендерим нижние виджеты
+        requestAnimationFrame(() => {
+            renderBottomWidgets();
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧ innerHTML #chatsList
+    //  Вставляет только TOP-виджеты.
+    // ═══════════════════════════════════════════════════════════
+    function patchChatsListInnerHTML() {
+        const container = document.getElementById('chatsList');
+        if (!container) { setTimeout(patchChatsListInnerHTML, 500); return; }
+        if (container._placementV2Patched) return;
+
+        // Запоминаем оригинальный дескриптор
+        const proto = Object.getPrototypeOf(container);
+        const originalDescriptor = Object.getOwnPropertyDescriptor(proto, 'innerHTML')
+            || Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML');
+        if (!originalDescriptor) return;
+
+        try {
+            Object.defineProperty(container, 'innerHTML', {
+                get() {
+                    return originalDescriptor.get.call(this);
+                },
+                set(value) {
+                    // Вставляем только top-виджеты
+                    if (typeof value === 'string'
+                        && value.indexOf('data-widget-id=') === -1
+                        && window.WidgetsRegistry) {
+                        const topHtml = buildTopHtml();
+                        if (topHtml) value = topHtml + value;
+                    }
+                    return originalDescriptor.set.call(this, value);
+                },
+                configurable: true,
+            });
+            container._placementV2Patched = true;
+            log('✅ innerHTML #chatsList пропатчен (только top-виджеты)');
+        } catch (e) {
+            console.warn('🧩 [Placement v2] Патч innerHTML не удался:', e);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧ renderChatsList — рендерит также нижние виджеты
+    // ═══════════════════════════════════════════════════════════
+    function patchRenderChatsList() {
+        if (typeof renderChatsList !== 'function') {
+            setTimeout(patchRenderChatsList, 500);
+            return;
+        }
+        if (renderChatsList._placementV2Patched) return;
+
+        const _origRender = renderChatsList;
+
+        renderChatsList = function() {
+            const result = _origRender.apply(this, arguments);
+
+            // После отрисовки списка — заполняем нижний контейнер
+            requestAnimationFrame(() => {
+                renderBottomWidgets();
+            });
+
+            return result;
+        };
+
+        renderChatsList._placementV2Patched = true;
+        log('✅ renderChatsList пропатчен');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧ МОДАЛКИ ВЫБОРА ВИДЖЕТОВ
+    // ═══════════════════════════════════════════════════════════
+    function patchWidgetPicker() {
+        const observer = new MutationObserver(() => {
+            const modal = document.getElementById('widgetPickerModal');
+            if (!modal || !modal.classList.contains('active')) return;
+            if (modal._placementV2Patched) return;
+            modal._placementV2Patched = true;
+
+            // Своя версия рендера списка
+            const list = modal.querySelector('#wpWidgetsList');
+            if (list) {
+                renderPickerListWithPlacement(list);
+            }
+
+            // Следим за пересозданием списка (WidgetsPicker может перерисовать)
+            const listObs = new MutationObserver(() => {
+                const l = modal.querySelector('#wpWidgetsList');
+                if (!l) return;
+                // Если пересоздан с нуля — перерисуем с позициями
+                if (!l.querySelector('.wp-widget-position-toggle')
+                    && window.WidgetsRegistry
+                    && window.WidgetsRegistry.getActiveIds().length > 0) {
+                    renderPickerListWithPlacement(l);
+                }
+            });
+            if (list) listObs.observe(list, { childList: true });
+        });
+
+        observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
+        log('✅ Модалка выбора виджетов под наблюдением');
+    }
+
+    function escapeHtmlSimple(s) {
+        if (typeof escapeHtml === 'function') return escapeHtml(s);
+        const div = document.createElement('div');
+        div.textContent = s == null ? '' : String(s);
+        return div.innerHTML;
+    }
+
+    function showToastSimple(msg, dur) {
+        if (typeof showToast === 'function') showToast(msg, dur || 2000);
+    }
+
+    function renderPickerListWithPlacement(list) {
+        if (!window.WidgetsRegistry) return;
+
+        const available = window.WidgetsRegistry.available();
+
+        list.innerHTML = available.map(w => {
+            const isAdded = window.WidgetsRegistry.isActive(w.id);
+            const position = getWidgetPosition(w.id);
+
+            return `
+                <div class="wp-widget-item ${isAdded ? 'added' : ''}" data-widget-id="${w.id}">
+                    <div class="wp-widget-icon">${w.icon || '🧩'}</div>
+                    <div class="wp-widget-info">
+                        <div class="wp-widget-name">${escapeHtmlSimple(w.name)}</div>
+                        <div class="wp-widget-desc">${escapeHtmlSimple(w.description || '')}</div>
+                        ${isAdded ? `
+                            <div class="wp-widget-position-toggle" data-position-for="${w.id}">
+                                <button class="wp-pos-btn ${position === 'top' ? 'active' : ''}"
+                                        data-pos="top" data-for="${w.id}"
+                                        title="Над списком чатов">⬆ Над чатами</button>
+                                <button class="wp-pos-btn ${position === 'bottom' ? 'active' : ''}"
+                                        data-pos="bottom" data-for="${w.id}"
+                                        title="Под списком чатов">⬇ Под чатами</button>
+                            </div>
+                        ` : ''}
+                    </div>
+                    <div class="wp-widget-status">${isAdded ? '✓' : '+'}</div>
+                </div>
+            `;
+        }).join('');
+
+        // Стили переключателя
+        if (!document.getElementById('widgetPositionToggleStylesV2')) {
+            const style = document.createElement('style');
+            style.id = 'widgetPositionToggleStylesV2';
+            style.textContent = `
+                .wp-widget-position-toggle {
+                    display: flex;
+                    gap: 6px;
+                    margin-top: 8px;
+                }
+                .wp-pos-btn {
+                    flex: 1;
+                    padding: 6px 10px;
+                    border-radius: 8px;
+                    border: 1px solid rgba(108, 92, 231, 0.3);
+                    background: rgba(108, 92, 231, 0.08);
+                    color: #a78bfa;
+                    font-size: 11px;
+                    font-weight: 600;
+                    cursor: pointer;
+                    font-family: inherit;
+                    transition: all 0.15s;
+                    -webkit-tap-highlight-color: transparent;
+                }
+                .wp-pos-btn:hover {
+                    background: rgba(108, 92, 231, 0.2);
+                    border-color: rgba(108, 92, 231, 0.5);
+                    color: #fff;
+                }
+                .wp-pos-btn.active {
+                    background: linear-gradient(135deg,
+                        rgba(108, 92, 231, 0.35),
+                        rgba(0, 184, 148, 0.25));
+                    border-color: rgba(108, 92, 231, 0.7);
+                    color: #fff;
+                    box-shadow: 0 0 0 2px rgba(108, 92, 231, 0.2);
+                }
+                .wp-pos-btn:active { transform: scale(0.95); }
+            `;
+            document.head.appendChild(style);
+        }
+
+        // Клик по виджету (кроме кнопок позиции)
+        list.querySelectorAll('.wp-widget-item').forEach(el => {
+            el.addEventListener('click', (e) => {
+                if (e.target.closest('.wp-pos-btn')) return;
+
+                const id = el.dataset.widgetId;
+                const isAdded = window.WidgetsRegistry.isActive(id);
+
+                if (isAdded) {
+                    const info = window.WidgetsRegistry.available().find(w => w.id === id);
+                    if (confirm(`Удалить виджет «${info ? info.name : id}»?`)) {
+                        window.WidgetsRegistry.remove(id);
+                        renderPickerListWithPlacement(list);
+                        rerenderAllWidgets();
+                    }
+                } else {
+                    if (window.WidgetsRegistry.add(id)) {
+                        renderPickerListWithPlacement(list);
+                        rerenderAllWidgets();
+                    }
+                }
+            });
+        });
+
+        // Клик по кнопкам позиции
+        list.querySelectorAll('.wp-pos-btn').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                e.preventDefault();
+
+                const id = btn.dataset.for;
+                const pos = btn.dataset.pos;
+
+                if (getWidgetPosition(id) === pos) return;
+
+                setWidgetPosition(id, pos);
+
+                // Обновляем активные классы
+                const parent = btn.closest('.wp-widget-position-toggle');
+                if (parent) {
+                    parent.querySelectorAll('.wp-pos-btn').forEach(b => {
+                        b.classList.toggle('active', b === btn);
+                    });
+                }
+
+                const name = window.WidgetsRegistry.available().find(w => w.id === id)?.name || id;
+                const label = pos === 'top' ? 'над списком' : 'под списком';
+                showToastSimple(`✅ «${name}» → ${label}`, 1800);
+
+                if (navigator.vibrate) navigator.vibrate(10);
+                if (typeof soundManager !== 'undefined') {
+                    try { soundManager.play('click'); } catch (err) {}
+                }
+            });
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХУКИ
+    // ═══════════════════════════════════════════════════════════
+    if (typeof showChatsScreen === 'function') {
+        const _origShowChats = showChatsScreen;
+        showChatsScreen = function() {
+            const r = _origShowChats.apply(this, arguments);
+            setTimeout(() => {
+                ensureBottomContainer();
+                renderBottomWidgets();
+            }, 100);
+            return r;
+        };
+    }
+
+    if (typeof logout === 'function') {
+        const _origLogout = logout;
+        logout = function() {
+            const c = document.getElementById('widgetsBottom');
+            if (c) { c.innerHTML = ''; c.classList.remove('has-widgets'); }
+            return _origLogout.apply(this, arguments);
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  API
+    // ═══════════════════════════════════════════════════════════
+    window.WidgetsPlacement = {
+        set: setWidgetPosition,
+        get: getWidgetPosition,
+        all: () => ({ ..._placement }),
+        setAll: (position) => {
+            if (position !== 'top' && position !== 'bottom') return false;
+            const ids = window.WidgetsRegistry ? window.WidgetsRegistry.getActiveIds() : [];
+            ids.forEach(id => { _placement[id] = position; });
+            savePlacement();
+            rerenderAllWidgets();
+            return true;
+        },
+        reset: () => {
+            _placement = {};
+            savePlacement();
+            rerenderAllWidgets();
+            log('Раскладка сброшена');
+        },
+        rerender: rerenderAllWidgets,
+        debug: () => {
+            const ids = window.WidgetsRegistry ? window.WidgetsRegistry.getActiveIds() : [];
+            const result = ids.map(id => ({
+                id,
+                position: getWidgetPosition(id),
+            }));
+            console.table(result);
+            return result;
+        },
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЗАПУСК
+    // ═══════════════════════════════════════════════════════════
+    loadPlacement();
+    ensureBottomContainer();
+    patchChatsListInnerHTML();
+    patchRenderChatsList();
+    patchWidgetPicker();
+
+    // Первичный рендер нижних виджетов
+    setTimeout(() => {
+        ensureBottomContainer();
+        renderBottomWidgets();
+    }, 5000);
+
+    // Ещё раз через 8 сек — на случай если виджеты зарегистрировались позже
+    setTimeout(() => {
+        ensureBottomContainer();
+        renderBottomWidgets();
+    }, 8000);
+
+    log('✅ Установлено');
+    log('   API: WidgetsPlacement.set("radio", "bottom")');
+    log('        WidgetsPlacement.debug()');
+    log('        WidgetsPlacement.reset()');
+})();
+</script><script>
+// ═══════════════════════════════════════════════════════════════
+//  🩹 FIX: убираем дублирование виджетов при bottom-раскладке
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: старый патч WidgetsRegistry вставляет ВСЕ активные
+//  виджеты (включая bottom) в #chatsList через buildAllHtml().
+//  Наш WidgetsPlacement v2 вставляет только top — но старый
+//  патч всё ещё активен и добавляет ВСЕ.
+//
+//  Решение: переопределить WidgetsRegistry.buildAllHtml так,
+//  чтобы он возвращал ТОЛЬКО top-виджеты.
+// ═══════════════════════════════════════════════════════════════
+
+(function fixWidgetDuplication() {
+    'use strict';
+
+    console.log('🩹 [WidgetDupFix] Установка…');
+
+    function applyFix() {
+        if (!window.WidgetsRegistry) {
+            setTimeout(applyFix, 500);
+            return;
+        }
+
+        // Переопределяем buildAllHtml — теперь только top-виджеты
+        window.WidgetsRegistry.buildAllHtml = function() {
+            const activeIds = window.WidgetsRegistry.getActiveIds();
+            const available = window.WidgetsRegistry.available();
+            const map = new Map(available.map(d => [d.id, d]));
+
+            // Определяем позицию через WidgetsPlacement (если есть)
+            const getPos = (id) => {
+                if (window.WidgetsPlacement && typeof window.WidgetsPlacement.get === 'function') {
+                    return window.WidgetsPlacement.get(id);
+                }
+                return 'top'; // по умолчанию — сверху
+            };
+
+            const defs = activeIds
+                .map(id => map.get(id))
+                .filter(Boolean)
+                .filter(def => getPos(def.id) === 'top')
+                .sort((a, b) => (a.position ?? 100) - (b.position ?? 100));
+
+            return defs.map(def => {
+                try { return def.buildHtml(); }
+                catch (e) {
+                    console.warn('buildAllHtml error for', def.id, e);
+                    return '';
+                }
+            }).join('');
+        };
+
+        console.log('🩹 [WidgetDupFix] buildAllHtml переопределён (только top-виджеты)');
+    }
+
+    applyFix();
+})();
+</script>
 </body>
 </html>
