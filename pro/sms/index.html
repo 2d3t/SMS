@@ -56463,6 +56463,386 @@ async function refreshWeatherManually(btn, card) {
     console.log('   • Клик → сброс кэша + перезапрос геолокации и погоды');
     console.log('   • API: WeatherRefresh.trigger() / .clearCache()');
 })();
+</script><script>
+// ═══════════════════════════════════════════════════════════════
+//  🩹 ФИКС: ПОСТОЯННЫЙ ПОЛЛИНГ НЕПРОЧИТАННЫХ В ЭКРАНЕ ЧАТОВ
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: если долго сидеть в списке чатов, бейджи новых
+//  сообщений не появляются, пока не откроешь чат вручную.
+//
+//  Причины:
+//   1. refreshUnreadBadges вызывается из setInterval каждые 3 сек,
+//      но реальный цикл с checkUnreadForAllChats попадает под
+//      троттлинг Rate Limit Pacifier (не чаще 1 раза в 60 сек).
+//   2. Периодические вызовы блокируются при document.hidden.
+//   3. В showChatsScreen нет гарантированного пускового цикла.
+//
+//  Решение: свой независимый поллинг meta.json для всех чатов
+//  с интервалом 15 секунд, работающий ВСЕГДА пока мы на экране
+//  чатов (даже если основной механизм заблокирован троттлингом).
+// ═══════════════════════════════════════════════════════════════
+
+(function installChatsScreenUnreadPolling() {
+    'use strict';
+
+    console.log('🔔 [ChatsPolling] Установка патча…');
+
+    const CFG = {
+        POLL_INTERVAL_MS: 15000,      // Проверяем каждые 15 секунд
+        CHECK_BATCH_SIZE: 5,           // По 5 чатов параллельно
+        DELAY_BETWEEN_BATCHES: 200,    // Пауза между пачками
+        DEBUG: true,
+    };
+    const log = (...a) => CFG.DEBUG && console.log('🔔 [ChatsPolling]', ...a);
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОСТОЯНИЕ
+    // ═══════════════════════════════════════════════════════════
+    const State = {
+        // Таймер основного цикла
+        timer: null,
+        // Флаг: идёт ли проверка прямо сейчас
+        checking: false,
+        // Флаг: последний скан упал из-за сети
+        networkError: false,
+        // Время последней успешной проверки
+        lastSuccessTs: 0,
+        // Кэш версий meta (чтобы не пересчитывать непрочитанные
+        // при каждой проверке — только при изменении version)
+        lastKnownVersions: new Map(),
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПРОВЕРКА ОДНОГО ЧАТА
+    //  Возвращает { version, count, hasUnread } или null
+    // ═══════════════════════════════════════════════════════════
+    async function checkOneChatMeta(chat, token) {
+        const file = chat.file;
+
+        try {
+            const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/chats/${file}.meta.json`;
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+            const res = await fetch(url, {
+                headers: {
+                    'Authorization': `token ${token}`,
+                    'Accept': 'application/vnd.github.v3+json',
+                },
+                cache: 'no-store',
+                signal: controller.signal,
+            });
+            clearTimeout(timeoutId);
+
+            if (res.status === 404) return null;
+            if (res.status === 401 || res.status === 403) {
+                throw new Error(`${res.status}`);
+            }
+            if (!res.ok) return null;
+
+            const data = await res.json();
+            const meta = JSON.parse(base64ToUtf8((data.content || '').replace(/\n/g, '')));
+
+            if (!meta || typeof meta.version !== 'number') return null;
+
+            return {
+                file,
+                version: meta.version,
+                count: typeof meta.count === 'number' ? meta.count : 0,
+            };
+        } catch (e) {
+            if (e.name === 'AbortError') {
+                log(`Таймаут для ${file}`);
+            }
+            return null;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПРОВЕРКА ВСЕХ ЧАТОВ (с батчингом)
+    // ═══════════════════════════════════════════════════════════
+    async function checkAllChatsMeta() {
+        if (State.checking) return;
+        if (!state.isAuthorized || !state.token) return;
+        if (state.currentScreen !== 'chats') return;
+        if (state.chats.length === 0) return;
+
+        State.checking = true;
+
+        try {
+            const chats = state.chats.slice();
+            const results = new Map();
+
+            // ─── Батчинг запросов ───
+            for (let i = 0; i < chats.length; i += CFG.CHECK_BATCH_SIZE) {
+                const batch = chats.slice(i, i + CFG.CHECK_BATCH_SIZE);
+
+                const batchResults = await Promise.all(
+                    batch.map(chat => checkOneChatMeta(chat, state.token))
+                );
+
+                for (const result of batchResults) {
+                    if (result) results.set(result.file, result);
+                }
+
+                if (i + CFG.CHECK_BATCH_SIZE < chats.length) {
+                    await new Promise(r => setTimeout(r, CFG.DELAY_BETWEEN_BATCHES));
+                }
+            }
+
+            // ─── Если ни одного ответа не пришло — вероятно, нет сети ───
+            if (results.size === 0) {
+                log('⚠️ Нет ответов от GitHub — возможно, нет сети');
+                State.networkError = true;
+                return;
+            }
+
+            State.networkError = false;
+            State.lastSuccessTs = Date.now();
+
+            // ═══ Обрабатываем каждый чат ═══
+            let changed = false;
+
+            for (const chat of state.chats) {
+                const result = results.get(chat.file);
+                if (!result) continue;
+
+                const lastKnownVersion = State.lastKnownVersions.get(chat.file);
+                const lastReadId = getLastReadId(chat.file);
+
+                // Обновляем кэш версий
+                State.lastKnownVersions.set(chat.file, result.version);
+
+                // Проверяем: есть ли непрочитанные?
+                // Сообщение считается непрочитанным, если его version > lastReadId
+                let hasUnread = false;
+                let unreadCount = 0;
+
+                if (!lastReadId) {
+                    // Никогда не читали — считаем что непрочитанное есть
+                    // (но не показываем цифру, только точку)
+                    hasUnread = result.count > 0;
+                    unreadCount = 0;
+                } else if (result.version > lastReadId) {
+                    // Есть сообщения новее последнего прочитанного
+                    hasUnread = true;
+
+                    // Если знаем предыдущую версию — можем вычислить дельту
+                    // Иначе просто 1+
+                    unreadCount = 1;   // скромно, без точного подсчёта
+                }
+
+                // Обновляем состояние чата
+                if (hasUnread) {
+                    if (!chat.hasUnread || chat.unreadCount !== unreadCount) {
+                        chat.hasUnread = true;
+                        chat.unreadCount = unreadCount;
+                        changed = true;
+                    }
+                } else {
+                    if (chat.hasUnread || chat.unreadCount) {
+                        delete chat.hasUnread;
+                        delete chat.unreadCount;
+                        changed = true;
+                    }
+                }
+            }
+
+            // ═══ Если что-то изменилось — сохраняем и перерисовываем ═══
+            if (changed) {
+                log('✨ Найдены изменения в статусах непрочитанных');
+                saveChatsList();
+
+                // Воспроизводим звук уведомления только если
+                // появились НОВЫЕ непрочитанные
+                const hasNewUnread = state.chats.some(c => c.hasUnread && c.unreadCount > 0);
+                if (hasNewUnread && !document.hidden) {
+                    try { soundManager.play('notification'); } catch (e) {}
+                    if (navigator.vibrate) navigator.vibrate([80, 40, 80]);
+                }
+
+                // Перерисовываем список
+                if (typeof renderChatsList === 'function') {
+                    renderChatsList();
+                }
+
+                // Обновляем бейдж приложения
+                const totalUnread = state.chats.reduce((sum, c) => sum + (c.unreadCount || 0), 0);
+                if (typeof updateAppBadge === 'function') {
+                    updateAppBadge(totalUnread);
+                }
+            }
+        } catch (e) {
+            console.warn('🔔 [ChatsPolling] Ошибка проверки:', e.message);
+        } finally {
+            State.checking = false;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СТАРТ / СТОП ЦИКЛА
+    // ═══════════════════════════════════════════════════════════
+    function startPolling() {
+        if (State.timer) return;
+
+        log('▶️ Запуск цикла проверки непрочитанных');
+
+        // Первая проверка через 1 сек после входа на экран
+        setTimeout(() => {
+            if (state.currentScreen === 'chats' && state.isAuthorized) {
+                checkAllChatsMeta();
+            }
+        }, 1000);
+
+        // Основной цикл
+        State.timer = setInterval(() => {
+            if (document.hidden) return;
+            if (state.currentScreen !== 'chats') return;
+            if (!state.isAuthorized) return;
+            checkAllChatsMeta();
+        }, CFG.POLL_INTERVAL_MS);
+    }
+
+    function stopPolling() {
+        if (State.timer) {
+            clearInterval(State.timer);
+            State.timer = null;
+            log('⏸️ Цикл проверки остановлен');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХУКИ НА СМЕНУ ЭКРАНОВ
+    // ═══════════════════════════════════════════════════════════
+
+    // showChatsScreen — старт
+    if (typeof showChatsScreen === 'function') {
+        const _origShowChats = showChatsScreen;
+        showChatsScreen = function() {
+            const r = _origShowChats.apply(this, arguments);
+            // Сбрасываем кэш версий, чтобы поймать все изменения,
+            // накопившиеся пока мы были в чате
+            State.lastKnownVersions.clear();
+            State.lastSuccessTs = 0;
+            startPolling();
+            return r;
+        };
+    }
+
+    // showChatScreen — стоп
+    if (typeof showChatScreen === 'function') {
+        const _origShowChat = showChatScreen;
+        showChatScreen = function() {
+            stopPolling();
+            return _origShowChat.apply(this, arguments);
+        };
+    }
+
+    // showAuthScreen — стоп
+    if (typeof showAuthScreen === 'function') {
+        const _origShowAuth = showAuthScreen;
+        showAuthScreen = function() {
+            stopPolling();
+            return _origShowAuth.apply(this, arguments);
+        };
+    }
+
+    // logout — стоп
+    if (typeof logout === 'function') {
+        const _origLogout = logout;
+        logout = function() {
+            stopPolling();
+            State.lastKnownVersions.clear();
+            State.lastSuccessTs = 0;
+            return _origLogout.apply(this, arguments);
+        };
+    }
+
+    // backToChats — сброс кэша версий + старт
+    if (typeof backToChats === 'function') {
+        const _origBack = backToChats;
+        backToChats = function() {
+            const r = _origBack.apply(this, arguments);
+            State.lastKnownVersions.clear();
+            State.lastSuccessTs = 0;
+            // startPolling будет вызван через showChatsScreen, но на всякий
+            setTimeout(() => {
+                if (state.currentScreen === 'chats') {
+                    startPolling();
+                }
+            }, 100);
+            return r;
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ДОПОЛНИТЕЛЬНАЯ СТРАХОВКА
+    //  Если основной цикл заблокирован троттлингом — этот
+    //  страховочный таймер с большим интервалом всё равно
+    //  рано или поздно отработает.
+    // ═══════════════════════════════════════════════════════════
+    setInterval(() => {
+        if (document.hidden) return;
+        if (state.currentScreen !== 'chats') return;
+        if (!state.isAuthorized) return;
+        if (State.checking) return;
+
+        // Если последняя успешная проверка была больше 40 секунд назад —
+        // форсируем новую
+        const age = Date.now() - State.lastSuccessTs;
+        if (age > 40000) {
+            log('⚠️ Страховочная проверка (age=' + Math.round(age / 1000) + 'с)');
+            checkAllChatsMeta();
+        }
+    }, 30000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  РЕАКЦИЯ НА ВОЗВРАТ ФОКУСА
+    // ═══════════════════════════════════════════════════════════
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) return;
+        if (state.currentScreen !== 'chats') return;
+        if (!state.isAuthorized) return;
+
+        // Мгновенная проверка при возврате
+        log('👁️ Возврат фокуса — проверка непрочитанных');
+        setTimeout(() => checkAllChatsMeta(), 500);
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API
+    // ═══════════════════════════════════════════════════════════
+    window.ChatsPolling = {
+        status: () => ({
+            running: !!State.timer,
+            checking: State.checking,
+            lastSuccessAgo: State.lastSuccessTs
+                ? Math.round((Date.now() - State.lastSuccessTs) / 1000) + 's'
+                : 'never',
+            cachedVersions: State.lastKnownVersions.size,
+            networkError: State.networkError,
+        }),
+        forceCheck: () => checkAllChatsMeta(),
+        start: startPolling,
+        stop: stopPolling,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  СТАРТ ПРИ ЗАГРУЗКЕ
+    //  Если пользователь уже на экране чатов — стартуем сразу
+    // ═══════════════════════════════════════════════════════════
+    setTimeout(() => {
+        if (state.currentScreen === 'chats' && state.isAuthorized) {
+            startPolling();
+        }
+    }, 3000);
+
+    console.log('🔔 [ChatsPolling] Готово:');
+    console.log('   • Проверка непрочитанных каждые 15 сек');
+    console.log('   • Работает всегда, пока открыт экран чатов');
+    console.log('   • Устойчиво к троттлингу Rate Limit Pacifier');
+    console.log('   • API: ChatsPolling.status() / .forceCheck()');
+})();
 </script>
 </body>
 </html>
