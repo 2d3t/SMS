@@ -38361,22 +38361,69 @@ async function handleIncomingInvite() {
     } catch (e) {}
 
     if (savedUsername && savedToken) {
-        console.log(`🔗 [Invite v2] Найдена сессия «${savedUsername}» — авто-вход в чат`);
+    console.log(`🔗 [Invite v2] Найдена сессия «${savedUsername}» — авто-вход в чат`);
 
-        // Применяем сессию
-        state.username = savedUsername;
-        state.token = savedToken;
-        state.isAuthorized = true;
+    // ═══ 1. Применяем сессию ═══
+    state.username = savedUsername;
+    state.token = savedToken;
+    state.isAuthorized = true;
 
-        // Подгружаем списки
+    // ═══ 2. Подгружаем списки ДО каких-либо манипуляций ═══
+    if (typeof loadChatsList === 'function') loadChatsList();
+    if (typeof loadSavedPasswords === 'function') loadSavedPasswords();
+
+    // ═══ 3. Добавляем чат в список СРАЗУ ═══
+    const chatFile = payload.chat.file;
+    const chatName = payload.chat.name || chatFile;
+
+    const existingIdx = state.chats.findIndex(c => c.file === chatFile);
+    if (existingIdx === -1) {
+        state.chats.push({
+            name: chatName,
+            file: chatFile,
+            createdAt: new Date().toISOString(),
+        });
+        console.log(`🔗 [Invite v2] Чат «${chatName}» добавлен в state.chats`);
+    } else {
+        // Чат уже есть — обновим имя, если оно было пустым
+        if (!state.chats[existingIdx].name) {
+            state.chats[existingIdx].name = chatName;
+        }
+        console.log(`🔗 [Invite v2] Чат «${chatName}» уже в списке`);
+    }
+
+    // 🆕 КЛЮЧЕВОЕ: сохраняем в localStorage СРАЗУ
+    if (typeof saveChatsList === 'function') saveChatsList();
+
+    // ═══ 4. Сохраняем пароль ═══
+    state.savedPasswords[chatFile] = payload.password;
+    if (typeof saveSavedPasswords === 'function') saveSavedPasswords();
+
+    console.log(`🔗 [Invite v2] Пароль для «${chatFile}» сохранён`);
+
+    // ═══ 5. Заполняем поля логина (на случай logout) ═══
+    const usernameInput = document.getElementById('usernameInput');
+    const tokenInput = document.getElementById('tokenInput');
+    const rememberMeInput = document.getElementById('rememberMeInput');
+    const rememberWarning = document.getElementById('rememberWarning');
+    if (usernameInput) usernameInput.value = savedUsername;
+    if (tokenInput) tokenInput.value = savedToken;
+    if (rememberMeInput) rememberMeInput.checked = true;
+    if (rememberWarning) rememberWarning.style.display = 'block';
+
+    // ═══ 6. Входим в чат ═══
+    try {
+        if (typeof enterChat === 'function') {
+            await enterChat(chatFile, chatName, payload.password);
+        }
+
+        // 🆕 ЕЩЁ РАЗ СОХРАНЯЕМ — на случай, если enterChat что-то перезаписал
         if (typeof loadChatsList === 'function') loadChatsList();
-        if (typeof loadSavedPasswords === 'function') loadSavedPasswords();
 
-        // Добавляем чат
-        const chatFile = payload.chat.file;
-        const chatName = payload.chat.name || chatFile;
-
-        if (!state.chats.find(c => c.file === chatFile)) {
+        const finalIdx = state.chats.findIndex(c => c.file === chatFile);
+        if (finalIdx === -1) {
+            // Чат каким-то образом исчез — добавим заново
+            console.warn(`🔗 [Invite v2] Чат исчез после enterChat — восстанавливаю`);
             state.chats.push({
                 name: chatName,
                 file: chatFile,
@@ -38385,42 +38432,41 @@ async function handleIncomingInvite() {
         }
         if (typeof saveChatsList === 'function') saveChatsList();
 
-        // Сохраняем пароль
-        state.savedPasswords[chatFile] = payload.password;
-        if (typeof saveSavedPasswords === 'function') saveSavedPasswords();
-
-        // Подставляем данные на экран логина (на случай logout)
-        const usernameInput = document.getElementById('usernameInput');
-        const tokenInput = document.getElementById('tokenInput');
-        const rememberMeInput = document.getElementById('rememberMeInput');
-        const rememberWarning = document.getElementById('rememberWarning');
-        if (usernameInput) usernameInput.value = savedUsername;
-        if (tokenInput) tokenInput.value = savedToken;
-        if (rememberMeInput) rememberMeInput.checked = true;
-        if (rememberWarning) rememberWarning.style.display = 'block';
-
-        // Входим в чат
-        try {
-            if (typeof enterChat === 'function') {
-                await enterChat(chatFile, chatName, payload.password);
-            }
-            if (typeof showToast === 'function') {
-                showToast(`✅ Добро пожаловать в «${chatName}», ${savedUsername}!`, 3000);
-            }
-            if (typeof soundManager !== 'undefined') {
-                try { soundManager.play('notification'); } catch (e) {}
-            }
-        } catch (e) {
-            console.error('🔗 [Invite v2] Ошибка авто-входа:', e);
-            if (typeof showToast === 'function') {
-                showToast('❌ Не удалось открыть чат: ' + (e.message || 'ошибка'), 4000);
-            }
-            if (typeof showChatsScreen === 'function') showChatsScreen();
+        // Пароль тоже восстановим
+        if (!state.savedPasswords[chatFile]) {
+            state.savedPasswords[chatFile] = payload.password;
+            if (typeof saveSavedPasswords === 'function') saveSavedPasswords();
         }
 
-        return true;
+        if (typeof showToast === 'function') {
+            showToast(`✅ Добро пожаловать в «${chatName}», ${savedUsername}!`, 3000);
+        }
+        if (typeof soundManager !== 'undefined') {
+            try { soundManager.play('notification'); } catch (e) {}
+        }
+
+        // 🆕 Обновляем список чатов если вдруг пользователь вернётся
+        setTimeout(() => {
+            if (typeof renderChatsList === 'function') {
+                try { renderChatsList(); } catch (e) {}
+            }
+        }, 300);
+
+    } catch (e) {
+        console.error('🔗 [Invite v2] Ошибка авто-входа:', e);
+
+        // 🆕 Даже если enterChat упал — чат УЖЕ в списке и в localStorage
+        // Показываем список чатов, где он будет виден
+        if (typeof showToast === 'function') {
+            showToast('⚠️ Не удалось войти в чат: ' + (e.message || 'ошибка'), 4000);
+        }
+        if (typeof showChatsScreen === 'function') {
+            showChatsScreen();
+        }
     }
 
+    return true;
+}
     // ═══ СЕССИИ НЕТ — обычный флоу ═══
     console.log('🔗 [Invite v2] Сессии нет — показываем экран приветствия');
     showWelcomeScreen(payload);
