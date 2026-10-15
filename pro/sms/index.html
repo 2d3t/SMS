@@ -57838,6 +57838,105 @@ async function refreshWeatherManually(btn, card) {
     console.log('   • API: AudioDucking.status() / .test() / .setVolume(20)');
     console.log('   • UI настроек: в модалке «🧩 Виджеты»');
 })();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🩹 ПАТЧ: АВТО-ВХОД ПО ССЫЛКЕ-ПРИГЛАШЕНИЮ ДЛЯ СУЩЕСТВУЮЩИХ ЮЗЕРОВ
+//  ─────────────────────────────────────────────────────────────
+//  Если пользователь уже залогинен (есть имя и токен),
+//  приглашение обрабатывается мгновенно без экрана ввода имени.
+// ═══════════════════════════════════════════════════════════════
+
+(function installSmartInviteHandling() {
+    'use strict';
+
+    console.log('🩹 [SmartInvite] Установка патча…');
+
+    // Проверяем, что зависимость существует
+    if (typeof handleIncomingInvite !== 'function') {
+        console.warn('🩹 [SmartInvite] handleIncomingInvite не найдена. Патч не установлен.');
+        return;
+    }
+
+    // Сохраняем оригинальную функцию (на случай отката)
+    const _origHandleIncomingInvite = handleIncomingInvite;
+
+    // Перезаписываем
+    handleIncomingInvite = async function() {
+        const params = new URLSearchParams(location.search);
+        const rawParam = params.get('invite');
+        if (!rawParam) return false;
+
+        console.log('🩹 [SmartInvite] Обнаружено приглашение');
+        const result = await parseAndValidateInvite(rawParam);
+
+        if (!result.ok) {
+            showInviteError(result.reason, result.message);
+            history.replaceState({}, '', location.origin + location.pathname);
+            return true;
+        }
+
+        const payload = result.payload;
+
+        // ─── ГЛАВНОЕ ИЗМЕНЕНИЕ: ПРОВЕРКА СУЩЕСТВУЮЩЕЙ СЕССИИ ───
+        const savedUsername = localStorage.getItem('chathub_username');
+        const savedToken = localStorage.getItem('chathub_token');
+
+        if (savedUsername && savedToken) {
+            console.log(`🩹 [SmartInvite] Найдена существующая сессия для "${savedUsername}". Вход без приветствия.`);
+            
+            // Помечаем инвайт как использованный
+            markInviteUsed(payload.jti);
+            history.replaceState({}, '', location.origin + location.pathname);
+
+            // Применяем токен и пользователя из сессии
+            state.username = savedUsername;
+            state.token = savedToken;
+            state.isAuthorized = true;
+
+            // Загружаем списки чатов и паролей
+            loadChatsList();
+            loadSavedPasswords();
+
+            // Добавляем/обновляем чат из приглашения
+            const chatFile = payload.chat.file;
+            const chatName = payload.chat.name || chatFile;
+
+            if (!state.chats.find(c => c.file === chatFile)) {
+                state.chats.push({ name: chatName, file: chatFile, createdAt: new Date().toISOString() });
+            }
+            saveChatsList();
+
+            // Сохраняем пароль
+            state.savedPasswords[chatFile] = payload.password;
+            saveSavedPasswords();
+
+            // Запускаем обычный вход в чат
+            try {
+                await enterChat(chatFile, chatName, payload.password);
+                showToast(`✅ Добро пожаловать в «${chatName}», ${savedUsername}!`, 3000);
+                soundManager.play('notification');
+            } catch (e) {
+                console.error('🩹 [SmartInvite] Ошибка входа в чат:', e);
+                showToast('❌ Не удалось открыть чат: ' + e.message, 4000);
+                // На всякий случай показываем список чатов
+                showChatsScreen();
+            }
+            
+            return true;
+        }
+
+        // ─── СТАРАЯ ЛОГИКА: ЕСЛИ СЕССИИ НЕТ ───
+        console.log('🩹 [SmartInvite] Сессия не найдена. Показываем экран приветствия.');
+        markInviteUsed(payload.jti);
+        history.replaceState({}, '', location.origin + location.pathname);
+        showWelcomeScreen(payload);
+        
+        return true;
+    };
+
+    console.log('🩹 [SmartInvite] Патч установлен. Авто-вход для существующих юзеров активен.');
+})();
 </script>
 
 
