@@ -57264,6 +57264,582 @@ async function refreshWeatherManually(btn, card) {
     console.log('   • API: UnreadJump.status() / .refresh() / .jump()');
 })();
 
+
+
+
 </script>
+
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🔉 UNIVERSAL AUDIO DUCKING — приглушение ЛЮБОГО аудио
+//  ─────────────────────────────────────────────────────────────
+//  Работает со всеми источниками звука:
+//   • 📻 Радио (radioWidgetAudio)
+//   • 🎵 Глобальный плеер (GlobalPlayer, музыка из чатов)
+//   • 🎤 Голосовые в чате (audioPlayers)
+//
+//  Когда приходит новое сообщение или сигнал уведомления —
+//  громкость ВСЕХ активных источников временно снижается,
+//  чтобы пользователь услышал сигнал. Через пару секунд
+//  громкость возвращается.
+//
+//  Особенности:
+//   • Каждый источник помнит свою громкость независимо
+//   • Работает с несколькими источниками одновременно
+//   • Мягкие fade in/out
+//   • Не накапливается при частых уведомлениях
+//   • Полностью настраивается
+// ═══════════════════════════════════════════════════════════════
+
+(function installUniversalAudioDucking() {
+    'use strict';
+
+    console.log('🔉 [AudioDucking] Установка универсального модуля…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  КОНФИГ
+    // ═══════════════════════════════════════════════════════════
+    const CFG = {
+        STORAGE_KEY: 'smschat_audio_ducking',
+        defaults: {
+            enabled: true,
+            duckVolume: 15,        // до какого % от оригинала
+            duckDuration: 2000,    // сколько держать приглушённым
+            fadeInMs: 300,         // плавное снижение
+            fadeOutMs: 600,        // плавный возврат
+        },
+        // Какие звуки вызывают ducking
+        DUCKING_SOUNDS: ['receive', 'notification'],
+        DEBUG: true,
+    };
+    const log = (...a) => CFG.DEBUG && console.log('🔉 [AudioDucking]', ...a);
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОСТОЯНИЕ
+    // ═══════════════════════════════════════════════════════════
+    const D = {
+        settings: { ...CFG.defaults },
+        // Карта активных источников: audioEl → { originalVolume, fadeRaf, ... }
+        activeSources: new Map(),
+        // Общий таймер возврата
+        returnTimer: null,
+        // Счётчик для логирования
+        duckRequestCount: 0,
+        // Идёт ли сейчас общий ducking
+        active: false,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  НАСТРОЙКИ
+    // ═══════════════════════════════════════════════════════════
+    function loadSettings() {
+        try {
+            const raw = localStorage.getItem(CFG.STORAGE_KEY);
+            if (raw) {
+                const saved = JSON.parse(raw);
+                Object.assign(D.settings, saved);
+            }
+        } catch (e) {
+            log('loadSettings failed:', e);
+        }
+    }
+
+    function saveSettings() {
+        try {
+            localStorage.setItem(CFG.STORAGE_KEY, JSON.stringify(D.settings));
+        } catch (e) {
+            log('saveSettings failed:', e);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СБОР ВСЕХ АКТИВНЫХ ИСТОЧНИКОВ АУДИО
+    // ═══════════════════════════════════════════════════════════
+    /**
+     * Возвращает массив активных <audio> элементов:
+     *  - Радио (radioWidgetAudio)
+     *  - Глобальный плеер (GlobalPlayer.audioEl)
+     *  - Голосовые в чате (audioPlayers[*].audio)
+     *  - Любые другие на странице, которые играют
+     */
+    function collectActiveAudioSources() {
+        const sources = [];
+
+        // 1. Радио
+        const radio = document.getElementById('radioWidgetAudio');
+        if (radio && radio.src && !radio.paused && !radio.ended) {
+            sources.push(radio);
+        }
+
+        // 2. Глобальный плеер (музыка из чатов)
+        if (typeof GlobalPlayer !== 'undefined' && GlobalPlayer.audioEl) {
+            const gp = GlobalPlayer.audioEl;
+            if (gp.src && !gp.paused && !gp.ended) {
+                sources.push(gp);
+            }
+        }
+
+        // 3. Голосовые в чате (локальные)
+        if (typeof audioPlayers !== 'undefined' && audioPlayers) {
+            Object.values(audioPlayers).forEach(p => {
+                if (p && p.audio && p.audio.src && !p.audio.paused && !p.audio.ended) {
+                    sources.push(p.audio);
+                }
+            });
+        }
+
+        // 4. Любые другие <audio> на странице (на будущее)
+        document.querySelectorAll('audio').forEach(a => {
+            if (a.src && !a.paused && !a.ended && !sources.includes(a)) {
+                // Пропускаем уже добавленные
+                sources.push(a);
+            }
+        });
+
+        return sources;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЛАВНОЕ ИЗМЕНЕНИЕ ГРОМКОСТИ ОДНОГО ИСТОЧНИКА
+    // ═══════════════════════════════════════════════════════════
+    function fadeTo(audio, targetVolume, durationMs, onComplete) {
+        // Отменяем предыдущий fade для этого же audio
+        const existing = D.activeSources.get(audio);
+        if (existing && existing.fadeRaf) {
+            cancelAnimationFrame(existing.fadeRaf);
+            existing.fadeRaf = null;
+        }
+
+        const startVolume = audio.volume;
+        const startTs = performance.now();
+
+        if (durationMs <= 0) {
+            audio.volume = Math.max(0, Math.min(1, targetVolume));
+            if (onComplete) onComplete();
+            return;
+        }
+
+        const step = (now) => {
+            const elapsed = now - startTs;
+            const progress = Math.min(1, elapsed / durationMs);
+            // Ease-out кубическая
+            const eased = 1 - Math.pow(1 - progress, 3);
+            const current = startVolume + (targetVolume - startVolume) * eased;
+            audio.volume = Math.max(0, Math.min(1, current));
+
+            if (progress < 1) {
+                const entry = D.activeSources.get(audio);
+                if (entry) entry.fadeRaf = requestAnimationFrame(step);
+            } else {
+                const entry = D.activeSources.get(audio);
+                if (entry) entry.fadeRaf = null;
+                if (onComplete) onComplete();
+            }
+        };
+
+        // Создаём или обновляем запись
+        if (!D.activeSources.has(audio)) {
+            D.activeSources.set(audio, {
+                originalVolume: audio.volume,
+                fadeRaf: null,
+            });
+        }
+
+        D.activeSources.get(audio).fadeRaf = requestAnimationFrame(step);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  DUCKING (приглушение)
+    // ═══════════════════════════════════════════════════════════
+    function duck(reason = 'notification') {
+        if (!D.settings.enabled) return;
+        if (D.settings.duckVolume >= 100) return;
+
+        const sources = collectActiveAudioSources();
+        if (sources.length === 0) return;
+
+        D.duckRequestCount++;
+        log(`duck(${reason}) — запрос №${D.duckRequestCount}, источников: ${sources.length}`);
+
+        // Если уже приглушено — просто продлеваем таймер возврата
+        if (D.active) {
+            if (D.returnTimer) {
+                clearTimeout(D.returnTimer);
+                D.returnTimer = null;
+            }
+            scheduleReturn();
+            return;
+        }
+
+        D.active = true;
+        const targetRatio = D.settings.duckVolume / 100;
+
+        // Приглушаем каждый источник
+        sources.forEach(audio => {
+            // Запоминаем оригинальную громкость (только при первом ducking)
+            const existing = D.activeSources.get(audio);
+            if (!existing) {
+                D.activeSources.set(audio, {
+                    originalVolume: audio.volume,
+                    fadeRaf: null,
+                });
+            } else if (!D.active) {
+                // Обновляем при новом ducking
+                existing.originalVolume = audio.volume;
+            }
+
+            const entry = D.activeSources.get(audio);
+            const targetVolume = entry.originalVolume * targetRatio;
+
+            fadeTo(audio, targetVolume, D.settings.fadeInMs, () => {
+                log(`  └ приглушено до ${Math.round(targetVolume * 100)}%`);
+            });
+        });
+
+        scheduleReturn();
+    }
+
+    function scheduleReturn() {
+        if (D.returnTimer) clearTimeout(D.returnTimer);
+
+        D.returnTimer = setTimeout(() => {
+            D.returnTimer = null;
+            unduck();
+        }, D.settings.duckDuration);
+    }
+
+    function unduck() {
+        if (!D.active) return;
+
+        const targetRatio = 1; // возвращаем к 100%
+
+        D.activeSources.forEach((entry, audio) => {
+            // Если источник уже неактивен — пропускаем
+            if (!audio || audio.ended) {
+                D.activeSources.delete(audio);
+                return;
+            }
+
+            const targetVolume = entry.originalVolume * targetRatio;
+
+            fadeTo(audio, targetVolume, D.settings.fadeOutMs, () => {
+                log(`  └ восстановлено до ${Math.round(targetVolume * 100)}%`);
+                D.activeSources.delete(audio);
+            });
+        });
+
+        // Через fadeOutMs очищаем всё
+        setTimeout(() => {
+            D.active = false;
+            D.duckRequestCount = 0;
+            // Удаляем мёртвые источники
+            D.activeSources.forEach((_, audio) => {
+                if (!audio || audio.ended || audio.paused) {
+                    D.activeSources.delete(audio);
+                }
+            });
+        }, D.settings.fadeOutMs + 100);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХУК 1: soundManager.play
+    //  Центральная точка всех звуков приложения
+    // ═══════════════════════════════════════════════════════════
+    if (typeof soundManager !== 'undefined' && soundManager.play) {
+        const _origPlay = soundManager.play.bind(soundManager);
+
+        soundManager.play = function(type) {
+            if (CFG.DUCKING_SOUNDS.includes(type)) {
+                try { duck(type); } catch (e) {}
+            }
+            return _origPlay(type);
+        };
+
+        log('patched: soundManager.play');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХУК 2: appendMessages — новые сообщения в чате
+    //  Страховка на случай если звук не сыграл
+    // ═══════════════════════════════════════════════════════════
+    if (typeof appendMessages === 'function') {
+        const _origAppend = appendMessages;
+        appendMessages = function(newMsgs) {
+            if (Array.isArray(newMsgs) && newMsgs.length > 0) {
+                const hasForeign = newMsgs.some(m =>
+                    m && m.username && m.username !== state.username
+                );
+                if (hasForeign) {
+                    try { duck('appendMessages'); } catch (e) {}
+                }
+            }
+            return _origAppend.apply(this, arguments);
+        };
+        log('patched: appendMessages');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХУК 3: обновление бейджей непрочитанных
+    //  Когда бейдж непрочитанных растёт — значит новое
+    // ═══════════════════════════════════════════════════════════
+    // Работает через флаг _lastKnownUnreadTotal — не наш,
+    // поэтому перехватываем через refreshUnreadBadges.
+    // Но там звук уже играет — этого достаточно.
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХУК 4: автоматическая очистка мёртвых источников
+    // ═══════════════════════════════════════════════════════════
+    setInterval(() => {
+        if (D.activeSources.size === 0) return;
+
+        D.activeSources.forEach((entry, audio) => {
+            // Если источник уже не играет — восстанавливаем или удаляем
+            if (!audio || audio.ended || (!audio.paused && audio.volume === 0)) {
+                // Если paused, но громкость всё ещё приглушена — восстанавливаем
+                if (audio && audio.paused && entry.originalVolume != null) {
+                    try {
+                        audio.volume = entry.originalVolume;
+                    } catch (e) {}
+                }
+                D.activeSources.delete(audio);
+            }
+        });
+    }, 2000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХУК 5: сброс при паузе на любом источнике
+    //  Если пользователь сам остановил музыку — сбрасываем
+    // ═══════════════════════════════════════════════════════════
+    document.addEventListener('pause', (e) => {
+        if (e.target && e.target.tagName === 'AUDIO') {
+            const entry = D.activeSources.get(e.target);
+            if (entry) {
+                // Восстанавливаем громкость, чтобы в следующий раз играло нормально
+                if (entry.originalVolume != null) {
+                    try { e.target.volume = entry.originalVolume; } catch (err) {}
+                }
+                D.activeSources.delete(e.target);
+            }
+        }
+    }, true);
+
+    // ═══════════════════════════════════════════════════════════
+    //  🆕 ХУК 6: отдельный сигнал для случая, когда
+    //  радио/плеер ГРОМКО, а уведомление тихое
+    //  (можно усилить звук уведомления)
+    // ═══════════════════════════════════════════════════════════
+    // Это опционально — сейчас не реализовано, но можно
+    // добавить через настройку «boostNotification».
+
+    // ═══════════════════════════════════════════════════════════
+    //  UI НАСТРОЕК — добавляем в модалку виджетов (если есть)
+    // ═══════════════════════════════════════════════════════════
+    function injectSettingsUI() {
+        const modal = document.getElementById('widgetPickerModal');
+        if (!modal) return false;
+        if (modal.querySelector('#duckingSettingsBlock')) return true;
+
+        const body = modal.querySelector('.wp-body');
+        if (!body) return false;
+
+        const block = document.createElement('div');
+        block.id = 'duckingSettingsBlock';
+        block.style.cssText = `
+            margin-top: 16px;
+            padding: 14px 16px;
+            background: rgba(108, 92, 231, 0.08);
+            border: 1px solid rgba(108, 92, 231, 0.25);
+            border-radius: 14px;
+        `;
+        block.innerHTML = `
+            <div style="font-size:13px;font-weight:700;color:#fff;margin-bottom:12px;display:flex;align-items:center;gap:8px;">
+                <span>🔉</span>
+                <span>Приглушение звука</span>
+            </div>
+
+            <div style="font-size:11px;color:#888;margin-bottom:12px;line-height:1.5;">
+                Радио и плеер временно приглушаются при новом сообщении, чтобы услышать уведомление.
+            </div>
+
+            <label class="pc-toggle" style="display:flex;align-items:center;gap:8px;padding:10px 12px;border-radius:10px;border:1px solid rgba(255,255,255,0.1);background:rgba(255,255,255,0.04);cursor:pointer;margin-bottom:12px;user-select:none;">
+                <input type="checkbox" id="duckingEnabledToggle" ${D.settings.enabled ? 'checked' : ''} style="width:16px;height:16px;accent-color:#6c5ce7;cursor:pointer;margin:0;">
+                <span style="font-size:13px;font-weight:600;color:#ccc;">Включено</span>
+            </label>
+
+            <div style="font-size:11px;color:#888;margin-bottom:6px;display:flex;justify-content:space-between;">
+                <span>Громкость приглушения</span>
+                <span id="duckingVolumeValue" style="color:#a78bfa;font-weight:700;">${D.settings.duckVolume}%</span>
+            </div>
+            <input type="range" id="duckingVolumeSlider"
+                   min="0" max="50" value="${D.settings.duckVolume}" step="1"
+                   style="width:100%;height:6px;-webkit-appearance:none;appearance:none;border-radius:3px;background:linear-gradient(90deg,rgba(108,92,231,0.3),rgba(108,92,231,0.9));outline:none;cursor:pointer;margin-bottom:14px;">
+
+            <div style="font-size:11px;color:#888;margin-bottom:6px;display:flex;justify-content:space-between;">
+                <span>Длительность</span>
+                <span id="duckingDurationValue" style="color:#a78bfa;font-weight:700;">${(D.settings.duckDuration / 1000).toFixed(1)}с</span>
+            </div>
+            <input type="range" id="duckingDurationSlider"
+                   min="500" max="5000" value="${D.settings.duckDuration}" step="100"
+                   style="width:100%;height:6px;-webkit-appearance:none;appearance:none;border-radius:3px;background:linear-gradient(90deg,rgba(108,92,231,0.3),rgba(108,92,231,0.9));outline:none;cursor:pointer;margin-bottom:10px;">
+
+            <button id="duckingTestBtn" style="width:100%;padding:8px;border-radius:10px;border:1px solid rgba(0,184,148,0.4);background:rgba(0,184,148,0.15);color:#00b894;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;margin-top:4px;">
+                🎵 Проверить сейчас
+            </button>
+        `;
+
+        body.appendChild(block);
+
+        // ─── Обработчики ───
+        const enabledToggle = block.querySelector('#duckingEnabledToggle');
+        enabledToggle.addEventListener('change', () => {
+            D.settings.enabled = enabledToggle.checked;
+            saveSettings();
+            if (!D.settings.enabled && D.active) unduck();
+        });
+
+        const volumeSlider = block.querySelector('#duckingVolumeSlider');
+        const volumeValue = block.querySelector('#duckingVolumeValue');
+        volumeSlider.addEventListener('input', () => {
+            D.settings.duckVolume = parseInt(volumeSlider.value, 10);
+            volumeValue.textContent = D.settings.duckVolume + '%';
+            saveSettings();
+        });
+
+        const durationSlider = block.querySelector('#duckingDurationSlider');
+        const durationValue = block.querySelector('#duckingDurationValue');
+        durationSlider.addEventListener('input', () => {
+            D.settings.duckDuration = parseInt(durationSlider.value, 10);
+            durationValue.textContent = (D.settings.duckDuration / 1000).toFixed(1) + 'с';
+            saveSettings();
+        });
+
+        const testBtn = block.querySelector('#duckingTestBtn');
+        testBtn.addEventListener('click', () => {
+            const sources = collectActiveAudioSources();
+            if (sources.length === 0) {
+                if (typeof showToast === 'function') {
+                    showToast('🎵 Ничего не играет — включите радио или трек', 2000);
+                }
+                return;
+            }
+            duck('test');
+            if (typeof showToast === 'function') {
+                showToast(`🔉 Приглушено на ${D.settings.duckDuration / 1000}с`, 1500);
+            }
+        });
+
+        return true;
+    }
+
+    // Следим за открытием модалки виджетов
+    const uiObserver = new MutationObserver(() => {
+        if (document.getElementById('widgetPickerModal')?.classList.contains('active')) {
+            setTimeout(injectSettingsUI, 50);
+        }
+    });
+    uiObserver.observe(document.body, { childList: true, subtree: true });
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЗАПУСК
+    // ═══════════════════════════════════════════════════════════
+    loadSettings();
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API
+    // ═══════════════════════════════════════════════════════════
+    window.AudioDucking = {
+        // Ручное приглушение
+        duck: (reason) => duck(reason || 'manual'),
+        unduck: () => unduck(),
+
+        // Включение / выключение
+        enable: () => {
+            D.settings.enabled = true;
+            saveSettings();
+            log('✅ Ducking включён');
+        },
+        disable: () => {
+            D.settings.enabled = false;
+            saveSettings();
+            if (D.active) unduck();
+            log('⏸ Ducking выключен');
+        },
+        isEnabled: () => D.settings.enabled,
+
+        // Настройки
+        setVolume: (percent) => {
+            D.settings.duckVolume = Math.max(0, Math.min(100, percent | 0));
+            saveSettings();
+            log(`громкость приглушения: ${D.settings.duckVolume}%`);
+            return D.settings.duckVolume;
+        },
+        setDuration: (ms) => {
+            D.settings.duckDuration = Math.max(500, Math.min(10000, ms | 0));
+            saveSettings();
+            log(`длительность: ${D.settings.duckDuration}мс`);
+            return D.settings.duckDuration;
+        },
+        setFadeIn: (ms) => {
+            D.settings.fadeInMs = Math.max(0, Math.min(2000, ms | 0));
+            saveSettings();
+        },
+        setFadeOut: (ms) => {
+            D.settings.fadeOutMs = Math.max(0, Math.min(3000, ms | 0));
+            saveSettings();
+        },
+
+        // Сброс
+        reset: () => {
+            D.settings = { ...CFG.defaults };
+            saveSettings();
+            log('сброшено к дефолтам');
+        },
+
+        // Статус
+        status: () => {
+            const sources = collectActiveAudioSources();
+            return {
+                enabled: D.settings.enabled,
+                active: D.active,
+                settings: { ...D.settings },
+                activeSourcesCount: sources.length,
+                activeSources: sources.map(a => ({
+                    tag: a.tagName,
+                    id: a.id || null,
+                    src: a.src ? a.src.slice(0, 60) + '…' : null,
+                    volume: a.volume,
+                    paused: a.paused,
+                })),
+                savedVolumes: Array.from(D.activeSources.entries()).map(([audio, entry]) => ({
+                    src: audio.src ? audio.src.slice(0, 60) + '…' : null,
+                    originalVolume: entry.originalVolume,
+                    currentVolume: audio.volume,
+                })),
+            };
+        },
+
+        // Ручной тест
+        test: () => {
+            const sources = collectActiveAudioSources();
+            if (sources.length === 0) {
+                console.log('🔉 [AudioDucking] Нечего тестировать — аудио не играет');
+                return false;
+            }
+            console.log('🔉 [AudioDucking] Тест: приглушаем', sources.length, 'источник(ов)');
+            duck('test');
+            return true;
+        },
+    };
+
+    console.log('🔉 [AudioDucking] Готово:');
+    console.log('   • Работает с радио 📻, плеером 🎵 и голосовыми 🎤');
+    console.log('   • Громкость приглушения: ' + D.settings.duckVolume + '%');
+    console.log('   • Длительность: ' + D.settings.duckDuration + 'мс');
+    console.log('   • API: AudioDucking.status() / .test() / .setVolume(20)');
+    console.log('   • UI настроек: в модалке «🧩 Виджеты»');
+})();
+</script>
+
+
 </body>
 </html>
