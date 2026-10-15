@@ -53343,6 +53343,1194 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
     console.log('🩹 [MultiImageFix v2] Патч установлен.');
     console.log('   • Отправка теперь ждёт реального завершения каждого фото.');
 })();
+</script><script>
+// ═══════════════════════════════════════════════════════════════
+//  🌠 ОТКРЫТКИ — ТЕКСТ ПОВЕРХ ФОТО
+//  ─────────────────────────────────────────────────────────────
+//  • Кнопка в панели вложений → «Создать открытку»
+//  • Полноэкранный редактор: фото + текст + стиль
+//  • Живой предпросмотр в реальном времени
+//  • Отправляется как обычное изображение
+// ═══════════════════════════════════════════════════════════════
+
+(function installPostcardCreator() {
+    'use strict';
+
+    console.log('🌠 [Postcard] Установка…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  КОНФИГ
+    // ═══════════════════════════════════════════════════════════
+    const CFG = {
+        MAX_WIDTH: 1600,
+        MAX_HEIGHT: 1600,
+        JPEG_QUALITY: 0.92,
+        FONT_DEFAULT: 'Arial, sans-serif',
+        TEXT_COLORS: [
+            '#ffffff', '#000000', '#feca57', '#ff6b6b',
+            '#00b894', '#6c5ce7', '#5CA8FF', '#F36BE1',
+            '#FFA85C', '#7B7FF6'
+        ],
+        FONT_FAMILIES: [
+            { id: 'sans',    name: 'Обычный',   css: 'Arial, sans-serif' },
+            { id: 'serif',   name: 'С засечк.', css: 'Georgia, serif' },
+            { id: 'mono',    name: 'Моно',      css: 'Courier New, monospace' },
+            { id: 'cursive', name: 'Рукописн.', css: 'Comic Sans MS, cursive' },
+            { id: 'impact',  name: 'Жирный',    css: 'Impact, sans-serif' },
+        ],
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОСТОЯНИЕ РЕДАКТОРА
+    // ═══════════════════════════════════════════════════════════
+    const State = {
+        imageBlob: null,       // исходный файл
+        imageUrl: null,        // blob:URL для превью
+        imageEl: null,         // Image() для canvas
+
+        text: 'Привет!',
+        color: '#ffffff',
+        fontId: 'sans',
+        fontSize: 48,          // относительный размер
+        position: 'bottom',    // 'top' | 'center' | 'bottom' | 'custom'
+        customY: 0.5,          // 0..1 для custom
+        shadow: true,          // тень под текстом
+        backdrop: true,        // полупрозрачная плашка
+
+        modalEl: null,
+        canvasEl: null,
+        previewEl: null,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  СТИЛИ
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('postcardStyles')) {
+        const style = document.createElement('style');
+        style.id = 'postcardStyles';
+        style.textContent = `
+            /* ═══ Полноэкранный редактор ═══ */
+            #postcardEditor {
+                position: fixed;
+                inset: 0;
+                background: #0a0a0f;
+                z-index: 9000;
+                display: none;
+                flex-direction: column;
+                animation: pcFadeIn 0.2s ease;
+                overscroll-behavior: contain;
+            }
+            #postcardEditor.show { display: flex; }
+            @keyframes pcFadeIn {
+                from { opacity: 0; }
+                to   { opacity: 1; }
+            }
+
+            /* ═══ Шапка ═══ */
+            #postcardEditor .pc-header {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                padding: 12px 14px;
+                padding-top: calc(12px + env(safe-area-inset-top, 0px));
+                background: rgba(255,255,255,0.04);
+                backdrop-filter: blur(20px);
+                -webkit-backdrop-filter: blur(20px);
+                border-bottom: 1px solid rgba(255,255,255,0.06);
+                flex-shrink: 0;
+                z-index: 10;
+            }
+            #postcardEditor .pc-title {
+                flex: 1;
+                min-width: 0;
+                font-size: 16px;
+                font-weight: 700;
+                color: #fff;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+            #postcardEditor .pc-btn {
+                width: 38px; height: 38px;
+                border-radius: 50%;
+                border: none;
+                background: rgba(255,255,255,0.06);
+                color: #ccc;
+                font-size: 16px;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                flex-shrink: 0;
+                transition: all 0.15s;
+                font-family: inherit;
+                padding: 0;
+                -webkit-tap-highlight-color: transparent;
+            }
+            #postcardEditor .pc-btn:active { transform: scale(0.9); }
+            #postcardEditor .pc-btn:hover {
+                background: rgba(255,255,255,0.12);
+                color: #fff;
+            }
+            #postcardEditor .pc-btn-primary {
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                color: #fff;
+                width: auto;
+                padding: 0 16px;
+                height: 38px;
+                border-radius: 19px;
+                font-size: 14px;
+                font-weight: 600;
+                display: flex;
+                align-items: center;
+                gap: 6px;
+            }
+            #postcardEditor .pc-btn-primary:hover {
+                background: linear-gradient(135deg, #7a6cf0, #00cfa4);
+            }
+            #postcardEditor .pc-btn-primary:disabled {
+                opacity: 0.4;
+                cursor: not-allowed;
+                transform: none;
+            }
+
+            /* ═══ Превью (canvas) ═══ */
+            #postcardEditor .pc-preview-wrap {
+                flex: 1;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 14px;
+                min-height: 0;
+                overflow: hidden;
+                position: relative;
+                background: #05050a;
+            }
+            #postcardEditor .pc-canvas {
+                max-width: 100%;
+                max-height: 100%;
+                border-radius: 12px;
+                box-shadow: 0 10px 40px rgba(0,0,0,0.6);
+                display: block;
+                object-fit: contain;
+            }
+            #postcardEditor .pc-empty {
+                text-align: center;
+                color: #666;
+                padding: 40px 20px;
+                pointer-events: none;
+            }
+            #postcardEditor .pc-empty-icon {
+                font-size: 64px;
+                margin-bottom: 14px;
+                opacity: 0.6;
+            }
+            #postcardEditor .pc-empty-title {
+                font-size: 16px;
+                color: #aaa;
+                margin-bottom: 6px;
+                font-weight: 600;
+            }
+            #postcardEditor .pc-empty-sub {
+                font-size: 13px;
+                color: #666;
+                line-height: 1.5;
+                max-width: 280px;
+                margin: 0 auto;
+            }
+
+            /* ═══ Панель инструментов (снизу) ═══ */
+            #postcardEditor .pc-controls {
+                flex-shrink: 0;
+                background: rgba(255,255,255,0.03);
+                backdrop-filter: blur(20px);
+                -webkit-backdrop-filter: blur(20px);
+                border-top: 1px solid rgba(255,255,255,0.06);
+                padding: 12px 14px;
+                padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+                max-height: 55vh;
+                overflow-y: auto;
+            }
+            #postcardEditor .pc-controls::-webkit-scrollbar { width: 4px; }
+            #postcardEditor .pc-controls::-webkit-scrollbar-thumb {
+                background: rgba(255,255,255,0.15);
+                border-radius: 2px;
+            }
+
+            #postcardEditor .pc-row {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                flex-wrap: wrap;
+            }
+            #postcardEditor .pc-label {
+                font-size: 11px;
+                color: #888;
+                text-transform: uppercase;
+                letter-spacing: 0.4px;
+                font-weight: 700;
+                width: 100%;
+                margin-bottom: -2px;
+            }
+
+            /* Поле ввода текста */
+            #postcardEditor .pc-text-input {
+                width: 100%;
+                padding: 12px 14px;
+                background: rgba(255,255,255,0.06);
+                border: 1px solid rgba(255,255,255,0.1);
+                border-radius: 12px;
+                color: #fff;
+                font-size: 15px;
+                font-family: inherit;
+                resize: none;
+                outline: none;
+                min-height: 44px;
+                max-height: 100px;
+                line-height: 1.4;
+                transition: border-color 0.2s;
+            }
+            #postcardEditor .pc-text-input:focus {
+                border-color: #6c5ce7;
+                background: rgba(255,255,255,0.08);
+            }
+
+            /* Цвета текста */
+            #postcardEditor .pc-colors {
+                display: flex;
+                gap: 6px;
+                flex-wrap: wrap;
+            }
+            #postcardEditor .pc-color {
+                width: 32px;
+                height: 32px;
+                border-radius: 50%;
+                border: 2px solid rgba(255,255,255,0.15);
+                cursor: pointer;
+                transition: all 0.15s;
+                flex-shrink: 0;
+                -webkit-tap-highlight-color: transparent;
+                position: relative;
+            }
+            #postcardEditor .pc-color:active { transform: scale(0.9); }
+            #postcardEditor .pc-color.selected {
+                border-color: #fff;
+                box-shadow: 0 0 0 3px rgba(255,255,255,0.25);
+                transform: scale(1.05);
+            }
+            #postcardEditor .pc-color.selected::after {
+                content: '✓';
+                position: absolute;
+                inset: 0;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                color: #fff;
+                font-size: 14px;
+                font-weight: 700;
+                text-shadow: 0 1px 3px rgba(0,0,0,0.9);
+            }
+            #postcardEditor .pc-color.pc-color-white {
+                box-shadow: inset 0 0 0 1px rgba(0,0,0,0.15);
+            }
+            #postcardEditor .pc-color.pc-color-white.selected::after {
+                color: #333;
+                text-shadow: none;
+            }
+
+            /* Шрифты */
+            #postcardEditor .pc-fonts {
+                display: flex;
+                gap: 6px;
+                flex-wrap: wrap;
+            }
+            #postcardEditor .pc-font {
+                padding: 8px 14px;
+                border-radius: 10px;
+                border: 1px solid rgba(255,255,255,0.1);
+                background: rgba(255,255,255,0.04);
+                color: #ccc;
+                font-size: 13px;
+                cursor: pointer;
+                transition: all 0.15s;
+                font-family: inherit;
+                -webkit-tap-highlight-color: transparent;
+                white-space: nowrap;
+            }
+            #postcardEditor .pc-font.selected {
+                background: linear-gradient(135deg, rgba(108,92,231,0.35), rgba(0,184,148,0.25));
+                border-color: rgba(108,92,231,0.7);
+                color: #fff;
+            }
+            #postcardEditor .pc-font:active { transform: scale(0.95); }
+
+            /* Позиция */
+            #postcardEditor .pc-positions {
+                display: flex;
+                gap: 6px;
+            }
+            #postcardEditor .pc-pos {
+                flex: 1;
+                padding: 9px 6px;
+                border-radius: 10px;
+                border: 1px solid rgba(255,255,255,0.1);
+                background: rgba(255,255,255,0.04);
+                color: #ccc;
+                font-size: 12px;
+                font-weight: 600;
+                cursor: pointer;
+                text-align: center;
+                transition: all 0.15s;
+                font-family: inherit;
+                -webkit-tap-highlight-color: transparent;
+                white-space: nowrap;
+            }
+            #postcardEditor .pc-pos.selected {
+                background: linear-gradient(135deg, rgba(108,92,231,0.35), rgba(0,184,148,0.25));
+                border-color: rgba(108,92,231,0.7);
+                color: #fff;
+            }
+            #postcardEditor .pc-pos:active { transform: scale(0.95); }
+
+            /* Переключатели */
+            #postcardEditor .pc-toggles {
+                display: flex;
+                gap: 8px;
+                flex-wrap: wrap;
+            }
+            #postcardEditor .pc-toggle {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                padding: 9px 14px;
+                border-radius: 10px;
+                border: 1px solid rgba(255,255,255,0.1);
+                background: rgba(255,255,255,0.04);
+                color: #ccc;
+                font-size: 13px;
+                font-weight: 600;
+                cursor: pointer;
+                transition: all 0.15s;
+                font-family: inherit;
+                -webkit-tap-highlight-color: transparent;
+                user-select: none;
+            }
+            #postcardEditor .pc-toggle input {
+                width: 16px;
+                height: 16px;
+                accent-color: #6c5ce7;
+                cursor: pointer;
+                margin: 0;
+                flex-shrink: 0;
+            }
+            #postcardEditor .pc-toggle:has(input:checked) {
+                background: linear-gradient(135deg, rgba(108,92,231,0.25), rgba(0,184,148,0.15));
+                border-color: rgba(108,92,231,0.5);
+                color: #fff;
+            }
+            #postcardEditor .pc-toggle:active { transform: scale(0.97); }
+
+            /* Слайдер размера */
+            #postcardEditor .pc-size-row {
+                display: flex;
+                align-items: center;
+                gap: 12px;
+            }
+            #postcardEditor .pc-size-row input[type="range"] {
+                flex: 1;
+                -webkit-appearance: none;
+                appearance: none;
+                height: 6px;
+                border-radius: 3px;
+                background: linear-gradient(90deg, rgba(108,92,231,0.3), rgba(108,92,231,0.9));
+                outline: none;
+                cursor: pointer;
+            }
+            #postcardEditor .pc-size-row input[type="range"]::-webkit-slider-thumb {
+                -webkit-appearance: none;
+                appearance: none;
+                width: 22px; height: 22px;
+                border-radius: 50%;
+                background: #fff;
+                border: 2px solid #6c5ce7;
+                box-shadow: 0 2px 8px rgba(108,92,231,0.5);
+                cursor: pointer;
+            }
+            #postcardEditor .pc-size-row input[type="range"]::-moz-range-thumb {
+                width: 22px; height: 22px;
+                border-radius: 50%;
+                background: #fff;
+                border: 2px solid #6c5ce7;
+                cursor: pointer;
+            }
+            #postcardEditor .pc-size-value {
+                font-size: 14px;
+                font-weight: 700;
+                color: #a78bfa;
+                font-variant-numeric: tabular-nums;
+                min-width: 44px;
+                text-align: right;
+            }
+
+            /* ═══ Пункт в меню вложений ═══ */
+            .attach-menu-item.postcard .icon {
+                background: linear-gradient(135deg, rgba(243,107,225,0.25), rgba(254,202,87,0.15));
+                color: #F36BE1;
+            }
+
+            /* ═══ Прогресс при отправке ═══ */
+            #postcardEditor .pc-sending {
+                position: absolute;
+                inset: 0;
+                background: rgba(0,0,0,0.85);
+                backdrop-filter: blur(10px);
+                -webkit-backdrop-filter: blur(10px);
+                display: none;
+                align-items: center;
+                justify-content: center;
+                flex-direction: column;
+                gap: 16px;
+                z-index: 20;
+            }
+            #postcardEditor.sending .pc-sending {
+                display: flex;
+            }
+            #postcardEditor .pc-spinner {
+                width: 44px;
+                height: 44px;
+                border: 3px solid rgba(108,92,231,0.25);
+                border-top-color: #6c5ce7;
+                border-right-color: #00b894;
+                border-radius: 50%;
+                animation: pcSpin 0.9s linear infinite;
+            }
+            @keyframes pcSpin { to { transform: rotate(360deg); } }
+            #postcardEditor .pc-sending-text {
+                font-size: 15px;
+                font-weight: 600;
+                color: #fff;
+            }
+            #postcardEditor .pc-sending-sub {
+                font-size: 12px;
+                color: #888;
+                margin-top: -8px;
+            }
+
+            @media (max-width: 480px) {
+                #postcardEditor .pc-controls {
+                    max-height: 60vh;
+                }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХЕЛПЕРЫ
+    // ═══════════════════════════════════════════════════════════
+    function escapeHtmlSafe(s) {
+        if (typeof escapeHtml === 'function') return escapeHtml(s);
+        const div = document.createElement('div');
+        div.textContent = s == null ? '' : String(s);
+        return div.innerHTML;
+    }
+
+    function showToastSafe(msg, dur) {
+        try { if (typeof showToast === 'function') showToast(msg, dur || 2000); } catch (e) {}
+    }
+
+    function getFontFamily(fontId) {
+        const f = CFG.FONT_FAMILIES.find(x => x.id === fontId);
+        return f ? f.css : CFG.FONT_DEFAULT;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  РЕНДЕР CANVAS
+    // ═══════════════════════════════════════════════════════════
+    function renderPostcardToCanvas(canvas) {
+        if (!canvas || !State.imageEl) return false;
+
+        const img = State.imageEl;
+        const MAX = CFG.MAX_WIDTH;
+
+        // Определяем размеры с сохранением пропорций
+        let w = img.naturalWidth || img.width;
+        let h = img.naturalHeight || img.height;
+
+        if (w > MAX || h > MAX) {
+            const r = Math.min(MAX / w, MAX / h);
+            w = Math.floor(w * r);
+            h = Math.floor(h * r);
+        }
+        if (w % 2) w++;
+        if (h % 2) h++;
+
+        canvas.width = w;
+        canvas.height = h;
+
+        const ctx = canvas.getContext('2d');
+
+        // ─── 1. Рисуем фото ───
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, w, h);
+        ctx.drawImage(img, 0, 0, w, h);
+
+        // ─── 2. Если текста нет — выходим ───
+        const text = (State.text || '').trim();
+        if (!text) return true;
+
+        // ─── 3. Готовим текст ───
+        // Масштабируем размер шрифта относительно ширины
+        const baseSize = Math.max(20, Math.round((State.fontSize / 100) * w / 12));
+        const fontFamily = getFontFamily(State.fontId);
+
+        ctx.font = `bold ${baseSize}px ${fontFamily}`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+
+        // Разбиваем на строки (по \n и по ширине)
+        const maxLineWidth = w * 0.9;
+        const lines = wrapText(ctx, text, maxLineWidth);
+
+        const lineHeight = baseSize * 1.2;
+        const totalTextHeight = lines.length * lineHeight;
+        const padding = baseSize * 0.6;
+
+        // ─── 4. Определяем Y ───
+        let centerY;
+        if (State.position === 'top') {
+            centerY = padding + totalTextHeight / 2;
+        } else if (State.position === 'bottom') {
+            centerY = h - padding - totalTextHeight / 2;
+        } else if (State.position === 'center') {
+            centerY = h / 2;
+        } else {
+            centerY = h * State.customY;
+        }
+
+        const textBlockTop = centerY - totalTextHeight / 2;
+
+        // ─── 5. Плашка (если включена) ───
+        if (State.backdrop) {
+            const maxLineW = Math.max(...lines.map(l => ctx.measureText(l).width));
+            const padX = baseSize * 0.6;
+            const padY = baseSize * 0.4;
+            const boxW = maxLineW + padX * 2;
+            const boxH = totalTextHeight + padY * 2;
+            const boxX = w / 2 - boxW / 2;
+            const boxY = textBlockTop - padY;
+
+            // Скруглённый прямоугольник
+            const radius = Math.min(20, boxH / 2);
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
+            roundRect(ctx, boxX, boxY, boxW, boxH, radius);
+            ctx.fill();
+        }
+
+        // ─── 6. Тень текста ───
+        if (State.shadow) {
+            ctx.shadowColor = 'rgba(0, 0, 0, 0.9)';
+            ctx.shadowBlur = baseSize * 0.3;
+            ctx.shadowOffsetX = 0;
+            ctx.shadowOffsetY = baseSize * 0.08;
+        } else {
+            ctx.shadowColor = 'transparent';
+            ctx.shadowBlur = 0;
+            ctx.shadowOffsetX = 0;
+            ctx.shadowOffsetY = 0;
+        }
+
+        // ─── 7. Рисуем строки ───
+        ctx.fillStyle = State.color;
+
+        for (let i = 0; i < lines.length; i++) {
+            const lineY = textBlockTop + lineHeight * i + lineHeight / 2;
+            ctx.fillText(lines[i], w / 2, lineY);
+        }
+
+        // Сброс тени
+        ctx.shadowColor = 'transparent';
+        ctx.shadowBlur = 0;
+        ctx.shadowOffsetX = 0;
+        ctx.shadowOffsetY = 0;
+
+        return true;
+    }
+
+    function wrapText(ctx, text, maxWidth) {
+        const lines = [];
+        const explicit = text.split('\n');
+
+        for (const rawLine of explicit) {
+            if (rawLine === '') {
+                lines.push('');
+                continue;
+            }
+            const words = rawLine.split(/\s+/);
+            let current = '';
+
+            for (const word of words) {
+                const test = current ? current + ' ' + word : word;
+                if (ctx.measureText(test).width > maxWidth && current) {
+                    lines.push(current);
+                    current = word;
+                } else {
+                    current = test;
+                }
+            }
+            if (current) lines.push(current);
+        }
+
+        return lines;
+    }
+
+    function roundRect(ctx, x, y, w, h, r) {
+        ctx.beginPath();
+        ctx.moveTo(x + r, y);
+        ctx.lineTo(x + w - r, y);
+        ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+        ctx.lineTo(x + w, y + h - r);
+        ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+        ctx.lineTo(x + r, y + h);
+        ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+        ctx.lineTo(x, y + r);
+        ctx.quadraticCurveTo(x, y, x + r, y);
+        ctx.closePath();
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПОСТРОЕНИЕ РЕДАКТОРА
+    // ═══════════════════════════════════════════════════════════
+    function buildEditor() {
+        if (State.modalEl && State.modalEl.isConnected) return State.modalEl;
+
+        const old = document.getElementById('postcardEditor');
+        if (old) old.remove();
+
+        const modal = document.createElement('div');
+        modal.id = 'postcardEditor';
+        modal.innerHTML = `
+            <div class="pc-header">
+                <button class="pc-btn" id="pcCloseBtn" title="Отмена">✕</button>
+                <div class="pc-title">
+                    <span>🌠</span>
+                    <span>Создать открытку</span>
+                </div>
+                <button class="pc-btn-primary" id="pcSendBtn" disabled>
+                    <span>➤</span>
+                    <span>Отправить</span>
+                </button>
+            </div>
+
+            <div class="pc-preview-wrap">
+                <canvas class="pc-canvas" id="pcCanvas" style="display:none;"></canvas>
+                <div class="pc-empty" id="pcEmpty">
+                    <div class="pc-empty-icon">🖼️</div>
+                    <div class="pc-empty-title">Выберите фото</div>
+                    <div class="pc-empty-sub">Нажмите на кнопку ниже чтобы выбрать изображение с устройства</div>
+                </div>
+
+                <div class="pc-sending">
+                    <div class="pc-spinner"></div>
+                    <div class="pc-sending-text">Отправляем открытку…</div>
+                    <div class="pc-sending-sub">Сжатие и шифрование</div>
+                </div>
+            </div>
+
+            <div class="pc-controls">
+                <!-- Кнопка выбора фото -->
+                <button class="pc-btn-primary" id="pcPickImageBtn" style="width:100%;height:44px;justify-content:center;border-radius:14px;">
+                    <span>📷</span>
+                    <span id="pcPickImageLabel">Выбрать фото</span>
+                </button>
+
+                <!-- Текст -->
+                <div class="pc-label">📝 Текст открытки</div>
+                <textarea class="pc-text-input" id="pcTextInput" placeholder="Напишите что-нибудь..." maxlength="500" rows="2"></textarea>
+
+                <!-- Цвет текста -->
+                <div class="pc-label">🎨 Цвет текста</div>
+                <div class="pc-colors" id="pcColors"></div>
+
+                <!-- Размер -->
+                <div class="pc-label">📏 Размер шрифта</div>
+                <div class="pc-size-row">
+                    <input type="range" id="pcSizeSlider" min="20" max="100" value="48" step="1">
+                    <span class="pc-size-value" id="pcSizeValue">48</span>
+                </div>
+
+                <!-- Шрифт -->
+                <div class="pc-label">🔤 Шрифт</div>
+                <div class="pc-fonts" id="pcFonts"></div>
+
+                <!-- Позиция -->
+                <div class="pc-label">📍 Положение текста</div>
+                <div class="pc-positions" id="pcPositions">
+                    <div class="pc-pos" data-pos="top">⬆ Сверху</div>
+                    <div class="pc-pos selected" data-pos="center">⬛ Центр</div>
+                    <div class="pc-pos" data-pos="bottom">⬇ Снизу</div>
+                </div>
+
+                <!-- Опции -->
+                <div class="pc-label">✨ Оформление</div>
+                <div class="pc-toggles">
+                    <label class="pc-toggle">
+                        <input type="checkbox" id="pcShadowToggle" checked>
+                        <span>Тень</span>
+                    </label>
+                    <label class="pc-toggle">
+                        <input type="checkbox" id="pcBackdropToggle" checked>
+                        <span>Плашка</span>
+                    </label>
+                </div>
+            </div>
+
+            <input type="file" id="pcFileInput" accept="image/*" style="display:none;">
+        `;
+        document.body.appendChild(modal);
+        State.modalEl = modal;
+        State.canvasEl = modal.querySelector('#pcCanvas');
+        State.previewEl = modal.querySelector('#pcEmpty');
+
+        // ─── Обработчики ───
+        modal.querySelector('#pcCloseBtn').addEventListener('click', closeEditor);
+        modal.querySelector('#pcSendBtn').addEventListener('click', () => sendPostcard());
+
+        const fileInput = modal.querySelector('#pcFileInput');
+        modal.querySelector('#pcPickImageBtn').addEventListener('click', () => {
+            fileInput.value = '';
+            fileInput.click();
+        });
+        fileInput.addEventListener('change', handleImagePick);
+
+        // Текст
+        const textInput = modal.querySelector('#pcTextInput');
+        textInput.value = State.text;
+        textInput.addEventListener('input', () => {
+            State.text = textInput.value;
+            updatePreview();
+        });
+
+        // Цвета
+        const colorsEl = modal.querySelector('#pcColors');
+        colorsEl.innerHTML = CFG.TEXT_COLORS.map(c => `
+            <div class="pc-color ${c === '#ffffff' ? 'pc-color-white' : ''} ${c === State.color ? 'selected' : ''}"
+                 data-color="${c}"
+                 style="background-color: ${c};"></div>
+        `).join('');
+        colorsEl.querySelectorAll('.pc-color').forEach(el => {
+            el.addEventListener('click', () => {
+                State.color = el.dataset.color;
+                colorsEl.querySelectorAll('.pc-color').forEach(x => {
+                    x.classList.toggle('selected', x === el);
+                });
+                updatePreview();
+                if (navigator.vibrate) navigator.vibrate(8);
+            });
+        });
+
+        // Размер
+        const sizeSlider = modal.querySelector('#pcSizeSlider');
+        const sizeValue = modal.querySelector('#pcSizeValue');
+        sizeSlider.value = State.fontSize;
+        sizeValue.textContent = State.fontSize;
+        sizeSlider.addEventListener('input', () => {
+            State.fontSize = parseInt(sizeSlider.value, 10);
+            sizeValue.textContent = State.fontSize;
+            updatePreview();
+        });
+
+        // Шрифты
+        const fontsEl = modal.querySelector('#pcFonts');
+        fontsEl.innerHTML = CFG.FONT_FAMILIES.map(f => `
+            <div class="pc-font ${f.id === State.fontId ? 'selected' : ''}"
+                 data-font-id="${f.id}"
+                 style="font-family: ${f.css};">
+                ${escapeHtmlSafe(f.name)}
+            </div>
+        `).join('');
+        fontsEl.querySelectorAll('.pc-font').forEach(el => {
+            el.addEventListener('click', () => {
+                State.fontId = el.dataset.fontId;
+                fontsEl.querySelectorAll('.pc-font').forEach(x => {
+                    x.classList.toggle('selected', x === el);
+                });
+                updatePreview();
+            });
+        });
+
+        // Позиция
+        const positionsEl = modal.querySelector('#pcPositions');
+        positionsEl.querySelectorAll('.pc-pos').forEach(el => {
+            el.addEventListener('click', () => {
+                State.position = el.dataset.pos;
+                positionsEl.querySelectorAll('.pc-pos').forEach(x => {
+                    x.classList.toggle('selected', x === el);
+                });
+                updatePreview();
+                if (navigator.vibrate) navigator.vibrate(8);
+            });
+        });
+        // Устанавливаем начальное состояние
+        positionsEl.querySelectorAll('.pc-pos').forEach(x => {
+            x.classList.toggle('selected', x.dataset.pos === State.position);
+        });
+
+        // Тогглы
+        const shadowToggle = modal.querySelector('#pcShadowToggle');
+        shadowToggle.checked = State.shadow;
+        shadowToggle.addEventListener('change', () => {
+            State.shadow = shadowToggle.checked;
+            updatePreview();
+        });
+
+        const backdropToggle = modal.querySelector('#pcBackdropToggle');
+        backdropToggle.checked = State.backdrop;
+        backdropToggle.addEventListener('change', () => {
+            State.backdrop = backdropToggle.checked;
+            updatePreview();
+        });
+
+        return modal;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОБНОВЛЕНИЕ ПРЕВЬЮ
+    // ═══════════════════════════════════════════════════════════
+    let _previewRAF = null;
+
+    function updatePreview() {
+        if (_previewRAF) return;
+        _previewRAF = requestAnimationFrame(() => {
+            _previewRAF = null;
+            if (!State.imageEl || !State.canvasEl) return;
+            renderPostcardToCanvas(State.canvasEl);
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ВЫБОР ФОТО
+    // ═══════════════════════════════════════════════════════════
+    async function handleImagePick(e) {
+        const file = e.target.files && e.target.files[0];
+        if (!file) return;
+
+        if (!file.type.startsWith('image/')) {
+            showToastSafe('❌ Только изображения', 2000);
+            return;
+        }
+        if (file.size > 25 * 1024 * 1024) {
+            showToastSafe('❌ Максимум 25 МБ', 2500);
+            return;
+        }
+
+        showToastSafe('⏳ Обработка фото…', 1500);
+
+        try {
+            // Освобождаем старый URL
+            if (State.imageUrl) {
+                try { URL.revokeObjectURL(State.imageUrl); } catch (err) {}
+            }
+
+            State.imageBlob = file;
+            State.imageUrl = URL.createObjectURL(file);
+
+            // Загружаем как Image для canvas
+            const img = await loadImage(State.imageUrl);
+            State.imageEl = img;
+
+            // Показываем canvas
+            State.canvasEl.style.display = 'block';
+            State.previewEl.style.display = 'none';
+
+            // Обновляем UI
+            const label = State.modalEl.querySelector('#pcPickImageLabel');
+            if (label) label.textContent = '🔄 Заменить фото';
+
+            const sendBtn = State.modalEl.querySelector('#pcSendBtn');
+            sendBtn.disabled = false;
+
+            // Рендерим
+            updatePreview();
+
+            showToastSafe('✅ Фото загружено', 1200);
+
+        } catch (err) {
+            console.error('🌠 [Postcard] Image load error:', err);
+            showToastSafe('❌ Не удалось загрузить фото', 2500);
+        }
+    }
+
+    function loadImage(url) {
+        return new Promise((resolve, reject) => {
+            const img = new Image();
+            img.onload = () => resolve(img);
+            img.onerror = () => reject(new Error('Не удалось прочитать изображение'));
+            img.src = url;
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОТКРЫТИЕ / ЗАКРЫТИЕ
+    // ═══════════════════════════════════════════════════════════
+    function openEditor() {
+        if (!state.isAuthorized || !state.chatFile) {
+            showToastSafe('🔒 Требуется вход в чат', 2000);
+            return;
+        }
+
+        buildEditor();
+
+        // Сбрасываем состояние, но оставляем последние настройки текста
+        // для удобства повторных открыток
+        if (State.imageUrl) {
+            try { URL.revokeObjectURL(State.imageUrl); } catch (e) {}
+        }
+        State.imageBlob = null;
+        State.imageUrl = null;
+        State.imageEl = null;
+
+        // Сбрасываем UI
+        const canvas = State.modalEl.querySelector('#pcCanvas');
+        canvas.style.display = 'none';
+        const empty = State.modalEl.querySelector('#pcEmpty');
+        empty.style.display = 'block';
+
+        const label = State.modalEl.querySelector('#pcPickImageLabel');
+        if (label) label.textContent = 'Выбрать фото';
+
+        const sendBtn = State.modalEl.querySelector('#pcSendBtn');
+        sendBtn.disabled = true;
+
+        State.modalEl.classList.add('show');
+        State.modalEl.classList.remove('sending');
+        document.body.style.overflow = 'hidden';
+
+        if (navigator.vibrate) navigator.vibrate(12);
+        if (typeof soundManager !== 'undefined') {
+            try { soundManager.play('click'); } catch (e) {}
+        }
+    }
+
+    function closeEditor() {
+        if (!State.modalEl) return;
+        State.modalEl.classList.remove('show', 'sending');
+        document.body.style.overflow = '';
+        if (navigator.vibrate) navigator.vibrate(10);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОТПРАВКА
+    // ═══════════════════════════════════════════════════════════
+    async function sendPostcard() {
+        if (!State.imageEl || !State.imageBlob) {
+            showToastSafe('❌ Сначала выберите фото', 2000);
+            return;
+        }
+
+        const modal = State.modalEl;
+        const sendBtn = modal.querySelector('#pcSendBtn');
+        sendBtn.disabled = true;
+
+        modal.classList.add('sending');
+
+        try {
+            // ─── 1. Рендерим финальный canvas ───
+            const finalCanvas = document.createElement('canvas');
+            renderPostcardToCanvas(finalCanvas);
+
+            // ─── 2. Преобразуем в Blob (JPEG для меньшего размера) ───
+            const blob = await new Promise((resolve, reject) => {
+                finalCanvas.toBlob(
+                    b => b ? resolve(b) : reject(new Error('toBlob failed')),
+                    'image/jpeg',
+                    CFG.JPEG_QUALITY
+                );
+            });
+
+            if (!blob) throw new Error('Не удалось создать изображение');
+
+            console.log(`🌠 [Postcard] Готово изображение: ${blob.size} байт`);
+
+            // ─── 3. Сжимаем если нужно ───
+            let finalBlob = blob;
+            const TARGET = (typeof CONFIG !== 'undefined' && CONFIG.autoCompressTargetBytes)
+                ? CONFIG.autoCompressTargetBytes
+                : 950 * 1024;
+
+            if (blob.size > TARGET) {
+                console.log('🌠 [Postcard] Сжимаем побольше…');
+                // Пробуем уменьшить качество
+                let quality = 0.8;
+                while (finalBlob.size > TARGET && quality >= 0.4) {
+                    finalBlob = await new Promise((resolve, reject) => {
+                        finalCanvas.toBlob(
+                            b => b ? resolve(b) : reject(new Error('toBlob failed')),
+                            'image/jpeg',
+                            quality
+                        );
+                    });
+                    quality -= 0.1;
+                }
+                console.log(`🌠 [Postcard] Сжато до: ${finalBlob.size} байт`);
+            }
+
+            // ─── 4. Отправляем как обычное изображение ───
+            // Используем существующий sendMessage
+            await new Promise((resolve, reject) => {
+                try {
+                    // sendMessage принимает imageBlob как второй параметр
+                    const result = sendMessage('', finalBlob);
+                    // sendMessage асинхронный, но не возвращает promise.
+                    // Ждём завершения через polling state.isSending
+                    waitForSendComplete(60000).then(resolve).catch(reject);
+                } catch (e) {
+                    reject(e);
+                }
+            });
+
+            showToastSafe('✅ Открытка отправлена!', 2000);
+            if (typeof soundManager !== 'undefined') {
+                try { soundManager.play('send'); } catch (e) {}
+            }
+
+            // Закрываем редактор
+            closeEditor();
+
+        } catch (err) {
+            console.error('🌠 [Postcard] Send error:', err);
+            showToastSafe('❌ Ошибка отправки: ' + (err.message || 'неизвестно'), 3000);
+            sendBtn.disabled = false;
+            modal.classList.remove('sending');
+        }
+    }
+
+    function waitForSendComplete(timeoutMs = 60000) {
+        return new Promise((resolve) => {
+            const start = Date.now();
+            let sawActivity = false;
+
+            const tick = () => {
+                const isSending = (typeof state !== 'undefined' && state.isSending);
+                const queueBusy = (typeof SendQueue !== 'undefined'
+                    && typeof SendQueue.isBusy === 'function'
+                    && SendQueue.isBusy());
+
+                const busy = isSending || queueBusy;
+
+                if (busy) sawActivity = true;
+                if (sawActivity && !busy) { resolve(true); return; }
+                if (Date.now() - start > timeoutMs) { resolve(false); return; }
+
+                setTimeout(tick, 200);
+            };
+            setTimeout(tick, 300);
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУНКТ В МЕНЮ ВЛОЖЕНИЙ
+    // ═══════════════════════════════════════════════════════════
+    function injectAttachMenuItem() {
+        const menu = document.getElementById('attachMenu');
+        if (!menu) return false;
+        if (menu.querySelector('[data-action="postcard"]')) return true;
+
+        const item = document.createElement('div');
+        item.className = 'attach-menu-item postcard';
+        item.dataset.action = 'postcard';
+        item.innerHTML = `
+            <div class="icon">🌠</div>
+            <div class="text">
+                <div class="title">Создать открытку</div>
+                <div class="subtitle">Текст поверх фотографии</div>
+            </div>
+        `;
+
+        // Вставляем ПЕРВЫМ (перед "Изображения")
+        menu.insertBefore(item, menu.firstChild);
+
+        return true;
+    }
+
+    // Перехватываем клик по пункту "Открытка" — ДО общего обработчика
+    document.addEventListener('click', (e) => {
+        const item = e.target.closest('.attach-menu-item[data-action="postcard"]');
+        if (!item) return;
+
+        e.stopImmediatePropagation();
+        e.preventDefault();
+
+        // Закрываем меню вложений
+        if (typeof toggleAttachMenu === 'function') {
+            toggleAttachMenu(false);
+        }
+
+        // Небольшая задержка — пусть меню закроется
+        setTimeout(() => openEditor(), 150);
+    }, true);
+
+    // Наблюдаем за появлением меню
+    const observer = new MutationObserver(() => {
+        if (document.getElementById('attachMenu')) {
+            injectAttachMenuItem();
+        }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    setTimeout(injectAttachMenuItem, 2000);
+    setTimeout(injectAttachMenuItem, 5000);
+
+    // Также при каждом открытии меню вложений
+    document.addEventListener('click', (e) => {
+        if (e.target.closest('#fileBtn')) {
+            setTimeout(injectAttachMenuItem, 30);
+            setTimeout(injectAttachMenuItem, 150);
+        }
+    }, true);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОБРАБОТКА ESC
+    // ═══════════════════════════════════════════════════════════
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && State.modalEl && State.modalEl.classList.contains('show')) {
+            e.preventDefault();
+            e.stopPropagation();
+            closeEditor();
+        }
+    }, true);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API
+    // ═══════════════════════════════════════════════════════════
+    window.PostcardCreator = {
+        open: openEditor,
+        close: closeEditor,
+        // Программное заполнение
+        setText: (t) => {
+            State.text = t;
+            if (State.modalEl) {
+                const inp = State.modalEl.querySelector('#pcTextInput');
+                if (inp) inp.value = t;
+            }
+            updatePreview();
+        },
+        setColor: (c) => {
+            State.color = c;
+            updatePreview();
+        },
+        config: CFG,
+        state: () => ({ ...State, imageEl: null, modalEl: null, canvasEl: null, previewEl: null }),
+    };
+
+    console.log('🌠 [Postcard] Готово:');
+    console.log('   • Кнопка "Создать открытку" в панели вложений 📎');
+    console.log('   • Живой предпросмотр + выбор цвета/шрифта/позиции');
+    console.log('   • API: PostcardCreator.open()');
+})();
 </script>
 </body>
 </html>
