@@ -38243,54 +38243,79 @@ try {
         setTimeout(() => input.focus(), 300);
 
         const submit = async () => {
-            const name = input.value.trim();
-            if (name.length < 2) { showToast('❌ Имя должно быть не короче 2 символов', 2000); return; }
-            if (name.length > 20) { showToast('❌ Имя не должно быть длиннее 20 символов', 2000); return; }
+    const name = input.value.trim();
+    if (name.length < 2) { showToast('❌ Имя должно быть не короче 2 символов', 2000); return; }
+    if (name.length > 20) { showToast('❌ Имя не должно быть длиннее 20 символов', 2000); return; }
 
-            btn.disabled = true;
-            btn.textContent = '⏳ Подключаемся…';
+    btn.disabled = true;
+    btn.textContent = '⏳ Подключаемся…';
 
-            try {
-                // Применяем токен и пользователя
-                state.username = name;
-                state.token = payload.token;
-                state.isAuthorized = true;
-                localStorage.setItem('chathub_username', name);
+    try {
+        // ═══ 1. Применяем данные ═══
+        state.username = name;
+        state.token = payload.token;
+        state.isAuthorized = true;
 
-                if (typeof loadChatsList === 'function') loadChatsList();
-                if (typeof loadSavedPasswords === 'function') loadSavedPasswords();
+        // ═══ 🆕 2. СОХРАНЯЕМ СЕССИЮ В localStorage ═══
+        // Чтобы при следующем запуске сработал тихий автовход
+        // (через PersistentSession)
+        try {
+            localStorage.setItem('chathub_username', name);
+            localStorage.setItem('chathub_token', payload.token);
+            localStorage.setItem('chathub_remember', '1');
+            localStorage.setItem('chathub_session_source', 'invite');
+            console.log('🔗 [Invite v2] Сессия сохранена в localStorage');
+        } catch (e) {
+            console.warn('🔗 [Invite v2] Не удалось сохранить сессию:', e);
+        }
 
-                // Добавляем/обновляем чат
-                const chatFile = payload.chat.file;
-                const chatName = payload.chat.name || chatFile;
-                if (!state.chats.find(c => c.file === chatFile)) {
-                    state.chats.push({ name: chatName, file: chatFile, createdAt: new Date().toISOString() });
-                }
-                if (typeof saveChatsList === 'function') saveChatsList();
+        // ═══ 3. Загружаем списки ═══
+        if (typeof loadChatsList === 'function') loadChatsList();
+        if (typeof loadSavedPasswords === 'function') loadSavedPasswords();
 
-                // Сохраняем пароль
-                state.savedPasswords[chatFile] = payload.password;
-                if (typeof saveSavedPasswords === 'function') saveSavedPasswords();
+        // ═══ 4. Добавляем/обновляем чат ═══
+        const chatFile = payload.chat.file;
+        const chatName = payload.chat.name || chatFile;
+        if (!state.chats.find(c => c.file === chatFile)) {
+            state.chats.push({ name: chatName, file: chatFile, createdAt: new Date().toISOString() });
+        }
+        if (typeof saveChatsList === 'function') saveChatsList();
 
-                // Обновляем поля на экране авторизации
-                if (usernameInput) usernameInput.value = name;
-                if (tokenInput) tokenInput.value = state.token;
+        // ═══ 5. Сохраняем пароль чата ═══
+        state.savedPasswords[chatFile] = payload.password;
+        if (typeof saveSavedPasswords === 'function') saveSavedPasswords();
 
-                // Входим в чат
-                await enterChat(chatFile, chatName, payload.password);
+        // ═══ 6. Обновляем поля на экране авторизации ═══
+        if (usernameInput) usernameInput.value = name;
+        if (tokenInput) tokenInput.value = payload.token;
+        if (typeof rememberMeInput !== 'undefined' && rememberMeInput) rememberMeInput.checked = true;
+        if (typeof rememberWarning !== 'undefined' && rememberWarning) rememberWarning.style.display = 'block';
 
-                screen.remove();
-                showToast(`✅ Добро пожаловать в «${chatName}», ${name}!`, 3000);
-                soundManager.play('notification');
+        // ═══ 7. Входим в чат ═══
+        await enterChat(chatFile, chatName, payload.password);
 
-            } catch (e) {
-                console.error('🔗 [Invite v2] Ошибка входа:', e);
-                btn.disabled = false;
-                btn.textContent = 'Войти в чат';
-                showToast('❌ Не удалось войти: ' + e.message, 4000);
-                showInviteError('unknown', 'Не удалось открыть чат. Возможно, ссылка устарела или токен недействителен.');
-            }
-        };
+        // ═══ 🆕 8. Ещё раз сохраняем на всякий случай ═══
+        // (если какой-то патч перезаписал localStorage)
+        try {
+            localStorage.setItem('chathub_username', name);
+            localStorage.setItem('chathub_token', payload.token);
+            localStorage.setItem('chathub_remember', '1');
+        } catch (e) {}
+
+        screen.remove();
+        showToast(`✅ Добро пожаловать в «${chatName}», ${name}!`, 3000);
+        if (typeof soundManager !== 'undefined') {
+            try { soundManager.play('notification'); } catch (e) {}
+        }
+
+    } catch (e) {
+        console.error('🔗 [Invite v2] Ошибка входа:', e);
+        btn.disabled = false;
+        btn.textContent = 'Войти в чат';
+        showToast('❌ Не удалось войти: ' + e.message, 4000);
+        showInviteError('unknown', 'Не удалось открыть чат. Возможно, ссылка устарела или токен недействителен.');
+    }
+};
 
         btn.addEventListener('click', submit);
         input.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
