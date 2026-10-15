@@ -56119,6 +56119,424 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
     console.log('   • Undo, отмена, очистка');
     console.log('   • API: DrawingEditor.open()');
 })();
+</script><script>
+// ═══════════════════════════════════════════════════════════════
+//  🔄 КНОПКА РУЧНОГО ОБНОВЛЕНИЯ ПОГОДЫ
+//  ─────────────────────────────────────────────────────────────
+//  • Маленькая иконка ⟳ в шапке виджета погоды
+//  • При клике — сбрасывает кэш и запрашивает свежие данные
+//  • Анимация вращения во время загрузки
+//  • Полезно при смене VPN / переезде / смене геолокации
+// ═══════════════════════════════════════════════════════════════
+
+(function installWeatherRefreshButton() {
+    'use strict';
+
+    console.log('🔄 [WeatherRefresh] Установка…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  1. Стили для кнопки обновления
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('weatherRefreshStyles')) {
+        const style = document.createElement('style');
+        style.id = 'weatherRefreshStyles';
+        style.textContent = `
+            /* Кнопка обновления в шапке виджета погоды */
+            .widget-card.weather .wc-header {
+                position: relative;
+            }
+
+            .widget-card.weather .wc-refresh-btn {
+                width: 32px;
+                height: 32px;
+                border-radius: 50%;
+                border: 1px solid rgba(255,255,255,0.12);
+                background: rgba(255,255,255,0.06);
+                color: #aaa;
+                font-size: 16px;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                flex-shrink: 0;
+                margin-left: 6px;
+                transition: all 0.18s ease;
+                padding: 0;
+                line-height: 1;
+                -webkit-tap-highlight-color: transparent;
+                font-family: inherit;
+            }
+            .widget-card.weather .wc-refresh-btn:hover {
+                background: rgba(108,92,231,0.22);
+                border-color: rgba(108,92,231,0.5);
+                color: #fff;
+            }
+            .widget-card.weather .wc-refresh-btn:active {
+                transform: scale(0.88);
+            }
+            .widget-card.weather .wc-refresh-btn.loading {
+                pointer-events: none;
+                color: #a78bfa;
+                border-color: rgba(108,92,231,0.5);
+            }
+            .widget-card.weather .wc-refresh-btn.loading .wc-refresh-icon {
+                display: inline-block;
+                animation: wcRefreshSpin 0.9s linear infinite;
+            }
+            @keyframes wcRefreshSpin {
+                to { transform: rotate(360deg); }
+            }
+
+            /* Тонкий индикатор внизу карточки, пока идёт загрузка */
+            .widget-card.weather.refreshing::after {
+                content: '';
+                position: absolute;
+                left: 0;
+                right: 0;
+                bottom: 0;
+                height: 2px;
+                background: linear-gradient(
+                    90deg,
+                    transparent 0%,
+                    rgba(108,92,231,0.5) 20%,
+                    #00b894 50%,
+                    rgba(108,92,231,0.5) 80%,
+                    transparent 100%
+                );
+                background-size: 60% 100%;
+                background-repeat: no-repeat;
+                animation: wcRefreshBar 1.1s ease-in-out infinite;
+                pointer-events: none;
+                border-radius: 0 0 14px 14px;
+            }
+            @keyframes wcRefreshBar {
+                0%   { background-position: -60% 0; }
+                100% { background-position: 160% 0; }
+            }
+
+            /* Мобильная адаптация */
+            @media (max-width: 480px) {
+                .widget-card.weather .wc-refresh-btn {
+                    width: 28px;
+                    height: 28px;
+                    font-size: 14px;
+                }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  2. Функция добавления кнопки в DOM карточки погоды
+    // ═══════════════════════════════════════════════════════════
+    function injectRefreshButton() {
+        const container = document.getElementById('chatsList');
+        if (!container) return false;
+
+        // Ищем карточку погоды
+        const weatherCard = container.querySelector('.widget-card.weather');
+        if (!weatherCard) return false;
+
+        // Уже есть кнопка — ничего не делаем
+        if (weatherCard.querySelector('.wc-refresh-btn')) return true;
+
+        // Ищем шапку виджета
+        const header = weatherCard.querySelector('.wc-header');
+        if (!header) return false;
+
+        // Создаём кнопку
+        const btn = document.createElement('button');
+        btn.className = 'wc-refresh-btn';
+        btn.type = 'button';
+        btn.title = 'Обновить данные (сбросить кэш геолокации)';
+        btn.setAttribute('aria-label', 'Обновить погоду');
+        btn.innerHTML = '<span class="wc-refresh-icon">⟳</span>';
+
+        // Обработчик клика
+        btn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            await refreshWeatherManually(btn, weatherCard);
+        });
+
+        // Вставляем в шапку (в конец — после title-block)
+        header.appendChild(btn);
+
+        return true;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. Обработчик клика: сброс кэша + запрос новых данных
+    // ═══════════════════════════════════════════════════════════
+    async function refreshWeatherManually(btn, card) {
+        // Защита от повторного клика
+        if (btn.classList.contains('loading')) return;
+
+        console.log('🔄 [WeatherRefresh] Ручное обновление погоды');
+
+        // Визуальный отклик
+        btn.classList.add('loading');
+        if (card) card.classList.add('refreshing');
+        if (navigator.vibrate) navigator.vibrate(15);
+
+        try {
+            // ─── 1. Очищаем кэш геолокации и погоды ───
+            if (typeof WeatherWidget !== 'undefined') {
+                // Используем публичный API refresh(), если он есть
+                if (typeof WeatherWidget.refresh === 'function') {
+                    await WeatherWidget.refresh();
+                } else {
+                    // Fallback: чистим кэш вручную через localStorage
+                    clearWeatherCacheManually();
+                }
+            } else {
+                // Если API нет — чистим localStorage напрямую
+                clearWeatherCacheManually();
+            }
+
+            // ─── 2. Даём время на обновление ───
+            // WeatherWidget.refresh запускает асинхронную загрузку в фоне.
+            // Нам нужно дождаться, когда DOM обновится.
+            await waitForWeatherUpdate(weatherCard);
+
+            showToast('✅ Погода обновлена', 1500);
+            if (typeof soundManager !== 'undefined') {
+                try { soundManager.play('send'); } catch (err) {}
+            }
+
+        } catch (err) {
+            console.error('🔄 [WeatherRefresh] Ошибка:', err);
+            showToast('❌ Не удалось обновить', 2500);
+        } finally {
+            btn.classList.remove('loading');
+            if (card) card.classList.remove('refreshing');
+        }
+    }
+
+    // ─── Fallback: очистка кэша вручную ───
+    function clearWeatherCacheManually() {
+        try {
+            // Кэш хранится в localStorage под ключом 'smschat_widgets_cache'
+            // со структурой: { "weather::location": { ts, data }, "weather::X_Y": { ts, data } }
+            const CACHE_KEY = 'smschat_widgets_cache';
+            const raw = localStorage.getItem(CACHE_KEY);
+            if (!raw) return;
+
+            const cache = JSON.parse(raw);
+            let removed = 0;
+
+            // Удаляем всё, что начинается с 'weather'
+            Object.keys(cache).forEach(key => {
+                if (key.startsWith('weather')) {
+                    delete cache[key];
+                    removed++;
+                }
+            });
+
+            if (removed > 0) {
+                localStorage.setItem(CACHE_KEY, JSON.stringify(cache));
+                console.log(`🔄 [WeatherRefresh] Очищено записей: ${removed}`);
+            }
+        } catch (e) {
+            console.warn('🔄 [WeatherRefresh] clearCache failed:', e);
+        }
+    }
+
+    // ─── Ожидание обновления DOM ───
+    function waitForWeatherUpdate(oldCard, timeoutMs = 15000) {
+        return new Promise((resolve) => {
+            const start = Date.now();
+            const oldText = oldCard ? (oldCard.querySelector('.wc-weather-temp')?.textContent || '') : '';
+
+            const tick = () => {
+                const container = document.getElementById('chatsList');
+                const newCard = container?.querySelector('.widget-card.weather');
+
+                // Карточка перерисовалась и в ней уже не скелетон
+                if (newCard) {
+                    const newTemp = newCard.querySelector('.wc-weather-temp')?.textContent || '';
+                    const isLoading = newTemp === '—°' || newTemp === '';
+
+                    // Если температура обновилась или карточка уже не скелетон
+                    if (!isLoading && newTemp !== oldText) {
+                        // Дадим ещё 200мс чтобы всё встало на место
+                        setTimeout(resolve, 200);
+                        return;
+                    }
+                    if (!isLoading && Date.now() - start > 2000) {
+                        resolve();
+                        return;
+                    }
+                }
+
+                if (Date.now() - start > timeoutMs) {
+                    resolve();   // Таймаут — просто выходим
+                    return;
+                }
+
+                setTimeout(tick, 200);
+            };
+
+            // Первая проверка через 300мс
+            setTimeout(tick, 300);
+        });
+    }
+
+    // ─── showToast safe ───
+    function showToast(msg, dur) {
+        try {
+            if (typeof window.showToast === 'function') {
+                window.showToast(msg, dur);
+            }
+        } catch (e) {}
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  4. Наблюдаем за появлением карточки погоды
+    // ═══════════════════════════════════════════════════════════
+    const observer = new MutationObserver(() => {
+        // При любом изменении DOM пробуем вставить кнопку
+        // (если карточки погоды нет — injectRefreshButton вернёт false)
+        requestAnimationFrame(() => {
+            injectRefreshButton();
+        });
+    });
+
+    // Наблюдаем за body целиком — карточка может перерисовываться
+    observer.observe(document.body, {
+        childList: true,
+        subtree: true,
+    });
+
+    // Первичные попытки установки
+    setTimeout(injectRefreshButton, 3000);
+    setTimeout(injectRefreshButton, 6000);
+
+    // Периодическая страховка — раз в 2 секунды
+    setInterval(injectRefreshButton, 2000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  5. Публичное API
+    // ═══════════════════════════════════════════════════════════
+    window.WeatherRefresh = {
+        // Ручное обновление (эквивалент клика по кнопке)
+        trigger: () => {
+            const container = document.getElementById('chatsList');
+            const card = container?.querySelector('.widget-card.weather');
+            const btn = card?.querySelector('.wc-refresh-btn');
+            if (btn) {
+                btn.click();
+                return true;
+            }
+            return false;
+        },
+
+        // Очистка кэша без обновления UI
+        clearCache: () => {
+            clearWeatherCacheManually();
+            showToast('🧹 Кэш погоды очищен', 1500);
+        },
+
+        // Статус
+        status: () => {
+            const container = document.getElementById('chatsList');
+            const card = container?.querySelector('.widget-card.weather');
+            const btn = card?.querySelector('.wc-refresh-btn');
+            return {
+                widgetExists: !!card,
+                buttonExists: !!btn,
+                buttonLoading: btn ? btn.classList.contains('loading') : false,
+            };
+        },
+    };
+
+    console.log('🔄 [WeatherRefresh] Готово:');
+    console.log('   • Кнопка ⟳ в шапке виджета погоды');
+    console.log('   • Клик → сброс кэша + перезапрос геолокации и погоды');
+    console.log('   • API: WeatherRefresh.trigger() / .clearCache()');
+})();
+
+// ═══════════════════════════════════════════════════════════
+//  3. Обработчик клика: сброс кэша + запрос новых данных
+//     ИСПРАВЛЕНО: не показываем ошибку, если данные обновились
+// ═══════════════════════════════════════════════════════════
+async function refreshWeatherManually(btn, card) {
+    if (btn.classList.contains('loading')) return;
+
+    console.log('🔄 [WeatherRefresh] Ручное обновление погоды');
+
+    btn.classList.add('loading');
+    if (card) card.classList.add('refreshing');
+    if (navigator.vibrate) navigator.vibrate(15);
+
+    // ─── Запоминаем старую температуру для сравнения ───
+    const oldTemp = card
+        ? (card.querySelector('.wc-weather-temp')?.textContent || '')
+        : '';
+    const oldCity = card
+        ? (card.querySelector('.wc-title')?.textContent || '')
+        : '';
+
+    let refreshError = null;
+
+    // ─── 1. Пробуем сбросить кэш и запустить обновление ───
+    //      ВСЕГДА через try/catch, чтобы ошибка не валила всё
+    try {
+        if (typeof WeatherWidget !== 'undefined') {
+            if (typeof WeatherWidget.refresh === 'function') {
+                try {
+                    // Может вернуть Promise, может не вернуть — не важно
+                    const result = WeatherWidget.refresh();
+                    if (result && typeof result.then === 'function') {
+                        await result;
+                    }
+                } catch (e) {
+                    refreshError = e;
+                    console.warn('🔄 [WeatherRefresh] refresh() выбросил:', e);
+                }
+            } else {
+                clearWeatherCacheManually();
+            }
+        } else {
+            clearWeatherCacheManually();
+        }
+    } catch (e) {
+        refreshError = e;
+        console.warn('🔄 [WeatherRefresh] Внешняя ошибка:', e);
+    }
+
+    // ─── 2. Ждём обновления DOM ───
+    //      ВАЖНО: даже если refreshError был — всё равно ждём,
+    //      потому что данные могли реально обновиться
+    let updated = false;
+    try {
+        updated = await waitForWeatherUpdate(card, oldTemp, oldCity);
+    } catch (e) {
+        console.warn('🔄 [WeatherRefresh] waitForWeatherUpdate failed:', e);
+    }
+
+    // ─── 3. Решаем, что показать ───
+    //      Логика: смотрим на РЕАЛЬНЫЙ результат, а не на ошибку
+    if (updated) {
+        showToast('✅ Погода обновлена', 1500);
+        if (typeof soundManager !== 'undefined') {
+            try { soundManager.play('send'); } catch (err) {}
+        }
+        // Даже если refreshError был — раз данные обновились,
+        // значит всё ок. Не пугаем пользователя.
+    } else if (refreshError) {
+        // Данные НЕ обновились И была ошибка — сообщаем
+        showToast('❌ Не удалось обновить', 2500);
+    } else {
+        // Ошибки нет, но и явного обновления не увидели —
+        // возможно данные те же. Скажем мягко.
+        showToast('✅ Данные актуальны', 1500);
+    }
+
+    btn.classList.remove('loading');
+    if (card) card.classList.remove('refreshing');
+}
+
 </script>
 </body>
 </html>
