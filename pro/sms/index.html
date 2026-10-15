@@ -38329,31 +38329,103 @@ try {
             screen.remove();
         });
     }
+// ═══════════════════════════════════════════════════════════
+//  ОБРАБОТКА ПРИГЛАШЕНИЯ ПРИ ЗАГРУЗКЕ
+//  🆕 Если есть сохранённая сессия — сразу входим в чат,
+//     минуя экран приветствия.
+// ═══════════════════════════════════════════════════════════
+async function handleIncomingInvite() {
+    const params = new URLSearchParams(location.search);
+    const rawParam = params.get(CFG.URL_PARAM);
+    if (!rawParam) return false;
 
-    // ═══════════════════════════════════════════════════════════
-    //  ОБРАБОТКА ПРИГЛАШЕНИЯ ПРИ ЗАГРУЗКЕ
-    // ═══════════════════════════════════════════════════════════
-    async function handleIncomingInvite() {
-        const params = new URLSearchParams(location.search);
-        const rawParam = params.get(CFG.URL_PARAM);
-        if (!rawParam) return false;
+    console.log('🔗 [Invite v2] Обнаружено приглашение');
+    const result = await parseAndValidateInvite(rawParam);
 
-        console.log('🔗 [Invite v2] Обнаружено приглашение');
-        const result = await parseAndValidateInvite(rawParam);
-
-        if (!result.ok) {
-            showInviteError(result.reason, result.message);
-            history.replaceState({}, '', location.origin + location.pathname);
-            return true;
-        }
-
-        const payload = result.payload;
-        markInviteUsed(payload.jti);
+    if (!result.ok) {
+        showInviteError(result.reason, result.message);
         history.replaceState({}, '', location.origin + location.pathname);
-        showWelcomeScreen(payload);
         return true;
     }
 
+    const payload = result.payload;
+    markInviteUsed(payload.jti);
+    history.replaceState({}, '', location.origin + location.pathname);
+
+    // ═══ 🆕 ГЛАВНОЕ: проверка существующей сессии ═══
+    let savedUsername = null;
+    let savedToken = null;
+    try {
+        savedUsername = localStorage.getItem('chathub_username');
+        savedToken = localStorage.getItem('chathub_token');
+    } catch (e) {}
+
+    if (savedUsername && savedToken) {
+        console.log(`🔗 [Invite v2] Найдена сессия «${savedUsername}» — авто-вход в чат`);
+
+        // Применяем сессию
+        state.username = savedUsername;
+        state.token = savedToken;
+        state.isAuthorized = true;
+
+        // Подгружаем списки
+        if (typeof loadChatsList === 'function') loadChatsList();
+        if (typeof loadSavedPasswords === 'function') loadSavedPasswords();
+
+        // Добавляем чат
+        const chatFile = payload.chat.file;
+        const chatName = payload.chat.name || chatFile;
+
+        if (!state.chats.find(c => c.file === chatFile)) {
+            state.chats.push({
+                name: chatName,
+                file: chatFile,
+                createdAt: new Date().toISOString(),
+            });
+        }
+        if (typeof saveChatsList === 'function') saveChatsList();
+
+        // Сохраняем пароль
+        state.savedPasswords[chatFile] = payload.password;
+        if (typeof saveSavedPasswords === 'function') saveSavedPasswords();
+
+        // Подставляем данные на экран логина (на случай logout)
+        const usernameInput = document.getElementById('usernameInput');
+        const tokenInput = document.getElementById('tokenInput');
+        const rememberMeInput = document.getElementById('rememberMeInput');
+        const rememberWarning = document.getElementById('rememberWarning');
+        if (usernameInput) usernameInput.value = savedUsername;
+        if (tokenInput) tokenInput.value = savedToken;
+        if (rememberMeInput) rememberMeInput.checked = true;
+        if (rememberWarning) rememberWarning.style.display = 'block';
+
+        // Входим в чат
+        try {
+            if (typeof enterChat === 'function') {
+                await enterChat(chatFile, chatName, payload.password);
+            }
+            if (typeof showToast === 'function') {
+                showToast(`✅ Добро пожаловать в «${chatName}», ${savedUsername}!`, 3000);
+            }
+            if (typeof soundManager !== 'undefined') {
+                try { soundManager.play('notification'); } catch (e) {}
+            }
+        } catch (e) {
+            console.error('🔗 [Invite v2] Ошибка авто-входа:', e);
+            if (typeof showToast === 'function') {
+                showToast('❌ Не удалось открыть чат: ' + (e.message || 'ошибка'), 4000);
+            }
+            if (typeof showChatsScreen === 'function') showChatsScreen();
+        }
+
+        return true;
+    }
+
+    // ═══ СЕССИИ НЕТ — обычный флоу ═══
+    console.log('🔗 [Invite v2] Сессии нет — показываем экран приветствия');
+    showWelcomeScreen(payload);
+    return true;
+}
     // ═══════════════════════════════════════════════════════════
     //  ПЕРЕХВАТ КНОПКИ «Другие приложения…»
     // ═══════════════════════════════════════════════════════════
@@ -57837,105 +57909,6 @@ async function refreshWeatherManually(btn, card) {
     console.log('   • Длительность: ' + D.settings.duckDuration + 'мс');
     console.log('   • API: AudioDucking.status() / .test() / .setVolume(20)');
     console.log('   • UI настроек: в модалке «🧩 Виджеты»');
-})();
-
-
-// ═══════════════════════════════════════════════════════════════
-//  🩹 ПАТЧ: АВТО-ВХОД ПО ССЫЛКЕ-ПРИГЛАШЕНИЮ ДЛЯ СУЩЕСТВУЮЩИХ ЮЗЕРОВ
-//  ─────────────────────────────────────────────────────────────
-//  Если пользователь уже залогинен (есть имя и токен),
-//  приглашение обрабатывается мгновенно без экрана ввода имени.
-// ═══════════════════════════════════════════════════════════════
-
-(function installSmartInviteHandling() {
-    'use strict';
-
-    console.log('🩹 [SmartInvite] Установка патча…');
-
-    // Проверяем, что зависимость существует
-    if (typeof handleIncomingInvite !== 'function') {
-        console.warn('🩹 [SmartInvite] handleIncomingInvite не найдена. Патч не установлен.');
-        return;
-    }
-
-    // Сохраняем оригинальную функцию (на случай отката)
-    const _origHandleIncomingInvite = handleIncomingInvite;
-
-    // Перезаписываем
-    handleIncomingInvite = async function() {
-        const params = new URLSearchParams(location.search);
-        const rawParam = params.get('invite');
-        if (!rawParam) return false;
-
-        console.log('🩹 [SmartInvite] Обнаружено приглашение');
-        const result = await parseAndValidateInvite(rawParam);
-
-        if (!result.ok) {
-            showInviteError(result.reason, result.message);
-            history.replaceState({}, '', location.origin + location.pathname);
-            return true;
-        }
-
-        const payload = result.payload;
-
-        // ─── ГЛАВНОЕ ИЗМЕНЕНИЕ: ПРОВЕРКА СУЩЕСТВУЮЩЕЙ СЕССИИ ───
-        const savedUsername = localStorage.getItem('chathub_username');
-        const savedToken = localStorage.getItem('chathub_token');
-
-        if (savedUsername && savedToken) {
-            console.log(`🩹 [SmartInvite] Найдена существующая сессия для "${savedUsername}". Вход без приветствия.`);
-            
-            // Помечаем инвайт как использованный
-            markInviteUsed(payload.jti);
-            history.replaceState({}, '', location.origin + location.pathname);
-
-            // Применяем токен и пользователя из сессии
-            state.username = savedUsername;
-            state.token = savedToken;
-            state.isAuthorized = true;
-
-            // Загружаем списки чатов и паролей
-            loadChatsList();
-            loadSavedPasswords();
-
-            // Добавляем/обновляем чат из приглашения
-            const chatFile = payload.chat.file;
-            const chatName = payload.chat.name || chatFile;
-
-            if (!state.chats.find(c => c.file === chatFile)) {
-                state.chats.push({ name: chatName, file: chatFile, createdAt: new Date().toISOString() });
-            }
-            saveChatsList();
-
-            // Сохраняем пароль
-            state.savedPasswords[chatFile] = payload.password;
-            saveSavedPasswords();
-
-            // Запускаем обычный вход в чат
-            try {
-                await enterChat(chatFile, chatName, payload.password);
-                showToast(`✅ Добро пожаловать в «${chatName}», ${savedUsername}!`, 3000);
-                soundManager.play('notification');
-            } catch (e) {
-                console.error('🩹 [SmartInvite] Ошибка входа в чат:', e);
-                showToast('❌ Не удалось открыть чат: ' + e.message, 4000);
-                // На всякий случай показываем список чатов
-                showChatsScreen();
-            }
-            
-            return true;
-        }
-
-        // ─── СТАРАЯ ЛОГИКА: ЕСЛИ СЕССИИ НЕТ ───
-        console.log('🩹 [SmartInvite] Сессия не найдена. Показываем экран приветствия.');
-        markInviteUsed(payload.jti);
-        history.replaceState({}, '', location.origin + location.pathname);
-        showWelcomeScreen(payload);
-        
-        return true;
-    };
-
-    console.log('🩹 [SmartInvite] Патч установлен. Авто-вход для существующих юзеров активен.');
 })();
 </script>
 
