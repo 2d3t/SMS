@@ -56746,6 +56746,524 @@ async function refreshWeatherManually(btn, card) {
     console.log('   • API: RadioPolling.status()');
 })();
 
+
+// ═══════════════════════════════════════════════════════════════
+//  ⬇️ UNREAD JUMP BUTTON — прыжок к непрочитанным чатам
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: чат с новым сообщением может оказаться ниже зоны
+//  видимости в списке. Пользователь не знает, что пришло что-то
+//  новое, пока не проскроллит.
+//
+//  Решение: плавающая кнопка «↓ N» в правом нижнем углу списка
+//  чатов. Появляется, если хотя бы один непрочитанный чат
+//  находится за пределами видимой области. По клику — плавный
+//  скролл к первому непрочитанному. Автоматически исчезает,
+//  когда все непрочитанные в зоне видимости.
+// ═══════════════════════════════════════════════════════════════
+
+(function installUnreadJumpButton() {
+    'use strict';
+
+    console.log('⬇️ [UnreadJump] Установка…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОСТОЯНИЕ
+    // ═══════════════════════════════════════════════════════════
+    const UJ = {
+        btnEl: null,
+        unreadCount: 0,
+        targetFile: null,        // ID чата, к которому скроллить
+        isScrolling: false,      // защита от двойного клика
+        scrollContainer: null,   // контейнер, который скроллим
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  СТИЛИ
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('unreadJumpStyles')) {
+        const style = document.createElement('style');
+        style.id = 'unreadJumpStyles';
+        style.textContent = `
+            #unreadJumpBtn {
+                position: fixed;
+                right: 16px;
+                bottom: 90px;
+                width: 52px;
+                height: 52px;
+                border-radius: 50%;
+                border: none;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                color: #fff;
+                font-size: 22px;
+                font-weight: 700;
+                cursor: pointer;
+                display: none;
+                align-items: center;
+                justify-content: center;
+                box-shadow: 0 6px 24px rgba(108, 92, 231, 0.5),
+                            0 0 0 0 rgba(108, 92, 231, 0.4);
+                z-index: 65;
+                transition: transform 0.2s ease, opacity 0.25s ease;
+                -webkit-tap-highlight-color: transparent;
+                animation: ujBtnPulse 2s ease-in-out infinite;
+                padding: 0;
+                font-family: inherit;
+                line-height: 1;
+            }
+            #unreadJumpBtn.show {
+                display: flex;
+                animation: ujBtnSlideIn 0.25s ease,
+                           ujBtnPulse 2s ease-in-out infinite 0.25s;
+            }
+            #unreadJumpBtn:active {
+                transform: scale(0.88);
+            }
+            @keyframes ujBtnSlideIn {
+                from { opacity: 0; transform: translateY(20px) scale(0.85); }
+                to   { opacity: 1; transform: translateY(0) scale(1); }
+            }
+            @keyframes ujBtnPulse {
+                0%, 100% {
+                    box-shadow: 0 6px 24px rgba(108, 92, 231, 0.5),
+                                0 0 0 0 rgba(108, 92, 231, 0.5);
+                }
+                50% {
+                    box-shadow: 0 6px 24px rgba(108, 92, 231, 0.5),
+                                0 0 0 10px rgba(108, 92, 231, 0);
+                }
+            }
+
+            /* Счётчик непрочитанных на кнопке */
+            #unreadJumpBtn .uj-count {
+                position: absolute;
+                top: -4px;
+                right: -4px;
+                min-width: 22px;
+                height: 22px;
+                padding: 0 6px;
+                border-radius: 11px;
+                background: linear-gradient(135deg, #ff6b6b, #ee5253);
+                color: #fff;
+                font-size: 11px;
+                font-weight: 800;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                border: 2px solid #0a0a0f;
+                box-shadow: 0 2px 8px rgba(238, 82, 83, 0.6);
+                line-height: 1;
+                pointer-events: none;
+            }
+
+            /* Иконка стрелки */
+            #unreadJumpBtn .uj-arrow {
+                display: inline-block;
+                animation: ujArrowBounce 1.4s ease-in-out infinite;
+                line-height: 1;
+            }
+            @keyframes ujArrowBounce {
+                0%, 100% { transform: translateY(-2px); }
+                50%      { transform: translateY(2px); }
+            }
+
+            /* Мобильная адаптация */
+            @media (max-width: 480px) {
+                #unreadJumpBtn {
+                    right: 12px;
+                    bottom: 80px;
+                    width: 48px;
+                    height: 48px;
+                    font-size: 20px;
+                }
+                #unreadJumpBtn .uj-count {
+                    min-width: 20px;
+                    height: 20px;
+                    font-size: 10px;
+                }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОЗДАНИЕ КНОПКИ
+    // ═══════════════════════════════════════════════════════════
+    function ensureButton() {
+        if (UJ.btnEl && UJ.btnEl.isConnected) return UJ.btnEl;
+
+        const btn = document.createElement('button');
+        btn.id = 'unreadJumpBtn';
+        btn.type = 'button';
+        btn.title = 'К непрочитанным чатам';
+        btn.setAttribute('aria-label', 'Перейти к непрочитанным');
+        btn.innerHTML = `
+            <span class="uj-arrow">↓</span>
+            <span class="uj-count" id="ujCount">0</span>
+        `;
+        document.body.appendChild(btn);
+
+        btn.addEventListener('click', handleClick);
+
+        UJ.btnEl = btn;
+        return btn;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОБРАБОТЧИК КЛИКА
+    // ═══════════════════════════════════════════════════════════
+    function handleClick(e) {
+        e.stopPropagation();
+        e.preventDefault();
+
+        if (UJ.isScrolling) return;
+        if (!UJ.targetFile) return;
+
+        // Находим DOM-элемент целевого чата
+        const container = document.getElementById('chatsList');
+        if (!container) return;
+
+        const targetEl = container.querySelector(
+            `.chat-list-item[data-file="${UJ.targetFile}"]`
+        );
+        if (!targetEl) {
+            console.warn('⬇️ [UnreadJump] Целевой чат не найден в DOM');
+            return;
+        }
+
+        UJ.isScrolling = true;
+        if (navigator.vibrate) navigator.vibrate(15);
+        if (typeof soundManager !== 'undefined') {
+            try { soundManager.play('click'); } catch (e) {}
+        }
+
+        // Определяем контейнер для скролла
+        // В этой версии приложения скроллится сама страница (body),
+        // а не #chatsList (у него нет overflow: scroll).
+        // Но на всякий случай проверяем оба варианта.
+        const scrollTarget = findScrollTarget(targetEl);
+
+        if (scrollTarget === window || scrollTarget === document.documentElement) {
+            // Скроллим окно
+            const rect = targetEl.getBoundingClientRect();
+            const targetScrollY = window.scrollY + rect.top - window.innerHeight * 0.3;
+
+            window.scrollTo({
+                top: Math.max(0, targetScrollY),
+                behavior: 'smooth',
+            });
+        } else {
+            // Скроллим внутренний контейнер
+            const containerRect = scrollTarget.getBoundingClientRect();
+            const targetRect = targetEl.getBoundingClientRect();
+            const targetScrollTop = scrollTarget.scrollTop
+                + (targetRect.top - containerRect.top)
+                - scrollTarget.clientHeight * 0.3;
+
+            scrollTarget.scrollTo({
+                top: Math.max(0, targetScrollTop),
+                behavior: 'smooth',
+            });
+        }
+
+        // Подсвечиваем целевой чат
+        setTimeout(() => {
+            targetEl.classList.add('uj-highlight');
+            setTimeout(() => targetEl.classList.remove('uj-highlight'), 1500);
+        }, 350);
+
+        // Снимаем блокировку через 800мс
+        setTimeout(() => {
+            UJ.isScrolling = false;
+            // После скролла — пересчитываем состояние (кнопка может исчезнуть)
+            requestAnimationFrame(updateButton);
+        }, 800);
+    }
+
+    // ─── Определяем, какой контейнер реально скроллится ───
+    function findScrollTarget(element) {
+        let el = element.parentElement;
+        while (el && el !== document.body) {
+            const style = getComputedStyle(el);
+            const overflowY = style.overflowY;
+            if ((overflowY === 'auto' || overflowY === 'scroll')
+                && el.scrollHeight > el.clientHeight + 5) {
+                return el;
+            }
+            el = el.parentElement;
+        }
+        return window;
+    }
+
+    // ─── Стиль подсветки целевого чата ───
+    if (!document.getElementById('unreadJumpHighlightStyles')) {
+        const style = document.createElement('style');
+        style.id = 'unreadJumpHighlightStyles';
+        style.textContent = `
+            .chat-list-item.uj-highlight {
+                animation: ujHighlight 1.4s cubic-bezier(0.22, 0.61, 0.36, 1);
+            }
+            @keyframes ujHighlight {
+                0% {
+                    box-shadow:
+                        0 0 0 0 rgba(108, 92, 231, 1),
+                        0 0 0 0 rgba(108, 92, 231, 0.6),
+                        0 0 30px 8px rgba(108, 92, 231, 0.5);
+                    transform: scale(1.015);
+                }
+                40% {
+                    box-shadow:
+                        0 0 0 3px rgba(108, 92, 231, 0.9),
+                        0 0 0 8px rgba(108, 92, 231, 0.35),
+                        0 0 24px 6px rgba(108, 92, 231, 0.4);
+                }
+                100% {
+                    box-shadow: none;
+                    transform: scale(1);
+                }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОБНОВЛЕНИЕ СОСТОЯНИЯ КНОПКИ
+    //  Определяем: есть ли непрочитанные чаты, и все ли они
+    //  в зоне видимости. Если хоть один вне — показываем кнопку.
+    // ═══════════════════════════════════════════════════════════
+    function updateButton() {
+        // Только на экране чатов
+        if (typeof state === 'undefined'
+            || state.currentScreen !== 'chats'
+            || !state.isAuthorized) {
+            hideButton();
+            return;
+        }
+
+        const container = document.getElementById('chatsList');
+        if (!container) {
+            hideButton();
+            return;
+        }
+
+        // Собираем все непрочитанные чаты
+        const unreadItems = container.querySelectorAll(
+            '.chat-list-item.has-unread'
+        );
+
+        if (unreadItems.length === 0) {
+            hideButton();
+            return;
+        }
+
+        // Проверяем: все ли они в зоне видимости?
+        // Находим первый «вне видимости» (сверху или снизу)
+        const scrollTarget = findScrollTarget(container.querySelector('.chat-list-item') || container);
+        const viewport = getViewportBounds(scrollTarget);
+
+        let firstOffscreen = null;
+        let offscreenCount = 0;
+
+        unreadItems.forEach(el => {
+            const rect = el.getBoundingClientRect();
+            const isVisible = rect.bottom > viewport.top + 5
+                && rect.top < viewport.bottom - 5;
+
+            if (!isVisible) {
+                offscreenCount++;
+                // Запоминаем первый вне видимости (приоритет — тот что ниже)
+                if (!firstOffscreen || rect.top > viewport.top) {
+                    firstOffscreen = el;
+                }
+            }
+        });
+
+        if (offscreenCount === 0 || !firstOffscreen) {
+            hideButton();
+            return;
+        }
+
+        // Показываем кнопку
+        UJ.unreadCount = offscreenCount;
+        UJ.targetFile = firstOffscreen.dataset.file;
+
+        showButton(offscreenCount);
+    }
+
+    // ─── Получаем границы видимой области ───
+    function getViewportBounds(scrollTarget) {
+        if (scrollTarget === window || scrollTarget === document.documentElement) {
+            return {
+                top: 0,
+                bottom: window.innerHeight,
+            };
+        }
+        const rect = scrollTarget.getBoundingClientRect();
+        return {
+            top: rect.top,
+            bottom: rect.bottom,
+        };
+    }
+
+    // ─── Показать / скрыть ───
+    function showButton(count) {
+        const btn = ensureButton();
+        const countEl = btn.querySelector('#ujCount');
+
+        if (countEl) {
+            countEl.textContent = count > 99 ? '99+' : String(count);
+        }
+
+        if (!btn.classList.contains('show')) {
+            btn.classList.add('show');
+            console.log(`⬇️ [UnreadJump] Показана (непрочитанных вне экрана: ${count})`);
+        }
+    }
+
+    function hideButton() {
+        if (!UJ.btnEl) return;
+        if (UJ.btnEl.classList.contains('show')) {
+            UJ.btnEl.classList.remove('show');
+            console.log('⬇️ [UnreadJump] Скрыта');
+        }
+        UJ.unreadCount = 0;
+        UJ.targetFile = null;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СЛУШАТЕЛИ СОБЫТИЙ
+    // ═══════════════════════════════════════════════════════════
+
+    // ─── 1. Скролл — основное событие ───
+    // Слушаем скролл на window и на внутренних контейнерах
+    let _scrollRaf = null;
+    function onScroll() {
+        if (_scrollRaf) return;
+        _scrollRaf = requestAnimationFrame(() => {
+            _scrollRaf = null;
+            updateButton();
+        });
+    }
+
+    window.addEventListener('scroll', onScroll, { passive: true });
+    document.addEventListener('scroll', onScroll, { passive: true, capture: true });
+
+    // ─── 2. Resize — пересчитываем границы ───
+    let _resizeTimer = null;
+    window.addEventListener('resize', () => {
+        if (_resizeTimer) clearTimeout(_resizeTimer);
+        _resizeTimer = setTimeout(updateButton, 200);
+    });
+
+    // ─── 3. Изменения в списке чатов (новые непрочитанные) ───
+    // Наблюдаем за мутациями в контейнере
+    function startObservers() {
+        const container = document.getElementById('chatsList');
+        if (!container) {
+            setTimeout(startObservers, 500);
+            return;
+        }
+
+        const observer = new MutationObserver(() => {
+            // Дебаунсим — не чаще раза в 100 мс
+            if (observer._timer) clearTimeout(observer._timer);
+            observer._timer = setTimeout(updateButton, 100);
+        });
+
+        observer.observe(container, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['class'],
+        });
+
+        console.log('⬇️ [UnreadJump] MutationObserver запущен');
+    }
+    startObservers();
+
+    // ─── 4. Периодическая проверка — страховка ───
+    setInterval(() => {
+        if (typeof state === 'undefined') return;
+        if (state.currentScreen !== 'chats') return;
+        updateButton();
+    }, 2000);
+
+    // ─── 5. При переключении экранов — прячем/показываем ───
+    if (typeof showChatsScreen === 'function') {
+        const _origShowChats = showChatsScreen;
+        showChatsScreen = function() {
+            const r = _origShowChats.apply(this, arguments);
+            // Даём DOM отрисоваться
+            setTimeout(updateButton, 300);
+            setTimeout(updateButton, 800);
+            return r;
+        };
+    }
+
+    if (typeof showChatScreen === 'function') {
+        const _origShowChat = showChatScreen;
+        showChatScreen = function() {
+            hideButton();
+            return _origShowChat.apply(this, arguments);
+        };
+    }
+
+    if (typeof showAuthScreen === 'function') {
+        const _origShowAuth = showAuthScreen;
+        showAuthScreen = function() {
+            hideButton();
+            return _origShowAuth.apply(this, arguments);
+        };
+    }
+
+    // ─── 6. При открытии чата — прячем кнопку ───
+    if (typeof enterChat === 'function') {
+        const _origEnterChat = enterChat;
+        enterChat = async function(...args) {
+            hideButton();
+            return _origEnterChat.apply(this, arguments);
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  АВТОЗАПУСК
+    // ═══════════════════════════════════════════════════════════
+    setTimeout(updateButton, 1500);
+    setTimeout(updateButton, 3500);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API
+    // ═══════════════════════════════════════════════════════════
+    window.UnreadJump = {
+        // Вручную обновить состояние кнопки
+        refresh: () => updateButton(),
+
+        // Показать / скрыть принудительно
+        show: () => showButton(UJ.unreadCount || 1),
+        hide: () => hideButton(),
+
+        // Программный прыжок (без клика)
+        jump: () => {
+            if (UJ.targetFile && UJ.btnEl && UJ.btnEl.classList.contains('show')) {
+                handleClick({ stopPropagation: () => {}, preventDefault: () => {} });
+            }
+        },
+
+        // Статус
+        status: () => ({
+            visible: UJ.btnEl ? UJ.btnEl.classList.contains('show') : false,
+            unreadCount: UJ.unreadCount,
+            targetFile: UJ.targetFile,
+            isScrolling: UJ.isScrolling,
+        }),
+    };
+
+    console.log('⬇️ [UnreadJump] Готово:');
+    console.log('   • Кнопка «↓» появляется, если непрочитанные вне экрана');
+    console.log('   • По клику — плавный скролл + подсветка');
+    console.log('   • Автоматически исчезает, когда все видимы');
+    console.log('   • API: UnreadJump.status() / .refresh() / .jump()');
+})();
+
 </script>
 </body>
 </html>
