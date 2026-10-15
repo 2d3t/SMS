@@ -56266,53 +56266,61 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  3. Обработчик клика: сброс кэша + запрос новых данных
-    // ═══════════════════════════════════════════════════════════
-    async function refreshWeatherManually(btn, card) {
-        // Защита от повторного клика
-        if (btn.classList.contains('loading')) return;
+//  3. Обработчик клика: сброс кэша + запрос новых данных
+//     БЕЗ тостов — только визуальная анимация кнопки
+// ═══════════════════════════════════════════════════════════
+async function refreshWeatherManually(btn, card) {
+    if (btn.classList.contains('loading')) return;
 
-        console.log('🔄 [WeatherRefresh] Ручное обновление погоды');
+    console.log('🔄 [WeatherRefresh] Ручное обновление погоды');
 
-        // Визуальный отклик
-        btn.classList.add('loading');
-        if (card) card.classList.add('refreshing');
-        if (navigator.vibrate) navigator.vibrate(15);
+    // Визуальный отклик
+    btn.classList.add('loading');
+    if (card) card.classList.add('refreshing');
+    if (navigator.vibrate) navigator.vibrate(15);
 
-        try {
-            // ─── 1. Очищаем кэш геолокации и погоды ───
-            if (typeof WeatherWidget !== 'undefined') {
-                // Используем публичный API refresh(), если он есть
-                if (typeof WeatherWidget.refresh === 'function') {
-                    await WeatherWidget.refresh();
-                } else {
-                    // Fallback: чистим кэш вручную через localStorage
-                    clearWeatherCacheManually();
+    // Минимальное время показа анимации — чтобы даже при мгновенном
+    // ответе пользователь увидел, что «что-то произошло»
+    const minSpinMs = 800;
+    const startTs = Date.now();
+
+    try {
+        // ─── 1. Сброс кэша + запуск обновления ───
+        if (typeof WeatherWidget !== 'undefined'
+            && typeof WeatherWidget.refresh === 'function') {
+            try {
+                const result = WeatherWidget.refresh();
+                if (result && typeof result.then === 'function') {
+                    await result;
                 }
-            } else {
-                // Если API нет — чистим localStorage напрямую
-                clearWeatherCacheManually();
+            } catch (e) {
+                // Тихо игнорируем — данные всё равно обновятся в фоне
+                console.warn('🔄 [WeatherRefresh] refresh() threw:', e);
             }
-
-            // ─── 2. Даём время на обновление ───
-            // WeatherWidget.refresh запускает асинхронную загрузку в фоне.
-            // Нам нужно дождаться, когда DOM обновится.
-            await waitForWeatherUpdate(weatherCard);
-
-            showToast('✅ Погода обновлена', 1500);
-            if (typeof soundManager !== 'undefined') {
-                try { soundManager.play('send'); } catch (err) {}
-            }
-
-        } catch (err) {
-            console.error('🔄 [WeatherRefresh] Ошибка:', err);
-            showToast('❌ Не удалось обновить', 2500);
-        } finally {
-            btn.classList.remove('loading');
-            if (card) card.classList.remove('refreshing');
+        } else {
+            // Fallback: очищаем кэш вручную
+            clearWeatherCacheManually();
         }
-    }
 
+        // ─── 2. Небольшая пауза — пусть анимация «доиграет» ───
+        const elapsed = Date.now() - startTs;
+        if (elapsed < minSpinMs) {
+            await new Promise(r => setTimeout(r, minSpinMs - elapsed));
+        }
+
+        // ─── 3. Один короткий звук в момент завершения (без тоста) ───
+        if (typeof soundManager !== 'undefined') {
+            try { soundManager.play('click'); } catch (e) {}
+        }
+
+    } catch (err) {
+        // Даже на ошибке не показываем тост — просто логируем
+        console.warn('🔄 [WeatherRefresh] Ошибка:', err);
+    } finally {
+        btn.classList.remove('loading');
+        if (card) card.classList.remove('refreshing');
+    }
+}
     // ─── Fallback: очистка кэша вручную ───
     function clearWeatherCacheManually() {
         try {
@@ -56455,88 +56463,6 @@ async function saveFile(token, owner, repo, path, content, sha, opts = {}) {
     console.log('   • Клик → сброс кэша + перезапрос геолокации и погоды');
     console.log('   • API: WeatherRefresh.trigger() / .clearCache()');
 })();
-
-// ═══════════════════════════════════════════════════════════
-//  3. Обработчик клика: сброс кэша + запрос новых данных
-//     ИСПРАВЛЕНО: не показываем ошибку, если данные обновились
-// ═══════════════════════════════════════════════════════════
-async function refreshWeatherManually(btn, card) {
-    if (btn.classList.contains('loading')) return;
-
-    console.log('🔄 [WeatherRefresh] Ручное обновление погоды');
-
-    btn.classList.add('loading');
-    if (card) card.classList.add('refreshing');
-    if (navigator.vibrate) navigator.vibrate(15);
-
-    // ─── Запоминаем старую температуру для сравнения ───
-    const oldTemp = card
-        ? (card.querySelector('.wc-weather-temp')?.textContent || '')
-        : '';
-    const oldCity = card
-        ? (card.querySelector('.wc-title')?.textContent || '')
-        : '';
-
-    let refreshError = null;
-
-    // ─── 1. Пробуем сбросить кэш и запустить обновление ───
-    //      ВСЕГДА через try/catch, чтобы ошибка не валила всё
-    try {
-        if (typeof WeatherWidget !== 'undefined') {
-            if (typeof WeatherWidget.refresh === 'function') {
-                try {
-                    // Может вернуть Promise, может не вернуть — не важно
-                    const result = WeatherWidget.refresh();
-                    if (result && typeof result.then === 'function') {
-                        await result;
-                    }
-                } catch (e) {
-                    refreshError = e;
-                    console.warn('🔄 [WeatherRefresh] refresh() выбросил:', e);
-                }
-            } else {
-                clearWeatherCacheManually();
-            }
-        } else {
-            clearWeatherCacheManually();
-        }
-    } catch (e) {
-        refreshError = e;
-        console.warn('🔄 [WeatherRefresh] Внешняя ошибка:', e);
-    }
-
-    // ─── 2. Ждём обновления DOM ───
-    //      ВАЖНО: даже если refreshError был — всё равно ждём,
-    //      потому что данные могли реально обновиться
-    let updated = false;
-    try {
-        updated = await waitForWeatherUpdate(card, oldTemp, oldCity);
-    } catch (e) {
-        console.warn('🔄 [WeatherRefresh] waitForWeatherUpdate failed:', e);
-    }
-
-    // ─── 3. Решаем, что показать ───
-    //      Логика: смотрим на РЕАЛЬНЫЙ результат, а не на ошибку
-    if (updated) {
-        showToast('✅ Погода обновлена', 1500);
-        if (typeof soundManager !== 'undefined') {
-            try { soundManager.play('send'); } catch (err) {}
-        }
-        // Даже если refreshError был — раз данные обновились,
-        // значит всё ок. Не пугаем пользователя.
-    } else if (refreshError) {
-        // Данные НЕ обновились И была ошибка — сообщаем
-        showToast('❌ Не удалось обновить', 2500);
-    } else {
-        // Ошибки нет, но и явного обновления не увидели —
-        // возможно данные те же. Скажем мягко.
-        showToast('✅ Данные актуальны', 1500);
-    }
-
-    btn.classList.remove('loading');
-    if (card) card.classList.remove('refreshing');
-}
-
 </script>
 </body>
 </html>
