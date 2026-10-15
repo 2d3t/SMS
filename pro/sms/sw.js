@@ -1,5 +1,5 @@
 // sw.js - Универсальный кеш + уведомления
-const CACHE_NAME = 'sms-pwa-v5-weatherok';
+const CACHE_NAME = 'sms-pwa-v5-weatheroknezasypaet';
 
 const FILES_TO_CACHE = [
     '/SMS/pro/sms/index.html',
