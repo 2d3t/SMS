@@ -57981,6 +57981,266 @@ async function refreshWeatherManually(btn, card) {
     console.log('   • API: AudioDucking.status() / .test() / .setVolume(20)');
     console.log('   • UI настроек: в модалке «🧩 Виджеты»');
 })();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🩹 ФИКС: СКРОЛЛ СПИСКА СТАНЦИЙ В ВИДЖЕТЕ РАДИО
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: при скролле списка станций вниз, позиция скролла
+//  сбрасывается из-за перерисовки карточки (поллинг, обновления).
+//
+//  Решение:
+//   1. Сохраняем позицию скролла ПЕРЕД любой перерисовкой
+//   2. Восстанавливаем её ПОСЛЕ
+//   3. Блокируем перерисовку пока пользователь скроллит
+// ═══════════════════════════════════════════════════════════════
+
+(function fixRadioScrollPreservation() {
+    'use strict';
+
+    console.log('🩹 [RadioScrollFix] Установка…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОСТОЯНИЕ
+    // ═══════════════════════════════════════════════════════════
+    const SCROLL_FIX = {
+        // Сохранённая позиция скролла списка станций
+        savedScrollTop: 0,
+        // Флаг: пользователь сейчас скроллит список
+        isUserScrolling: false,
+        // Таймер для снятия флага
+        scrollEndTimer: null,
+        // Флаг: идёт восстановление скролла
+        isRestoring: false,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  1. СЛЕДИМ ЗА СКРОЛЛОМ СПИСКА СТАНЦИЙ
+    // ═══════════════════════════════════════════════════════════
+    function attachScrollListener() {
+        const container = document.getElementById('chatsList');
+        if (!container) {
+            setTimeout(attachScrollListener, 500);
+            return;
+        }
+
+        // Делегированный слушатель скролла
+        container.addEventListener('scroll', (e) => {
+            const target = e.target;
+            if (!target.classList || !target.classList.contains('wc-radio-list-scroll')) {
+                return;
+            }
+
+            // Запоминаем позицию
+            SCROLL_FIX.savedScrollTop = target.scrollTop;
+            SCROLL_FIX.isUserScrolling = true;
+
+            // Снимаем флаг через 500мс после последнего скролла
+            if (SCROLL_FIX.scrollEndTimer) {
+                clearTimeout(SCROLL_FIX.scrollEndTimer);
+            }
+            SCROLL_FIX.scrollEndTimer = setTimeout(() => {
+                SCROLL_FIX.isUserScrolling = false;
+                SCROLL_FIX.scrollEndTimer = null;
+            }, 500);
+        }, { passive: true, capture: true });  // capture: true — ловим до всплытия
+
+        console.log('🩹 [RadioScrollFix] Слушатель скролла установлен');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  2. ФУНКЦИЯ ВОССТАНОВЛЕНИЯ СКРОЛЛА
+    // ═══════════════════════════════════════════════════════════
+    function restoreScrollPosition() {
+        if (SCROLL_FIX.savedScrollTop <= 0) return;
+        if (SCROLL_FIX.isRestoring) return;
+
+        const container = document.getElementById('chatsList');
+        if (!container) return;
+
+        const scrollEl = container.querySelector('.wc-radio-list-scroll');
+        if (!scrollEl) return;
+
+        if (scrollEl.scrollTop !== SCROLL_FIX.savedScrollTop) {
+            SCROLL_FIX.isRestoring = true;
+            scrollEl.scrollTop = SCROLL_FIX.savedScrollTop;
+            console.log(`🩹 [RadioScrollFix] Восстановлен скролл: ${SCROLL_FIX.savedScrollTop}`);
+
+            requestAnimationFrame(() => {
+                SCROLL_FIX.isRestoring = false;
+            });
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. НАБЛЮДАЕМ ЗА ПЕРЕРИСОВКОЙ КАРТОЧКИ
+    // ═══════════════════════════════════════════════════════════
+    let _restoreScheduled = false;
+
+    function scheduleRestore() {
+        if (_restoreScheduled) return;
+        _restoreScheduled = true;
+
+        // Восстанавливаем через rAF и с небольшой задержкой
+        requestAnimationFrame(() => {
+            _restoreScheduled = false;
+            restoreScrollPosition();
+        });
+
+        // Дополнительная страховка — через 50мс
+        setTimeout(restoreScrollPosition, 50);
+    }
+
+    const observer = new MutationObserver((mutations) => {
+        // Проверяем, изменилась ли карточка радио
+        for (const mut of mutations) {
+            for (const node of mut.addedNodes) {
+                if (node.nodeType !== 1) continue;
+
+                // Если добавилась карточка радио или её часть
+                if (node.classList && (
+                    node.classList.contains('widget-card') &&
+                    node.classList.contains('radio')
+                )) {
+                    scheduleRestore();
+                    return;
+                }
+
+                if (node.querySelector && node.querySelector('.wc-radio-list-scroll')) {
+                    scheduleRestore();
+                    return;
+                }
+            }
+
+            // Если изменился сам список скролла
+            if (mut.target && mut.target.classList &&
+                mut.target.classList.contains('wc-radio-list-scroll')) {
+                scheduleRestore();
+                return;
+            }
+        }
+    });
+
+    function startObserver() {
+        const container = document.getElementById('chatsList');
+        if (!container) {
+            setTimeout(startObserver, 500);
+            return;
+        }
+        observer.observe(container, {
+            childList: true,
+            subtree: true,
+        });
+        console.log('🩹 [RadioScrollFix] MutationObserver запущен');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  4. ПАТЧ renderRadioCard — сохраняем скролл перед перерисовкой
+    // ═══════════════════════════════════════════════════════════
+
+    // Перехватываем через хук на innerHTML #chatsList
+    // (это уже пропатчено в других модулях, поэтому добавляем свой слой)
+
+    const _origRenderChatsList = window.renderChatsList;
+
+    window.renderChatsList = function() {
+        // Запоминаем скролл ПЕРЕД перерисовкой
+        const container = document.getElementById('chatsList');
+        if (container) {
+            const scrollEl = container.querySelector('.wc-radio-list-scroll');
+            if (scrollEl && scrollEl.scrollTop > 0) {
+                SCROLL_FIX.savedScrollTop = scrollEl.scrollTop;
+            }
+        }
+
+        // Вызываем оригинал
+        const result = _origRenderChatsList.apply(this, arguments);
+
+        // Восстанавливаем скролл ПОСЛЕ
+        if (SCROLL_FIX.savedScrollTop > 0) {
+            requestAnimationFrame(() => {
+                restoreScrollPosition();
+            });
+            // И ещё раз с задержкой
+            setTimeout(restoreScrollPosition, 100);
+            setTimeout(restoreScrollPosition, 300);
+        }
+
+        return result;
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  5. БЛОКИРУЕМ ПЕРЕРИСОВКУ ПОКА ПОЛЬЗОВАТЕЛЬ СКРОЛЛИТ
+    // ═══════════════════════════════════════════════════════════
+
+    // Патчим refreshUnreadBadges — самый частый источник перерисовок
+    if (typeof refreshUnreadBadges === 'function') {
+        const _origRefresh = refreshUnreadBadges;
+        refreshUnreadBadges = async function() {
+            // Если пользователь скроллит список станций — пропускаем
+            if (SCROLL_FIX.isUserScrolling) {
+                console.log('🩹 [RadioScrollFix] refreshUnreadBadges отложен (идёт скролл)');
+                return;
+            }
+            return _origRefresh.apply(this, arguments);
+        };
+    }
+
+    // Патч для MutationObserver внутри RadioWidget v3
+    // (он вызывает renderRadioCard при некоторых событиях)
+    // Это уже покрыто через renderChatsList патч выше
+
+    // ═══════════════════════════════════════════════════════════
+    //  6. ТАКЖЕ ПАТЧИМ GLOBAL PLAYER SYNC
+    //  Он тоже может триггерить перерисовку
+    // ═══════════════════════════════════════════════════════════
+    if (typeof syncInlineWithGlobal === 'function') {
+        const _origSync = syncInlineWithGlobal;
+        window.syncInlineWithGlobal = function() {
+            if (SCROLL_FIX.isUserScrolling) return;
+            return _origSync.apply(this, arguments);
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  7. ПУБЛИЧНОЕ API
+    // ═══════════════════════════════════════════════════════════
+    window.RadioScrollFix = {
+        status: () => ({
+            savedScrollTop: SCROLL_FIX.savedScrollTop,
+            isUserScrolling: SCROLL_FIX.isUserScrolling,
+            isRestoring: SCROLL_FIX.isRestoring,
+        }),
+        save: () => {
+            const container = document.getElementById('chatsList');
+            if (!container) return;
+            const scrollEl = container.querySelector('.wc-radio-list-scroll');
+            if (scrollEl) {
+                SCROLL_FIX.savedScrollTop = scrollEl.scrollTop;
+                console.log(`🩹 [RadioScrollFix] Сохранено: ${SCROLL_FIX.savedScrollTop}`);
+            }
+        },
+        restore: () => restoreScrollPosition(),
+        reset: () => {
+            SCROLL_FIX.savedScrollTop = 0;
+            SCROLL_FIX.isUserScrolling = false;
+            SCROLL_FIX.isRestoring = false;
+        },
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЗАПУСК
+    // ═══════════════════════════════════════════════════════════
+    attachScrollListener();
+    startObserver();
+
+    console.log('🩹 [RadioScrollFix] Готово:');
+    console.log('   • Скролл списка станций сохраняется при перерисовке');
+    console.log('   • Перерисовка блокируется во время скролла');
+    console.log('   • API: RadioScrollFix.status()');
+})();
+
+
 </script>
 
 
