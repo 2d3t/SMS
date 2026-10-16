@@ -58243,6 +58243,323 @@ async function refreshWeatherManually(btn, card) {
 
 </script>
 
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🩹 ФИКС: СООБЩЕНИЯ С ПРИГЛАШЕНИЕМ ВИДНЫ В СПИСКЕ ЧАТОВ
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: когда приходит .smschat-файл, checkUnreadForAllChats
+//  может не увидеть его как "чужое непрочитанное", потому что:
+//   1. Расшифровка упала (нет ключа чата у получателя)
+//   2. Сообщение содержит только file, без text
+//   3. Какой-то из многих патчей checkUnread перезаписал логику
+//
+//  Решение: упрощённая финальная версия checkUnreadForAllChats,
+//  которая для чатов, где мы недавно получили meta-изменение,
+//  ставит флаг непрочитанного БЕЗ глубокой расшифровки.
+// ═══════════════════════════════════════════════════════════════
+
+(function fixInviteMessagesInChatList() {
+    'use strict';
+
+    console.log('🩹 [InviteFix] Установка…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  УПРОЩЁННАЯ ПРОВЕРКА НЕПРОЧИТАННЫХ
+    //  ────────────────────────────────────────────────────────
+    //  Ключевая идея: не пытаться расшифровать каждое сообщение,
+    //  а просто сравнить meta.json.version с lastReadId.
+    //  Если version > lastReadId — есть что-то новое.
+    //
+    //  Это менее точно (своё сообщение тоже даст +1), но зато
+    //  НАДЁЖНО. И это компенсируется тем, что при входе в чат
+    //  lastReadId синхронизируется.
+    // ═══════════════════════════════════════════════════════════
+    checkUnreadForAllChats = async function() {
+        const result = {};
+        const now = Date.now();
+
+        // Чаты, из которых только что вышли — игнорируем
+        const excludedFiles = new Set();
+        try {
+            if (typeof FIX !== 'undefined' && FIX.recentlyExited) {
+                FIX.recentlyExited.forEach((exitTs, file) => {
+                    if (now - exitTs < 8000) excludedFiles.add(file);
+                });
+            }
+        } catch (e) {}
+
+        const tasks = state.chats.map(async (chat) => {
+            const file = chat.file;
+            if (excludedFiles.has(file)) return;
+
+            try {
+                const cachedEtag = state._metaEtagsByFile[file] || null;
+                let metaRes;
+                try {
+                    metaRes = await fetchMetaFast(file, cachedEtag);
+                } catch (e) {
+                    // Сеть упала — сохраняем что было
+                    if (chat.hasUnread) {
+                        result[file] = { hasUnread: true, count: chat.unreadCount || 0 };
+                    }
+                    return;
+                }
+
+                if (metaRes.notModified) {
+                    if (chat.hasUnread) {
+                        result[file] = { hasUnread: true, count: chat.unreadCount || 0 };
+                    }
+                    return;
+                }
+
+                if (!metaRes.exists) {
+                    state._metaEtagsByFile[file] = null;
+                    return;
+                }
+
+                state._metaEtagsByFile[file] = metaRes.etag || null;
+                const metaVersion = metaRes.content && metaRes.content.version;
+                if (!metaVersion) return;
+
+                chat._lastMetaVersion = metaVersion;
+                saveChatsList();
+
+                // Если последняя прочитанная версия >= версии meta —
+                // всё прочитано, ничего не помечаем
+                const lastReadId = getLastReadId(file);
+                if (lastReadId && metaVersion <= lastReadId) {
+                    return;
+                }
+
+                // 🆕 Есть что-то новое. Помечаем как непрочитанное.
+                // Не пытаемся расшифровывать — это слишком ненадёжно
+                // (может не быть ключа, может быть ошибка сети и т.д.)
+                //
+                // Также не считаем точное количество — показываем
+                // минимум «•» (точку-бейдж), что уже привлекает внимание.
+                const prevCount = chat._lastMetaVersion
+                    ? (chat.unreadCount || 0)
+                    : 1;
+
+                // Пробуем получить реальное количество через содержимое
+                // (если можем) — но не обязательно
+                let count = 1;
+                try {
+                    const password = state.savedPasswords[file];
+                    if (password) {
+                        const path = getChatPath(file);
+                        const chatData = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
+                        if (chatData && chatData.exists && chatData.content) {
+                            const encMessages = chatData.content.messages || [];
+                            let unread = 0;
+                            for (const enc of encMessages) {
+                                if (!lastReadId || enc.id > lastReadId) unread++;
+                            }
+                            if (unread > 0) count = unread;
+                        }
+                    }
+                } catch (e) {
+                    // Не смогли посчитать — оставляем 1
+                }
+
+                result[file] = { hasUnread: true, count };
+
+            } catch (e) {
+                console.warn('🩹 [InviteFix] checkUnread error для', file, e.message);
+                if (chat.hasUnread) {
+                    result[file] = { hasUnread: true, count: chat.unreadCount || 0 };
+                }
+            }
+        });
+
+        await Promise.all(tasks);
+        return result;
+    };
+
+    console.log('🩹 [InviteFix] checkUnreadForAllChats упрощён:');
+    console.log('   • Не пытается расшифровать каждое сообщение');
+    console.log('   • Сравнивает meta.version с lastReadId напрямую');
+    console.log('   • Считает количество через файл чата (если есть пароль)');
+    console.log('   • Надёжно ловит .smschat-приглашения');
+})();
+</script>
+
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🩹 ФИКС: КАРТОЧКА ПРИГЛАШЕНИЯ НЕ ВЫЛЕЗАЕТ ЗА ЭКРАН
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: .invite-card имеет min-width: 240px, но
+//  .message-wrapper на мобиле может быть уже — из-за чего
+//  карточка выходит за пределы bubble и за экран.
+//
+//  Решение:
+//   1. Убрать min-width, задать width: 100% и max-width: 100%
+//   2. Сделать более компактный layout на мобиле
+//   3. Уменьшить иконку и паддинги
+//   4. Убрать overflow и flex-wrap
+// ═══════════════════════════════════════════════════════════════
+
+(function fixInviteCardLayout() {
+    'use strict';
+
+    console.log('🩹 [InviteCardFix] Установка…');
+
+    const style = document.createElement('style');
+    style.id = 'inviteCardFixStyles';
+    style.textContent = `
+        /* ═══════════════════════════════════════════════════
+           Базовая карточка: адаптивная, без вылезания
+           ═══════════════════════════════════════════════════ */
+        .invite-card {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 12px 14px;
+            margin: 6px 0 4px;
+
+            /* 🆕 Главное: адаптивная ширина вместо фиксированной */
+            width: 100%;
+            max-width: 100%;
+            min-width: 0;         /* ← сбрасываем min-width */
+            box-sizing: border-box;
+
+            background: linear-gradient(135deg,
+                rgba(108, 92, 231, 0.18),
+                rgba(0, 184, 148, 0.12));
+            border: 1px solid rgba(108, 92, 231, 0.35);
+            border-radius: 14px;
+            cursor: pointer;
+            transition: all 0.18s ease;
+            position: relative;
+            overflow: hidden;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        .invite-card:hover {
+            background: linear-gradient(135deg,
+                rgba(108, 92, 231, 0.28),
+                rgba(0, 184, 148, 0.18));
+            border-color: rgba(108, 92, 231, 0.55);
+            transform: translateY(-1px);
+            box-shadow: 0 4px 18px rgba(108, 92, 231, 0.25);
+        }
+
+        .invite-card:active {
+            transform: scale(0.98);
+        }
+
+        /* 🆕 Иконка — компактнее */
+        .invite-icon {
+            width: 38px;
+            height: 38px;
+            border-radius: 10px;
+            background: linear-gradient(135deg, #6c5ce7, #00b894);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+            flex-shrink: 0;
+            box-shadow: 0 3px 10px rgba(108, 92, 231, 0.35);
+        }
+
+        /* 🆕 Тело карточки — обрезает длинные имена */
+        .invite-body {
+            flex: 1;
+            min-width: 0;         /* ← важно для ellipsis внутри */
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            overflow: hidden;
+        }
+
+        .invite-title {
+            font-size: 10px;
+            font-weight: 600;
+            color: #a78bfa;
+            text-transform: uppercase;
+            letter-spacing: 0.4px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .invite-name {
+            font-size: 14px;
+            font-weight: 700;
+            color: #fff;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .invite-sub {
+            font-size: 10px;
+            color: rgba(255, 255, 255, 0.55);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        /* 🆕 Стрелка — компактнее */
+        .invite-arrow {
+            font-size: 18px;
+            color: rgba(255, 255, 255, 0.5);
+            flex-shrink: 0;
+            transition: transform 0.15s, color 0.15s;
+            margin-left: 2px;
+        }
+
+        .invite-card:hover .invite-arrow {
+            transform: translateX(2px);
+            color: #fff;
+        }
+
+        /* 🆕 Для own-сообщений — другой оттенок */
+        .message-wrapper.own .invite-card {
+            background: linear-gradient(135deg,
+                rgba(0, 0, 0, 0.35),
+                rgba(108, 92, 231, 0.2));
+            border-color: rgba(167, 139, 250, 0.5);
+        }
+
+        /* 🆕 На мобиле ещё компактнее */
+        @media (max-width: 480px) {
+            .invite-card {
+                padding: 10px 12px;
+                gap: 8px;
+            }
+            .invite-icon {
+                width: 34px;
+                height: 34px;
+                font-size: 16px;
+                border-radius: 9px;
+            }
+            .invite-title { font-size: 9px; }
+            .invite-name { font-size: 13px; }
+            .invite-sub { font-size: 9px; }
+            .invite-arrow { font-size: 16px; }
+        }
+
+        /* 🆕 На очень узких экранах — прячем подпись */
+        @media (max-width: 360px) {
+            .invite-sub { display: none; }
+        }
+
+        /* 🆕 Если карточка внутри сообщения с текстом —
+              чуть отступаем сверху */
+        .message .text + .invite-card,
+        .message .text + * + .invite-card {
+            margin-top: 8px;
+        }
+    `;
+    document.head.appendChild(style);
+
+    console.log('🩹 [InviteCardFix] Стили установлены:');
+    console.log('   • min-width убран, добавлен width: 100%');
+    console.log('   • Все текстовые поля получили text-overflow: ellipsis');
+    console.log('   • Компактные размеры на мобиле');
+})();
+</script>
 
 </body>
 </html>
