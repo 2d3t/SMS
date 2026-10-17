@@ -62393,17 +62393,11 @@ async function refreshWeatherManually(btn, card) {
 
 // ═══════════════════════════════════════════════════════════════
 //  🌐 NOTIFIER URL — динамический адрес Flask с надёжной проверкой
-//  ─────────────────────────────────────────────────────────────
-//  • Загружает URL из notifier-url.json на GitHub
-//  • При сетевой ошибке → немедленно перечитывает с GitHub
-//  • Фоновая проверка раз в 2 минуты (если PWA открыто)
-//  • При смене URL — прозрачный retry запроса
 // ═══════════════════════════════════════════════════════════════
-
 const NotifierURL = (() => {
     'use strict';
 
-    // Замените на ваш репозиторий, если отличается
+    // ⚠️ Замените на ваш репозиторий, если отличается
     const RAW_URL = 'https://raw.githubusercontent.com/2d3t/SMS/main/notifier-url.json';
 
     const CACHE_KEY = 'smschat_notifier_url';
@@ -62452,11 +62446,8 @@ const NotifierURL = (() => {
     }
 
     async function get(force = false) {
-        if (!force && _current && (Date.now() - _lastFetch < CACHE_TTL_MS)) {
-            return _current;
-        }
+        if (!force && _current && (Date.now() - _lastFetch < CACHE_TTL_MS)) return _current;
         if (_pending) return _pending;
-
         _pending = (async () => {
             try {
                 const url = await fetchFromGitHub();
@@ -62470,14 +62461,9 @@ const NotifierURL = (() => {
                 _failures++;
                 console.warn(`🌐 [NotifierURL] Ошибка (${_failures}):`, e.message);
                 const cached = _current || loadCache();
-                if (cached) {
-                    _current = cached;
-                    return cached;
-                }
+                if (cached) { _current = cached; return cached; }
                 throw e;
-            } finally {
-                _pending = null;
-            }
+            } finally { _pending = null; }
         })();
         return _pending;
     }
@@ -62486,31 +62472,20 @@ const NotifierURL = (() => {
         try {
             const res = await fetchWithTimeout(`${url}/ping`, { cache: 'no-store' });
             return res.ok;
-        } catch (e) {
-            return false;
-        }
+        } catch (e) { return false; }
     }
 
     async function request(path, opts = {}) {
         let url = await get();
-
         try {
-            const res = await fetchWithTimeout(`${url}${path}`, opts);
-            return res;
+            return await fetchWithTimeout(`${url}${path}`, opts);
         } catch (e) {
-            console.warn(`🌐 [NotifierURL] Запрос ${path} упал:`, e.message);
-
-            // Пробуем перечитать URL
+            console.warn(`🌐 [NotifierURL] ${path} упал:`, e.message);
             let newUrl;
-            try {
-                newUrl = await get(true);
-            } catch (fetchErr) {
-                throw new Error(`URL refresh failed: ${fetchErr.message}`);
-            }
-
+            try { newUrl = await get(true); }
+            catch (fe) { throw new Error(`URL refresh failed: ${fe.message}`); }
             if (newUrl === url) throw e;
-
-            console.log(`🌐 [NotifierURL] URL сменился: ${url} → ${newUrl}, retry`);
+            console.log(`🌐 [NotifierURL] URL сменился, retry`);
             return await fetchWithTimeout(`${newUrl}${path}`, opts);
         }
     }
@@ -62520,11 +62495,10 @@ const NotifierURL = (() => {
         _pingTimer = setInterval(async () => {
             if (document.hidden) return;
             if (typeof state === 'undefined' || !state.isAuthorized) return;
-
             try {
                 const fresh = await fetchFromGitHub();
                 if (fresh !== _current) {
-                    console.log(`🌐 [NotifierURL] Фон: URL сменился ${_current} → ${fresh}`);
+                    console.log(`🌐 [NotifierURL] Фон: URL ${_current} → ${fresh}`);
                     _current = fresh;
                     _lastFetch = Date.now();
                     _failures = 0;
@@ -62535,9 +62509,7 @@ const NotifierURL = (() => {
                 if (!alive) {
                     console.warn('🌐 [NotifierURL] Фон: сервер не отвечает');
                     await get(true).catch(() => {});
-                } else {
-                    _failures = 0;
-                }
+                } else { _failures = 0; }
             } catch (e) {}
         }, PING_INTERVAL_MS);
     }
@@ -62546,9 +62518,7 @@ const NotifierURL = (() => {
         try { await get(false); } catch (e) {}
         startPing();
         document.addEventListener('visibilitychange', () => {
-            if (!document.hidden && state.isAuthorized) {
-                get(true).catch(() => {});
-            }
+            if (!document.hidden && state.isAuthorized) get(true).catch(() => {});
         });
     }
 
@@ -62569,8 +62539,203 @@ const NotifierURL = (() => {
     };
 })();
 
+
 // ═══════════════════════════════════════════════════════════════
-//  🔗 mark-read через NotifierURL
+//  🔔 WEB PUSH — подписка и регистрация SW
+// ═══════════════════════════════════════════════════════════════
+(function installWebPush() {
+    'use strict';
+
+    const PUSH = { reg: null, sub: null, done: false };
+
+    function urlBase64ToUint8Array(b64) {
+        const padding = '='.repeat((4 - b64.length % 4) % 4);
+        const base64 = (b64 + padding).replace(/-/g, '+').replace(/_/g, '/');
+        const raw = atob(base64);
+        const out = new Uint8Array(raw.length);
+        for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+        return out;
+    }
+
+    async function subscribe() {
+        try {
+            const perm = await Notification.requestPermission();
+            if (perm !== 'granted') {
+                console.log('🔔 [Push] пользователь отказал');
+                return false;
+            }
+
+            // VAPID public key с Flask
+            const keyRes = await NotifierURL.request('/vapid-public');
+            if (!keyRes.ok) throw new Error(`vapid: ${keyRes.status}`);
+            const { key } = await keyRes.json();
+
+            PUSH.sub = await PUSH.reg.pushManager.subscribe({
+                userVisibleOnly: true,
+                applicationServerKey: urlBase64ToUint8Array(key),
+            });
+
+            // Отправляем подписку в Flask
+            const subRes = await NotifierURL.request('/subscribe', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(PUSH.sub),
+            });
+            if (subRes.ok) {
+                const d = await subRes.json();
+                console.log(`🔔 [Push] подписка сохранена (всего: ${d.count})`);
+            }
+            return true;
+        } catch (e) {
+            console.warn('🔔 [Push] ошибка:', e);
+            return false;
+        }
+    }
+
+    async function init() {
+        if (PUSH.done) return;
+        if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+            console.log('🔔 [Push] не поддерживается');
+            return;
+        }
+
+        try {
+            PUSH.reg = await navigator.serviceWorker.register('/sw.js');
+            await navigator.serviceWorker.ready;
+            console.log('🔔 [Push] SW зарегистрирован');
+
+            const existing = await PUSH.reg.pushManager.getSubscription();
+            if (existing) {
+                PUSH.sub = existing;
+                // Переотправляем на сервер (вдруг он потерял)
+                try {
+                    await NotifierURL.request('/subscribe', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(existing),
+                    });
+                } catch (e) {}
+            } else if (Notification.permission === 'granted') {
+                await subscribe();
+            }
+
+            PUSH.done = true;
+        } catch (e) {
+            console.warn('🔔 [Push] init:', e);
+        }
+    }
+
+    // Спрашиваем разрешение через 3 минуты использования
+    setTimeout(() => {
+        if (Notification.permission === 'default' && !PUSH.sub) subscribe();
+    }, 3 * 60 * 1000);
+
+    // Или при первом клике по чату
+    document.addEventListener('click', function first(e) {
+        if (e.target.closest('.chat-list-item')) {
+            if (Notification.permission === 'default' && !PUSH.sub) subscribe();
+            document.removeEventListener('click', first);
+        }
+    }, { passive: true });
+
+    // Если URL сменился — переотправляем подписку
+    let _lastSentUrl = null;
+    setInterval(async () => {
+        if (!PUSH.sub) return;
+        const cur = NotifierURL.current();
+        if (cur && cur !== _lastSentUrl) {
+            _lastSentUrl = cur;
+            try {
+                await NotifierURL.request('/subscribe', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(PUSH.sub),
+                });
+                console.log('🔔 [Push] подписка переотправлена на новый URL');
+            } catch (e) {}
+        }
+    }, 3 * 60 * 1000);
+
+    if (document.readyState === 'complete') init();
+    else window.addEventListener('load', init);
+
+    window.SmsPush = {
+        init,
+        subscribe,
+        status: () => ({
+            swRegistered: !!PUSH.reg,
+            hasSubscription: !!PUSH.sub,
+            permission: Notification.permission,
+        }),
+    };
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  📤 SYNC CHATS — отправка списка чатов в Flask
+// ═══════════════════════════════════════════════════════════════
+(function installChatsSync() {
+    'use strict';
+
+    let _timer = null;
+    let _lastJson = null;
+
+    function collect() {
+        if (typeof state === 'undefined' || !Array.isArray(state.chats)) return [];
+        return state.chats.map(c => ({
+            file: c.file,
+            name: c.name || c.file,
+            password: (state.savedPasswords || {})[c.file] || '',
+        }));
+    }
+
+    async function sync(force = false) {
+        const chats = collect();
+        const json = JSON.stringify(chats);
+        if (!force && json === _lastJson) return;
+
+        try {
+            const res = await NotifierURL.request('/sync-chats', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ chats }),
+            });
+            if (res.ok) {
+                _lastJson = json;
+                const d = await res.json();
+                console.log(`📤 [SyncChats] ${d.count} чатов`);
+            }
+        } catch (e) {
+            console.warn('📤 [SyncChats]', e.message);
+        }
+    }
+
+    function schedule(delay = 1500, force = false) {
+        if (_timer) clearTimeout(_timer);
+        _timer = setTimeout(() => { _timer = null; sync(force); }, delay);
+    }
+
+    if (typeof saveChatsList === 'function') {
+        const _orig = saveChatsList;
+        saveChatsList = function() { const r = _orig.apply(this, arguments); schedule(); return r; };
+    }
+    if (typeof saveSavedPasswords === 'function') {
+        const _orig = saveSavedPasswords;
+        saveSavedPasswords = function() { const r = _orig.apply(this, arguments); schedule(); return r; };
+    }
+
+    setTimeout(() => { if (state.isAuthorized) sync(true); }, 5000);
+
+    document.addEventListener('visibilitychange', () => {
+        if (!document.hidden && state.isAuthorized) sync();
+    });
+
+    window.ChatsSync = { sync: () => sync(true) };
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🔔 MARK READ — сообщаем Flask, что чат прочитан
 // ═══════════════════════════════════════════════════════════════
 async function notifyMarkRead(chatFile, version) {
     if (!chatFile || !version || !state.isAuthorized) return;
@@ -62586,7 +62751,6 @@ async function notifyMarkRead(chatFile, version) {
     }
 }
 
-// Хук на markChatAsRead
 if (typeof markChatAsRead === 'function') {
     const _orig = markChatAsRead;
     markChatAsRead = function() {
@@ -62603,7 +62767,6 @@ if (typeof markChatAsRead === 'function') {
     };
 }
 
-// Хук на backToChats
 if (typeof backToChats === 'function') {
     const _orig = backToChats;
     backToChats = function() {
@@ -62623,17 +62786,10 @@ if (typeof backToChats === 'function') {
 window.NotifierURL = NotifierURL;
 window.notifyMarkRead = notifyMarkRead;
 
-console.log('🌐 [NotifierURL] Модуль установлен');
+console.log('🌐 [NotifierURL] + Push + Sync + MarkRead установлены');
 console.log('   • URL:', NotifierURL.current() || 'загружается...');
-console.log('   • Проверка: NotifierURL.status()');
-
-
+console.log('   • Проверка: NotifierURL.status(), SmsPush.status()');
 
 </script>
-
-
-
-
-
 </body>
 </html>
