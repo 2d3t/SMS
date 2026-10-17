@@ -62388,6 +62388,252 @@ async function refreshWeatherManually(btn, card) {
     console.log('   • Максимум кругов: ' + CFG.MAX_ROUNDS + ' (предохранитель)');
     console.log('   • API: RadioAutoRetry.status()');
 })();
+
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🌐 NOTIFIER URL — динамический адрес Flask с надёжной проверкой
+//  ─────────────────────────────────────────────────────────────
+//  • Загружает URL из notifier-url.json на GitHub
+//  • При сетевой ошибке → немедленно перечитывает с GitHub
+//  • Фоновая проверка раз в 2 минуты (если PWA открыто)
+//  • При смене URL — прозрачный retry запроса
+// ═══════════════════════════════════════════════════════════════
+
+const NotifierURL = (() => {
+    'use strict';
+
+    // Замените на ваш репозиторий, если отличается
+    const RAW_URL = 'https://raw.githubusercontent.com/2d3t/SMS/main/notifier-url.json';
+
+    const CACHE_KEY = 'smschat_notifier_url';
+    const CACHE_TTL_MS = 5 * 60 * 1000;
+    const PING_INTERVAL_MS = 2 * 60 * 1000;
+    const TIMEOUT_MS = 5000;
+
+    let _current = null;
+    let _lastFetch = 0;
+    let _pending = null;
+    let _failures = 0;
+    let _pingTimer = null;
+
+    function loadCache() {
+        try {
+            const raw = localStorage.getItem(CACHE_KEY);
+            if (!raw) return null;
+            const d = JSON.parse(raw);
+            if (d && d.url && d.url.startsWith('https://')) return d.url;
+        } catch (e) {}
+        return null;
+    }
+
+    function saveCache(url) {
+        try {
+            localStorage.setItem(CACHE_KEY, JSON.stringify({ url, ts: Date.now() }));
+        } catch (e) {}
+    }
+
+    async function fetchWithTimeout(url, opts = {}) {
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+        try {
+            return await fetch(url, { ...opts, signal: ctrl.signal });
+        } finally {
+            clearTimeout(t);
+        }
+    }
+
+    async function fetchFromGitHub() {
+        const res = await fetchWithTimeout(`${RAW_URL}?t=${Date.now()}`, { cache: 'no-store' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (!data.url || !data.url.startsWith('https://')) throw new Error('bad url');
+        return data.url;
+    }
+
+    async function get(force = false) {
+        if (!force && _current && (Date.now() - _lastFetch < CACHE_TTL_MS)) {
+            return _current;
+        }
+        if (_pending) return _pending;
+
+        _pending = (async () => {
+            try {
+                const url = await fetchFromGitHub();
+                _current = url;
+                _lastFetch = Date.now();
+                _failures = 0;
+                saveCache(url);
+                console.log(`🌐 [NotifierURL] ${force ? 'Обновлён' : 'Загружен'}: ${url}`);
+                return url;
+            } catch (e) {
+                _failures++;
+                console.warn(`🌐 [NotifierURL] Ошибка (${_failures}):`, e.message);
+                const cached = _current || loadCache();
+                if (cached) {
+                    _current = cached;
+                    return cached;
+                }
+                throw e;
+            } finally {
+                _pending = null;
+            }
+        })();
+        return _pending;
+    }
+
+    async function isAlive(url) {
+        try {
+            const res = await fetchWithTimeout(`${url}/ping`, { cache: 'no-store' });
+            return res.ok;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    async function request(path, opts = {}) {
+        let url = await get();
+
+        try {
+            const res = await fetchWithTimeout(`${url}${path}`, opts);
+            return res;
+        } catch (e) {
+            console.warn(`🌐 [NotifierURL] Запрос ${path} упал:`, e.message);
+
+            // Пробуем перечитать URL
+            let newUrl;
+            try {
+                newUrl = await get(true);
+            } catch (fetchErr) {
+                throw new Error(`URL refresh failed: ${fetchErr.message}`);
+            }
+
+            if (newUrl === url) throw e;
+
+            console.log(`🌐 [NotifierURL] URL сменился: ${url} → ${newUrl}, retry`);
+            return await fetchWithTimeout(`${newUrl}${path}`, opts);
+        }
+    }
+
+    function startPing() {
+        if (_pingTimer) clearInterval(_pingTimer);
+        _pingTimer = setInterval(async () => {
+            if (document.hidden) return;
+            if (typeof state === 'undefined' || !state.isAuthorized) return;
+
+            try {
+                const fresh = await fetchFromGitHub();
+                if (fresh !== _current) {
+                    console.log(`🌐 [NotifierURL] Фон: URL сменился ${_current} → ${fresh}`);
+                    _current = fresh;
+                    _lastFetch = Date.now();
+                    _failures = 0;
+                    saveCache(fresh);
+                    return;
+                }
+                const alive = await isAlive(_current);
+                if (!alive) {
+                    console.warn('🌐 [NotifierURL] Фон: сервер не отвечает');
+                    await get(true).catch(() => {});
+                } else {
+                    _failures = 0;
+                }
+            } catch (e) {}
+        }, PING_INTERVAL_MS);
+    }
+
+    async function init() {
+        try { await get(false); } catch (e) {}
+        startPing();
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden && state.isAuthorized) {
+                get(true).catch(() => {});
+            }
+        });
+    }
+
+    init();
+
+    return {
+        get: () => get(false),
+        refresh: () => get(true),
+        request,
+        isAlive: () => isAlive(_current),
+        current: () => _current,
+        status: () => ({
+            current: _current,
+            ageSec: _lastFetch ? Math.round((Date.now() - _lastFetch) / 1000) : null,
+            failures: _failures,
+            cache: loadCache(),
+        }),
+    };
+})();
+
+// ═══════════════════════════════════════════════════════════════
+//  🔗 mark-read через NotifierURL
+// ═══════════════════════════════════════════════════════════════
+async function notifyMarkRead(chatFile, version) {
+    if (!chatFile || !version || !state.isAuthorized) return;
+    try {
+        await NotifierURL.request('/mark-read', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ file: chatFile, version: version }),
+        });
+        console.log(`🔔 [mark-read] ${chatFile} = ${version}`);
+    } catch (e) {
+        console.warn('🔔 [mark-read]', e.message);
+    }
+}
+
+// Хук на markChatAsRead
+if (typeof markChatAsRead === 'function') {
+    const _orig = markChatAsRead;
+    markChatAsRead = function() {
+        const r = _orig.apply(this, arguments);
+        try {
+            if (state.chatFile && state._lastMetaVersion) {
+                notifyMarkRead(state.chatFile, state._lastMetaVersion);
+            } else if (state.chatFile && historyState.allMessages.length > 0) {
+                const last = historyState.allMessages[historyState.allMessages.length - 1];
+                if (last && last.id) notifyMarkRead(state.chatFile, last.id);
+            }
+        } catch (e) {}
+        return r;
+    };
+}
+
+// Хук на backToChats
+if (typeof backToChats === 'function') {
+    const _orig = backToChats;
+    backToChats = function() {
+        const file = state.chatFile;
+        let version = null;
+        try {
+            version = state._lastMetaVersion;
+            if (!version && historyState.allMessages.length > 0) {
+                version = historyState.allMessages[historyState.allMessages.length - 1].id;
+            }
+        } catch (e) {}
+        if (file && version) notifyMarkRead(file, version);
+        return _orig.apply(this, arguments);
+    };
+}
+
+window.NotifierURL = NotifierURL;
+window.notifyMarkRead = notifyMarkRead;
+
+console.log('🌐 [NotifierURL] Модуль установлен');
+console.log('   • URL:', NotifierURL.current() || 'загружается...');
+console.log('   • Проверка: NotifierURL.status()');
+
+
+
 </script>
+
+
+
+
+
 </body>
 </html>
