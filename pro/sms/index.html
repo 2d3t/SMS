@@ -59659,5 +59659,766 @@ async function refreshWeatherManually(btn, card) {
 })();
 </script>
 
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🎛️ УНИВЕРСАЛЬНАЯ КНОПКА РЕЖИМОВ НАВИГАЦИИ
+//  ─────────────────────────────────────────────────────────────
+//  Одна кнопка вместо 🎲 (shuffle) и 🔀 (direction).
+//  4 режима по кругу:
+//    1. ⏩ Вперёд     — обычный порядок
+//    2. ⏪ Назад      — обратный порядок
+//    3. 🎲 Случайно   — случайный трек
+//    4. 🔂 Повтор     — зацикливает текущий
+//
+//  • Каждое нажатие → следующий режим
+//  • Режим сохраняется в localStorage
+//  • Кнопки ⏮ ⏭ работают по режиму
+//  • По окончании трека — автопереход по режиму
+// ═══════════════════════════════════════════════════════════════
+
+(function installUnifiedNavMode() {
+    'use strict';
+
+    console.log('🎛️ [NavMode] Установка…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  КОНФИГ
+    // ═══════════════════════════════════════════════════════════
+    const CFG = {
+        STORAGE_KEY: 'smschat_nav_mode',
+        MODES: ['forward', 'backward', 'shuffle', 'repeat-one'],
+        MODE_INFO: {
+            'forward': {
+                icon: '⏩',
+                label: 'Вперёд',
+                toast: '⏩ Обычный порядок',
+                color: '#5CA8FF',
+            },
+            'backward': {
+                icon: '⏪',
+                label: 'Назад',
+                toast: '⏪ Обратный порядок',
+                color: '#F36BE1',
+            },
+            'shuffle': {
+                icon: '🎲',
+                label: 'Случайно',
+                toast: '🎲 Случайный порядок',
+                color: '#feca57',
+            },
+            'repeat-one': {
+                icon: '🔂',
+                label: 'Повтор',
+                toast: '🔂 Повтор текущего трека',
+                color: '#00b894',
+            },
+        },
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОСТОЯНИЕ
+    // ═══════════════════════════════════════════════════════════
+    const NM = {
+        mode: 'forward',
+        btnEl: null,
+        // История для режима shuffle — чтобы ⏮ возвращал к предыдущему
+        shuffleHistory: [],
+        shufflePos: -1,
+        // Флаг — уже навешаны обработчики на текущий аудио-элемент?
+        audioAttached: false,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЗАГРУЗКА / СОХРАНЕНИЕ РЕЖИМА
+    // ═══════════════════════════════════════════════════════════
+    function loadMode() {
+        try {
+            const saved = localStorage.getItem(CFG.STORAGE_KEY);
+            if (saved && CFG.MODES.includes(saved)) {
+                NM.mode = saved;
+                console.log(`🎛️ [NavMode] Загружен режим: ${saved}`);
+            }
+        } catch (e) {}
+    }
+
+    function saveMode() {
+        try {
+            localStorage.setItem(CFG.STORAGE_KEY, NM.mode);
+        } catch (e) {}
+    }
+
+    function setMode(newMode) {
+        if (!CFG.MODES.includes(newMode)) return;
+        NM.mode = newMode;
+        saveMode();
+
+        // Сбрасываем историю shuffle при выходе из режима
+        if (newMode !== 'shuffle') {
+            NM.shuffleHistory = [];
+            NM.shufflePos = -1;
+        } else {
+            // При входе в shuffle — начинаем с текущего трека
+            const curIdx = getCurrentIndex();
+            if (curIdx >= 0) {
+                NM.shuffleHistory = [curIdx];
+                NM.shufflePos = 0;
+            }
+        }
+
+        updateButtonAppearance();
+        updateNavButtonStates();
+
+        // Показываем тост
+        const info = CFG.MODE_INFO[newMode];
+        if (typeof showToast === 'function') {
+            showToast(info.toast, 1500);
+        }
+        if (navigator.vibrate) navigator.vibrate(15);
+        if (typeof soundManager !== 'undefined') {
+            try { soundManager.play('click'); } catch (e) {}
+        }
+
+        console.log(`🎛️ [NavMode] Режим: ${newMode} (${info.label})`);
+    }
+
+    function cycleMode() {
+        const currentIdx = CFG.MODES.indexOf(NM.mode);
+        const nextIdx = (currentIdx + 1) % CFG.MODES.length;
+        setMode(CFG.MODES[nextIdx]);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ДОСТУП К ПЛЕЕРУ
+    // ═══════════════════════════════════════════════════════════
+    function getQueue() {
+        return (typeof GlobalPlayer !== 'undefined' && GlobalPlayer.queue) || [];
+    }
+
+    function getCurrentIndex() {
+        return (typeof GlobalPlayer !== 'undefined') ? GlobalPlayer.currentIndex : -1;
+    }
+
+    function getAudio() {
+        return (typeof GlobalPlayer !== 'undefined') ? GlobalPlayer.audioEl : null;
+    }
+
+    function getCurrentMsgId() {
+        return (typeof GlobalPlayer !== 'undefined' && GlobalPlayer.getCurrentMsgId)
+            ? GlobalPlayer.getCurrentMsgId()
+            : null;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОБНОВЛЕНИЕ ВНЕШНЕГО ВИДА КНОПКИ
+    // ═══════════════════════════════════════════════════════════
+    function updateButtonAppearance() {
+        if (!NM.btnEl || !NM.btnEl.isConnected) return;
+
+        const info = CFG.MODE_INFO[NM.mode];
+
+        // Меняем иконку
+        const iconEl = NM.btnEl.querySelector('.nm-icon');
+        if (iconEl) iconEl.textContent = info.icon;
+
+        // Меняем цвет через CSS-переменную
+        NM.btnEl.style.setProperty('--nm-color', info.color);
+
+        // Меняем title
+        NM.btnEl.title = `Режим: ${info.label} (нажмите для смены)`;
+        NM.btnEl.setAttribute('aria-label', `Режим воспроизведения: ${info.label}`);
+
+        // Добавляем класс для анимации
+        NM.btnEl.classList.add('nm-changed');
+        setTimeout(() => {
+            if (NM.btnEl) NM.btnEl.classList.remove('nm-changed');
+        }, 400);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОБНОВЛЕНИЕ СОСТОЯНИЯ КНОПОК ⏮ ⏭
+    //  Они работают по-разному в зависимости от режима
+    // ═══════════════════════════════════════════════════════════
+    function updateNavButtonStates() {
+        const bar = document.getElementById('globalPlayerBar');
+        if (!bar) return;
+
+        const prevBtn = bar.querySelector('#gpPrev');
+        const nextBtn = bar.querySelector('#gpNext');
+        if (!prevBtn || !nextBtn) return;
+
+        const queue = getQueue();
+        const audio = getAudio();
+        const currentIdx = getCurrentIndex();
+
+        // Для repeat-one — ⏮ ⏭ всегда активны (переключают трек)
+        // но при этом трек зацикливается. Так что:
+        //   ⏮ — предыдущий (или текущий в начало)
+        //   ⏭ — следующий
+
+        // Для shuffle — ⏮ идёт по истории назад, ⏭ — случайный
+        // Для forward/backward — обычная логика
+
+        if (queue.length <= 1) {
+            nextBtn.disabled = true;
+            prevBtn.disabled = true;
+            nextBtn.style.opacity = '0.3';
+            prevBtn.style.opacity = '0.3';
+            return;
+        }
+
+        // В forward/backward — блокируем на краях
+        if (NM.mode === 'forward') {
+            prevBtn.disabled = currentIdx <= 0;
+            nextBtn.disabled = currentIdx >= queue.length - 1;
+        } else if (NM.mode === 'backward') {
+            prevBtn.disabled = currentIdx >= queue.length - 1;
+            nextBtn.disabled = currentIdx <= 0;
+        } else {
+            // shuffle и repeat-one — всегда активны
+            prevBtn.disabled = false;
+            nextBtn.disabled = false;
+        }
+
+        prevBtn.style.opacity = prevBtn.disabled ? '0.3' : '1';
+        nextBtn.style.opacity = nextBtn.disabled ? '0.3' : '1';
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОБРАБОТЧИКИ ⏮ ⏭
+    // ═══════════════════════════════════════════════════════════
+    function handleNext() {
+        const queue = getQueue();
+        const currentIdx = getCurrentIndex();
+        if (queue.length === 0 || currentIdx < 0) return;
+
+        switch (NM.mode) {
+            case 'forward': {
+                const target = currentIdx + 1;
+                if (target < queue.length) {
+                    jumpToIndex(target);
+                }
+                break;
+            }
+            case 'backward': {
+                const target = currentIdx - 1;
+                if (target >= 0) {
+                    jumpToIndex(target);
+                }
+                break;
+            }
+            case 'shuffle': {
+                // Добавляем в историю
+                const target = getRandomIndex(currentIdx);
+                NM.shuffleHistory.push(target);
+                NM.shufflePos = NM.shuffleHistory.length - 1;
+                jumpToIndex(target);
+                break;
+            }
+            case 'repeat-one': {
+                // ⏭ в repeat-one — переключает на следующий трек
+                // (а вот АВТОЗАВЕРШЕНИЕ зацикливает)
+                const target = currentIdx + 1;
+                if (target < queue.length) {
+                    jumpToIndex(target);
+                } else {
+                    // В конце — на первый
+                    jumpToIndex(0);
+                }
+                break;
+            }
+        }
+    }
+
+    function handlePrev() {
+        const queue = getQueue();
+        const audio = getAudio();
+        const currentIdx = getCurrentIndex();
+        if (queue.length === 0 || currentIdx < 0) return;
+
+        // Если трек играет больше 3 секунд — сначала в начало
+        if (audio && audio.currentTime > 3) {
+            audio.currentTime = 0;
+            updatePositionState();
+            return;
+        }
+
+        switch (NM.mode) {
+            case 'forward': {
+                const target = currentIdx - 1;
+                if (target >= 0) {
+                    jumpToIndex(target);
+                }
+                break;
+            }
+            case 'backward': {
+                const target = currentIdx + 1;
+                if (target < queue.length) {
+                    jumpToIndex(target);
+                }
+                break;
+            }
+            case 'shuffle': {
+                // Возврат по истории
+                if (NM.shufflePos > 0) {
+                    NM.shufflePos--;
+                    const target = NM.shuffleHistory[NM.shufflePos];
+                    if (target >= 0 && target < queue.length) {
+                        jumpToIndex(target);
+                    }
+                }
+                break;
+            }
+            case 'repeat-one': {
+                // ⏮ в repeat-one — предыдущий трек
+                const target = currentIdx - 1;
+                if (target >= 0) {
+                    jumpToIndex(target);
+                } else {
+                    // В начале — на последний
+                    jumpToIndex(queue.length - 1);
+                }
+                break;
+            }
+        }
+    }
+
+    // ─── Случайный индекс ───
+    function getRandomIndex(exclude) {
+        const queue = getQueue();
+        if (queue.length <= 1) return 0;
+        let idx, attempts = 0;
+        do {
+            idx = Math.floor(Math.random() * queue.length);
+            attempts++;
+        } while (idx === exclude && attempts < 20);
+        return idx;
+    }
+
+    // ─── Прыжок к треку ───
+    async function jumpToIndex(index) {
+        const queue = getQueue();
+        if (index < 0 || index >= queue.length) return;
+        const track = queue[index];
+        if (!track || !track.src) return;
+
+        const chatFile = (typeof GlobalPlayer !== 'undefined')
+            ? GlobalPlayer.currentChatFile : null;
+
+        // Используем публичный API playQueue
+        if (typeof GlobalPlayer !== 'undefined' && GlobalPlayer.playQueue) {
+            try {
+                await GlobalPlayer.playQueue(queue.slice(), index, chatFile);
+                // После переключения — обновляем состояние
+                setTimeout(updateNavButtonStates, 100);
+            } catch (e) {
+                console.warn('🎛️ [NavMode] playQueue failed:', e);
+            }
+        }
+    }
+
+    // ─── Обновление позиции для MediaSession ───
+    function updatePositionState() {
+        if (!('mediaSession' in navigator)) return;
+        const audio = getAudio();
+        if (!audio) return;
+        const d = audio.duration;
+        if (!isFinite(d) || d <= 0) return;
+        try {
+            navigator.mediaSession.setPositionState({
+                duration: d,
+                playbackRate: audio.playbackRate || 1,
+                position: audio.currentTime,
+            });
+        } catch (e) {}
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  АВТОПЕРЕХОД ПО ОКОНЧАНИИ ТРЕКА
+    //  Здесь важна логика repeat-one!
+    // ═══════════════════════════════════════════════════════════
+    function handleTrackEnded() {
+        const queue = getQueue();
+        const currentIdx = getCurrentIndex();
+        if (queue.length === 0 || currentIdx < 0) return;
+
+        console.log(`🎛️ [NavMode] Трек закончился (режим: ${NM.mode})`);
+
+        switch (NM.mode) {
+            case 'repeat-one': {
+                // 🔂 ЗАЦИКЛИВАЕМ текущий трек
+                const audio = getAudio();
+                if (audio) {
+                    audio.currentTime = 0;
+                    audio.play().catch(() => {});
+                    console.log('🔂 [NavMode] Повтор текущего трека');
+                }
+                break;
+            }
+            case 'forward': {
+                const target = currentIdx + 1;
+                if (target < queue.length) {
+                    jumpToIndex(target);
+                }
+                break;
+            }
+            case 'backward': {
+                const target = currentIdx - 1;
+                if (target >= 0) {
+                    jumpToIndex(target);
+                }
+                break;
+            }
+            case 'shuffle': {
+                const target = getRandomIndex(currentIdx);
+                NM.shuffleHistory.push(target);
+                NM.shufflePos = NM.shuffleHistory.length - 1;
+                jumpToIndex(target);
+                break;
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОЗДАНИЕ И ВСТАВКА КНОПКИ
+    // ═══════════════════════════════════════════════════════════
+    function injectModeButton() {
+        const bar = document.getElementById('globalPlayerBar');
+        if (!bar) return false;
+
+        // Уже вставлена — обновляем только внешний вид
+        if (bar.querySelector('#gpNavMode')) {
+            NM.btnEl = bar.querySelector('#gpNavMode');
+            updateButtonAppearance();
+            return true;
+        }
+
+        const controls = bar.querySelector('.gp-controls');
+        if (!controls) return false;
+
+        // Удаляем старые shuffle и direction
+        ['#gpShuffle', '#gpDir'].forEach(sel => {
+            const old = bar.querySelector(sel);
+            if (old) {
+                old.remove();
+                console.log(`🎛️ [NavMode] Удалена кнопка ${sel}`);
+            }
+        });
+
+        const btn = document.createElement('button');
+        btn.className = 'gp-btn gp-btn-navmode';
+        btn.id = 'gpNavMode';
+        btn.type = 'button';
+        btn.innerHTML = `<span class="nm-icon">${CFG.MODE_INFO[NM.mode].icon}</span>`;
+
+        // Вставляем в то место, где была кнопка direction (перед close)
+        const closeBtn = bar.querySelector('#gpClose');
+        if (closeBtn) {
+            controls.insertBefore(btn, closeBtn);
+        } else {
+            controls.appendChild(btn);
+        }
+
+        // Обработчик клика — переключение режима
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            cycleMode();
+        });
+
+        NM.btnEl = btn;
+        updateButtonAppearance();
+        updateNavButtonStates();
+
+        console.log('🎛️ [NavMode] Кнопка режима добавлена');
+        return true;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ ⏮ ⏭
+    //  Устанавливаем свой обработчик, отключаем старые
+    // ═══════════════════════════════════════════════════════════
+    function installNavButtonInterceptors() {
+        const bar = document.getElementById('globalPlayerBar');
+        if (!bar) return false;
+
+        const prevBtn = bar.querySelector('#gpPrev');
+        const nextBtn = bar.querySelector('#gpNext');
+        if (!prevBtn || !nextBtn) return false;
+
+        // Если уже перехвачено — выходим
+        if (prevBtn._navModeAttached && nextBtn._navModeAttached) return true;
+
+        // Используем capture-фазу + stopImmediatePropagation
+        // чтобы перебить обработчики GlobalPlayer
+        if (!prevBtn._navModeAttached) {
+            prevBtn.addEventListener('click', (e) => {
+                e.stopImmediatePropagation();
+                e.preventDefault();
+                handlePrev();
+            }, true);
+            prevBtn._navModeAttached = true;
+        }
+
+        if (!nextBtn._navModeAttached) {
+            nextBtn.addEventListener('click', (e) => {
+                e.stopImmediatePropagation();
+                e.preventDefault();
+                handleNext();
+            }, true);
+            nextBtn._navModeAttached = true;
+        }
+
+        console.log('🎛️ [NavMode] ⏮ ⏭ перехвачены');
+        return true;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ AUDIO.ENDED — для автоперехода по режиму
+    // ═══════════════════════════════════════════════════════════
+    function attachEndedListener() {
+        const audio = getAudio();
+        if (!audio) return false;
+
+        if (audio._navModeEndedAttached) {
+            // Уже прикреплён, но могли пересоздать audio — проверим
+            if (audio._navModeEndedHandler) return true;
+        }
+
+        const handler = (e) => {
+            // ВАЖНО: блокируем встроенный обработчик GlobalPlayer
+            e.stopImmediatePropagation();
+
+            // Даём GlobalPlayer обработать свою внутреннюю логику
+            // но только если режим не repeat-one
+            if (NM.mode === 'repeat-one') {
+                handleTrackEnded();
+                return;
+            }
+
+            // Вызываем автопереход по нашему режиму
+            handleTrackEnded();
+        };
+
+        audio.addEventListener('ended', handler, true);
+        audio._navModeEndedHandler = handler;
+        audio._navModeEndedAttached = true;
+
+        console.log('🎛️ [NavMode] audio.ended перехвачен');
+        return true;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧ GlobalPlayer.playQueue — сброс истории shuffle
+    // ═══════════════════════════════════════════════════════════
+    function patchGlobalPlayer() {
+        if (typeof GlobalPlayer === 'undefined') return false;
+        if (GlobalPlayer._navModePatched) return true;
+
+        const _origPlayQueue = GlobalPlayer.playQueue;
+
+        GlobalPlayer.playQueue = function(newQueue, startIndex, chatFile) {
+            const result = _origPlayQueue.call(this, newQueue, startIndex, chatFile);
+
+            // Сброс истории shuffle при новом плейлисте
+            if (NM.mode === 'shuffle') {
+                NM.shuffleHistory = [startIndex || 0];
+                NM.shufflePos = 0;
+            } else {
+                NM.shuffleHistory = [];
+                NM.shufflePos = -1;
+            }
+
+            setTimeout(() => {
+                updateNavButtonStates();
+            }, 200);
+
+            return result;
+        };
+
+        GlobalPlayer._navModePatched = true;
+        console.log('🎛️ [NavMode] playQueue пропатчен');
+        return true;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СТИЛИ
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('navModeStyles')) {
+        const style = document.createElement('style');
+        style.id = 'navModeStyles';
+        style.textContent = `
+            /* ═══ Кнопка режима ═══ */
+            #globalPlayerBar .gp-btn-navmode {
+                color: var(--nm-color, #5CA8FF);
+                font-size: 18px;
+                position: relative;
+                transition: color 0.25s ease, background 0.25s ease, transform 0.15s ease;
+            }
+            #globalPlayerBar .gp-btn-navmode:hover {
+                background: rgba(255,255,255,0.08);
+                transform: scale(1.05);
+            }
+            #globalPlayerBar .gp-btn-navmode:active {
+                transform: scale(0.88);
+            }
+            #globalPlayerBar .gp-btn-navmode .nm-icon {
+                display: inline-block;
+                line-height: 1;
+                transition: transform 0.3s ease;
+            }
+
+            /* Анимация при смене режима */
+            #globalPlayerBar .gp-btn-navmode.nm-changed .nm-icon {
+                animation: nmIconPop 0.4s cubic-bezier(0.22, 0.61, 0.36, 1);
+            }
+            @keyframes nmIconPop {
+                0% {
+                    transform: scale(1) rotate(0deg);
+                    opacity: 1;
+                }
+                40% {
+                    transform: scale(1.5) rotate(180deg);
+                    opacity: 0.7;
+                }
+                100% {
+                    transform: scale(1) rotate(360deg);
+                    opacity: 1;
+                }
+            }
+
+            /* Убираем старые кнопки, если вдруг ещё где-то остались */
+            #globalPlayerBar .gp-btn-shuffle,
+            #globalPlayerBar .gp-btn-dir {
+                display: none !important;
+            }
+
+            /* Мобильная адаптация */
+            @media (max-width: 480px) {
+                #globalPlayerBar .gp-btn-navmode {
+                    font-size: 16px;
+                }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ГЛАВНАЯ ИНИЦИАЛИЗАЦИЯ
+    // ═══════════════════════════════════════════════════════════
+    let _initAttempts = 0;
+
+    function tryInit() {
+        _initAttempts++;
+
+        const bar = document.getElementById('globalPlayerBar');
+        if (!bar) {
+            if (_initAttempts < 60) setTimeout(tryInit, 500);
+            return;
+        }
+
+        const injected = injectModeButton();
+        const intercepted = installNavButtonInterceptors();
+        const audioAttached = attachEndedListener();
+        const patched = patchGlobalPlayer();
+
+        if (injected && intercepted && audioAttached && patched) {
+            console.log('🎛️ [NavMode] ✅ Полная инициализация');
+            updateNavButtonStates();
+        } else {
+            // Повторяем через 500мс — что-то ещё не готово
+            if (_initAttempts < 60) {
+                setTimeout(tryInit, 500);
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  НАБЛЮДАТЕЛЬ ЗА ПОЯВЛЕНИЕМ ПЛЕЕРА
+    // ═══════════════════════════════════════════════════════════
+    const observer = new MutationObserver(() => {
+        if (document.getElementById('globalPlayerBar')) {
+            if (!document.getElementById('gpNavMode')) {
+                injectModeButton();
+            }
+            installNavButtonInterceptors();
+            attachEndedListener();
+        }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    // ─── Периодическая страховка ───
+    // (на случай пересоздания audio элемента)
+    setInterval(() => {
+        if (document.getElementById('globalPlayerBar')) {
+            if (!document.getElementById('gpNavMode')) {
+                injectModeButton();
+            }
+            installNavButtonInterceptors();
+            attachEndedListener();
+            updateNavButtonStates();
+        }
+    }, 2000);
+
+    // ─── Обновление при изменении play/pause ───
+    document.addEventListener('play', (e) => {
+        if (e.target && e.target.tagName === 'AUDIO') {
+            setTimeout(updateNavButtonStates, 100);
+        }
+    }, true);
+
+    document.addEventListener('pause', (e) => {
+        if (e.target && e.target.tagName === 'AUDIO') {
+            setTimeout(updateNavButtonStates, 100);
+        }
+    }, true);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ESC — не нужно, кнопка не модальная
+    // ═══════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API
+    // ═══════════════════════════════════════════════════════════
+    window.NavMode = {
+        // Текущий режим
+        get: () => NM.mode,
+        set: (mode) => setMode(mode),
+        cycle: () => cycleMode(),
+
+        // Все доступные режимы
+        list: () => CFG.MODES.slice(),
+        info: () => ({ ...CFG.MODE_INFO }),
+
+        // Информация о текущем
+        current: () => CFG.MODE_INFO[NM.mode],
+
+        // Статус
+        status: () => ({
+            mode: NM.mode,
+            label: CFG.MODE_INFO[NM.mode].label,
+            icon: CFG.MODE_INFO[NM.mode].icon,
+            buttonExists: !!document.getElementById('gpNavMode'),
+            shuffleHistoryLength: NM.shuffleHistory.length,
+            shufflePos: NM.shufflePos,
+            queueLength: getQueue().length,
+            currentIndex: getCurrentIndex(),
+            audioAttached: NM.audioAttached,
+        }),
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЗАПУСК
+    // ═══════════════════════════════════════════════════════════
+    loadMode();
+    setTimeout(tryInit, 1500);
+
+    console.log('🎛️ [NavMode] Установлен');
+    console.log('   • Одна кнопка вместо 🎲 и 🔀');
+    console.log('   • Режимы: ⏩ ⏪ 🎲 🔂');
+    console.log('   • Текущий режим: ' + CFG.MODE_INFO[NM.mode].label);
+    console.log('   • API: NavMode.get() / .set("shuffle") / .cycle()');
+})();
+</script>
+
 </body>
 </html>
