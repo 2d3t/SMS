@@ -58774,5 +58774,890 @@ async function refreshWeatherManually(btn, card) {
 
 })();
 </script>
+
+
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🎵 QUICK TRACK PICKER — быстрый выбор трека в плеере
+//  ─────────────────────────────────────────────────────────────
+//  • Кнопка ≡ в глобальном плеере (без бейджа с количеством)
+//  • Bottom-sheet со списком всех аудио текущего чата
+//  • Мгновенный запуск по тапу
+//  • Подсветка текущего трека + автопрокрутка к нему
+//  • Разделение: музыка / голосовые
+// ═══════════════════════════════════════════════════════════════
+
+(function installQuickTrackPicker() {
+    'use strict';
+
+    console.log('🎵 [QuickPicker] Установка…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОСТОЯНИЕ
+    // ═══════════════════════════════════════════════════════════
+    const QP = {
+        sheetEl: null,
+        overlayEl: null,
+        isOpen: false,
+        currentChatFile: null,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  СТИЛИ
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('quickPickerStyles')) {
+        const style = document.createElement('style');
+        style.id = 'quickPickerStyles';
+        style.textContent = `
+            /* ═══ Кнопка ≡ в плеере ═══ */
+            #globalPlayerBar .gp-btn-picker {
+                color: #888;
+                font-size: 18px;
+                font-weight: 700;
+            }
+            #globalPlayerBar .gp-btn-picker:hover {
+                color: #a78bfa;
+                background: rgba(108,92,231,0.15);
+            }
+            #globalPlayerBar .gp-btn-picker.active {
+                color: #00b894;
+                background: linear-gradient(135deg, rgba(0,184,148,0.2), rgba(108,92,231,0.15));
+                box-shadow: 0 0 10px rgba(0,184,148,0.3);
+            }
+
+            /* ═══ Задний фон ═══ */
+            #quickPickerOverlay {
+                position: fixed;
+                inset: 0;
+                background: rgba(0, 0, 0, 0.6);
+                backdrop-filter: blur(6px);
+                -webkit-backdrop-filter: blur(6px);
+                z-index: 3600;
+                opacity: 0;
+                pointer-events: none;
+                transition: opacity 0.25s ease;
+            }
+            #quickPickerOverlay.show {
+                opacity: 1;
+                pointer-events: auto;
+            }
+
+            /* ═══ Bottom-sheet ═══ */
+            #quickPickerSheet {
+                position: fixed;
+                left: 50%;
+                bottom: 0;
+                transform: translateX(-50%) translateY(100%);
+                width: 100%;
+                max-width: 500px;
+                max-height: 70vh;
+                background: linear-gradient(180deg, #1a1a2e 0%, #14142a 100%);
+                border: 1px solid rgba(255,255,255,0.1);
+                border-bottom: none;
+                border-radius: 22px 22px 0 0;
+                box-shadow: 0 -12px 40px rgba(0,0,0,0.6);
+                z-index: 3601;
+                display: flex;
+                flex-direction: column;
+                overflow: hidden;
+                transition: transform 0.32s cubic-bezier(0.22, 0.61, 0.36, 1);
+            }
+            #quickPickerSheet.show {
+                transform: translateX(-50%) translateY(0);
+            }
+
+            /* ─── Ручка ─── */
+            #quickPickerSheet .qp-handle {
+                width: 40px;
+                height: 4px;
+                border-radius: 2px;
+                background: rgba(255,255,255,0.2);
+                margin: 8px auto 4px;
+                flex-shrink: 0;
+            }
+
+            /* ─── Шапка ─── */
+            #quickPickerSheet .qp-header {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                padding: 8px 16px 12px;
+                border-bottom: 1px solid rgba(255,255,255,0.06);
+                flex-shrink: 0;
+            }
+            #quickPickerSheet .qp-header-icon {
+                width: 36px;
+                height: 36px;
+                border-radius: 10px;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 18px;
+                flex-shrink: 0;
+                box-shadow: 0 3px 10px rgba(108,92,231,0.4);
+            }
+            #quickPickerSheet .qp-header-info {
+                flex: 1;
+                min-width: 0;
+            }
+            #quickPickerSheet .qp-header-title {
+                font-size: 15px;
+                font-weight: 700;
+                color: #fff;
+                margin-bottom: 2px;
+            }
+            #quickPickerSheet .qp-header-sub {
+                font-size: 11px;
+                color: #888;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            #quickPickerSheet .qp-close {
+                width: 34px;
+                height: 34px;
+                border-radius: 50%;
+                border: none;
+                background: rgba(255,255,255,0.06);
+                color: #888;
+                font-size: 15px;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                flex-shrink: 0;
+                transition: all 0.15s;
+            }
+            #quickPickerSheet .qp-close:hover {
+                background: rgba(255,107,107,0.2);
+                color: #ff6b6b;
+            }
+
+            /* ─── Тело ─── */
+            #quickPickerSheet .qp-body {
+                flex: 1;
+                overflow-y: auto;
+                padding: 8px 12px 20px;
+                min-height: 100px;
+                -webkit-overflow-scrolling: touch;
+                overscroll-behavior: contain;
+            }
+            #quickPickerSheet .qp-body::-webkit-scrollbar {
+                width: 4px;
+            }
+            #quickPickerSheet .qp-body::-webkit-scrollbar-thumb {
+                background: rgba(255,255,255,0.15);
+                border-radius: 2px;
+            }
+
+            /* ─── Секция ─── */
+            #quickPickerSheet .qp-section {
+                margin-bottom: 12px;
+            }
+            #quickPickerSheet .qp-section-title {
+                font-size: 10px;
+                font-weight: 700;
+                color: #888;
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
+                padding: 6px 6px 8px;
+                display: flex;
+                align-items: center;
+                gap: 6px;
+            }
+
+            /* ─── Трек ─── */
+            #quickPickerSheet .qp-track {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                padding: 8px 10px;
+                border-radius: 12px;
+                cursor: pointer;
+                transition: background 0.15s ease, transform 0.1s ease;
+                position: relative;
+                -webkit-tap-highlight-color: transparent;
+                margin-bottom: 2px;
+            }
+            #quickPickerSheet .qp-track:hover {
+                background: rgba(255,255,255,0.06);
+            }
+            #quickPickerSheet .qp-track:active {
+                transform: scale(0.98);
+                background: rgba(108,92,231,0.15);
+            }
+            #quickPickerSheet .qp-track.active {
+                background: linear-gradient(135deg,
+                    rgba(108,92,231,0.25),
+                    rgba(0,184,148,0.15));
+                border: 1px solid rgba(108,92,231,0.4);
+                padding: 7px 9px;
+            }
+
+            /* Обложка / иконка трека */
+            #quickPickerSheet .qp-track-thumb {
+                width: 40px;
+                height: 40px;
+                border-radius: 8px;
+                background: linear-gradient(135deg,
+                    rgba(108,92,231,0.3),
+                    rgba(0,184,148,0.2));
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 18px;
+                flex-shrink: 0;
+                overflow: hidden;
+                position: relative;
+                color: #fff;
+            }
+            #quickPickerSheet .qp-track-thumb img {
+                width: 100%;
+                height: 100%;
+                object-fit: cover;
+                display: block;
+            }
+            #quickPickerSheet .qp-track-thumb.is-voice {
+                background: linear-gradient(135deg,
+                    rgba(255,107,107,0.25),
+                    rgba(238,82,83,0.15));
+            }
+            /* Анимация текущего трека */
+            #quickPickerSheet .qp-track.active .qp-track-thumb::after {
+                content: '';
+                position: absolute;
+                inset: 2px;
+                border-radius: 6px;
+                border: 1.5px solid rgba(255,255,255,0.8);
+                animation: qpTrackPulse 1.4s ease-in-out infinite;
+            }
+            @keyframes qpTrackPulse {
+                0%, 100% { opacity: 0.6; transform: scale(1); }
+                50%      { opacity: 1; transform: scale(0.92); }
+            }
+
+            /* Инфо трека */
+            #quickPickerSheet .qp-track-info {
+                flex: 1;
+                min-width: 0;
+                display: flex;
+                flex-direction: column;
+                gap: 2px;
+            }
+            #quickPickerSheet .qp-track-name {
+                font-size: 13px;
+                font-weight: 600;
+                color: #fff;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            #quickPickerSheet .qp-track.active .qp-track-name {
+                color: #a78bfa;
+            }
+            #quickPickerSheet .qp-track-meta {
+                font-size: 11px;
+                color: #888;
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            #quickPickerSheet .qp-track-meta .qp-track-author {
+                color: #a78bfa;
+                font-weight: 600;
+            }
+            #quickPickerSheet .qp-track-meta .qp-dot {
+                color: #444;
+            }
+
+            /* Кнопка play */
+            #quickPickerSheet .qp-track-play {
+                width: 32px;
+                height: 32px;
+                border-radius: 50%;
+                border: none;
+                background: rgba(255,255,255,0.06);
+                color: #ccc;
+                font-size: 13px;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                flex-shrink: 0;
+                transition: all 0.15s;
+                padding: 0;
+                line-height: 1;
+            }
+            #quickPickerSheet .qp-track:hover .qp-track-play {
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                color: #fff;
+            }
+            #quickPickerSheet .qp-track.active .qp-track-play {
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                color: #fff;
+                box-shadow: 0 0 10px rgba(108,92,231,0.5);
+            }
+
+            /* ─── Пусто ─── */
+            #quickPickerSheet .qp-empty {
+                text-align: center;
+                padding: 40px 20px;
+                color: #666;
+            }
+            #quickPickerSheet .qp-empty-icon {
+                font-size: 48px;
+                margin-bottom: 10px;
+                opacity: 0.5;
+            }
+            #quickPickerSheet .qp-empty-title {
+                font-size: 14px;
+                color: #aaa;
+                margin-bottom: 4px;
+                font-weight: 600;
+            }
+            #quickPickerSheet .qp-empty-sub {
+                font-size: 12px;
+                color: #666;
+                line-height: 1.4;
+            }
+
+            /* ─── Мобильная адаптация ─── */
+            @media (max-width: 480px) {
+                #quickPickerSheet {
+                    max-height: 75vh;
+                    border-radius: 18px 18px 0 0;
+                }
+                #quickPickerSheet .qp-header {
+                    padding: 6px 14px 10px;
+                }
+                #quickPickerSheet .qp-header-icon {
+                    width: 32px;
+                    height: 32px;
+                    font-size: 16px;
+                }
+                #quickPickerSheet .qp-header-title {
+                    font-size: 14px;
+                }
+                #quickPickerSheet .qp-track {
+                    padding: 8px;
+                }
+                #quickPickerSheet .qp-track-thumb {
+                    width: 36px;
+                    height: 36px;
+                    font-size: 16px;
+                }
+                #quickPickerSheet .qp-track-name {
+                    font-size: 12px;
+                }
+                #quickPickerSheet .qp-track-meta {
+                    font-size: 10px;
+                }
+                #globalPlayerBar .gp-btn-picker {
+                    font-size: 16px;
+                }
+            }
+
+            /* ─── Скрытие кнопки в минимизированном плеере ─── */
+            #globalPlayerBar.minimized .gp-btn-picker {
+                display: none;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СБОР СПИСКА ТРЕКОВ ИЗ ТЕКУЩЕГО ЧАТА
+    // ═══════════════════════════════════════════════════════════
+    function collectTracksFromCurrentChat() {
+        if (typeof historyState === 'undefined' || !Array.isArray(historyState.allMessages)) {
+            return { tracks: [], voices: [] };
+        }
+
+        const tracks = [];
+        const voices = [];
+
+        for (const msg of historyState.allMessages) {
+            if (!msg.audio) continue;
+
+            const hasName = !!(msg.audioName && msg.audioName.trim());
+            const isVoice = !hasName;
+
+            const item = {
+                msgId: msg.id,
+                username: msg.username,
+                name: hasName ? msg.audioName : 'Голосовое',
+                duration: msg.audioDuration || 0,
+                audioName: msg.audio,
+                coverName: msg.audioCover || null,
+                isVoice,
+                time: msg.time,
+            };
+
+            if (isVoice) voices.push(item);
+            else tracks.push(item);
+        }
+
+        return { tracks, voices };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ФОРМАТИРОВАНИЕ
+    // ═══════════════════════════════════════════════════════════
+    function fmtTime(seconds) {
+        if (!seconds || seconds < 0) seconds = 0;
+        const m = Math.floor(seconds / 60);
+        const s = Math.floor(seconds % 60);
+        return `${m}:${s.toString().padStart(2, '0')}`;
+    }
+
+    function fmtDate(iso) {
+        if (!iso) return '';
+        try {
+            const d = new Date(iso);
+            return d.toLocaleDateString('ru-RU', { day: 'numeric', month: 'short' });
+        } catch (e) {
+            return '';
+        }
+    }
+
+    function escapeHtmlSafe(s) {
+        const div = document.createElement('div');
+        div.textContent = s == null ? '' : String(s);
+        return div.innerHTML;
+    }
+
+    function pluralize(n, one, two, five) {
+        const m10 = n % 10, m100 = n % 100;
+        if (m10 === 1 && m100 !== 11) return one;
+        if (m10 >= 2 && m10 <= 4 && (m100 < 10 || m100 >= 20)) return two;
+        return five;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПОСТРОЕНИЕ SHEET
+    // ═══════════════════════════════════════════════════════════
+    function ensureSheet() {
+        if (QP.sheetEl && QP.sheetEl.isConnected) return QP.sheetEl;
+
+        // Overlay
+        const overlay = document.createElement('div');
+        overlay.id = 'quickPickerOverlay';
+        overlay.addEventListener('click', closeSheet);
+        document.body.appendChild(overlay);
+        QP.overlayEl = overlay;
+
+        // Sheet
+        const sheet = document.createElement('div');
+        sheet.id = 'quickPickerSheet';
+        sheet.innerHTML = `
+            <div class="qp-handle"></div>
+            <div class="qp-header">
+                <div class="qp-header-icon">🎵</div>
+                <div class="qp-header-info">
+                    <div class="qp-header-title">Плейлист чата</div>
+                    <div class="qp-header-sub" id="qpHeaderSub">—</div>
+                </div>
+                <button class="qp-close" id="qpCloseBtn" title="Закрыть">✕</button>
+            </div>
+            <div class="qp-body" id="qpBody"></div>
+        `;
+        document.body.appendChild(sheet);
+        QP.sheetEl = sheet;
+
+        sheet.querySelector('#qpCloseBtn').addEventListener('click', closeSheet);
+
+        return sheet;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  РЕНДЕР СПИСКА
+    // ═══════════════════════════════════════════════════════════
+    function renderTracksList() {
+        const body = document.getElementById('qpBody');
+        const sub = document.getElementById('qpHeaderSub');
+        if (!body) return;
+
+        const { tracks, voices } = collectTracksFromCurrentChat();
+        const total = tracks.length + voices.length;
+
+        // Текущий трек
+        let currentMsgId = null;
+        let isPaused = true;
+        try {
+            if (typeof GlobalPlayer !== 'undefined' && GlobalPlayer.getCurrentMsgId) {
+                currentMsgId = GlobalPlayer.getCurrentMsgId();
+                const audio = GlobalPlayer.audioEl;
+                isPaused = audio ? audio.paused : true;
+            }
+        } catch (e) {}
+
+        // Подзаголовок
+        const chatName = (state && state.chatName) || 'чат';
+        if (sub) {
+            if (total === 0) {
+                sub.textContent = chatName;
+            } else {
+                const parts = [chatName];
+                if (tracks.length > 0) {
+                    parts.push(`${tracks.length} трек${pluralize(tracks.length, '', 'а', 'ов')}`);
+                }
+                if (voices.length > 0) {
+                    parts.push(`${voices.length} голосов${pluralize(voices.length, 'ое', 'ых', 'ых')}`);
+                }
+                sub.textContent = parts.join(' · ');
+            }
+        }
+
+        if (total === 0) {
+            body.innerHTML = `
+                <div class="qp-empty">
+                    <div class="qp-empty-icon">🎧</div>
+                    <div class="qp-empty-title">Нет аудио</div>
+                    <div class="qp-empty-sub">В этом чате пока нет ни музыки, ни голосовых</div>
+                </div>
+            `;
+            return;
+        }
+
+        let html = '';
+
+        // Музыка
+        if (tracks.length > 0) {
+            html += `<div class="qp-section">
+                <div class="qp-section-title">🎵 Музыка (${tracks.length})</div>`;
+            for (const track of tracks) {
+                html += renderTrackItem(track, currentMsgId, isPaused);
+            }
+            html += '</div>';
+        }
+
+        // Голосовые
+        if (voices.length > 0) {
+            html += `<div class="qp-section">
+                <div class="qp-section-title">🎤 Голосовые (${voices.length})</div>`;
+            for (const voice of voices) {
+                html += renderTrackItem(voice, currentMsgId, isPaused);
+            }
+            html += '</div>';
+        }
+
+        body.innerHTML = html;
+
+        // Обработчики
+        body.querySelectorAll('.qp-track').forEach(el => {
+            el.addEventListener('click', (e) => {
+                if (e.target.closest('.qp-track-play')) return;
+                const msgId = parseInt(el.dataset.msgId);
+                if (!isNaN(msgId)) playTrack(msgId);
+            });
+        });
+
+        body.querySelectorAll('.qp-track-play').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const msgId = parseInt(btn.dataset.msgId);
+                if (!isNaN(msgId)) playTrack(msgId);
+            });
+        });
+
+        // Автопрокрутка к активному треку
+        if (currentMsgId != null) {
+            setTimeout(() => {
+                const activeEl = body.querySelector('.qp-track.active');
+                if (activeEl) {
+                    activeEl.scrollIntoView({
+                        behavior: 'smooth',
+                        block: 'center',
+                    });
+                }
+            }, 100);
+        }
+    }
+
+    function renderTrackItem(track, currentMsgId, isPaused) {
+        const isActive = String(track.msgId) === String(currentMsgId);
+        const isPlaying = isActive && !isPaused;
+
+        // Иконка / обложка
+        let thumbHtml;
+        if (track.isVoice) {
+            thumbHtml = '🎤';
+        } else {
+            thumbHtml = '🎵';
+            if (track.coverName) {
+                try {
+                    const cached = (typeof _attachmentCache !== 'undefined')
+                        ? _attachmentCache.get(track.coverName)
+                        : null;
+                    if (cached) {
+                        thumbHtml = `<img src="${cached}" alt="" loading="lazy">`;
+                    }
+                } catch (e) {}
+            }
+        }
+
+        const playIcon = isPlaying ? '⏸' : '▶';
+
+        // Мета
+        const author = track.username === state.username
+            ? 'Вы'
+            : escapeHtmlSafe(track.username);
+
+        const durationStr = track.duration > 0 ? fmtTime(track.duration) : '';
+        const dateStr = fmtDate(track.time);
+
+        const metaParts = [`<span class="qp-track-author">${author}</span>`];
+        if (durationStr) metaParts.push(`<span>${durationStr}</span>`);
+        if (dateStr) metaParts.push(`<span>${dateStr}</span>`);
+
+        return `
+            <div class="qp-track ${isActive ? 'active' : ''}"
+                 data-msg-id="${track.msgId}">
+                <div class="qp-track-thumb ${track.isVoice ? 'is-voice' : ''}">${thumbHtml}</div>
+                <div class="qp-track-info">
+                    <div class="qp-track-name">${escapeHtmlSafe(track.name)}</div>
+                    <div class="qp-track-meta">${metaParts.join('<span class="qp-dot">·</span>')}</div>
+                </div>
+                <button class="qp-track-play" data-msg-id="${track.msgId}" title="${isPlaying ? 'Пауза' : 'Играть'}">
+                    ${playIcon}
+                </button>
+            </div>
+        `;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЗАПУСК ТРЕКА
+    // ═══════════════════════════════════════════════════════════
+    async function playTrack(msgId) {
+        try {
+            // Тот же трек — toggle
+            if (typeof GlobalPlayer !== 'undefined' && GlobalPlayer.getCurrentMsgId) {
+                const currentId = GlobalPlayer.getCurrentMsgId();
+                if (String(currentId) === String(msgId)) {
+                    GlobalPlayer.toggle();
+                    if (typeof syncInlineWithGlobal === 'function') {
+                        syncInlineWithGlobal();
+                    }
+                    setTimeout(renderTracksList, 150);
+                    if (navigator.vibrate) navigator.vibrate(10);
+                    return;
+                }
+            }
+
+            // Новый трек — запускаем
+            if (typeof playAudioFromMessage === 'function') {
+                if (navigator.vibrate) navigator.vibrate(15);
+                await playAudioFromMessage(msgId);
+                setTimeout(renderTracksList, 400);
+            } else {
+                console.warn('🎵 [QuickPicker] playAudioFromMessage недоступен');
+            }
+        } catch (e) {
+            console.error('🎵 [QuickPicker] play error:', e);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОТКРЫТИЕ / ЗАКРЫТИЕ
+    // ═══════════════════════════════════════════════════════════
+    function openSheet() {
+        if (!state || !state.chatFile) {
+            if (typeof showToast === 'function') showToast('🔒 Откройте чат', 2000);
+            return;
+        }
+
+        ensureSheet();
+        QP.currentChatFile = state.chatFile;
+        QP.isOpen = true;
+
+        renderTracksList();
+
+        requestAnimationFrame(() => {
+            QP.overlayEl.classList.add('show');
+            QP.sheetEl.classList.add('show');
+            const btn = document.querySelector('#gpQuickPicker');
+            if (btn) btn.classList.add('active');
+        });
+
+        document.body.style.overflow = 'hidden';
+
+        if (navigator.vibrate) navigator.vibrate(12);
+        if (typeof soundManager !== 'undefined') {
+            try { soundManager.play('click'); } catch (e) {}
+        }
+    }
+
+    function closeSheet() {
+        if (!QP.isOpen) return;
+
+        QP.isOpen = false;
+
+        if (QP.overlayEl) QP.overlayEl.classList.remove('show');
+        if (QP.sheetEl) QP.sheetEl.classList.remove('show');
+        const btn = document.querySelector('#gpQuickPicker');
+        if (btn) btn.classList.remove('active');
+
+        document.body.style.overflow = '';
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  КНОПКА ≡ В ПЛЕЕРЕ (без бейджа)
+    // ═══════════════════════════════════════════════════════════
+    function injectPickerButton() {
+        const bar = document.getElementById('globalPlayerBar');
+        if (!bar) return false;
+        if (bar.querySelector('#gpQuickPicker')) return true;
+
+        const controls = bar.querySelector('.gp-controls');
+        if (!controls) return false;
+
+        const btn = document.createElement('button');
+        btn.className = 'gp-btn gp-btn-picker';
+        btn.id = 'gpQuickPicker';
+        btn.title = 'Плейлист чата';
+        btn.setAttribute('aria-label', 'Открыть плейлист');
+        btn.innerHTML = '≡';
+
+        // Вставляем перед кнопкой закрытия
+        const closeBtn = bar.querySelector('#gpClose');
+        if (closeBtn) {
+            controls.insertBefore(btn, closeBtn);
+        } else {
+            controls.appendChild(btn);
+        }
+
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            if (QP.isOpen) closeSheet();
+            else openSheet();
+        });
+
+        console.log('🎵 [QuickPicker] Кнопка добавлена в плеер');
+        return true;
+    }
+
+    // ─── Наблюдатель за появлением плеера ───
+    const observer = new MutationObserver(() => {
+        injectPickerButton();
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    // Периодическая страховка
+    setInterval(injectPickerButton, 1000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЖИВОЕ ОБНОВЛЕНИЕ ИКОНОК ▶/⏸
+    //  (без полной перерисовки списка, чтобы не сбивать скролл)
+    // ═══════════════════════════════════════════════════════════
+    setInterval(() => {
+        if (!QP.isOpen) return;
+        const body = document.getElementById('qpBody');
+        if (!body) return;
+
+        let currentMsgId = null;
+        let isPaused = true;
+        try {
+            if (typeof GlobalPlayer !== 'undefined' && GlobalPlayer.getCurrentMsgId) {
+                currentMsgId = GlobalPlayer.getCurrentMsgId();
+                const audio = GlobalPlayer.audioEl;
+                isPaused = audio ? audio.paused : true;
+            }
+        } catch (e) {}
+
+        body.querySelectorAll('.qp-track').forEach(el => {
+            const id = parseInt(el.dataset.msgId);
+            const isActive = String(id) === String(currentMsgId);
+            const isPlaying = isActive && !isPaused;
+
+            el.classList.toggle('active', isActive);
+            const playBtn = el.querySelector('.qp-track-play');
+            if (playBtn) {
+                playBtn.textContent = isPlaying ? '⏸' : '▶';
+                playBtn.title = isPlaying ? 'Пауза' : 'Играть';
+            }
+        });
+    }, 800);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЗАКРЫТИЕ ПРИ СМЕНЕ ЧАТА / ВЫХОДЕ
+    // ═══════════════════════════════════════════════════════════
+    if (typeof enterChat === 'function') {
+        const _origEnter = enterChat;
+        enterChat = async function(...args) {
+            if (QP.isOpen) closeSheet();
+            return _origEnter.apply(this, arguments);
+        };
+    }
+
+    if (typeof backToChats === 'function') {
+        const _origBack = backToChats;
+        backToChats = function() {
+            if (QP.isOpen) closeSheet();
+            return _origBack.apply(this, arguments);
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ESC
+    // ═══════════════════════════════════════════════════════════
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && QP.isOpen) {
+            e.preventDefault();
+            e.stopPropagation();
+            closeSheet();
+        }
+    }, true);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API
+    // ═══════════════════════════════════════════════════════════
+    window.QuickTrackPicker = {
+        open: openSheet,
+        close: closeSheet,
+        isOpen: () => QP.isOpen,
+        refresh: renderTracksList,
+
+        status: () => {
+            const { tracks, voices } = collectTracksFromCurrentChat();
+            let currentMsgId = null;
+            let isPaused = true;
+            try {
+                if (typeof GlobalPlayer !== 'undefined' && GlobalPlayer.getCurrentMsgId) {
+                    currentMsgId = GlobalPlayer.getCurrentMsgId();
+                    const audio = GlobalPlayer.audioEl;
+                    isPaused = audio ? audio.paused : true;
+                }
+            } catch (e) {}
+
+            return {
+                isOpen: QP.isOpen,
+                chatFile: state ? state.chatFile : null,
+                tracksCount: tracks.length,
+                voicesCount: voices.length,
+                currentMsgId,
+                isPaused,
+                buttonExists: !!document.getElementById('gpQuickPicker'),
+            };
+        },
+    };
+
+    // ─── Первичная установка ───
+    setTimeout(injectPickerButton, 3000);
+    setTimeout(injectPickerButton, 6000);
+
+    console.log('🎵 [QuickPicker] Готово:');
+    console.log('   • Кнопка ≡ в глобальном плеере (без счётчика)');
+    console.log('   • Bottom-sheet со списком всех аудио чата');
+    console.log('   • Музыка и голосовые разделены');
+    console.log('   • Мгновенный запуск по тапу');
+    console.log('   • API: QuickTrackPicker.open() / .status()');
+})();
+</script>
+
 </body>
 </html>
