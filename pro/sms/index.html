@@ -61809,6 +61809,585 @@ async function refreshWeatherManually(btn, card) {
     console.log('   • Проверить: RadioPlaylist.status()');
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🔁 RADIO AUTO-RETRY v2 — БЕСКОНЕЧНЫЙ ПОИСК РАБОЧЕЙ СТАНЦИИ
+//  ─────────────────────────────────────────────────────────────
+//  Принципы:
+//   • НЕ сдаёмся после N попыток — идём по кругу, пока не найдём
+//   • Работаем ТОЛЬКО в пуле, откуда пришёл запрос
+//     (random → случайные, manual → общий список, favorites → избр.)
+//   • Полностью блокируем RadioPlaylist на время автопоиска
+//   • Пауза при offline, продолжение при online
+//   • Стоп — только вручную пользователем (кнопка ✕ или нажатие play)
+// ═══════════════════════════════════════════════════════════════
 
+(function installRadioAutoRetryV2() {
+    'use strict';
+
+    console.log('🔁 [RadioAutoRetry v2] Установка…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  КОНФИГ
+    // ═══════════════════════════════════════════════════════════
+    const CFG = {
+        START_TIMEOUT_MS: 6000,    // сколько ждать «playing» после play()
+        BETWEEN_TRIES_MS: 500,      // пауза между попытками
+        MAX_ROUNDS: 50,             // предохранитель от бесконечного цикла
+        DEBUG: true,
+    };
+    const log = (...a) => CFG.DEBUG && console.log('🔁 [RadioAutoRetry v2]', ...a);
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОСТОЯНИЕ
+    // ═══════════════════════════════════════════════════════════
+    const R = {
+        active: false,
+        round: 0,
+        pool: [],                    // из какого списка ищем
+        poolType: 'all',             // 'all' | 'random' | 'manual' | 'favorites'
+        visitedThisRound: new Set(), // в текущем круге
+        currentCandidateId: null,    // что сейчас пробуем
+        lastFailedId: null,          // что упало последним
+        startTimer: null,
+        _pausedByOffline: false,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХЕЛПЕРЫ
+    // ═══════════════════════════════════════════════════════════
+    function getRadioAudio() {
+        return document.getElementById('radioWidgetAudio');
+    }
+
+    function getStationsList() {
+        if (typeof RadioWidget === 'undefined' || typeof RadioWidget.list !== 'function') return [];
+        return RadioWidget.list();
+    }
+
+    function getFavoritesIds() {
+        try {
+            const raw = localStorage.getItem('smschat_radio_favorites');
+            const parsed = raw ? JSON.parse(raw) : [];
+            if (!Array.isArray(parsed)) return [];
+            return parsed.map(x => typeof x === 'string' ? x : x.id).filter(Boolean);
+        } catch (e) {
+            return [];
+        }
+    }
+
+    function getCurrentStationIdFromStorage() {
+        try {
+            const raw = localStorage.getItem('smschat_radio_state');
+            if (!raw) return null;
+            const parsed = JSON.parse(raw);
+            return typeof parsed === 'string' ? parsed : (parsed?.id || null);
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function getStationById(id) {
+        return getStationsList().find(s => s.id === id) || null;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ФОРМИРОВАНИЕ ПУЛА
+    // ═══════════════════════════════════════════════════════════
+    function buildPool(type) {
+        const all = getStationsList();
+        R.poolType = type || 'all';
+
+        if (R.poolType === 'favorites') {
+            const favIds = getFavoritesIds();
+            const favSet = new Set(favIds);
+            R.pool = all.filter(s => favSet.has(s.id));
+            // Если избранное пусто — fallback на всё
+            if (R.pool.length === 0) R.pool = all.slice();
+        } else {
+            // manual / random / all — все станции
+            R.pool = all.slice();
+        }
+
+        log(`Пул сформирован: ${R.pool.length} станций, тип=${R.poolType}`);
+        return R.pool;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ВЫБОР СЛЕДУЮЩЕЙ СТАНЦИИ
+    // ═══════════════════════════════════════════════════════════
+    function pickNextCandidate() {
+        if (R.pool.length === 0) return null;
+
+        // ─── random: любая непроверенная в этом круге ───
+        if (R.poolType === 'random') {
+            const candidates = R.pool.filter(s => !R.visitedThisRound.has(s.id));
+            if (candidates.length === 0) {
+                // Круг закончился — начинаем новый
+                R.visitedThisRound.clear();
+                R.round++;
+                log(`Новый круг #${R.round}`);
+                if (R.round >= CFG.MAX_ROUNDS) {
+                    log('Достигнут MAX_ROUNDS — стоп');
+                    return null;
+                }
+                return pickNextCandidate();
+            }
+            const idx = Math.floor(Math.random() * candidates.length);
+            return candidates[idx];
+        }
+
+        // ─── manual / all: по порядку от последнего провала ───
+        const curId = R.lastFailedId;
+        const curIdx = R.pool.findIndex(s => s.id === curId);
+
+        for (let offset = 1; offset <= R.pool.length; offset++) {
+            const idx = curIdx >= 0
+                ? (curIdx + offset) % R.pool.length
+                : (offset - 1);
+
+            const station = R.pool[idx];
+            if (!station) continue;
+            if (R.visitedThisRound.has(station.id)) continue;
+            return station;
+        }
+
+        // Все проверены — новый круг
+        R.visitedThisRound.clear();
+        R.round++;
+        log(`Новый круг #${R.round}`);
+        if (R.round >= CFG.MAX_ROUNDS) {
+            log('Достигнут MAX_ROUNDS — стоп');
+            return null;
+        }
+        return pickNextCandidate();
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СТАРТ АВТОПОИСКА
+    // ═══════════════════════════════════════════════════════════
+    function startAutoRetry(type, failedId) {
+        if (R.active) {
+            log('Уже идёт автопоиск');
+            return;
+        }
+
+        R.active = true;
+        R.round = 1;
+        R.visitedThisRound.clear();
+        R.lastFailedId = failedId || getCurrentStationIdFromStorage();
+        R.currentCandidateId = null;
+        R._pausedByOffline = false;
+
+        if (R.lastFailedId) {
+            R.visitedThisRound.add(R.lastFailedId);
+        }
+
+        buildPool(type);
+
+        if (R.pool.length === 0) {
+            finishAutoRetry(false, 'Список станций пуст');
+            return;
+        }
+
+        log(`Старт автопоиска (тип=${R.poolType}, упало=${R.lastFailedId})`);
+
+        if (typeof showToast === 'function') {
+            showToast('🔍 Станция недоступна — ищу рабочую…', 2000);
+        }
+
+        tryNext();
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПРОБА СЛЕДУЮЩЕЙ
+    // ═══════════════════════════════════════════════════════════
+    async function tryNext() {
+        if (!R.active) return;
+
+        // ─── Офлайн — ждём ───
+        if (!navigator.onLine) {
+            log('Офлайн — пауза автопоиска');
+            R._pausedByOffline = true;
+            disarmStartTimer();
+            if (typeof showToast === 'function') {
+                showToast('📵 Офлайн — ждём восстановления сети', 2500);
+            }
+            return;
+        }
+        R._pausedByOffline = false;
+
+        const station = pickNextCandidate();
+        if (!station) {
+            finishAutoRetry(false, 'Все станции перепробованы');
+            return;
+        }
+
+        R.currentCandidateId = station.id;
+        R.visitedThisRound.add(station.id);
+        R.lastFailedId = station.id;
+
+        log(`→ Пробуем: ${station.name} (круг ${R.round}, проверено ${R.visitedThisRound.size}/${R.pool.length})`);
+
+        if (typeof showToast === 'function') {
+            const progress = `${R.visitedThisRound.size}/${R.pool.length}`;
+            showToast(`🔍 ${progress} · ${station.name}…`, 1500);
+        }
+
+        // ─── Запускаем ───
+        try {
+            if (typeof RadioWidget !== 'undefined' && typeof RadioWidget.play === 'function') {
+                // ⚠️ Вызываем ОРИГИНАЛЬНЫЙ RadioWidget.play (обёрнутый ниже),
+                //    чтобы не запустить бесконечную рекурсию.
+                RadioWidget.play(station.id);
+            }
+        } catch (e) {
+            log('Ошибка запуска:', e);
+            scheduleNext();
+            return;
+        }
+
+        armStartTimer(station.id);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ТАЙМЕР «НЕ ЗАИГРАЛО»
+    // ═══════════════════════════════════════════════════════════
+    function armStartTimer(stationId) {
+        disarmStartTimer();
+        R.startTimer = setTimeout(() => {
+            R.startTimer = null;
+            if (!R.active) return;
+            if (R.currentCandidateId !== stationId) {
+                log('Станция сменилась — таймер отменён');
+                return;
+            }
+
+            const audio = getRadioAudio();
+            if (!audio) {
+                scheduleNext();
+                return;
+            }
+
+            // Играет? — значит успех
+            if (!audio.paused && audio.src && audio.readyState >= 2) {
+                log(`Станция ${stationId} играет (проверка по таймеру)`);
+                finishAutoRetry(true);
+                return;
+            }
+
+            log(`⏱ Станция ${stationId} не заиграла за ${CFG.START_TIMEOUT_MS}мс`);
+            scheduleNext();
+        }, CFG.START_TIMEOUT_MS);
+    }
+
+    function disarmStartTimer() {
+        if (R.startTimer) {
+            clearTimeout(R.startTimer);
+            R.startTimer = null;
+        }
+    }
+
+    function scheduleNext() {
+        disarmStartTimer();
+        setTimeout(() => {
+            if (R.active) tryNext();
+        }, CFG.BETWEEN_TRIES_MS);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ФИНАЛ
+    // ═══════════════════════════════════════════════════════════
+    function finishAutoRetry(success, reason) {
+        if (!R.active) return;
+
+        R.active = false;
+        disarmStartTimer();
+
+        if (success) {
+            log('✅ Нашли рабочую станцию');
+            const st = getStationById(R.currentCandidateId);
+            if (typeof showToast === 'function' && st) {
+                showToast(`✅ Играет: ${st.name}`, 2000);
+            }
+        } else {
+            log('❌ Автопоиск завершён:', reason);
+            if (typeof showToast === 'function') {
+                showToast('❌ ' + (reason || 'Не удалось найти рабочую станцию'), 3000);
+            }
+            // Останавливаем audio
+            const audio = getRadioAudio();
+            if (audio) {
+                try {
+                    audio.pause();
+                    audio.removeAttribute('src');
+                    audio.load();
+                } catch (e) {}
+            }
+            // Сбрасываем current в storage
+            try {
+                localStorage.removeItem('smschat_radio_state');
+            } catch (e) {}
+            // Обновляем UI
+            if (typeof renderRadioCard === 'function') {
+                try { renderRadioCard(); } catch (e) {}
+            }
+        }
+
+        R.currentCandidateId = null;
+        R.round = 0;
+        R.visitedThisRound.clear();
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХУКИ НА AUDIO
+    // ═══════════════════════════════════════════════════════════
+    function attachToAudio() {
+        const audio = getRadioAudio();
+        if (!audio) {
+            setTimeout(attachToAudio, 500);
+            return;
+        }
+        if (audio._autoRetryV2Attached) return;
+        audio._autoRetryV2Attached = true;
+
+        // ─── error ───
+        audio.addEventListener('error', () => {
+            const curId = R.currentCandidateId || getCurrentStationIdFromStorage();
+            log(`audio.error на ${curId}`);
+
+            if (R.active) {
+                // Уже ищем — просто следующая
+                R.lastFailedId = curId;
+                scheduleNext();
+                return;
+            }
+
+            // Не ищем — стартуем автопоиск
+            const type = (R.poolType === 'random') ? 'random'
+                       : (R.poolType === 'favorites') ? 'favorites'
+                       : 'manual';
+            startAutoRetry(type, curId);
+        }, true);  // capture — раньше RadioPlaylist
+
+        // ─── playing (успех) ───
+        audio.addEventListener('playing', () => {
+            disarmStartTimer();
+            if (R.active) {
+                finishAutoRetry(true);
+            }
+        }, true);
+
+        // ─── stalled (буферизация застряла) ───
+        audio.addEventListener('stalled', () => {
+            if (!R.active) return;
+            // Поток завис — через 3 сек проверим и переключим
+            setTimeout(() => {
+                if (!R.active) return;
+                const a = getRadioAudio();
+                if (a && a.paused) {
+                    log('Станция зависла — следующая');
+                    scheduleNext();
+                }
+            }, 3000);
+        }, true);
+
+        log('Слушатели на audio привязаны (capture)');
+    }
+
+    const audioObs = new MutationObserver(() => {
+        if (getRadioAudio()) attachToAudio();
+    });
+    audioObs.observe(document.body, { childList: true, subtree: true });
+
+    setTimeout(attachToAudio, 1500);
+
+    // ═══════════════════════════════════════════════════════════
+    //  🆕 ПОЛНАЯ НЕЙТРАЛИЗАЦИЯ RadioPlaylist
+    //  RadioPlaylist переключает на избранное при:
+    //    • audio.error
+    //    • audio.ended
+    //  Нам нужно, чтобы при активном автопоиске эти обработчики
+    //  НЕ срабатывали.
+    // ═══════════════════════════════════════════════════════════
+
+    // ─── Патч функции playNext внутри RadioPlaylist ───
+    //  Модуль RadioPlaylist — это IIFE, внутренние функции
+    //  недоступны снаружи. Но публичный API .next() — есть.
+    //  А вот audio.error-обработчик вызывает playNext() НАПРЯМУЮ,
+    //  минуя .next(). Поэтому нейтрализуем через audio.
+    //
+    //  Ключевой приём: наш error-обработчик стоит с capture: true,
+    //  значит выполняется РАНЬШЕ, чем RadioPlaylist (у него обычный).
+    //  Мы можем поставить флаг и в RadioPlaylist-е пропустить
+    //  действие — но RadioPlaylist не знает про наш флаг.
+    //
+    //  Другой приём: удалить обработчики RadioPlaylist с audio.
+    //  Это возможно: getEventListeners(audio) в DevTools — но
+    //  программно нельзя.
+    //
+    //  Поэтому делаем так: пока активен автопоиск, временно
+    //  «глушим» audio события через stopImmediatePropagation
+    //  в capture-фазе. RadioPlaylist слушает без capture, значит
+    //  наш capture-обработчик может остановить всплытие ДО него.
+    // ═══════════════════════════════════════════════════════════
+
+    function attachGuards() {
+        const audio = getRadioAudio();
+        if (!audio) {
+            setTimeout(attachGuards, 500);
+            return;
+        }
+        if (audio._autoRetryGuardsAttached) return;
+        audio._autoRetryGuardsAttached = true;
+
+        // Пока идёт автопоиск — блокируем error и ended
+        // для RadioPlaylist (и всех остальных слушателей)
+        const blocker = (e) => {
+            if (R.active) {
+                log(`Блокируем ${e.type} — активен автопоиск`);
+                e.stopImmediatePropagation();
+            }
+        };
+
+        audio.addEventListener('error', blocker, true);
+        audio.addEventListener('ended', blocker, true);
+
+        log('Guards на audio.error/ended установлены');
+    }
+
+    setTimeout(attachGuards, 2000);
+
+    // ─── Дополнительно: патчим RadioPlaylist.next ───
+    if (typeof RadioPlaylist !== 'undefined' && typeof RadioPlaylist.next === 'function') {
+        const _origNext = RadioPlaylist.next;
+        RadioPlaylist.next = function() {
+            if (R.active) {
+                log('RadioPlaylist.next заблокирован');
+                return;
+            }
+            return _origNext.apply(this, arguments);
+        };
+    }
+
+    // ─── И switchToIndex, если он есть в API ───
+    if (typeof RadioPlaylist !== 'undefined' && typeof RadioPlaylist.playByIndex === 'function') {
+        const _origPlayIdx = RadioPlaylist.playByIndex;
+        RadioPlaylist.playByIndex = function(i) {
+            if (R.active) {
+                log('RadioPlaylist.playByIndex заблокирован');
+                return false;
+            }
+            return _origPlayIdx.apply(this, arguments);
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХУКИ НА ЗАПУСК — определяем контекст
+    // ═══════════════════════════════════════════════════════════
+
+    // ─── RadioWidget.play → manual ───
+    if (typeof RadioWidget !== 'undefined' && typeof RadioWidget.play === 'function') {
+        const _origPlay = RadioWidget.play;
+        RadioWidget.play = function(id) {
+            // Если пользователь сам нажал play на другой станции —
+            // останавливаем автопоиск (это команда пользователя)
+            const requestedId = typeof id === 'string' ? id : (id?.id || null);
+
+            // Если это НЕ автопоиск — сбрасываем контекст на manual
+            if (!R.active) {
+                R.poolType = 'manual';
+            }
+
+            // Если активен автопоиск и запрошена не та станция,
+            // что мы ищем — это ручное вмешательство пользователя
+            if (R.active && requestedId && requestedId !== R.currentCandidateId) {
+                log('Пользователь выбрал другую станцию — останавливаем автопоиск');
+                finishAutoRetry(false, 'Отменено пользователем');
+            }
+
+            return _origPlay.apply(this, arguments);
+        };
+        log('patched: RadioWidget.play');
+    }
+
+    // ─── RadioWidget.playRandom → random ───
+    if (typeof RadioWidget !== 'undefined' && typeof RadioWidget.playRandom === 'function') {
+        const _origRandom = RadioWidget.playRandom;
+        RadioWidget.playRandom = function() {
+            // Начинаем с чистого листа
+            if (R.active) {
+                finishAutoRetry(false, 'Перезапуск random');
+            }
+
+            R.poolType = 'random';
+            R.lastFailedId = null;
+            R.round = 0;
+            R.visitedThisRound.clear();
+
+            const result = _origRandom.apply(this, arguments);
+
+            // Запоминаем контекст и ставим таймер
+            const curId = getCurrentStationIdFromStorage();
+            if (curId) {
+                R.lastFailedId = curId;
+                R.visitedThisRound.add(curId);
+                armStartTimer(curId);
+            }
+
+            return result;
+        };
+        log('patched: RadioWidget.playRandom');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ONLINE / OFFLINE
+    // ═══════════════════════════════════════════════════════════
+    window.addEventListener('online', () => {
+        if (R.active && R._pausedByOffline) {
+            log('Сеть вернулась — продолжаем автопоиск');
+            R._pausedByOffline = false;
+            setTimeout(() => {
+                if (R.active) tryNext();
+            }, 1000);
+        }
+    });
+
+    window.addEventListener('offline', () => {
+        if (R.active) {
+            log('Сеть пропала — пауза автопоиска');
+            R._pausedByOffline = true;
+            disarmStartTimer();
+        }
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API
+    // ═══════════════════════════════════════════════════════════
+    window.RadioAutoRetry = {
+        start: (type) => startAutoRetry(type || 'all'),
+        stop: (reason) => finishAutoRetry(false, reason || 'Остановлено вручную'),
+        isActive: () => R.active,
+        status: () => ({
+            active: R.active,
+            round: R.round,
+            poolType: R.poolType,
+            poolSize: R.pool.length,
+            visitedInRound: R.visitedThisRound.size,
+            lastFailedId: R.lastFailedId,
+            currentCandidateId: R.currentCandidateId,
+            pausedByOffline: R._pausedByOffline,
+        }),
+        config: CFG,
+    };
+
+    console.log('🔁 [RadioAutoRetry v2] Готово:');
+    console.log('   • Автопоиск НЕ прекращается после N попыток');
+    console.log('   • RadioPlaylist полностью нейтрализован на время поиска');
+    console.log('   • Пауза при offline, продолжение при online');
+    console.log('   • Максимум кругов: ' + CFG.MAX_ROUNDS + ' (предохранитель)');
+    console.log('   • API: RadioAutoRetry.status()');
+})();
+</script>
 </body>
 </html>
