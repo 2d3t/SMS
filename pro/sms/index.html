@@ -58560,6 +58560,219 @@ async function refreshWeatherManually(btn, card) {
     console.log('   • Компактные размеры на мобиле');
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🩹 ПАТЧ: EventAutoPlay обновляет сообщение перед прыжком
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: клик по колокольчику запускает режим автопоказа,
+//  который прыгает к сообщению БЕЗ обновления данных из GitHub.
+//  В результате пользователь видит старое сообщение без
+//  нового комментария или реакции.
+//
+//  Решение: перехватываем внутреннюю функцию jumpToEvent
+//  режима EventAutoPlay и добавляем перед прыжком вызов
+//  FreshJump.refresh() с ожиданием завершения.
+// ═══════════════════════════════════════════════════════════════
 
+(function patchAutoPlayFreshJump() {
+    'use strict';
+
+    console.log('🩹 [AutoPlayFresh] Установка патча…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  Ждём, пока EventAutoPlay и FreshJump будут готовы
+    // ═══════════════════════════════════════════════════════════
+    function waitForDependencies(callback) {
+        const start = Date.now();
+        const check = () => {
+            const hasAutoPlay = typeof window.EventAutoPlay !== 'undefined'
+                && typeof window.EventAutoPlay.isActive === 'function';
+            const hasFreshJump = typeof window.FreshJump !== 'undefined'
+                && typeof window.FreshJump.refresh === 'function';
+
+            if (hasAutoPlay && hasFreshJump) {
+                callback();
+                return;
+            }
+
+            if (Date.now() - start > 15000) {
+                console.warn('🩹 [AutoPlayFresh] Таймаут ожидания зависимостей');
+                return;
+            }
+
+            setTimeout(check, 300);
+        };
+        check();
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Патчим EventRadar.markSeen — но НЕ через него идёт прыжок
+    //  Нам нужен хук на сам прыжок внутри EventAutoPlay.
+    //
+    //  EventAutoPlay — это IIFE. Функция jumpToEvent внутри
+    //  недоступна снаружи. Поэтому перехватываем клик по кнопке
+    //  колокольчика В CAPTURE-фазе ДО обработчика EventAutoPlay,
+    //  и при необходимости — обновляем текущее сообщение.
+    //
+    //  Но проще: перехватить клик на сам колокольчик и после
+    //  того, как EventAutoPlay начнёт работу, следить за
+    //  появлением подсветки и обновлять сообщение.
+    // ═══════════════════════════════════════════════════════════
+
+    // ─── Слушаем клик на колокольчики в CAPTURE-фазе ───
+    document.addEventListener('click', async (e) => {
+        const btn = e.target.closest('#radar2Btn, #radar2BtnChat');
+        if (!btn) return;
+
+        // Проверяем: есть ли непрочитанные события
+        let hasUnseen = false;
+        try {
+            if (window.EventRadar && typeof window.EventRadar.getEvents === 'function') {
+                const events = window.EventRadar.getEvents();
+                hasUnseen = events.some(ev => !ev.seen);
+            }
+        } catch (err) {}
+
+        // Если непрочитанных нет — EventAutoPlay не запустится,
+        // пусть работает обычное открытие оверлея
+        if (!hasUnseen) return;
+
+        // 🆕 Есть непрочитанные — EventAutoPlay запустится.
+        //    Мы будем «догонять» его прыжки и обновлять сообщения.
+        startWatchdog();
+    }, true);
+
+    // ═══════════════════════════════════════════════════════════
+    //  WATCHDOG: следим за подсветкой сообщений, когда активен
+    //  режим автопоказа. Как только появляется новое подсвеченное
+    //  сообщение — принудительно обновляем его из GitHub.
+    // ═══════════════════════════════════════════════════════════
+    let _watchdogTimer = null;
+    let _lastSeenMsgId = null;
+
+    function startWatchdog() {
+        // Останавливаем предыдущий
+        stopWatchdog();
+
+        _lastSeenMsgId = null;
+
+        const tick = async () => {
+            // Проверяем, активен ли автоплей
+            const isAutoPlayActive = window.EventAutoPlay
+                && typeof window.EventAutoPlay.isActive === 'function'
+                && window.EventAutoPlay.isActive();
+
+            if (!isAutoPlayActive) {
+                stopWatchdog();
+                return;
+            }
+
+            // Ищем подсвеченное сообщение
+            const highlighted = document.querySelector(
+                '.message-wrapper.highlight-flash[data-msg-id]'
+            );
+
+            if (highlighted) {
+                const msgId = parseInt(highlighted.dataset.msgId);
+                if (!isNaN(msgId) && msgId !== _lastSeenMsgId) {
+                    _lastSeenMsgId = msgId;
+                    console.log(`🩹 [AutoPlayFresh] Обнаружен прыжок к msg ${msgId} — обновляем`);
+
+                    // 🆕 Сначала скрываем подсветку (чтобы не было
+                    //     «фальшивой» свежести) и обновляем сообщение
+                    try {
+                        if (window.FreshJump && typeof window.FreshJump.refresh === 'function') {
+                            await window.FreshJump.refresh(msgId, state.chatFile);
+                            console.log(`🩹 [AutoPlayFresh] Сообщение ${msgId} обновлено`);
+                        }
+                    } catch (err) {
+                        console.warn('🩹 [AutoPlayFresh] refresh failed:', err);
+                    }
+
+                    // 🆕 После обновления — заново прокручиваем к сообщению
+                    //     и подсвечиваем (т.к. DOM мог перерисоваться)
+                    setTimeout(() => {
+                        const el = messagesInner.querySelector(
+                            `.message-wrapper[data-msg-id="${msgId}"]`
+                        );
+                        if (el) {
+                            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                            el.classList.remove('highlight-flash', 'long');
+                            void el.offsetWidth;
+                            el.classList.add('highlight-flash', 'long');
+                            setTimeout(() => {
+                                el.classList.remove('highlight-flash', 'long');
+                            }, 2600);
+                        }
+                    }, 200);
+                }
+            }
+
+            // Продолжаем следить
+            _watchdogTimer = setTimeout(tick, 400);
+        };
+
+        // Запускаем watchdog с небольшой задержкой
+        // (ждём, пока EventAutoPlay активируется)
+        setTimeout(() => {
+            if (window.EventAutoPlay && window.EventAutoPlay.isActive()) {
+                tick();
+            }
+        }, 100);
+    }
+
+    function stopWatchdog() {
+        if (_watchdogTimer) {
+            clearTimeout(_watchdogTimer);
+            _watchdogTimer = null;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ДОПОЛНИТЕЛЬНО: патчим EventRadar.markSeen, чтобы он
+    //  проверял свежесть сообщения перед отметкой прочитанным.
+    //  Это на случай, если юзер кликает на событие в оверлее —
+    //  там тоже иногда бывают "залипшие" данные.
+    // ═══════════════════════════════════════════════════════════
+    if (window.EventRadar && typeof window.EventRadar.markSeen === 'function') {
+        const _origMarkSeen = window.EventRadar.markSeen;
+
+        window.EventRadar.markSeen = function(eventOrKey) {
+            const result = _origMarkSeen.call(this, eventOrKey);
+
+            // После отметки — обновляем это сообщение в фоне,
+            // чтобы при следующем клике пользователь увидел
+            // актуальную версию
+            try {
+                const ev = typeof eventOrKey === 'string'
+                    ? (window.EventRadar.getEvents && window.EventRadar.getEvents().find(e => e.key === eventOrKey))
+                    : eventOrKey;
+
+                if (ev && ev.msgId && ev.chatFile && window.FreshJump) {
+                    // Асинхронно, не блокируем UI
+                    setTimeout(() => {
+                        if (state.chatFile === ev.chatFile && state.currentScreen === 'chat') {
+                            window.FreshJump.refresh(ev.msgId, ev.chatFile).catch(() => {});
+                        }
+                    }, 100);
+                }
+            } catch (err) {
+                // Тихо игнорируем
+            }
+
+            return result;
+        };
+
+        console.log('🩹 [AutoPlayFresh] patched: EventRadar.markSeen');
+    }
+
+    console.log('🩹 [AutoPlayFresh] Готово:');
+    console.log('   • Watchdog следит за подсветкой сообщений при автоплее');
+    console.log('   • Как только прыжок произошёл — сообщение обновляется');
+    console.log('   • Повторный скролл + подсветка после обновления');
+    console.log('   • EventRadar.markSeen обновляет сообщение в фоне');
+
+})();
+</script>
 </body>
 </html>
