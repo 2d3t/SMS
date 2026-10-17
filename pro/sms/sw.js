@@ -1,5 +1,5 @@
 // sw.js - Универсальный кеш + уведомления
-const CACHE_NAME = 'sms-pwa-v5-priglush-inviteseparate4-radiofix-invnormal-kolokolfirst-playerlist-superbutton-radioorplayersilenceroprandradflag';
+const CACHE_NAME = 'sms-pwa-v5-goodfindradio';
 
 const FILES_TO_CACHE = [
     '/SMS/pro/sms/index.html',
