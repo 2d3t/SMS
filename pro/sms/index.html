@@ -60998,6 +60998,627 @@ async function refreshWeatherManually(btn, card) {
     console.log('   • Голосовые гасят радио, но не глобальный плеер');
     console.log('   • API: AudioExclusive.status() / .enforce()');
 })();
+</script><script>
+// ═══════════════════════════════════════════════════════════════
+//  📻 RADIO PLAYLIST + MEDIA SESSION — ИЗБРАННОЕ КАК ПЛЕЙЛИСТ
+//  ─────────────────────────────────────────────────────────────
+//  Позволяет переключать радиостанции кнопками ⏮ ⏭ на:
+//   • Bluetooth-наушниках (AirPods, Galaxy Buds и т.п.)
+//   • Экран блокировки телефона (Android / iOS)
+//   • Медиа-клавишах клавиатуры
+//   • Умных часах
+//
+//  Логика:
+//   1. Плейлист = список избранных станций (★)
+//   2. Если избранное пусто — играет весь список STATIONS
+//   3. ⏭ — следующая станция по кругу
+//   4. ⏮ — предыдущая (или текущая с начала, если >5 сек)
+//   5. MediaSession активна только пока играет радио
+//   6. Как только включается GlobalPlayer — радио отдаёт
+//      MediaSession обратно плееру чатов
+// ═══════════════════════════════════════════════════════════════
+
+(function installRadioPlaylistMediaSession() {
+    'use strict';
+
+    console.log('📻 [RadioPlaylist] Установка…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОСТОЯНИЕ
+    // ═══════════════════════════════════════════════════════════
+    const RP = {
+        // Наш ли сейчас MediaSession
+        ownsMediaSession: false,
+        // Debounce для ⏮ ⏭
+        lastNextTs: 0,
+        lastPrevTs: 0,
+        DEBOUNCE_MS: 500,
+        // Таймер для обновления позиции
+        positionTimer: null,
+        // Привязан ли audio
+        audioAttached: false,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ВСПОМОГАТЕЛЬНЫЕ
+    // ═══════════════════════════════════════════════════════════
+    function getRadioAudio() {
+        return document.getElementById('radioWidgetAudio');
+    }
+
+    function getRadioPlaying() {
+        const a = getRadioAudio();
+        return !!(a && !a.paused && a.src);
+    }
+
+    function getGlobalPlaying() {
+        if (typeof GlobalPlayer === 'undefined' || !GlobalPlayer.audioEl) return false;
+        const a = GlobalPlayer.audioEl;
+        return !!(a && !a.paused && a.src);
+    }
+
+    /**
+     * Получаем «плейлист» — либо избранные, либо все станции.
+     * Избранные хранятся в localStorage под 'smschat_radio_favorites'
+     */
+    function getPlaylist() {
+        if (typeof RadioWidget === 'undefined' || typeof RadioWidget.list !== 'function') {
+            return [];
+        }
+        const allStations = RadioWidget.list();
+
+        // Избранные ID
+        let favIds = [];
+        try {
+            const raw = localStorage.getItem('smschat_radio_favorites');
+            const parsed = raw ? JSON.parse(raw) : [];
+            if (Array.isArray(parsed)) {
+                favIds = parsed.map(x => typeof x === 'string' ? x : x.id).filter(Boolean);
+            }
+        } catch (e) {}
+
+        // Если избранное пусто — весь список
+        if (favIds.length === 0) {
+            return allStations.slice();
+        }
+
+        // Собираем избранные по порядку favIds
+        const map = new Map(allStations.map(s => [s.id, s]));
+        const result = [];
+        for (const id of favIds) {
+            const st = map.get(id);
+            if (st) result.push(st);
+        }
+        return result;
+    }
+
+    function getCurrentStation() {
+        const playlist = getPlaylist();
+        if (playlist.length === 0) return null;
+
+        // Пробуем взять из RadioWidget.state? Нет такого API.
+        // Читаем сохранённое значение
+        let currentId = null;
+        try {
+            const raw = localStorage.getItem('smschat_radio_state');
+            if (raw) {
+                const parsed = JSON.parse(raw);
+                currentId = typeof parsed === 'string' ? parsed : (parsed?.id || null);
+            }
+        } catch (e) {}
+
+        if (!currentId) {
+            // Fallback: ищем по src в audio
+            const audio = getRadioAudio();
+            if (audio && audio.src) {
+                for (const st of playlist) {
+                    if (st.url && audio.src.includes(st.url.replace(/^https?:\/\//, '').slice(0, 30))) {
+                        return st;
+                    }
+                }
+            }
+            return playlist[0] || null;
+        }
+
+        return playlist.find(s => s.id === currentId) || playlist[0] || null;
+    }
+
+    function getCurrentIndex() {
+        const playlist = getPlaylist();
+        const cur = getCurrentStation();
+        if (!cur) return -1;
+        return playlist.findIndex(s => s.id === cur.id);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОБНОВЛЕНИЕ METADATA
+    // ═══════════════════════════════════════════════════════════
+    function updateMediaSessionMetadata() {
+        if (!('mediaSession' in navigator)) return;
+
+        const station = getCurrentStation();
+        if (!station) return;
+
+        try {
+            // Иконка-эмодзи как SVG в artwork — самое простое решение
+            const iconSvg = `
+                <svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+                    <defs>
+                        <linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%">
+                            <stop offset="0%" stop-color="#6c5ce7"/>
+                            <stop offset="100%" stop-color="#00b894"/>
+                        </linearGradient>
+                    </defs>
+                    <rect width="512" height="512" rx="120" fill="url(#g)"/>
+                    <text x="256" y="320" text-anchor="middle" font-size="240" font-family="system-ui, sans-serif">📻</text>
+                </svg>
+            `.trim().replace(/\s+/g, ' ');
+
+            const artworkUrl = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(iconSvg);
+
+            const playlist = getPlaylist();
+            const currentIdx = getCurrentIndex();
+
+            navigator.mediaSession.metadata = new MediaMetadata({
+                title: station.name,
+                artist: `${station.country || ''} · ${station.genre || 'Radio'}`.trim(),
+                album: `Радио · ${currentIdx + 1} из ${playlist.length}`,
+                artwork: [
+                    { src: artworkUrl, sizes: '512x512', type: 'image/svg+xml' },
+                ],
+            });
+
+            // MediaSession.playbackState
+            navigator.mediaSession.playbackState = getRadioPlaying() ? 'playing' : 'paused';
+
+            console.log(`📻 [RadioPlaylist] Metadata: ${station.name} (${currentIdx + 1}/${playlist.length})`);
+        } catch (e) {
+            console.warn('📻 [RadioPlaylist] metadata error:', e);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕКЛЮЧЕНИЕ СТАНЦИЙ
+    // ═══════════════════════════════════════════════════════════
+    async function switchToIndex(index) {
+        const playlist = getPlaylist();
+        if (playlist.length === 0) {
+            if (typeof showToast === 'function') {
+                showToast('📻 Нет станций в избранном', 2000);
+            }
+            return false;
+        }
+
+        // Зацикливаем
+        if (index < 0) index = playlist.length - 1;
+        if (index >= playlist.length) index = 0;
+
+        const station = playlist[index];
+        if (!station) return false;
+
+        console.log(`📻 [RadioPlaylist] Переключение на: ${station.name} (${index + 1}/${playlist.length})`);
+
+        // 🆕 Ставим GlobalPlayer на паузу (если играет)
+        if (typeof GlobalPlayer !== 'undefined' && GlobalPlayer.audioEl) {
+            if (!GlobalPlayer.audioEl.paused) {
+                try { GlobalPlayer.audioEl.pause(); } catch (e) {}
+            }
+        }
+
+        // Запускаем станцию через RadioWidget
+        if (typeof RadioWidget !== 'undefined' && typeof RadioWidget.play === 'function') {
+            try {
+                RadioWidget.play(station.id);
+
+                // Обновляем metadata сразу
+                updateMediaSessionMetadata();
+
+                // И ещё раз через секунду (когда поток начнёт играть)
+                setTimeout(updateMediaSessionMetadata, 1000);
+                setTimeout(updateMediaSessionMetadata, 2500);
+
+                return true;
+            } catch (e) {
+                console.warn('📻 [RadioPlaylist] play error:', e);
+                return false;
+            }
+        }
+
+        return false;
+    }
+
+    async function playNext() {
+        const now = Date.now();
+        if (now - RP.lastNextTs < RP.DEBOUNCE_MS) return;
+        RP.lastNextTs = now;
+
+        const playlist = getPlaylist();
+        const currentIdx = getCurrentIndex();
+
+        if (playlist.length === 0) {
+            if (typeof showToast === 'function') showToast('📻 Избранное пусто', 1500);
+            return;
+        }
+
+        // Если ничего не играло — начинаем с первой
+        if (currentIdx === -1) {
+            await switchToIndex(0);
+            return;
+        }
+
+        // Иначе — следующая по кругу
+        await switchToIndex(currentIdx + 1);
+    }
+
+    async function playPrev() {
+        const now = Date.now();
+        if (now - RP.lastPrevTs < RP.DEBOUNCE_MS) return;
+        RP.lastPrevTs = now;
+
+        const playlist = getPlaylist();
+        const currentIdx = getCurrentIndex();
+
+        if (playlist.length === 0) {
+            if (typeof showToast === 'function') showToast('📻 Избранное пусто', 1500);
+            return;
+        }
+
+        // Если играет > 5 сек — в начало текущей
+        const audio = getRadioAudio();
+        if (audio && audio.currentTime > 5 && currentIdx !== -1) {
+            // Живой поток, currentTime обычно 0 — не сработает,
+            // но на всякий случай
+            try {
+                audio.currentTime = 0;
+            } catch (e) {}
+            return;
+        }
+
+        // Иначе — предыдущая по кругу
+        if (currentIdx === -1) {
+            await switchToIndex(playlist.length - 1);
+            return;
+        }
+
+        await switchToIndex(currentIdx - 1);
+    }
+
+    function togglePlayPause() {
+        if (typeof RadioWidget === 'undefined' || typeof RadioWidget.toggle !== 'function') {
+            return;
+        }
+        RadioWidget.toggle();
+        setTimeout(updateMediaSessionMetadata, 300);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЗАХВАТ / ОТДАЧА MEDIA SESSION
+    // ═══════════════════════════════════════════════════════════
+    let _nativeSetActionHandler = null;
+
+    // Находим нативный метод
+    try {
+        const MSProto = Object.getPrototypeOf(navigator.mediaSession);
+        if (MSProto && MSProto.setActionHandler) {
+            _nativeSetActionHandler = MSProto.setActionHandler;
+        }
+    } catch (e) {}
+    if (!_nativeSetActionHandler && navigator.mediaSession.setActionHandler) {
+        _nativeSetActionHandler = navigator.mediaSession.setActionHandler;
+    }
+
+    if (!_nativeSetActionHandler) {
+        console.error('📻 [RadioPlaylist] setActionHandler не найден — MediaSession не будет работать');
+        return;
+    }
+
+    function setHandler(action, handler) {
+        try {
+            _nativeSetActionHandler.call(navigator.mediaSession, action, handler);
+        } catch (e) {
+            try {
+                navigator.mediaSession.setActionHandler(action, handler);
+            } catch (err) {}
+        }
+    }
+
+    function takeOverMediaSession() {
+        if (!('mediaSession' in navigator)) return;
+
+        // Если GlobalPlayer играет — не влезаем
+        if (getGlobalPlaying()) {
+            console.log('📻 [RadioPlaylist] GlobalPlayer активен — не захватываем MediaSession');
+            return;
+        }
+
+        RP.ownsMediaSession = true;
+
+        // Наши обработчики
+        setHandler('play', () => {
+            console.log('📻 [MediaSession] play');
+            if (!getRadioPlaying()) togglePlayPause();
+        });
+
+        setHandler('pause', () => {
+            console.log('📻 [MediaSession] pause');
+            if (getRadioPlaying()) togglePlayPause();
+        });
+
+        setHandler('nexttrack', () => {
+            console.log('📻 [MediaSession] nexttrack');
+            playNext();
+        });
+
+        setHandler('previoustrack', () => {
+            console.log('📻 [MediaSession] previoustrack');
+            playPrev();
+        });
+
+        setHandler('stop', () => {
+            console.log('📻 [MediaSession] stop');
+            const audio = getRadioAudio();
+            if (audio) {
+                try { audio.pause(); } catch (e) {}
+            }
+            try { navigator.mediaSession.playbackState = 'none'; } catch (e) {}
+        });
+
+        setHandler('seekbackward', null);
+        setHandler('seekforward', null);
+        setHandler('seekto', null);
+
+        updateMediaSessionMetadata();
+
+        console.log('📻 [RadioPlaylist] MediaSession захвачена (наши обработчики активны)');
+    }
+
+    function releaseMediaSession() {
+        if (!RP.ownsMediaSession) return;
+        RP.ownsMediaSession = false;
+        console.log('📻 [RadioPlaylist] MediaSession отпущена');
+
+        // Пробуем вернуть GlobalPlayer — он сам поставит обработчики
+        // при следующем playQueue. Пока просто чистим.
+        try {
+            navigator.mediaSession.metadata = null;
+            navigator.mediaSession.playbackState = 'none';
+        } catch (e) {}
+
+        // Восстанавливаем обработчики GlobalPlayer если он готов
+        if (typeof window.MediaSessionNavMode !== 'undefined'
+            && typeof window.MediaSessionNavMode.reinstall === 'function') {
+            setTimeout(() => {
+                try { window.MediaSessionNavMode.reinstall(); } catch (e) {}
+            }, 200);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СЛЕЖЕНИЕ ЗА СОСТОЯНИЕМ РАДИО
+    // ═══════════════════════════════════════════════════════════
+    function checkRadioState() {
+        const radioPlaying = getRadioPlaying();
+        const globalPlaying = getGlobalPlaying();
+
+        // ─── Случай 1: играет радио ───
+        if (radioPlaying) {
+            // GlobalPlayer играет одновременно? → гасим его
+            if (globalPlaying) {
+                console.log('📻 [RadioPlaylist] Оба играют — гасим GlobalPlayer');
+                try {
+                    GlobalPlayer.audioEl.pause();
+                } catch (e) {}
+            }
+
+            // Захватываем MediaSession если ещё не
+            if (!RP.ownsMediaSession) {
+                takeOverMediaSession();
+            }
+
+            // Обновляем playbackState
+            try {
+                if (navigator.mediaSession.playbackState !== 'playing') {
+                    navigator.mediaSession.playbackState = 'playing';
+                }
+            } catch (e) {}
+
+            return;
+        }
+
+        // ─── Случай 2: радио не играет ───
+        if (RP.ownsMediaSession) {
+            // Если GlobalPlayer играет — отдаём ему MediaSession
+            if (globalPlaying) {
+                releaseMediaSession();
+                return;
+            }
+
+            // Никто не играет — просто ставим на паузу
+            try {
+                navigator.mediaSession.playbackState = 'paused';
+            } catch (e) {}
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СЛУШАТЕЛИ СОБЫТИЙ
+    // ═══════════════════════════════════════════════════════════
+
+    // ─── 1. Привязка к audio (при появлении) ───
+    function attachToAudio() {
+        const audio = getRadioAudio();
+        if (!audio) {
+            setTimeout(attachToAudio, 500);
+            return;
+        }
+        if (RP.audioAttached && audio._rpAttached) return;
+
+        RP.audioAttached = true;
+        audio._rpAttached = true;
+
+        // ─── На play ───
+        audio.addEventListener('play', () => {
+            console.log('📻 [RadioPlaylist] audio.play — обновляем metadata');
+            setTimeout(() => {
+                updateMediaSessionMetadata();
+                checkRadioState();
+            }, 200);
+            setTimeout(updateMediaSessionMetadata, 1000);
+        });
+
+        // ─── На pause ───
+        audio.addEventListener('pause', () => {
+            console.log('📻 [RadioPlaylist] audio.pause');
+            setTimeout(checkRadioState, 100);
+            try {
+                navigator.mediaSession.playbackState = 'paused';
+            } catch (e) {}
+        });
+
+        // ─── На loadedmetadata ───
+        audio.addEventListener('loadedmetadata', () => {
+            updateMediaSessionMetadata();
+        });
+
+        // ─── На error ───
+        audio.addEventListener('error', () => {
+            console.warn('📻 [RadioPlaylist] audio.error — переключаем на следующую');
+            // Автоматически перескакиваем на следующую станцию
+            setTimeout(() => {
+                if (typeof showToast === 'function') {
+                    showToast('⚠️ Станция недоступна — переключаем', 2000);
+                }
+                playNext();
+            }, 500);
+        });
+
+        // ─── На ended (для живых потоков не бывает, но на всякий) ───
+        audio.addEventListener('ended', () => {
+            console.log('📻 [RadioPlaylist] audio.ended — переключаем на следующую');
+            playNext();
+        });
+
+        console.log('📻 [RadioPlaylist] Слушатели на radioWidgetAudio привязаны');
+    }
+
+    // ─── 2. Наблюдаем за появлением audio ───
+    const audioObserver = new MutationObserver(() => {
+        if (document.getElementById('radioWidgetAudio')) {
+            attachToAudio();
+        }
+    });
+    audioObserver.observe(document.body, { childList: true, subtree: true });
+
+    // ─── 3. Периодическая проверка состояния (страховка) ───
+    setInterval(checkRadioState, 1500);
+
+    // ─── 4. Патч RadioWidget.play — обновляем metadata ───
+    if (typeof RadioWidget !== 'undefined' && typeof RadioWidget.play === 'function') {
+        const _origPlay = RadioWidget.play;
+        RadioWidget.play = function(id) {
+            const result = _origPlay.apply(this, arguments);
+            setTimeout(updateMediaSessionMetadata, 500);
+            setTimeout(updateMediaSessionMetadata, 1500);
+            setTimeout(takeOverMediaSession, 1000);
+            return result;
+        };
+        console.log('📻 [RadioPlaylist] patched: RadioWidget.play');
+    }
+
+    // ─── 5. Патч GlobalPlayer.playQueue — отдаём MediaSession ───
+    if (typeof GlobalPlayer !== 'undefined' && typeof GlobalPlayer.playQueue === 'function') {
+        const _origPlayQueue = GlobalPlayer.playQueue;
+        GlobalPlayer.playQueue = function() {
+            // Гасим радио (если играет)
+            const radio = getRadioAudio();
+            if (radio && !radio.paused) {
+                try { radio.pause(); } catch (e) {}
+            }
+            // Отдаём MediaSession
+            releaseMediaSession();
+            return _origPlayQueue.apply(this, arguments);
+        };
+        console.log('📻 [RadioPlaylist] patched: GlobalPlayer.playQueue');
+    }
+
+    // ─── 6. Патчим RadioWidget.add / remove — обновляем metadata ───
+    // (если пользователь добавил/удалил станцию из избранного,
+    //  а она играет — это меняет плейлист)
+    function patchFavoritesChanges() {
+        // Патчим localStorage.setItem — отслеживаем изменения избранного
+        const _origSetItem = localStorage.setItem.bind(localStorage);
+        localStorage.setItem = function(key, value) {
+            _origSetItem(key, value);
+            if (key === 'smschat_radio_favorites') {
+                // Обновляем metadata (мог измениться порядок/набор)
+                setTimeout(updateMediaSessionMetadata, 200);
+            }
+        };
+    }
+    patchFavoritesChanges();
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЗАПУСК
+    // ═══════════════════════════════════════════════════════════
+    attachToAudio();
+
+    // Если радио уже играет при загрузке — сразу захватываем
+    setTimeout(() => {
+        if (getRadioPlaying()) {
+            takeOverMediaSession();
+        }
+    }, 3000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API
+    // ═══════════════════════════════════════════════════════════
+    window.RadioPlaylist = {
+        // Текущий плейлист
+        getPlaylist: () => getPlaylist(),
+        getCurrent: () => getCurrentStation(),
+        getCurrentIndex: () => getCurrentIndex(),
+
+        // Переключение
+        next: () => playNext(),
+        prev: () => playPrev(),
+        playByIndex: (i) => switchToIndex(i),
+        playById: (id) => {
+            const pl = getPlaylist();
+            const idx = pl.findIndex(s => s.id === id);
+            if (idx >= 0) return switchToIndex(idx);
+            return false;
+        },
+
+        // MediaSession
+        grab: () => takeOverMediaSession(),
+        release: () => releaseMediaSession(),
+        ownsMediaSession: () => RP.ownsMediaSession,
+
+        // Принудительное обновление metadata
+        refreshMetadata: () => updateMediaSessionMetadata(),
+
+        // Статус
+        status: () => ({
+            playlistLength: getPlaylist().length,
+            currentStation: getCurrentStation()?.name || null,
+            currentIndex: getCurrentIndex(),
+            radioPlaying: getRadioPlaying(),
+            globalPlaying: getGlobalPlaying(),
+            ownsMediaSession: RP.ownsMediaSession,
+            audioAttached: RP.audioAttached,
+            mediaSessionSupported: 'mediaSession' in navigator,
+            mediaSessionState: navigator.mediaSession?.playbackState || 'unknown',
+        }),
+    };
+
+    console.log('📻 [RadioPlaylist] Готово:');
+    console.log('   • Избранные станции = плейлист');
+    console.log('   • ⏮ ⏭ на наушниках переключают станции по кругу');
+    console.log('   • Metadata показывается на экране блокировки');
+    console.log('   • При переключении на музыку из чатов — MediaSession отдаётся плееру');
+    console.log('   • API: RadioPlaylist.status() / .next() / .prev()');
+    console.log('   • Проверить: RadioPlaylist.status()');
+})();
 </script>
 
 </body>
