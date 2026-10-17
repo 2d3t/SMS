@@ -60418,6 +60418,586 @@ async function refreshWeatherManually(btn, card) {
     console.log('   • Текущий режим: ' + CFG.MODE_INFO[NM.mode].label);
     console.log('   • API: NavMode.get() / .set("shuffle") / .cycle()');
 })();
+</script><script>
+// ═══════════════════════════════════════════════════════════════
+//  🎧 MEDIA SESSION → NAV MODE BRIDGE v2 (ФИНАЛЬНЫЙ)
+//  ─────────────────────────────────────────────────────────────
+//  Проблема:
+//    Старый MediaSessionBridgeV2:
+//     • Каждые 20 сек переустанавливает свои обработчики
+//     • При play/pause/ended тоже переустанавливает
+//     • Использует _originalSetHandler из своего замыкания
+//     • Обходит любые внешние патчи setActionHandler
+//
+//  Решение:
+//    Перехватываем НА УРОВНЕ ПРОТОТИПА MediaSession —
+//    navigator.mediaSession.__proto__.setActionHandler
+//    Это гарантирует, что даже _originalSetHandler старого
+//    моста будет перехвачен, потому что это тот же самый
+//    нативный метод.
+// ═══════════════════════════════════════════════════════════════
+
+(function installMediaSessionNavModeBridgeV2() {
+    'use strict';
+
+    if (!('mediaSession' in navigator)) {
+        console.warn('🎧 [MS-NavMode v2] MediaSession не поддерживается');
+        return;
+    }
+
+    console.log('🎧 [MS-NavMode v2] Установка ФИНАЛЬНОГО моста…');
+
+    // ─── Debounce ───
+    let _lastNextTs = 0;
+    let _lastPrevTs = 0;
+    const DEBOUNCE_MS = 400;
+
+    // ─── Готовность ───
+    function isReady() {
+        return typeof window.NavMode !== 'undefined'
+            && typeof GlobalPlayer !== 'undefined'
+            && GlobalPlayer.audioEl;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  НАХОДИМ НАТИВНЫЙ setActionHandler (самый первый, настоящий)
+    //  Он может быть спрятан глубоко в цепочке переопределений.
+    //  Идём через прототип MediaSession.
+    // ═══════════════════════════════════════════════════════════
+    let _nativeSetActionHandler = null;
+
+    // Способ 1: через MediaSession.prototype
+    try {
+        const MSProto = Object.getPrototypeOf(navigator.mediaSession);
+        if (MSProto && MSProto.setActionHandler) {
+            _nativeSetActionHandler = MSProto.setActionHandler;
+        }
+    } catch (e) {}
+
+    // Способ 2: через дескриптор
+    if (!_nativeSetActionHandler) {
+        try {
+            let proto = Object.getPrototypeOf(navigator.mediaSession);
+            while (proto) {
+                const desc = Object.getOwnPropertyDescriptor(proto, 'setActionHandler');
+                if (desc && desc.value) {
+                    _nativeSetActionHandler = desc.value;
+                    break;
+                }
+                proto = Object.getPrototypeOf(proto);
+            }
+        } catch (e) {}
+    }
+
+    // Способ 3: через текущий метод (если не нативный — наш патч всё равно его обернёт)
+    if (!_nativeSetActionHandler) {
+        try {
+            const current = navigator.mediaSession.setActionHandler;
+            if (typeof current === 'function') {
+                _nativeSetActionHandler = current;
+                console.warn('🎧 [MS-NavMode v2] Не нашли нативный setActionHandler, используем текущий');
+            }
+        } catch (e) {}
+    }
+
+    if (!_nativeSetActionHandler) {
+        console.error('🎧 [MS-NavMode v2] НЕ УДАЛОСЬ НАЙТИ setActionHandler');
+        return;
+    }
+
+    console.log('🎧 [MS-NavMode v2] Нативный setActionHandler найден');
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОБРАБОТЧИКИ
+    // ═══════════════════════════════════════════════════════════
+    function onNext() {
+        const now = Date.now();
+        if (now - _lastNextTs < DEBOUNCE_MS) return;
+        _lastNextTs = now;
+
+        if (!isReady()) return;
+
+        const audio = GlobalPlayer.audioEl;
+        if (!audio || !audio.src) return;
+
+        console.log(`🎧 [MS-NavMode v2] nexttrack (режим: ${window.NavMode.get()})`);
+
+        // Имитируем клик по ⏭ — этот клик перехвачен NavMode
+        const bar = document.getElementById('globalPlayerBar');
+        const nextBtn = bar && bar.querySelector('#gpNext');
+        if (nextBtn && !nextBtn.disabled) {
+            nextBtn.click();
+            return;
+        }
+
+        // Fallback: если кнопки нет — вызываем NavMode напрямую
+        // через эмуляцию — но лучше вызвать handleNext из NavMode,
+        // если он экспортирован. У нас его нет в API, поэтому
+        // используем GlobalPlayer.next как последний шанс
+        try {
+            GlobalPlayer.next(true);
+        } catch (e) {}
+    }
+
+    function onPrev() {
+        const now = Date.now();
+        if (now - _lastPrevTs < DEBOUNCE_MS) return;
+        _lastPrevTs = now;
+
+        if (!isReady()) return;
+
+        const audio = GlobalPlayer.audioEl;
+        if (!audio || !audio.src) return;
+
+        console.log(`🎧 [MS-NavMode v2] previoustrack (режим: ${window.NavMode.get()})`);
+
+        // Имитируем клик по ⏮ — этот клик перехвачен NavMode
+        const bar = document.getElementById('globalPlayerBar');
+        const prevBtn = bar && bar.querySelector('#gpPrev');
+        if (prevBtn && !prevBtn.disabled) {
+            prevBtn.click();
+            return;
+        }
+
+        // Fallback: если играет > 3 сек — в начало
+        if (audio.currentTime > 3) {
+            audio.currentTime = 0;
+            return;
+        }
+
+        try {
+            GlobalPlayer.prev();
+        } catch (e) {}
+    }
+
+    function onSeekBackward(details) {
+        if (!isReady()) return;
+        const audio = GlobalPlayer.audioEl;
+        if (!audio || !isFinite(audio.duration)) return;
+        const offset = (details && details.seekOffset) || 10;
+        audio.currentTime = Math.max(0, audio.currentTime - offset);
+    }
+
+    function onSeekForward(details) {
+        if (!isReady()) return;
+        const audio = GlobalPlayer.audioEl;
+        if (!audio || !isFinite(audio.duration)) return;
+        const offset = (details && details.seekOffset) || 10;
+        audio.currentTime = Math.min(audio.duration, audio.currentTime + offset);
+    }
+
+    function onSeekTo(details) {
+        if (!isReady()) return;
+        const audio = GlobalPlayer.audioEl;
+        if (!audio || !isFinite(audio.duration)) return;
+        if (details && typeof details.seekTime === 'number') {
+            audio.currentTime = details.seekTime;
+        }
+    }
+
+    function onStop() {
+        if (!isReady()) return;
+        try { GlobalPlayer.stop(); } catch (e) {}
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ГЛАВНЫЙ ПЕРЕХВАТ
+    //  Переопределяем НА УРОВНЕ ПРОТОТИПА (или объекта).
+    //  Даже старый мост, вызывая свой _originalSetHandler,
+    //  попадёт в нашу обёртку, потому что это тот же метод.
+    // ═══════════════════════════════════════════════════════════
+
+    // Оборачиваем — теперь ЛЮБОЙ вызов setActionHandler для
+    // nexttrack/previoustrack/seek*/stop перезаписывается нашим
+    function interceptedSetActionHandler(action, handler) {
+        switch (action) {
+            case 'nexttrack':
+                return _nativeSetActionHandler.call(navigator.mediaSession, 'nexttrack', onNext);
+            case 'previoustrack':
+                return _nativeSetActionHandler.call(navigator.mediaSession, 'previoustrack', onPrev);
+            case 'seekbackward':
+                return _nativeSetActionHandler.call(navigator.mediaSession, 'seekbackward', onSeekBackward);
+            case 'seekforward':
+                return _nativeSetActionHandler.call(navigator.mediaSession, 'seekforward', onSeekForward);
+            case 'seekto':
+                return _nativeSetActionHandler.call(navigator.mediaSession, 'seekto', onSeekTo);
+            case 'stop':
+                return _nativeSetActionHandler.call(navigator.mediaSession, 'stop', onStop);
+            default:
+                // play/pause и всё остальное — пропускаем как есть
+                return _nativeSetActionHandler.call(navigator.mediaSession, action, handler);
+        }
+    }
+
+    // ─── Переопределяем ЧЕРЕЗ ПРОТОТИП ───
+    try {
+        const MSProto = Object.getPrototypeOf(navigator.mediaSession);
+        if (MSProto) {
+            Object.defineProperty(MSProto, 'setActionHandler', {
+                value: interceptedSetActionHandler,
+                writable: true,
+                configurable: true,
+            });
+            console.log('🎧 [MS-NavMode v2] setActionHandler переопределён ЧЕРЕЗ ПРОТОТИП');
+        }
+    } catch (e) {
+        console.warn('🎧 [MS-NavMode v2] Прототип не удалось, пробуем через объект');
+        try {
+            Object.defineProperty(navigator.mediaSession, 'setActionHandler', {
+                value: interceptedSetActionHandler,
+                writable: true,
+                configurable: true,
+            });
+        } catch (err) {
+            console.error('🎧 [MS-NavMode v2] Не удалось переопределить вообще:', err);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПРИНУДИТЕЛЬНАЯ ПЕРЕУСТАНОВКА
+    //  Старый мост каждые 20 сек ставит СВОИ обработчики.
+    //  Мы каждые 3 сек ставим СВОИ — побеждаем в гонке.
+    // ═══════════════════════════════════════════════════════════
+    function forceReinstall() {
+        try {
+            _nativeSetActionHandler.call(navigator.mediaSession, 'nexttrack', onNext);
+            _nativeSetActionHandler.call(navigator.mediaSession, 'previoustrack', onPrev);
+            _nativeSetActionHandler.call(navigator.mediaSession, 'seekbackward', onSeekBackward);
+            _nativeSetActionHandler.call(navigator.mediaSession, 'seekforward', onSeekForward);
+            _nativeSetActionHandler.call(navigator.mediaSession, 'seekto', onSeekTo);
+            _nativeSetActionHandler.call(navigator.mediaSession, 'stop', onStop);
+        } catch (e) {}
+    }
+
+    // ─── Страховка: каждые 3 секунды (быстрее, чем 20 сек старого моста) ───
+    setInterval(() => {
+        if (typeof GlobalPlayer === 'undefined' || !GlobalPlayer.audioEl) return;
+        if (GlobalPlayer.audioEl.paused) return;
+        forceReinstall();
+    }, 3000);
+
+    // ─── При каждом play/pause/ended/loadedmetadata ───
+    function attachToAudio() {
+        const audio = (typeof GlobalPlayer !== 'undefined') ? GlobalPlayer.audioEl : null;
+        if (!audio) {
+            setTimeout(attachToAudio, 500);
+            return;
+        }
+        if (audio._msNavModeV2Attached) return;
+        audio._msNavModeV2Attached = true;
+
+        audio.addEventListener('play', forceReinstall);
+        audio.addEventListener('loadedmetadata', forceReinstall);
+        audio.addEventListener('ended', () => {
+            setTimeout(forceReinstall, 100);
+            setTimeout(forceReinstall, 400);
+            setTimeout(forceReinstall, 1000);
+        });
+
+        console.log('🎧 [MS-NavMode v2] Слушатели на audio привязаны');
+    }
+
+    // ─── Первичная установка ───
+    setTimeout(forceReinstall, 1500);
+    setTimeout(forceReinstall, 3000);
+    setTimeout(forceReinstall, 5000);
+    setTimeout(attachToAudio, 2500);
+
+    // ─── Ещё одна страховка: слушаем изменения playbackState ───
+    // (некоторые браузеры сбрасывают обработчики при смене состояния)
+    let _lastPlaybackState = null;
+    setInterval(() => {
+        try {
+            const cur = navigator.mediaSession.playbackState;
+            if (cur !== _lastPlaybackState) {
+                _lastPlaybackState = cur;
+                forceReinstall();
+            }
+        } catch (e) {}
+    }, 1000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API
+    // ═══════════════════════════════════════════════════════════
+    window.MediaSessionNavMode = {
+        reinstall: forceReinstall,
+        status: () => ({
+            supported: 'mediaSession' in navigator,
+            navMode: (typeof window.NavMode !== 'undefined') ? window.NavMode.get() : null,
+            playbackState: navigator.mediaSession.playbackState,
+            hasMetadata: !!navigator.mediaSession.metadata,
+            audioPlaying: !!(typeof GlobalPlayer !== 'undefined'
+                && GlobalPlayer.audioEl
+                && !GlobalPlayer.audioEl.paused),
+            nativeHandlerFound: !!_nativeSetActionHandler,
+        }),
+        testNext: () => onNext(),
+        testPrev: () => onPrev(),
+    };
+
+    console.log('🎧 [MS-NavMode v2] ФИНАЛЬНЫЙ мост установлен:');
+    console.log('   • setActionHandler перехвачен через прототип');
+    console.log('   • Старый мост больше не может перезаписать');
+    console.log('   • Принудительная переустановка каждые 3 сек');
+    console.log('   • Проверка: MediaSessionNavMode.status()');
+})();
+</script><script>
+// ═══════════════════════════════════════════════════════════════
+//  🎵 AUDIO EXCLUSIVE MODE — радио и плеер не играют одновременно
+//  ─────────────────────────────────────────────────────────────
+//  Правило:
+//   • Включили радио  → глобальный плеер на паузу
+//   • Включили плеер  → радио на паузу
+//   • Голосовые в чате не трогаем (они кратковременные)
+// ═══════════════════════════════════════════════════════════════
+
+(function installAudioExclusiveMode() {
+    'use strict';
+
+    console.log('🎵 [AudioExclusive] Установка…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  ВСПОМОГАТЕЛЬНЫЕ
+    // ═══════════════════════════════════════════════════════════
+    function pauseRadio() {
+        const radio = document.getElementById('radioWidgetAudio');
+        if (radio && !radio.paused) {
+            radio.pause();
+            console.log('🎵 [AudioExclusive] Радио поставлено на паузу');
+            return true;
+        }
+        return false;
+    }
+
+    function pauseGlobalPlayer() {
+        if (typeof GlobalPlayer === 'undefined') return false;
+        const audio = GlobalPlayer.audioEl;
+        if (audio && !audio.paused) {
+            audio.pause();
+            console.log('🎵 [AudioExclusive] Глобальный плеер поставлен на паузу');
+            return true;
+        }
+        return false;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ «play» НА ВСЕХ <audio>
+    //  Один универсальный обработчик — надёжнее, чем патчить
+    //  каждую кнопку в отдельности.
+    // ═══════════════════════════════════════════════════════════
+    document.addEventListener('play', (e) => {
+        const audio = e.target;
+        if (!audio || audio.tagName !== 'AUDIO') return;
+
+        // ─── 1. Играет РАДИО ───
+        if (audio.id === 'radioWidgetAudio') {
+            // Гасим глобальный плеер
+            if (pauseGlobalPlayer()) {
+                if (typeof showToast === 'function') {
+                    // Тихо, без навязчивости — только если что-то реально играло
+                    // (без тоста, чтобы не мешать)
+                }
+            }
+            // Голосовые в чате тоже гасим — иначе каша
+            try {
+                if (typeof audioPlayers !== 'undefined' && audioPlayers) {
+                    Object.values(audioPlayers).forEach(p => {
+                        if (p && p.audio && !p.audio.paused) {
+                            p.audio.pause();
+                            if (p.waveEl) p.waveEl.classList.remove('playing');
+                            if (p.btn) p.btn.textContent = '▶';
+                        }
+                    });
+                }
+            } catch (err) {}
+            return;
+        }
+
+        // ─── 2. Играет ГЛОБАЛЬНЫЙ ПЛЕЕР ───
+        if (typeof GlobalPlayer !== 'undefined'
+            && GlobalPlayer.audioEl
+            && audio === GlobalPlayer.audioEl) {
+            // Гасим радио
+            pauseRadio();
+            return;
+        }
+
+        // ─── 3. Играет голосовое в чате ───
+        //  (audioPlayers[*].audio)
+        //  Логика: не трогаем глобальный плеер и радио — пусть
+        //  пользователь сам решит. Но если играет И радио, И голосовое —
+        //  это тоже плохо. Поэтому:
+        //  - если играет радио, а запустили голосовое — гасим радио
+        //  - если играет глобальный плеер, а запустили голосовое —
+        //    не трогаем (пользователь сам так захотел)
+        try {
+            if (typeof audioPlayers !== 'undefined' && audioPlayers) {
+                const isLocalVoice = Object.values(audioPlayers).some(
+                    p => p && p.audio === audio
+                );
+                if (isLocalVoice) {
+                    // Гасим радио, но не глобальный плеер
+                    pauseRadio();
+                    return;
+                }
+            }
+        } catch (err) {}
+
+        // ─── 4. Любое другое аудио ───
+        //  (например, встроенный плеер видео) — ничего не делаем
+    }, true);  // capture-фаза — раньше любых других обработчиков
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧ RADIO:PLAY (RadioWidget.playStation)
+    //  Ставим глобальный плеер на паузу ДО запуска радио.
+    //  Это надёжнее, чем ждать события «play» — успевает
+    //  остановить другое аудио раньше, чем они начнут «драться».
+    // ═══════════════════════════════════════════════════════════
+    if (typeof RadioWidget !== 'undefined' && typeof RadioWidget.play === 'function') {
+        const _origPlay = RadioWidget.play;
+        RadioWidget.play = function(id) {
+            pauseGlobalPlayer();
+            // Голосовые тоже
+            try {
+                if (typeof audioPlayers !== 'undefined' && audioPlayers) {
+                    Object.values(audioPlayers).forEach(p => {
+                        if (p && p.audio && !p.audio.paused) {
+                            p.audio.pause();
+                            if (p.waveEl) p.waveEl.classList.remove('playing');
+                            if (p.btn) p.btn.textContent = '▶';
+                        }
+                    });
+                }
+            } catch (e) {}
+            return _origPlay.apply(this, arguments);
+        };
+        console.log('🎵 [AudioExclusive] patched: RadioWidget.play');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧ GLOBAL PLAYER
+    //  Аналогично — ставим радио на паузу при запуске трека.
+    // ═══════════════════════════════════════════════════════════
+    if (typeof GlobalPlayer !== 'undefined'
+        && typeof GlobalPlayer.playQueue === 'function') {
+        const _origPlayQueue = GlobalPlayer.playQueue;
+        GlobalPlayer.playQueue = function() {
+            pauseRadio();
+            return _origPlayQueue.apply(this, arguments);
+        };
+        console.log('🎵 [AudioExclusive] patched: GlobalPlayer.playQueue');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧ playAudioFromMessage
+    //  Это главная точка запуска аудио в чате.
+    // ═══════════════════════════════════════════════════════════
+    if (typeof playAudioFromMessage === 'function') {
+        const _origPlayMsg = playAudioFromMessage;
+        playAudioFromMessage = async function(msgId) {
+            pauseRadio();
+            return _origPlayMsg.apply(this, arguments);
+        };
+        console.log('🎵 [AudioExclusive] patched: playAudioFromMessage');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧ toggleAudioPlayback (голосовые в чате)
+    // ═══════════════════════════════════════════════════════════
+    if (typeof toggleAudioPlayback === 'function') {
+        const _origToggle = toggleAudioPlayback;
+        toggleAudioPlayback = function(msgId) {
+            // Если собираемся запускать (не ставить на паузу) — гасим радио
+            const player = (typeof audioPlayers !== 'undefined')
+                ? audioPlayers[msgId]
+                : null;
+
+            const isCurrentlyPlaying = player && player.isPlaying;
+
+            // Если сейчас НЕ играет — значит будем запускать
+            // (или это глобальный трек — там своя логика)
+            if (!isCurrentlyPlaying) {
+                pauseRadio();
+            }
+
+            return _origToggle.apply(this, arguments);
+        };
+        console.log('🎵 [AudioExclusive] patched: toggleAudioPlayback');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API
+    // ═══════════════════════════════════════════════════════════
+    window.AudioExclusive = {
+        status: () => {
+            const radio = document.getElementById('radioWidgetAudio');
+            const gp = (typeof GlobalPlayer !== 'undefined') ? GlobalPlayer.audioEl : null;
+
+            let localVoicesPlaying = 0;
+            try {
+                if (typeof audioPlayers !== 'undefined' && audioPlayers) {
+                    localVoicesPlaying = Object.values(audioPlayers).filter(
+                        p => p && p.audio && !p.audio.paused
+                    ).length;
+                }
+            } catch (e) {}
+
+            return {
+                radio: {
+                    exists: !!radio,
+                    playing: !!(radio && !radio.paused),
+                },
+                globalPlayer: {
+                    exists: !!gp,
+                    playing: !!(gp && !gp.paused),
+                },
+                localVoicesPlaying,
+            };
+        },
+
+        // Ручное «помирить» — на всякий случай
+        enforce: () => {
+            const st = window.AudioExclusive.status();
+            const playingCount =
+                (st.radio.playing ? 1 : 0) +
+                (st.globalPlayer.playing ? 1 : 0) +
+                st.localVoicesPlaying;
+
+            if (playingCount > 1) {
+                // Приоритет: радио > глобальный > голосовые
+                if (st.radio.playing) {
+                    pauseGlobalPlayer();
+                    try {
+                        if (typeof audioPlayers !== 'undefined' && audioPlayers) {
+                            Object.values(audioPlayers).forEach(p => {
+                                if (p && p.audio && !p.audio.paused) p.audio.pause();
+                            });
+                        }
+                    } catch (e) {}
+                } else if (st.globalPlayer.playing) {
+                    try {
+                        if (typeof audioPlayers !== 'undefined' && audioPlayers) {
+                            Object.values(audioPlayers).forEach(p => {
+                                if (p && p.audio && !p.audio.paused) p.audio.pause();
+                            });
+                        }
+                    } catch (e) {}
+                }
+                console.log('🎵 [AudioExclusive] Принудительно применено');
+                return true;
+            }
+            return false;
+        },
+
+        pauseRadio,
+        pauseGlobalPlayer,
+    };
+
+    console.log('🎵 [AudioExclusive] Готово:');
+    console.log('   • Радио и глобальный плеер взаимоисключающие');
+    console.log('   • Голосовые гасят радио, но не глобальный плеер');
+    console.log('   • API: AudioExclusive.status() / .enforce()');
+})();
 </script>
 
 </body>
