@@ -1,5 +1,5 @@
 // sw.js - Универсальный кеш + уведомления
-const CACHE_NAME = 'sms-pwa-v5-goodfindradio';
+const CACHE_NAME = 'sms-pwa-v5-goodfindradio-videokruzhfast20sek';
 
 const FILES_TO_CACHE = [
     '/SMS/pro/sms/index.html',
