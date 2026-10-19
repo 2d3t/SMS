@@ -64829,6 +64829,961 @@ async function refreshWeatherManually(btn, card) {
     console.log('   • Игра 2: «Стихотворение по 2 строчки»');
     console.log('   • API: GamesHub.open() / .sendWord(word) / .sendPoem(l1, l2)');
 })();
+</script><script>
+// ═══════════════════════════════════════════════════════════════
+//  🕐 CLOCK WIDGET — РЕАЛЬНОЕ ИЛИ РУЧНОЕ ВРЕМЯ
+//  ─────────────────────────────────────────────────────────────
+//  • Каждые часы можно переключить в 1 из 2 режимов:
+//     🌍 "Реальное" — берётся из системного времени + timezone
+//     ✏️ "Ручное"   — сам вводишь время, оно тикает от введённого
+//  • Тап по карточке → модалка с редактором
+//  • Работает без хитрых патчей — всё в одном месте
+// ═══════════════════════════════════════════════════════════════
+
+(function installClockWidgetRealOrManual() {
+    'use strict';
+
+    console.log('🕐 [ClockWidget] Установка…');
+
+    const STORAGE_KEY = 'clock_widget_v2';
+
+    // ─── Дефолтные часы ───
+    const DEFAULT_CLOCKS = [
+        { label: 'Минск',  flag: '🇧🇾', mode: 'real', tz: 'Europe/Minsk',      h: 12, m: 0 },
+        { label: 'Оттава', flag: '🇨🇦', mode: 'real', tz: 'America/Toronto',   h: 5,  m: 0 },
+    ];
+
+    // ─── Популярные TZ для выпадающего списка ───
+    const POPULAR_TZ = [
+        { tz: 'Europe/Minsk',      label: 'Минск' },
+        { tz: 'Europe/Moscow',     label: 'Москва' },
+        { tz: 'Europe/Kyiv',       label: 'Киев' },
+        { tz: 'Europe/Warsaw',     label: 'Варшава' },
+        { tz: 'Europe/Berlin',     label: 'Берлин' },
+        { tz: 'Europe/London',     label: 'Лондон' },
+        { tz: 'Europe/Paris',      label: 'Париж' },
+        { tz: 'Europe/Istanbul',   label: 'Стамбул' },
+        { tz: 'America/Toronto',   label: 'Торонто' },
+        { tz: 'America/New_York',  label: 'Нью-Йорк' },
+        { tz: 'America/Chicago',   label: 'Чикаго' },
+        { tz: 'America/Los_Angeles','label': 'Лос-Анджелес' },
+        { tz: 'America/Sao_Paulo', label: 'Сан-Паулу' },
+        { tz: 'Asia/Dubai',        label: 'Дубай' },
+        { tz: 'Asia/Tbilisi',      label: 'Тбилиси' },
+        { tz: 'Asia/Almaty',       label: 'Алматы' },
+        { tz: 'Asia/Tokyo',        label: 'Токио' },
+        { tz: 'Asia/Shanghai',     label: 'Шанхай' },
+        { tz: 'Asia/Singapore',    label: 'Сингапур' },
+        { tz: 'Australia/Sydney',  label: 'Сидней' },
+        { tz: 'UTC',               label: 'UTC' },
+    ];
+
+    // ═══════════════════════════════════════════════════════════
+    //  Состояние
+    // ═══════════════════════════════════════════════════════════
+    let _clocks = [];
+
+    // ═══════════════════════════════════════════════════════════
+    //  Загрузка / сохранение
+    // ═══════════════════════════════════════════════════════════
+    function loadClocks() {
+        try {
+            const raw = localStorage.getItem(STORAGE_KEY);
+            if (raw) {
+                const arr = JSON.parse(raw);
+                if (Array.isArray(arr) && arr.length > 0) {
+                    _clocks = arr.map(normalize).filter(Boolean);
+                    return;
+                }
+            }
+        } catch (e) {}
+        _clocks = DEFAULT_CLOCKS.map(c => normalize(c));
+    }
+
+    function saveClocks() {
+        try {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(_clocks.map(c => ({
+                label: c.label,
+                flag: c.flag,
+                mode: c.mode,
+                tz: c.tz,
+                h: c.h,
+                m: c.m,
+            }))));
+        } catch (e) {}
+    }
+
+    function normalize(c) {
+        if (!c || typeof c !== 'object') return null;
+        return {
+            label: String(c.label || 'Город').slice(0, 20),
+            flag: String(c.flag || ''),
+            mode: c.mode === 'manual' ? 'manual' : 'real',
+            tz: typeof c.tz === 'string' && c.tz ? c.tz : 'Europe/Minsk',
+            h: clampInt(c.h, 0, 23, 12),
+            m: clampInt(c.m, 0, 59, 0),
+            s: 0,
+            // Для manual-режима: timestamp старта (Date.now()), чтобы тикать точно
+            startedAt: Date.now(),
+            // Сохранённые часы/минуты на момент старта
+            baseH: clampInt(c.h, 0, 23, 12),
+            baseM: clampInt(c.m, 0, 59, 0),
+        };
+    }
+
+    function clampInt(v, min, max, fallback) {
+        const n = parseInt(v, 10);
+        if (isNaN(n)) return fallback;
+        return Math.max(min, Math.min(max, n));
+    }
+
+    function isValidTz(tz) {
+        try {
+            new Intl.DateTimeFormat('en-US', { timeZone: tz });
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Вычисление текущего времени для часов
+    // ═══════════════════════════════════════════════════════════
+    function getDisplayTime(clock) {
+        if (clock.mode === 'real' && isValidTz(clock.tz)) {
+            try {
+                const fmt = new Intl.DateTimeFormat('ru-RU', {
+                    timeZone: clock.tz,
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    hour12: false,
+                });
+                return fmt.format(new Date());
+            } catch (e) {
+                return '--:--';
+            }
+        }
+        // Manual — тикаем от baseH/baseM + прошедшие секунды
+        const elapsedSec = Math.floor((Date.now() - clock.startedAt) / 1000);
+        let totalSec = clock.baseH * 3600 + clock.baseM * 60 + elapsedSec;
+        totalSec = totalSec % (24 * 3600);
+        if (totalSec < 0) totalSec += 24 * 3600;
+        const h = Math.floor(totalSec / 3600);
+        const m = Math.floor((totalSec % 3600) / 60);
+        return pad2(h) + ':' + pad2(m);
+    }
+
+    function pad2(n) {
+        return n < 10 ? '0' + n : String(n);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  HTML карточки
+    // ═══════════════════════════════════════════════════════════
+    function buildCardHTML() {
+        const parts = _clocks.map((c, i) => {
+            const sep = i < _clocks.length - 1 ? '<span class="cw-sep">|</span>' : '';
+            const modeIcon = c.mode === 'manual' ? '✏️' : '';
+            return `
+                <span class="cw-zone">
+                    ${c.flag ? `<span class="cw-flag">${esc(c.flag)}</span>` : ''}
+                    <span class="cw-label">${esc(c.label)}</span>
+                    <span class="cw-time" data-clock-idx="${i}">${getDisplayTime(c)}</span>
+                    ${modeIcon ? `<span class="cw-mode-icon">${modeIcon}</span>` : ''}
+                </span>${sep}
+            `;
+        }).join('');
+
+        return `
+            <div class="widget-card clock-widget" data-widget-id="clock" title="Нажмите, чтобы изменить">
+                <div class="cw-row">
+                    ${parts || '<span class="cw-empty">Нет городов — нажмите, чтобы добавить</span>'}
+                    <span class="cw-edit">✎</span>
+                </div>
+            </div>
+        `;
+    }
+
+    function esc(s) {
+        const d = document.createElement('div');
+        d.textContent = s == null ? '' : String(s);
+        return d.innerHTML;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Стили
+    // ═══════════════════════════════════════════════════════════
+    function ensureStyles() {
+        if (document.getElementById('clockWidgetStyles')) return;
+        const style = document.createElement('style');
+        style.id = 'clockWidgetStyles';
+        style.textContent = `
+            /* ═══ Карточка ═══ */
+            .widget-card.clock-widget {
+                padding: 10px 16px;
+                margin-bottom: 10px;
+                background: linear-gradient(135deg,
+                    rgba(108, 92, 231, 0.12),
+                    rgba(0, 184, 148, 0.08));
+                border: 1px solid rgba(108, 92, 231, 0.28);
+                border-radius: 14px;
+                cursor: pointer;
+                user-select: none;
+                -webkit-user-select: none;
+                -webkit-tap-highlight-color: transparent;
+                transition: background 0.2s, border-color 0.2s;
+            }
+            .widget-card.clock-widget:hover {
+                background: linear-gradient(135deg,
+                    rgba(108, 92, 231, 0.2),
+                    rgba(0, 184, 148, 0.14));
+                border-color: rgba(108, 92, 231, 0.5);
+            }
+            .widget-card.clock-widget:active {
+                transform: scale(0.99);
+            }
+            .widget-card.clock-widget .cw-row {
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                flex-wrap: wrap;
+                gap: 6px;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                font-size: 14px;
+                line-height: 1.2;
+                position: relative;
+            }
+            .widget-card.clock-widget .cw-zone {
+                display: inline-flex;
+                align-items: center;
+                gap: 5px;
+                white-space: nowrap;
+            }
+            .widget-card.clock-widget .cw-flag {
+                font-size: 15px;
+                line-height: 1;
+            }
+            .widget-card.clock-widget .cw-label {
+                color: #999;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            .widget-card.clock-widget .cw-time {
+                color: #fff;
+                font-size: 16px;
+                font-weight: 800;
+                font-variant-numeric: tabular-nums;
+                letter-spacing: 0.3px;
+                text-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+            }
+            .widget-card.clock-widget .cw-sep {
+                color: rgba(167, 139, 250, 0.5);
+                font-size: 13px;
+                padding: 0 2px;
+            }
+            .widget-card.clock-widget .cw-empty {
+                color: #666;
+                font-size: 13px;
+                font-style: italic;
+            }
+            .widget-card.clock-widget .cw-edit {
+                margin-left: 4px;
+                font-size: 12px;
+                color: rgba(167, 139, 250, 0.7);
+                opacity: 0;
+                transition: opacity 0.2s;
+            }
+            .widget-card.clock-widget:hover .cw-edit { opacity: 1; }
+            .widget-card.clock-widget .cw-mode-icon {
+                font-size: 10px;
+                opacity: 0.6;
+                margin-left: 1px;
+            }
+
+            @media (max-width: 480px) {
+                .widget-card.clock-widget { padding: 8px 12px; }
+                .widget-card.clock-widget .cw-row { font-size: 13px; gap: 4px; }
+                .widget-card.clock-widget .cw-flag { font-size: 14px; }
+                .widget-card.clock-widget .cw-label { font-size: 11px; }
+                .widget-card.clock-widget .cw-time { font-size: 15px; }
+            }
+
+            /* ═══ Модалка ═══ */
+            #clockEditModal {
+                position: fixed;
+                inset: 0;
+                z-index: 10000;
+                background: rgba(0, 0, 0, 0.7);
+                backdrop-filter: blur(8px);
+                -webkit-backdrop-filter: blur(8px);
+                display: none;
+                align-items: center;
+                justify-content: center;
+                padding: 16px;
+                animation: cwFadeIn 0.2s ease;
+            }
+            #clockEditModal.show { display: flex; }
+            @keyframes cwFadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+            #clockEditModal .cw-modal {
+                background: #1e1e2e;
+                color: #e0e0e0;
+                border-radius: 18px;
+                border: 1px solid rgba(108, 92, 231, 0.4);
+                box-shadow: 0 20px 60px rgba(0, 0, 0, 0.7);
+                width: 100%;
+                max-width: 520px;
+                max-height: 92vh;
+                display: flex;
+                flex-direction: column;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            }
+            #clockEditModal .cw-modal-header {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                padding: 16px 20px;
+                border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+                flex-shrink: 0;
+            }
+            #clockEditModal .cw-modal-title {
+                font-size: 16px;
+                font-weight: 700;
+                color: #fff;
+            }
+            #clockEditModal .cw-modal-close {
+                background: transparent;
+                border: none;
+                color: #999;
+                font-size: 22px;
+                cursor: pointer;
+                width: 32px;
+                height: 32px;
+                border-radius: 8px;
+                line-height: 1;
+            }
+            #clockEditModal .cw-modal-close:hover {
+                background: rgba(255, 255, 255, 0.08);
+                color: #fff;
+            }
+            #clockEditModal .cw-modal-body {
+                padding: 14px 18px;
+                overflow-y: auto;
+                flex: 1;
+            }
+            #clockEditModal .cw-modal-body::-webkit-scrollbar { width: 4px; }
+            #clockEditModal .cw-modal-body::-webkit-scrollbar-thumb {
+                background: rgba(108, 92, 231, 0.4);
+                border-radius: 2px;
+            }
+
+            /* ─── Блок одного города ─── */
+            #clockEditModal .cw-city-block {
+                background: rgba(255, 255, 255, 0.03);
+                border: 1px solid rgba(255, 255, 255, 0.06);
+                border-radius: 12px;
+                padding: 12px;
+                margin-bottom: 10px;
+            }
+            #clockEditModal .cw-city-row1 {
+                display: grid;
+                grid-template-columns: 44px 1fr 36px;
+                gap: 6px;
+                margin-bottom: 8px;
+                align-items: center;
+            }
+            #clockEditModal .cw-city-row2 {
+                display: flex;
+                gap: 6px;
+                margin-bottom: 8px;
+                flex-wrap: wrap;
+            }
+            #clockEditModal .cw-city-row3 {
+                display: grid;
+                grid-template-columns: 1fr 100px;
+                gap: 6px;
+                align-items: center;
+            }
+            #clockEditModal .cw-city-row3.manual {
+                grid-template-columns: 1fr 100px auto;
+            }
+            #clockEditModal .cw-input {
+                background: rgba(255, 255, 255, 0.05);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                color: #e0e0e0;
+                font-size: 14px;
+                padding: 9px 10px;
+                border-radius: 8px;
+                font-family: inherit;
+                width: 100%;
+                box-sizing: border-box;
+                min-width: 0;
+                outline: none;
+            }
+            #clockEditModal .cw-input:focus {
+                border-color: rgba(108, 92, 231, 0.7);
+                background: rgba(255, 255, 255, 0.08);
+            }
+            #clockEditModal .cw-input.flag {
+                text-align: center;
+                font-size: 20px;
+                padding: 5px 2px;
+            }
+            #clockEditModal .cw-input.time-input {
+                text-align: center;
+                font-size: 15px;
+                font-weight: 700;
+                font-variant-numeric: tabular-nums;
+                padding-left: 4px;
+                padding-right: 4px;
+            }
+            #clockEditModal select.cw-input {
+                cursor: pointer;
+                -webkit-appearance: none;
+                appearance: none;
+                background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath fill='%23a78bfa' d='M0 0l5 6 5-6z'/%3E%3C/svg%3E");
+                background-repeat: no-repeat;
+                background-position: right 8px center;
+                padding-right: 26px;
+            }
+            #clockEditModal select.cw-input option {
+                background: #1a1a2e;
+                color: #fff;
+            }
+            #clockEditModal .cw-del {
+                background: transparent;
+                border: 1px solid rgba(255, 107, 107, 0.3);
+                color: #ff6b6b;
+                cursor: pointer;
+                width: 32px;
+                height: 32px;
+                border-radius: 8px;
+                font-size: 16px;
+                line-height: 1;
+                padding: 0;
+            }
+            #clockEditModal .cw-del:hover {
+                background: rgba(255, 107, 107, 0.15);
+                border-color: rgba(255, 107, 107, 0.6);
+            }
+
+            /* ─── Переключатель режима ─── */
+            #clockEditModal .cw-mode-tabs {
+                display: flex;
+                gap: 0;
+                background: rgba(0, 0, 0, 0.25);
+                border-radius: 10px;
+                padding: 3px;
+                margin-bottom: 8px;
+            }
+            #clockEditModal .cw-mode-tab {
+                flex: 1;
+                padding: 8px 10px;
+                text-align: center;
+                font-size: 12px;
+                font-weight: 600;
+                color: #888;
+                border: none;
+                background: transparent;
+                border-radius: 8px;
+                cursor: pointer;
+                font-family: inherit;
+                transition: all 0.15s;
+            }
+            #clockEditModal .cw-mode-tab:hover {
+                color: #ccc;
+            }
+            #clockEditModal .cw-mode-tab.active {
+                background: linear-gradient(135deg, rgba(108, 92, 231, 0.5), rgba(0, 184, 148, 0.35));
+                color: #fff;
+                box-shadow: 0 2px 6px rgba(108, 92, 231, 0.3);
+            }
+
+            /* ─── Кнопка добавить ─── */
+            #clockEditModal .cw-add-btn {
+                width: 100%;
+                padding: 12px;
+                background: rgba(108, 92, 231, 0.15);
+                border: 1px dashed rgba(108, 92, 231, 0.5);
+                color: #a78bfa;
+                border-radius: 10px;
+                font-size: 13px;
+                font-weight: 600;
+                cursor: pointer;
+                font-family: inherit;
+                margin-top: 4px;
+            }
+            #clockEditModal .cw-add-btn:hover {
+                background: rgba(108, 92, 231, 0.25);
+                border-color: rgba(108, 92, 231, 0.8);
+            }
+
+            /* ─── Подсказка ─── */
+            #clockEditModal .cw-hint {
+                font-size: 11px;
+                color: #666;
+                margin: 10px 0 0;
+                line-height: 1.5;
+                text-align: center;
+                padding: 8px;
+                background: rgba(108, 92, 231, 0.06);
+                border-radius: 8px;
+            }
+
+            /* ─── Footer ─── */
+            #clockEditModal .cw-modal-footer {
+                display: flex;
+                gap: 8px;
+                padding: 14px 18px;
+                border-top: 1px solid rgba(255, 255, 255, 0.08);
+                flex-shrink: 0;
+            }
+            #clockEditModal .cw-btn {
+                flex: 1;
+                padding: 12px;
+                border-radius: 10px;
+                border: none;
+                font-size: 14px;
+                font-weight: 600;
+                cursor: pointer;
+                font-family: inherit;
+            }
+            #clockEditModal .cw-btn.primary {
+                background: linear-gradient(135deg, #6c5ce7, #a78bfa);
+                color: #fff;
+            }
+            #clockEditModal .cw-btn.secondary {
+                background: rgba(255, 255, 255, 0.06);
+                color: #ccc;
+                border: 1px solid rgba(255, 255, 255, 0.1);
+            }
+            @media (max-width: 480px) {
+                #clockEditModal .cw-modal-body { padding: 10px 12px; }
+                #clockEditModal .cw-modal-header { padding: 12px 14px; }
+                #clockEditModal .cw-modal-footer { padding: 10px 14px; }
+                #clockEditModal .cw-input { font-size: 13px; padding: 8px; }
+                #clockEditModal .cw-city-row3 { grid-template-columns: 1fr 88px; }
+                #clockEditModal .cw-city-row3.manual { grid-template-columns: 1fr 88px auto; }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Тиканье
+    // ═══════════════════════════════════════════════════════════
+    let _tickTimer = null;
+
+    function tick() {
+        updateTimesInDom();
+    }
+
+    function startTicking() {
+        if (_tickTimer) return;
+        _tickTimer = setInterval(tick, 1000);
+    }
+
+    function updateTimesInDom() {
+        const container = document.getElementById('chatsList');
+        if (!container) return;
+        const card = container.querySelector('.widget-card.clock-widget');
+        if (!card) return;
+
+        card.querySelectorAll('[data-clock-idx]').forEach(el => {
+            const idx = parseInt(el.dataset.clockIdx, 10);
+            const c = _clocks[idx];
+            if (!c) return;
+            const t = getDisplayTime(c);
+            if (el.textContent !== t) el.textContent = t;
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Модалка-редактор
+    // ═══════════════════════════════════════════════════════════
+    let _modalEl = null;
+    let _draft = [];
+
+    function openEditor() {
+        ensureStyles();
+        if (_modalEl) _modalEl.remove();
+
+        _draft = _clocks.map(c => ({ ...c }));
+
+        const modal = document.createElement('div');
+        modal.id = 'clockEditModal';
+        modal.className = 'show';
+        modal.innerHTML = `
+            <div class="cw-modal" onclick="event.stopPropagation()">
+                <div class="cw-modal-header">
+                    <div class="cw-modal-title">🕐 Города и время</div>
+                    <button class="cw-modal-close" id="cwCloseBtn">×</button>
+                </div>
+                <div class="cw-modal-body" id="cwBody"></div>
+                <div class="cw-modal-footer">
+                    <button class="cw-btn secondary" id="cwCancelBtn">Отмена</button>
+                    <button class="cw-btn primary" id="cwSaveBtn">💾 Сохранить</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+        _modalEl = modal;
+
+        renderEditor();
+
+        modal.querySelector('#cwCloseBtn').onclick = closeEditor;
+        modal.querySelector('#cwCancelBtn').onclick = closeEditor;
+        modal.querySelector('#cwSaveBtn').onclick = saveEditor;
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) closeEditor();
+        });
+
+        document.addEventListener('keydown', _escHandler, true);
+    }
+
+    function _escHandler(e) {
+        if (e.key === 'Escape' && _modalEl) {
+            e.preventDefault();
+            closeEditor();
+        }
+    }
+
+    function closeEditor() {
+        if (!_modalEl) return;
+        _modalEl.remove();
+        _modalEl = null;
+        document.removeEventListener('keydown', _escHandler, true);
+    }
+
+    function renderEditor() {
+        if (!_modalEl) return;
+        const body = _modalEl.querySelector('#cwBody');
+
+        let html = '';
+
+        if (_draft.length === 0) {
+            html += `<div style="text-align:center;color:#666;padding:20px 10px;font-size:13px;">
+                Городов нет. Добавьте хотя бы один.
+            </div>`;
+        }
+
+        _draft.forEach((c, i) => {
+            const isManual = c.mode === 'manual';
+            html += `
+                <div class="cw-city-block" data-block-idx="${i}">
+                    <div class="cw-city-row1">
+                        <input class="cw-input flag" data-idx="${i}" data-field="flag"
+                               value="${esc(c.flag)}" placeholder="🌍" maxlength="4">
+                        <input class="cw-input" data-idx="${i}" data-field="label"
+                               value="${esc(c.label)}" placeholder="Название города" maxlength="20">
+                        <button class="cw-del" data-del="${i}" title="Удалить">×</button>
+                    </div>
+
+                    <div class="cw-mode-tabs">
+                        <button class="cw-mode-tab ${!isManual ? 'active' : ''}"
+                                data-mode="real" data-idx="${i}">
+                            🌍 Реальное
+                        </button>
+                        <button class="cw-mode-tab ${isManual ? 'active' : ''}"
+                                data-mode="manual" data-idx="${i}">
+                            ✏️ Ручное
+                        </button>
+                    </div>
+
+                    ${!isManual ? `
+                        <div class="cw-city-row3">
+                            <select class="cw-input" data-idx="${i}" data-field="tz">
+                                ${POPULAR_TZ.map(p => `
+                                    <option value="${esc(p.tz)}" ${p.tz === c.tz ? 'selected' : ''}>
+                                        ${esc(p.label)} — ${esc(p.tz)}
+                                    </option>
+                                `).join('')}
+                                ${!POPULAR_TZ.find(p => p.tz === c.tz) && c.tz ? `
+                                    <option value="${esc(c.tz)}" selected>${esc(c.tz)}</option>
+                                ` : ''}
+                            </select>
+                        </div>
+                    ` : `
+                        <div class="cw-city-row3 manual">
+                            <div style="font-size:11px;color:#888;line-height:1.4;">
+                                Введи время и оно будет тикать само
+                            </div>
+                            <input class="cw-input time-input" data-idx="${i}" data-field="time"
+                                   value="${pad2(c.h)}:${pad2(c.m)}" placeholder="12:00"
+                                   maxlength="5" inputmode="numeric">
+                        </div>
+                    `}
+                </div>
+            `;
+        });
+
+        html += `<button class="cw-add-btn" id="cwAddBtn">+ Добавить город</button>`;
+        html += `<div class="cw-hint">
+            <b>🌍 Реальное</b> — время берётся из системы, учитывает часовой пояс.<br>
+            <b>✏️ Ручное</b> — сам задаёшь время, оно тикает от введённого.
+        </div>`;
+
+        body.innerHTML = html;
+
+        // ─── Обработчики ───
+
+        // Текстовые поля
+        body.querySelectorAll('input[data-field]:not([data-field="time"])').forEach(input => {
+            input.addEventListener('input', () => {
+                const idx = parseInt(input.dataset.idx, 10);
+                const field = input.dataset.field;
+                if (!_draft[idx]) return;
+                if (field === 'flag') _draft[idx].flag = input.value.slice(0, 4);
+                else if (field === 'label') _draft[idx].label = input.value.slice(0, 20);
+            });
+        });
+
+        // Поле времени (ручной режим)
+        body.querySelectorAll('input[data-field="time"]').forEach(input => {
+            input.addEventListener('input', () => {
+                const idx = parseInt(input.dataset.idx, 10);
+                if (!_draft[idx]) return;
+
+                let v = input.value.replace(/[^0-9:]/g, '');
+                if (v.length > 5) v = v.slice(0, 5);
+                if (v.length >= 3 && v[2] !== ':') {
+                    v = v.slice(0, 2) + ':' + v.slice(2);
+                }
+                input.value = v;
+                const m = v.match(/^(\d{0,2}):?(\d{0,2})$/);
+                if (m) {
+                    const hh = parseInt(m[1], 10);
+                    const mm = parseInt(m[2], 10);
+                    if (!isNaN(hh)) _draft[idx].h = Math.max(0, Math.min(23, hh));
+                    if (!isNaN(mm)) _draft[idx].m = Math.max(0, Math.min(59, mm));
+                }
+            });
+        });
+
+        // Выбор TZ
+        body.querySelectorAll('select[data-field="tz"]').forEach(sel => {
+            sel.addEventListener('change', () => {
+                const idx = parseInt(sel.dataset.idx, 10);
+                if (_draft[idx]) _draft[idx].tz = sel.value;
+            });
+        });
+
+        // Переключатель режима
+        body.querySelectorAll('.cw-mode-tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                const idx = parseInt(tab.dataset.idx, 10);
+                const mode = tab.dataset.mode;
+                if (!_draft[idx]) return;
+
+                const wasManual = _draft[idx].mode === 'manual';
+                const willBeManual = mode === 'manual';
+
+                if (!wasManual && willBeManual) {
+                    // Переход в ручной — берём текущее реальное время как стартовое
+                    const realTime = getDisplayTime({ ..._draft[idx], mode: 'real' });
+                    const parts = realTime.split(':');
+                    _draft[idx].h = parseInt(parts[0], 10) || 0;
+                    _draft[idx].m = parseInt(parts[1], 10) || 0;
+                }
+
+                _draft[idx].mode = mode;
+                renderEditor();
+            });
+        });
+
+        // Удаление
+        body.querySelectorAll('.cw-del').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const idx = parseInt(btn.dataset.del, 10);
+                _draft.splice(idx, 1);
+                renderEditor();
+            });
+        });
+
+        // Добавить
+        const addBtn = body.querySelector('#cwAddBtn');
+        if (addBtn) {
+            addBtn.addEventListener('click', () => {
+                _draft.push({
+                    label: 'Новый город',
+                    flag: '',
+                    mode: 'real',
+                    tz: 'Europe/Minsk',
+                    h: 12,
+                    m: 0,
+                });
+                renderEditor();
+                setTimeout(() => {
+                    const blocks = body.querySelectorAll('.cw-city-block');
+                    const last = blocks[blocks.length - 1];
+                    if (last) {
+                        const labelInput = last.querySelector('input[data-field="label"]');
+                        if (labelInput) { labelInput.focus(); labelInput.select(); }
+                    }
+                }, 50);
+            });
+        }
+    }
+
+    function saveEditor() {
+        if (_draft.length === 0) {
+            if (typeof showToast === 'function') showToast('❌ Добавьте хотя бы один город', 2000);
+            return;
+        }
+
+        const clean = _draft.map(c => {
+            const base = {
+                label: (c.label || '').trim().slice(0, 20) || 'Город',
+                flag: (c.flag || '').trim().slice(0, 4),
+                mode: c.mode === 'manual' ? 'manual' : 'real',
+                tz: (c.mode === 'manual') ? c.tz : (c.tz || 'Europe/Minsk'),
+                h: Math.max(0, Math.min(23, c.h | 0)),
+                m: Math.max(0, Math.min(59, c.m | 0)),
+            };
+            return normalize(base);
+        }).filter(Boolean);
+
+        _clocks = clean;
+        saveClocks();
+        closeEditor();
+        rerenderCard();
+
+        if (typeof showToast === 'function') showToast('✅ Часы сохранены', 1500);
+        if (typeof soundManager !== 'undefined') {
+            try { soundManager.play('send'); } catch (e) {}
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Перерисовка карточки
+    // ═══════════════════════════════════════════════════════════
+    function rerenderCard() {
+        const container = document.getElementById('chatsList');
+        if (!container) return;
+        const oldCard = container.querySelector('.widget-card.clock-widget');
+        if (!oldCard) return;
+
+        const wrapper = document.createElement('div');
+        wrapper.innerHTML = buildCardHTML().trim();
+        const newCard = wrapper.firstElementChild;
+        oldCard.replaceWith(newCard);
+
+        attachCardClick(newCard);
+    }
+
+    function attachCardClick(card) {
+        if (!card || card._cwBound) return;
+        card._cwBound = true;
+        card.addEventListener('click', (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            openEditor();
+        });
+    }
+
+    function bindCardWhenReady() {
+        const container = document.getElementById('chatsList');
+        if (!container) return false;
+        const card = container.querySelector('.widget-card.clock-widget');
+        if (!card) return false;
+        attachCardClick(card);
+        return true;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Регистрация в реестре
+    // ═══════════════════════════════════════════════════════════
+    function register() {
+        if (!window.WidgetsRegistry) {
+            setTimeout(register, 300);
+            return;
+        }
+        ensureStyles();
+
+        window.WidgetsRegistry.register({
+            id: 'clock',
+            position: 5,
+            name: 'Часы',
+            icon: '🕐',
+            description: 'Города и время (реальное или ручное)',
+            buildHtml: () => buildCardHTML(),
+            onMount: () => {
+                console.log('🕐 [ClockWidget] Установлен');
+                setTimeout(() => {
+                    bindCardWhenReady();
+                    updateTimesInDom();
+                }, 100);
+                setTimeout(bindCardWhenReady, 500);
+                setTimeout(bindCardWhenReady, 1500);
+            },
+        });
+
+        console.log('🕐 [ClockWidget] ✅ Зарегистрирован');
+    }
+    register();
+
+    // ═══════════════════════════════════════════════════════════
+    //  Старт
+    // ═══════════════════════════════════════════════════════════
+    loadClocks();
+    startTicking();
+
+    // Мгновенный пересчёт при возврате на вкладку
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) return;
+        updateTimesInDom();
+    });
+
+    if (typeof showChatsScreen === 'function') {
+        const _orig = showChatsScreen;
+        showChatsScreen = function() {
+            const r = _orig.apply(this, arguments);
+            setTimeout(() => {
+                bindCardWhenReady();
+                updateTimesInDom();
+            }, 200);
+            setTimeout(() => {
+                bindCardWhenReady();
+                updateTimesInDom();
+            }, 800);
+            return r;
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  API
+    // ═══════════════════════════════════════════════════════════
+    window.ClockWidget = {
+        open: openEditor,
+        close: closeEditor,
+        get: () => _clocks.map(c => ({
+            label: c.label,
+            flag: c.flag,
+            mode: c.mode,
+            tz: c.tz,
+            h: c.h,
+            m: c.m,
+            display: getDisplayTime(c),
+        })),
+        status: () => ({
+            clocksCount: _clocks.length,
+            ticking: !!_tickTimer,
+            cardInDom: !!document.querySelector('.widget-card.clock-widget'),
+            clocks: _clocks.map(c => ({
+                label: c.label,
+                mode: c.mode,
+                tz: c.mode === 'real' ? c.tz : null,
+                display: getDisplayTime(c),
+            })),
+        }),
+    };
+
+    console.log('🕐 [ClockWidget] Готово:');
+    console.log('   • Тап по карточке → редактор');
+    console.log('   • 🌍 Реальное — из системы (Минск по умолчанию)');
+    console.log('   • ✏️ Ручное — сам задаёшь время');
+    console.log('   • API: ClockWidget.open() / .status()');
+})();
 </script>
 </body>
 </html>
