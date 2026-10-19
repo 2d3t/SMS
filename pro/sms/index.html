@@ -63306,7 +63306,308 @@ async function refreshWeatherManually(btn, card) {
     console.log('   • openGallery проверяет валидность imageUrl');
     console.log('   • API: window.openPhotoGallery()');
 })();
+// ═══════════════════════════════════════════════════════════════
+//  🎯 ФИНАЛЬНЫЙ ФИКС: ПРЫЖОК К ТРЕКУ ВСЕГДА РАБОТАЕТ
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: после первого клика по названию трека плеер
+//  открывает нужный чат, но сообщение не находится в DOM —
+//  пользователь видит чат без прокрутки к треку. Повторный
+//  клик тоже не работает, потому что _pendingJumpToMsgId
+//  уже сброшен.
+//
+//  Решение: единая функция performJumpToTrack, которая:
+//   1. Всегда перечитывает историю в фоне
+//   2. Если сообщение не в DOM — догружает страницы
+//      истории пока не найдёт (максимум 30 попыток)
+//   3. Скроллит + подсвечивает
+//   4. Гарантированно работает и при первом, и при повторном клике
+// ═══════════════════════════════════════════════════════════════
 
+(function installFinalTrackJumpFix() {
+    'use strict';
+
+    console.log('🎯 [TrackJumpFinal] Установка финального фикса прыжка…');
+
+    // ─── Состояние: идёт ли уже прыжок ───
+    let _jumpInProgress = false;
+    let _jumpTargetMsgId = null;
+
+    // ═══════════════════════════════════════════════════════════
+    //  Утилита: ждём, пока сообщение появится в DOM
+    // ═══════════════════════════════════════════════════════════
+    function waitForElement(msgId, timeoutMs = 5000) {
+        return new Promise((resolve) => {
+            const start = Date.now();
+            const check = () => {
+                const el = messagesInner.querySelector(
+                    `.message-wrapper[data-msg-id="${msgId}"]`
+                );
+                if (el) {
+                    resolve(el);
+                    return;
+                }
+                if (Date.now() - start > timeoutMs) {
+                    resolve(null);
+                    return;
+                }
+                setTimeout(check, 100);
+            };
+            check();
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Утилита: догружаем историю, пока не найдём сообщение
+    // ═══════════════════════════════════════════════════════════
+    async function loadHistoryUntilFound(msgId, maxAttempts = 30) {
+        for (let i = 0; i < maxAttempts; i++) {
+            // Проверяем, не появилось ли уже
+            const el = messagesInner.querySelector(
+                `.message-wrapper[data-msg-id="${msgId}"]`
+            );
+            if (el) {
+                console.log(`🎯 [TrackJumpFinal] Сообщение найдено после ${i} догрузок`);
+                return el;
+            }
+
+            // Нечего грузить?
+            if (historyState.startIndex <= 0) {
+                console.log('🎯 [TrackJumpFinal] Достигнуто начало истории');
+                return null;
+            }
+
+            // Проверяем, есть ли сообщение вообще в allMessages
+            const inHistory = historyState.allMessages.some(
+                m => String(m.id) === String(msgId)
+            );
+            if (!inHistory) {
+                console.warn(`🎯 [TrackJumpFinal] Сообщение ${msgId} нет в истории чата`);
+                return null;
+            }
+
+            // Догружаем страницу
+            if (!_loadingOlder) {
+                try {
+                    await loadOlderMessages();
+                } catch (e) {
+                    console.warn('🎯 [TrackJumpFinal] loadOlderMessages failed:', e);
+                }
+            }
+
+            // Даём DOM обновиться
+            await new Promise(r => setTimeout(r, 250));
+        }
+        return null;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ГЛАВНАЯ ФУНКЦИЯ: выполнить прыжок к сообщению
+    //  Работает всегда, даже если сообщение не в DOM.
+    // ═══════════════════════════════════════════════════════════
+    async function performJumpToTrack(msgId, chatFile) {
+        if (_jumpInProgress) {
+            console.log('🎯 [TrackJumpFinal] Прыжок уже идёт — игнорируем');
+            return;
+        }
+
+        _jumpInProgress = true;
+        _jumpTargetMsgId = msgId;
+
+        try {
+            // ─── 1. Убеждаемся, что мы в нужном чате ───
+            if (state.chatFile !== chatFile) {
+                const chat = state.chats.find(c => c.file === chatFile);
+                if (!chat) {
+                    if (typeof showToast === 'function') showToast('❌ Чат-источник не найден', 2500);
+                    return;
+                }
+                const password = state.savedPasswords[chatFile];
+                if (!password) {
+                    if (typeof showToast === 'function') showToast('🔐 Нужен пароль чата', 2500);
+                    return;
+                }
+
+                if (typeof showToast === 'function') {
+                    showToast(`🎵 Переход в «${chat.name || chatFile}»…`, 1500);
+                }
+
+                // Устанавливаем флаг для renderHistory
+                window._pendingJumpToMsgId = msgId;
+
+                await enterChat(chatFile, chat.name || chatFile, password);
+
+                // После enterChat даём DOM стабилизироваться
+                await new Promise(r => setTimeout(r, 500));
+            }
+
+            // ─── 2. Проверяем, есть ли сообщение уже в DOM ───
+            let el = messagesInner.querySelector(
+                `.message-wrapper[data-msg-id="${msgId}"]`
+            );
+
+            // ─── 3. Если нет — принудительно грузим историю ───
+            if (!el) {
+                console.log(`🎯 [TrackJumpFinal] Сообщение ${msgId} не в DOM — догружаем`);
+                if (typeof showToast === 'function') {
+                    showToast('🔎 Ищем трек в истории…', 1500);
+                }
+
+                // Устанавливаем флаг для renderHistory (на всякий случай)
+                window._pendingJumpToMsgId = msgId;
+
+                // Ждём немного — вдруг renderHistory сработает сам
+                el = await waitForElement(msgId, 800);
+
+                // Если не дождались — грузим вручную
+                if (!el) {
+                    el = await loadHistoryUntilFound(msgId, 30);
+                }
+            }
+
+            // ─── 4. Скроллим и подсвечиваем ───
+            if (el) {
+                console.log(`🎯 [TrackJumpFinal] Прыгаем к сообщению ${msgId}`);
+
+                // Убираем старые подсветки
+                messagesInner.querySelectorAll('.message-wrapper.highlight-flash')
+                    .forEach(x => x.classList.remove('highlight-flash', 'long'));
+
+                // Скролл
+                el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+                // Подсветка после скролла
+                setTimeout(() => {
+                    el.classList.add('highlight-flash', 'long');
+                    setTimeout(() => {
+                        el.classList.remove('highlight-flash', 'long');
+                    }, 2700);
+                }, 300);
+
+                if (navigator.vibrate) navigator.vibrate([15, 30, 15]);
+            } else {
+                console.warn('🎯 [TrackJumpFinal] Сообщение так и не найдено');
+                if (typeof showToast === 'function') {
+                    showToast('⚠️ Не удалось найти трек в истории', 2500);
+                }
+            }
+
+        } catch (e) {
+            console.error('🎯 [TrackJumpFinal] Ошибка прыжка:', e);
+        } finally {
+            _jumpInProgress = false;
+            _jumpTargetMsgId = null;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕОПРЕДЕЛЯЕМ jumpToPlayingTrack
+    //  Это главная функция, вызываемая из GlobalPlayer по клику
+    //  на название трека / миниатюру.
+    // ═══════════════════════════════════════════════════════════
+    window.jumpToPlayingTrack = async function() {
+        if (typeof GlobalPlayer === 'undefined') return;
+
+        const targetChat = GlobalPlayer.currentChatFile;
+        const targetMsgId = GlobalPlayer.currentMsgId;
+
+        if (!targetChat || !targetMsgId) {
+            if (typeof showToast === 'function') showToast('ℹ️ Нет играющего трека', 1500);
+            return;
+        }
+
+        // Закрываем галерею, если открыта
+        if (typeof galleryState !== 'undefined' && galleryState.isOpen) {
+            if (typeof closeImageModal === 'function') closeImageModal();
+        }
+
+        // Закрываем quick picker, если открыт
+        if (typeof QuickTrackPicker !== 'undefined'
+            && typeof QuickTrackPicker.isOpen === 'function'
+            && QuickTrackPicker.isOpen()) {
+            QuickTrackPicker.close();
+        }
+
+        await performJumpToTrack(targetMsgId, targetChat);
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ДОПОЛНИТЕЛЬНО: перехватываем клик на thumb и title плеера
+    //  (на случай, если их обработчики были перезаписаны)
+    // ═══════════════════════════════════════════════════════════
+    function attachDirectClickHandlers() {
+        const bar = document.getElementById('globalPlayerBar');
+        if (!bar) return false;
+
+        const thumb = bar.querySelector('#gpThumb');
+        const title = bar.querySelector('#gpTitle');
+
+        [thumb, title].forEach(el => {
+            if (!el || el._trackJumpFinalAttached) return;
+            el._trackJumpFinalAttached = true;
+
+            el.addEventListener('click', (e) => {
+                e.stopPropagation();
+                e.preventDefault();
+                if (typeof window.jumpToPlayingTrack === 'function') {
+                    window.jumpToPlayingTrack();
+                }
+            }, true);  // capture — раньше любых других
+        });
+
+        return true;
+    }
+
+    // Привязываем при появлении плеера
+    const observer = new MutationObserver(() => {
+        if (document.getElementById('globalPlayerBar')) {
+            attachDirectClickHandlers();
+        }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    // Первичная попытка
+    setTimeout(attachDirectClickHandlers, 2000);
+    setTimeout(attachDirectClickHandlers, 5000);
+
+    // Периодическая страховка
+    setInterval(attachDirectClickHandlers, 2000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  API для отладки
+    // ═══════════════════════════════════════════════════════════
+    window.TrackJumpFinal = {
+        perform: (msgId, chatFile) => performJumpToTrack(msgId, chatFile || state.chatFile),
+        isInProgress: () => _jumpInProgress,
+        currentTarget: () => _jumpTargetMsgId,
+        status: () => {
+            const currentMsgId = (typeof GlobalPlayer !== 'undefined')
+                ? GlobalPlayer.currentMsgId : null;
+            const currentChatFile = (typeof GlobalPlayer !== 'undefined')
+                ? GlobalPlayer.currentChatFile : null;
+
+            let elInDom = false;
+            if (currentMsgId) {
+                elInDom = !!messagesInner.querySelector(
+                    `.message-wrapper[data-msg-id="${currentMsgId}"]`
+                );
+            }
+
+            return {
+                currentMsgId,
+                currentChatFile,
+                inSameChat: state.chatFile === currentChatFile,
+                elementInDom: elInDom,
+                jumpInProgress: _jumpInProgress,
+            };
+        },
+    };
+
+    console.log('🎯 [TrackJumpFinal] Готово:');
+    console.log('   • Клик по названию трека всегда прыгает к сообщению');
+    console.log('   • Работает и при первом, и при повторном клике');
+    console.log('   • Догружает историю, пока не найдёт');
+    console.log('   • API: TrackJumpFinal.status()');
+})();
 </script>
 </body>
 </html>
