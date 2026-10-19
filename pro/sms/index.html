@@ -64050,19 +64050,22 @@ async function refreshWeatherManually(btn, card) {
     console.log('   • API: RadioButtonsFix.status()');
 })();
 </script>
-
 <script>
 // ═══════════════════════════════════════════════════════════════
-//  🎮 ИГРЫ В ЧАТЕ v1 — «Слова из слова» + активные игры в ⋯
+//  🎮 GAMES OVERLAY v2 — Игра в отдельном полноэкранном оверлее
 //  ─────────────────────────────────────────────────────────────
-//  Часть 1: расширение кнопки ⋯ (меню + модалка активных игр)
-//  Часть 2: сама игра «Слова из слова» (создание, ход, сдача)
+//  Что нового:
+//   • Игра открывается в отдельном ОВЕРЛЕЕ (не в сообщении)
+//   • Кнопка-индикатор рядом с ⋯ (быстрый доступ к последней игре)
+//   • Сообщение в чате — только превью с кнопкой «Открыть»
+//   • Никаких input в сообщениях → нет глюков с фокусом
+//   • Поллинг не может сломать оверлей — он держит свою DOM
 // ═══════════════════════════════════════════════════════════════
 
-(function installGamesInChat() {
+(function installGamesOverlayV2() {
     'use strict';
 
-    console.log('🎮 [Games] Установка…');
+    console.log('🎮 [GamesOverlay v2] Установка…');
 
     // ═══════════════════════════════════════════════════════════
     //  КОНФИГ
@@ -64073,678 +64076,19 @@ async function refreshWeatherManually(btn, card) {
         MAX_BASE_WORD_LENGTH: 15,
         DEBUG: true,
     };
-    const log = (...a) => CFG.DEBUG && console.log('🎮 [Games]', ...a);
-    const warn = (...a) => console.warn('🎮 [Games]', ...a);
+    const log = (...a) => CFG.DEBUG && console.log('🎮 [GamesOverlay v2]', ...a);
 
     // ═══════════════════════════════════════════════════════════
-    //  СТИЛИ
+    //  СОСТОЯНИЕ ОВЕРЛЕЯ
     // ═══════════════════════════════════════════════════════════
-    if (!document.getElementById('gamesInChatStyles')) {
-        const style = document.createElement('style');
-        style.id = 'gamesInChatStyles';
-        style.textContent = `
-            /* ═══ Пункт "Активные игры" в меню ⋯ ═══ */
-            #chatQuickAccessMenu .cqa-item[data-action="games"] .cqa-icon {
-                background: linear-gradient(135deg, rgba(254,202,87,0.25), rgba(255,159,67,0.15));
-                border-radius: 8px;
-            }
-            #chatQuickAccessMenu .cqa-count.cqa-count-hot {
-                background: linear-gradient(135deg, #feca57, #ff9f43);
-                color: #1a1a2e;
-                font-weight: 800;
-                animation: cqaHotPulse 1.6s ease-in-out infinite;
-            }
-            @keyframes cqaHotPulse {
-                0%, 100% { box-shadow: 0 0 6px rgba(254,202,87,0.6); }
-                50%      { box-shadow: 0 0 14px rgba(254,202,87,0.95); }
-            }
-
-            /* ═══ Кнопка ⋯ с пульсацией "мой ход" ═══ */
-            .input-bar .chat-player-btn.has-my-turn {
-                background: linear-gradient(135deg, #feca57, #ff9f43);
-                color: #1a1a2e;
-                box-shadow: 0 0 14px rgba(254, 202, 87, 0.6);
-                animation: cpbMyTurnPulse 1.6s ease-in-out infinite;
-            }
-            @keyframes cpbMyTurnPulse {
-                0%, 100% { box-shadow: 0 0 12px rgba(254, 202, 87, 0.6); }
-                50%      { box-shadow: 0 0 22px rgba(254, 202, 87, 0.95),
-                                       0 0 0 4px rgba(254, 202, 87, 0.2); }
-            }
-            .input-bar .chat-player-btn.has-my-turn::after {
-                background: #1a1a2e;
-                box-shadow: 0 0 4px rgba(26, 26, 46, 0.8);
-            }
-
-            /* ═══ Пункт меню вложений "Игра" ═══ */
-            .attach-menu-item.game .icon {
-                background: linear-gradient(135deg, rgba(254,202,87,0.25), rgba(255,159,67,0.15));
-                color: #feca57;
-            }
-
-            /* ═══ Модалка списка активных игр ═══ */
-            #activeGamesModal {
-                display: none;
-            }
-            #activeGamesModal.active { display: flex; }
-
-            #activeGamesModal .agm-content {
-                background: #1a1a2e;
-                border-radius: 20px;
-                padding: 0;
-                max-width: 460px;
-                width: 100%;
-                max-height: 88vh;
-                display: flex;
-                flex-direction: column;
-                border: 1px solid rgba(255,255,255,0.1);
-                box-shadow: 0 20px 60px rgba(0,0,0,0.7);
-                overflow: hidden;
-                animation: agmIn 0.25s cubic-bezier(0.22, 0.61, 0.36, 1);
-            }
-            @keyframes agmIn {
-                from { opacity: 0; transform: scale(0.94); }
-                to   { opacity: 1; transform: scale(1); }
-            }
-            #activeGamesModal .agm-header {
-                display: flex;
-                align-items: center;
-                gap: 12px;
-                padding: 16px 20px;
-                border-bottom: 1px solid rgba(255,255,255,0.08);
-                background: linear-gradient(135deg, rgba(254,202,87,0.12), rgba(255,159,67,0.06));
-                flex-shrink: 0;
-            }
-            #activeGamesModal .agm-header h2 {
-                flex: 1;
-                font-size: 17px;
-                font-weight: 700;
-                color: #fff;
-                margin: 0;
-            }
-            #activeGamesModal .agm-close {
-                width: 34px; height: 34px;
-                border-radius: 50%;
-                border: none;
-                background: rgba(255,255,255,0.06);
-                color: #888;
-                font-size: 16px;
-                cursor: pointer;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                flex-shrink: 0;
-                transition: all 0.15s;
-            }
-            #activeGamesModal .agm-close:hover {
-                background: rgba(255,107,107,0.2);
-                color: #ff6b6b;
-            }
-            #activeGamesModal .agm-body {
-                flex: 1;
-                overflow-y: auto;
-                padding: 14px 16px 18px;
-                min-height: 100px;
-            }
-            #activeGamesModal .agm-empty {
-                text-align: center;
-                padding: 40px 20px;
-                color: #666;
-            }
-            #activeGamesModal .agm-empty-icon {
-                font-size: 56px; margin-bottom: 12px; opacity: 0.5;
-            }
-            #activeGamesModal .agm-empty-title {
-                font-size: 15px; color: #aaa; font-weight: 600; margin-bottom: 6px;
-            }
-            #activeGamesModal .agm-empty-sub {
-                font-size: 12px; color: #666; line-height: 1.5;
-            }
-
-            #activeGamesModal .agm-game {
-                display: flex;
-                gap: 12px;
-                padding: 12px 14px;
-                margin-bottom: 8px;
-                background: rgba(255,255,255,0.04);
-                border: 1px solid rgba(255,255,255,0.08);
-                border-radius: 14px;
-                cursor: pointer;
-                transition: background 0.15s ease, transform 0.1s ease;
-                -webkit-tap-highlight-color: transparent;
-            }
-            #activeGamesModal .agm-game:hover {
-                background: rgba(108,92,231,0.12);
-                border-color: rgba(108,92,231,0.35);
-            }
-            #activeGamesModal .agm-game:active {
-                transform: scale(0.98);
-            }
-            #activeGamesModal .agm-game.is-my-turn {
-                background: linear-gradient(135deg, rgba(254,202,87,0.12), rgba(255,159,67,0.06));
-                border-color: rgba(254,202,87,0.45);
-            }
-            #activeGamesModal .agm-game.is-my-turn:hover {
-                background: linear-gradient(135deg, rgba(254,202,87,0.2), rgba(255,159,67,0.1));
-                border-color: rgba(254,202,87,0.7);
-            }
-
-            #activeGamesModal .agm-game-icon {
-                width: 42px; height: 42px;
-                border-radius: 10px;
-                background: linear-gradient(135deg, #6c5ce7, #00b894);
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                font-size: 20px;
-                flex-shrink: 0;
-                box-shadow: 0 3px 10px rgba(108,92,231,0.35);
-            }
-            #activeGamesModal .agm-game.is-my-turn .agm-game-icon {
-                background: linear-gradient(135deg, #feca57, #ff9f43);
-                box-shadow: 0 3px 10px rgba(254,202,87,0.5);
-            }
-            #activeGamesModal .agm-game-body {
-                flex: 1;
-                min-width: 0;
-                display: flex;
-                flex-direction: column;
-                gap: 4px;
-            }
-            #activeGamesModal .agm-game-title {
-                font-size: 14px;
-                font-weight: 700;
-                color: #fff;
-                display: flex;
-                align-items: center;
-                gap: 6px;
-                flex-wrap: wrap;
-            }
-            #activeGamesModal .agm-game-badge {
-                font-size: 9px;
-                padding: 2px 6px;
-                border-radius: 6px;
-                background: rgba(108,92,231,0.25);
-                color: #a78bfa;
-                font-weight: 700;
-                text-transform: uppercase;
-                letter-spacing: 0.3px;
-            }
-            #activeGamesModal .agm-game.is-my-turn .agm-game-badge {
-                background: rgba(254,202,87,0.3);
-                color: #feca57;
-            }
-            #activeGamesModal .agm-game-word {
-                font-size: 12px;
-                color: #aaa;
-                white-space: nowrap;
-                overflow: hidden;
-                text-overflow: ellipsis;
-            }
-            #activeGamesModal .agm-game-word strong {
-                color: #fff;
-                letter-spacing: 1px;
-            }
-            #activeGamesModal .agm-game-status {
-                font-size: 11px;
-                color: #888;
-                display: flex;
-                align-items: center;
-                gap: 4px;
-            }
-            #activeGamesModal .agm-game.is-my-turn .agm-game-status {
-                color: #feca57;
-                font-weight: 600;
-            }
-            #activeGamesModal .agm-game.is-my-turn .agm-game-status::before {
-                content: '⚡';
-            }
-            #activeGamesModal .agm-game-players {
-                font-size: 10px;
-                color: #666;
-                white-space: nowrap;
-                overflow: hidden;
-                text-overflow: ellipsis;
-            }
-            #activeGamesModal .agm-game-arrow {
-                align-self: center;
-                font-size: 20px;
-                color: rgba(255,255,255,0.3);
-                flex-shrink: 0;
-            }
-            #activeGamesModal .agm-game:hover .agm-game-arrow {
-                color: #fff;
-            }
-
-            /* ═══ Модалка создания игры ═══ */
-            #createGameModal {
-                display: none;
-            }
-            #createGameModal.active { display: flex; }
-
-            #createGameModal .cgm-content {
-                background: #1a1a2e;
-                border-radius: 20px;
-                padding: 22px 22px 18px;
-                max-width: 440px;
-                width: 100%;
-                border: 1px solid rgba(255,255,255,0.1);
-                box-shadow: 0 20px 60px rgba(0,0,0,0.7);
-                animation: agmIn 0.25s cubic-bezier(0.22, 0.61, 0.36, 1);
-            }
-            #createGameModal .cgm-content h2 {
-                font-size: 19px;
-                font-weight: 700;
-                color: #fff;
-                margin-bottom: 14px;
-                display: flex;
-                align-items: center;
-                gap: 8px;
-            }
-            #createGameModal .cgm-desc {
-                font-size: 13px;
-                color: #aaa;
-                line-height: 1.6;
-                margin-bottom: 16px;
-                padding: 12px 14px;
-                background: rgba(108,92,231,0.08);
-                border: 1px solid rgba(108,92,231,0.2);
-                border-radius: 12px;
-            }
-            #createGameModal .cgm-desc strong {
-                color: #a78bfa;
-            }
-            #createGameModal label {
-                display: block;
-                font-size: 12px;
-                color: #999;
-                font-weight: 600;
-                margin-bottom: 6px;
-                text-transform: uppercase;
-                letter-spacing: 0.3px;
-            }
-            #createGameModal input[type="text"] {
-                width: 100%;
-                padding: 14px 16px;
-                background: rgba(255,255,255,0.06);
-                border: 1px solid rgba(255,255,255,0.1);
-                border-radius: 12px;
-                color: #fff;
-                font-size: 18px;
-                font-weight: 700;
-                letter-spacing: 2px;
-                text-align: center;
-                text-transform: uppercase;
-                outline: none;
-                margin-bottom: 8px;
-                font-family: 'SF Mono', 'Courier New', monospace;
-                transition: all 0.2s;
-            }
-            #createGameModal input[type="text"]:focus {
-                border-color: #6c5ce7;
-                background: rgba(255,255,255,0.08);
-                box-shadow: 0 0 0 3px rgba(108,92,231,0.15);
-            }
-            #createGameModal .cgm-hint {
-                font-size: 11px;
-                color: #666;
-                margin-bottom: 16px;
-                line-height: 1.5;
-                text-align: center;
-            }
-            #createGameModal .cgm-hint.error {
-                color: #ff6b6b;
-            }
-            #createGameModal .cgm-hint.success {
-                color: #00b894;
-            }
-
-            /* ═══ Карточка игры в чате ═══ */
-            .game-container {
-                margin: 6px 0 4px;
-                padding: 12px 14px;
-                background: linear-gradient(135deg,
-                    rgba(108,92,231,0.15),
-                    rgba(0,184,148,0.08));
-                border: 1px solid rgba(108,92,231,0.35);
-                border-radius: 16px;
-                min-width: 260px;
-                max-width: 100%;
-                box-sizing: border-box;
-                position: relative;
-                overflow: hidden;
-            }
-            .message-wrapper.own .game-container {
-                background: linear-gradient(135deg,
-                    rgba(0,0,0,0.3),
-                    rgba(108,92,231,0.2));
-                border-color: rgba(167,139,250,0.5);
-            }
-            .game-container.finished {
-                background: linear-gradient(135deg,
-                    rgba(0,184,148,0.12),
-                    rgba(108,92,231,0.08));
-                border-color: rgba(0,184,148,0.4);
-            }
-
-            .game-header {
-                display: flex;
-                align-items: center;
-                gap: 8px;
-                margin-bottom: 10px;
-                padding-bottom: 8px;
-                border-bottom: 1px solid rgba(255,255,255,0.08);
-            }
-            .game-icon {
-                font-size: 20px;
-                flex-shrink: 0;
-            }
-            .game-title {
-                flex: 1;
-                font-size: 14px;
-                font-weight: 700;
-                color: #fff;
-            }
-            .game-badge {
-                font-size: 9px;
-                padding: 2px 6px;
-                border-radius: 6px;
-                background: rgba(254,202,87,0.25);
-                color: #feca57;
-                font-weight: 700;
-                text-transform: uppercase;
-                letter-spacing: 0.3px;
-            }
-            .game-badge.finished-badge {
-                background: rgba(0,184,148,0.25);
-                color: #00b894;
-            }
-
-            .game-base-word {
-                text-align: center;
-                padding: 10px;
-                background: rgba(0,0,0,0.25);
-                border-radius: 10px;
-                margin-bottom: 10px;
-            }
-            .game-base-word-label {
-                font-size: 10px;
-                color: #888;
-                text-transform: uppercase;
-                letter-spacing: 0.5px;
-                margin-bottom: 4px;
-            }
-            .game-base-word strong {
-                font-size: 20px;
-                font-weight: 800;
-                letter-spacing: 3px;
-                color: #feca57;
-                font-family: 'SF Mono', 'Courier New', monospace;
-                text-shadow: 0 2px 8px rgba(254,202,87,0.3);
-            }
-
-            .game-players {
-                display: flex;
-                flex-wrap: wrap;
-                gap: 4px;
-                margin-bottom: 10px;
-            }
-            .game-player {
-                font-size: 11px;
-                padding: 3px 8px;
-                border-radius: 10px;
-                background: rgba(255,255,255,0.06);
-                color: #ccc;
-                border: 1px solid rgba(255,255,255,0.08);
-            }
-            .game-player.active {
-                background: linear-gradient(135deg,
-                    rgba(254,202,87,0.3),
-                    rgba(255,159,67,0.2));
-                color: #feca57;
-                border-color: rgba(254,202,87,0.5);
-                font-weight: 700;
-            }
-            .game-player.me {
-                box-shadow: 0 0 0 1px rgba(108,92,231,0.5);
-            }
-            .game-player.surrendered {
-                opacity: 0.4;
-                text-decoration: line-through;
-            }
-
-            .game-scoreboard {
-                display: flex;
-                flex-wrap: wrap;
-                gap: 6px;
-                margin-bottom: 10px;
-                padding: 8px 10px;
-                background: rgba(0,0,0,0.2);
-                border-radius: 10px;
-            }
-            .game-score-item {
-                font-size: 11px;
-                color: #aaa;
-                display: flex;
-                align-items: center;
-                gap: 4px;
-            }
-            .game-score-item strong {
-                color: #00b894;
-                font-size: 13px;
-                font-weight: 800;
-            }
-
-            .game-words-list {
-                max-height: 200px;
-                overflow-y: auto;
-                margin-bottom: 10px;
-                padding-right: 4px;
-            }
-            .game-words-list::-webkit-scrollbar {
-                width: 3px;
-            }
-            .game-words-list::-webkit-scrollbar-thumb {
-                background: rgba(255,255,255,0.15);
-                border-radius: 2px;
-            }
-            .game-words-empty {
-                text-align: center;
-                padding: 14px;
-                font-size: 11px;
-                color: #666;
-                font-style: italic;
-            }
-            .game-word {
-                display: flex;
-                align-items: center;
-                gap: 8px;
-                padding: 6px 10px;
-                margin-bottom: 3px;
-                background: rgba(255,255,255,0.04);
-                border-radius: 8px;
-                font-size: 12px;
-                animation: gwIn 0.25s ease-out;
-            }
-            @keyframes gwIn {
-                from { opacity: 0; transform: translateX(-6px); }
-                to   { opacity: 1; transform: translateX(0); }
-            }
-            .game-word-text {
-                font-weight: 700;
-                color: #fff;
-                letter-spacing: 1px;
-                font-family: 'SF Mono', 'Courier New', monospace;
-                flex-shrink: 0;
-            }
-            .game-word-author {
-                font-size: 10px;
-                color: #888;
-                margin-left: auto;
-            }
-
-            .game-input-area {
-                display: flex;
-                gap: 6px;
-                margin-bottom: 8px;
-            }
-            .game-word-input {
-                flex: 1;
-                padding: 10px 12px;
-                background: rgba(0,0,0,0.3);
-                border: 1px solid rgba(108,92,231,0.4);
-                border-radius: 10px;
-                color: #fff;
-                font-size: 14px;
-                font-weight: 700;
-                letter-spacing: 1px;
-                text-transform: uppercase;
-                outline: none;
-                font-family: 'SF Mono', 'Courier New', monospace;
-                min-width: 0;
-            }
-            .game-word-input:focus {
-                border-color: #6c5ce7;
-                background: rgba(0,0,0,0.4);
-                box-shadow: 0 0 0 2px rgba(108,92,231,0.25);
-            }
-            .game-word-input::placeholder {
-                color: #555;
-                letter-spacing: 0;
-                text-transform: none;
-                font-family: inherit;
-                font-weight: 400;
-            }
-            .game-submit-btn {
-                width: 40px;
-                height: 40px;
-                border-radius: 10px;
-                border: none;
-                background: linear-gradient(135deg, #6c5ce7, #00b894);
-                color: #fff;
-                font-size: 18px;
-                cursor: pointer;
-                flex-shrink: 0;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                padding: 0;
-                transition: transform 0.1s;
-                -webkit-tap-highlight-color: transparent;
-            }
-            .game-submit-btn:active {
-                transform: scale(0.9);
-            }
-            .game-submit-btn:disabled {
-                opacity: 0.5;
-                cursor: not-allowed;
-            }
-
-            .game-wait {
-                text-align: center;
-                padding: 10px;
-                background: rgba(0,0,0,0.2);
-                border-radius: 10px;
-                font-size: 12px;
-                color: #888;
-                margin-bottom: 8px;
-            }
-            .game-wait strong {
-                color: #a78bfa;
-            }
-
-            .game-footer {
-                display: flex;
-                gap: 6px;
-            }
-            .game-surrender-btn {
-                flex: 1;
-                padding: 8px 10px;
-                border-radius: 10px;
-                border: 1px solid rgba(255,107,107,0.3);
-                background: rgba(255,107,107,0.08);
-                color: #ff6b6b;
-                font-size: 11px;
-                font-weight: 600;
-                cursor: pointer;
-                transition: all 0.15s;
-                font-family: inherit;
-                -webkit-tap-highlight-color: transparent;
-            }
-            .game-surrender-btn:hover {
-                background: rgba(255,107,107,0.18);
-                border-color: rgba(255,107,107,0.5);
-            }
-            .game-surrender-btn:active {
-                transform: scale(0.96);
-            }
-            .game-join-btn {
-                flex: 1;
-                padding: 8px 10px;
-                border-radius: 10px;
-                border: 1px solid rgba(0,184,148,0.4);
-                background: linear-gradient(135deg,
-                    rgba(0,184,148,0.15),
-                    rgba(108,92,231,0.1));
-                color: #00b894;
-                font-size: 11px;
-                font-weight: 600;
-                cursor: pointer;
-                transition: all 0.15s;
-                font-family: inherit;
-                -webkit-tap-highlight-color: transparent;
-            }
-            .game-join-btn:hover {
-                background: linear-gradient(135deg,
-                    rgba(0,184,148,0.25),
-                    rgba(108,92,231,0.2));
-                border-color: rgba(0,184,148,0.7);
-                color: #fff;
-            }
-            .game-join-btn:active {
-                transform: scale(0.96);
-            }
-
-            .game-winner {
-                text-align: center;
-                padding: 12px;
-                background: linear-gradient(135deg,
-                    rgba(0,184,148,0.2),
-                    rgba(108,92,231,0.15));
-                border-radius: 12px;
-                margin-bottom: 8px;
-                border: 1px solid rgba(0,184,148,0.4);
-            }
-            .game-winner-icon {
-                font-size: 32px;
-                line-height: 1;
-                margin-bottom: 6px;
-            }
-            .game-winner-text {
-                font-size: 14px;
-                font-weight: 700;
-                color: #fff;
-            }
-            .game-winner-name {
-                color: #feca57;
-            }
-
-            @media (max-width: 480px) {
-                .game-container {
-                    min-width: 0;
-                    padding: 10px 12px;
-                }
-                .game-base-word strong {
-                    font-size: 17px;
-                    letter-spacing: 2px;
-                }
-                .game-title {
-                    font-size: 13px;
-                }
-            }
-        `;
-        document.head.appendChild(style);
-    }
+    const OV = {
+        overlayEl: null,
+        isOpen: false,
+        currentMsgId: null,     // какая игра открыта
+        inputEl: null,          // ссылка на поле ввода в оверлее
+        // Debounce для перерисовки (чтобы не дёргать при каждом поллинге)
+        refreshTimer: null,
+    };
 
     // ═══════════════════════════════════════════════════════════
     //  ХЕЛПЕРЫ
@@ -64789,212 +64133,1678 @@ async function refreshWeatherManually(btn, card) {
                 wordsCount: (gs.words || []).length,
                 createdAt: gs.startedAt || msg.time,
                 isMe: gs.players.includes(state.username),
-                waitingForPlayers: gs.players.length < 2 && !gs.waitingForJoin,
+                raw: msg,
             });
         }
         games.sort((a, b) => {
-            // Сначала — где наш ход
             if (a.isMyTurn !== b.isMyTurn) return a.isMyTurn ? -1 : 1;
-            // Потом — где мы участвуем
             if (a.isMe !== b.isMe) return a.isMe ? -1 : 1;
-            // Свежие — выше
             return new Date(b.createdAt) - new Date(a.createdAt);
         });
         return games;
     }
 
-    // ═══════════════════════════════════════════════════════════
-    //  МОДАЛКА СПИСКА АКТИВНЫХ ИГР
-    // ═══════════════════════════════════════════════════════════
-    function openActiveGamesModal() {
-        let modal = document.getElementById('activeGamesModal');
-        if (modal) modal.remove();
-
+    // ─── Игра, которую открывает быстрая кнопка ───
+    function getPrimaryGame() {
         const games = getActiveGames();
-
-        modal = document.createElement('div');
-        modal.id = 'activeGamesModal';
-        modal.className = 'image-modal active';
-        modal.innerHTML = `
-            <div class="agm-content" onclick="event.stopPropagation()">
-                <div class="agm-header">
-                    <h2>🎮 Активные игры</h2>
-                    <button class="agm-close" id="agmCloseBtn">✕</button>
-                </div>
-                <div class="agm-body" id="agmBody"></div>
-            </div>
-        `;
-        document.body.appendChild(modal);
-
-        const body = modal.querySelector('#agmBody');
-
-        if (games.length === 0) {
-            body.innerHTML = `
-                <div class="agm-empty">
-                    <div class="agm-empty-icon">🎮</div>
-                    <div class="agm-empty-title">Нет активных игр</div>
-                    <div class="agm-empty-sub">Создайте игру через меню вложений 📎 → 🎮 Игра</div>
-                </div>
-            `;
-        } else {
-            body.innerHTML = games.map(g => {
-                const badgeText = g.type === 'wordgame' ? 'Слова' : 'Игра';
-                const statusText = g.isMyTurn
-                    ? 'Ваш ход!'
-                    : (g.waitingForPlayers
-                        ? 'Ждёт участников'
-                        : `Ход: ${g.currentPlayer || '—'}`);
-                const playersShort = g.players.length > 0
-                    ? g.players.map(p => p === state.username ? 'Вы' : p).join(', ')
-                    : '—';
-
-                return `
-                    <div class="agm-game ${g.isMyTurn ? 'is-my-turn' : ''}"
-                         data-msg-id="${g.msgId}">
-                        <div class="agm-game-icon">🎮</div>
-                        <div class="agm-game-body">
-                            <div class="agm-game-title">
-                                <span>Слова из слова</span>
-                                <span class="agm-game-badge">${badgeText}</span>
-                            </div>
-                            <div class="agm-game-word">
-                                Слово: <strong>${escapeHtmlSafe(g.baseWord)}</strong>
-                                · ${g.wordsCount} ${pluralize(g.wordsCount, 'слово', 'слова', 'слов')}
-                            </div>
-                            <div class="agm-game-status">${escapeHtmlSafe(statusText)}</div>
-                            <div class="agm-game-players">👥 ${escapeHtmlSafe(playersShort)}</div>
-                        </div>
-                        <div class="agm-game-arrow">›</div>
-                    </div>
-                `;
-            }).join('');
-
-            body.querySelectorAll('.agm-game').forEach(el => {
-                el.addEventListener('click', () => {
-                    const msgId = parseInt(el.dataset.msgId, 10);
-                    if (isNaN(msgId)) return;
-
-                    modal.classList.remove('active');
-                    modal.remove();
-
-                    setTimeout(() => {
-                        if (typeof scrollToMessage === 'function') {
-                            scrollToMessage(msgId);
-                        }
-                    }, 200);
-                });
-            });
-        }
-
-        modal.querySelector('#agmCloseBtn').addEventListener('click', () => {
-            modal.classList.remove('active');
-            modal.remove();
-        });
-        modal.addEventListener('click', (e) => {
-            if (e.target === modal) {
-                modal.classList.remove('active');
-                modal.remove();
-            }
-        });
+        if (games.length === 0) return null;
+        // Первая — уже отсортирована (сначала мой ход, потом мои, потом свежие)
+        return games[0];
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  РАСШИРЕНИЕ КНОПКИ ⋯ (через переопределение renderMenu)
+    //  СТИЛИ
     // ═══════════════════════════════════════════════════════════
-    function patchChatPlayerShortcut() {
-        if (typeof window.ChatPlayerShortcut === 'undefined') {
-            setTimeout(patchChatPlayerShortcut, 500);
+    if (!document.getElementById('gamesOverlayV2Styles')) {
+        const style = document.createElement('style');
+        style.id = 'gamesOverlayV2Styles';
+        style.textContent = `
+            /* ═══════════════════════════════════════════════════
+               ОВЕРЛЕЙ ИГРЫ (полноэкранный)
+               ═══════════════════════════════════════════════════ */
+            #gameOverlayV2 {
+                position: fixed;
+                inset: 0;
+                background: linear-gradient(135deg, #0a0a0f 0%, #1a1a2e 100%);
+                z-index: 9500;
+                display: none;
+                flex-direction: column;
+                animation: gov2FadeIn 0.25s ease;
+                overscroll-behavior: contain;
+            }
+            #gameOverlayV2.show { display: flex; }
+            @keyframes gov2FadeIn {
+                from { opacity: 0; }
+                to   { opacity: 1; }
+            }
+
+            /* ═══ Шапка ═══ */
+            #gameOverlayV2 .gov2-header {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                padding: 14px 16px;
+                padding-top: calc(14px + env(safe-area-inset-top, 0px));
+                background: rgba(255,255,255,0.04);
+                backdrop-filter: blur(20px);
+                -webkit-backdrop-filter: blur(20px);
+                border-bottom: 1px solid rgba(255,255,255,0.06);
+                flex-shrink: 0;
+                z-index: 10;
+            }
+            #gameOverlayV2 .gov2-title {
+                flex: 1;
+                min-width: 0;
+                font-size: 17px;
+                font-weight: 700;
+                color: #fff;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+            #gameOverlayV2 .gov2-title-icon {
+                font-size: 22px;
+            }
+            #gameOverlayV2 .gov2-close {
+                width: 40px;
+                height: 40px;
+                border-radius: 50%;
+                border: none;
+                background: rgba(255,255,255,0.06);
+                color: #ccc;
+                font-size: 18px;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                flex-shrink: 0;
+                transition: all 0.15s;
+            }
+            #gameOverlayV2 .gov2-close:hover {
+                background: rgba(255,107,107,0.2);
+                color: #ff6b6b;
+            }
+            #gameOverlayV2 .gov2-close:active {
+                transform: scale(0.9);
+            }
+
+            /* ═══ Тело ═══ */
+            #gameOverlayV2 .gov2-body {
+                flex: 1;
+                overflow-y: auto;
+                padding: 16px;
+                display: flex;
+                flex-direction: column;
+                gap: 14px;
+                min-height: 0;
+                -webkit-overflow-scrolling: touch;
+            }
+            #gameOverlayV2 .gov2-body::-webkit-scrollbar {
+                width: 4px;
+            }
+            #gameOverlayV2 .gov2-body::-webkit-scrollbar-thumb {
+                background: rgba(255,255,255,0.15);
+                border-radius: 2px;
+            }
+
+            /* ═══ Исходное слово ═══ */
+            #gameOverlayV2 .gov2-base-word {
+                text-align: center;
+                padding: 20px 16px;
+                background: linear-gradient(135deg,
+                    rgba(108,92,231,0.18),
+                    rgba(0,184,148,0.1));
+                border: 1px solid rgba(108,92,231,0.35);
+                border-radius: 18px;
+                box-shadow: 0 6px 24px rgba(108,92,231,0.15);
+            }
+            #gameOverlayV2 .gov2-base-word-label {
+                font-size: 11px;
+                color: #888;
+                text-transform: uppercase;
+                letter-spacing: 0.6px;
+                font-weight: 700;
+                margin-bottom: 8px;
+            }
+            #gameOverlayV2 .gov2-base-word strong {
+                font-size: 32px;
+                font-weight: 800;
+                letter-spacing: 4px;
+                color: #feca57;
+                font-family: 'SF Mono', 'Courier New', monospace;
+                text-shadow: 0 2px 12px rgba(254,202,87,0.4);
+                line-height: 1.2;
+                word-break: break-word;
+            }
+
+            /* ═══ Игроки ═══ */
+            #gameOverlayV2 .gov2-players {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 8px;
+                justify-content: center;
+            }
+            #gameOverlayV2 .gov2-player {
+                display: inline-flex;
+                align-items: center;
+                gap: 6px;
+                padding: 8px 14px;
+                background: rgba(255,255,255,0.05);
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 20px;
+                font-size: 13px;
+                color: #ccc;
+                transition: all 0.2s;
+            }
+            #gameOverlayV2 .gov2-player.active {
+                background: linear-gradient(135deg,
+                    rgba(254,202,87,0.25),
+                    rgba(255,159,67,0.15));
+                border-color: rgba(254,202,87,0.5);
+                color: #feca57;
+                font-weight: 700;
+                box-shadow: 0 4px 12px rgba(254,202,87,0.2);
+            }
+            #gameOverlayV2 .gov2-player.me {
+                box-shadow: 0 0 0 2px rgba(108,92,231,0.35);
+            }
+            #gameOverlayV2 .gov2-player.surrendered {
+                opacity: 0.4;
+                text-decoration: line-through;
+            }
+            #gameOverlayV2 .gov2-player-score {
+                padding: 2px 8px;
+                background: rgba(0,0,0,0.3);
+                border-radius: 10px;
+                font-size: 11px;
+                font-weight: 700;
+                color: #00b894;
+            }
+            #gameOverlayV2 .gov2-player.active .gov2-player-score {
+                background: rgba(0,0,0,0.4);
+                color: #fff;
+            }
+
+            /* ═══ Статус хода ═══ */
+            #gameOverlayV2 .gov2-turn-status {
+                text-align: center;
+                padding: 12px 16px;
+                border-radius: 14px;
+                font-size: 14px;
+                font-weight: 600;
+                transition: all 0.25s;
+            }
+            #gameOverlayV2 .gov2-turn-status.my-turn {
+                background: linear-gradient(135deg,
+                    rgba(0,184,148,0.2),
+                    rgba(108,92,231,0.15));
+                border: 1px solid rgba(0,184,148,0.45);
+                color: #00e5b8;
+                box-shadow: 0 4px 16px rgba(0,184,148,0.2);
+            }
+            #gameOverlayV2 .gov2-turn-status.waiting {
+                background: rgba(255,255,255,0.04);
+                border: 1px solid rgba(255,255,255,0.08);
+                color: #aaa;
+            }
+            #gameOverlayV2 .gov2-turn-status strong {
+                color: #fff;
+            }
+
+            /* ═══ Слова ═══ */
+            #gameOverlayV2 .gov2-words-title {
+                font-size: 12px;
+                color: #888;
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
+                font-weight: 700;
+                padding: 4px 4px 0;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+            }
+            #gameOverlayV2 .gov2-words-title span {
+                color: #666;
+                font-weight: 500;
+                text-transform: none;
+                letter-spacing: 0;
+            }
+            #gameOverlayV2 .gov2-words-list {
+                display: flex;
+                flex-direction: column;
+                gap: 6px;
+            }
+            #gameOverlayV2 .gov2-words-empty {
+                text-align: center;
+                padding: 24px;
+                color: #666;
+                font-size: 13px;
+                font-style: italic;
+                background: rgba(255,255,255,0.02);
+                border-radius: 12px;
+                border: 1px dashed rgba(255,255,255,0.08);
+            }
+            #gameOverlayV2 .gov2-word {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                padding: 10px 14px;
+                background: rgba(255,255,255,0.04);
+                border-radius: 12px;
+                font-size: 14px;
+                animation: gov2WordIn 0.3s ease-out;
+            }
+            @keyframes gov2WordIn {
+                from { opacity: 0; transform: translateX(-8px); }
+                to   { opacity: 1; transform: translateX(0); }
+            }
+            #gameOverlayV2 .gov2-word-text {
+                font-weight: 700;
+                color: #fff;
+                letter-spacing: 1.5px;
+                font-family: 'SF Mono', 'Courier New', monospace;
+                flex-shrink: 0;
+            }
+            #gameOverlayV2 .gov2-word-author {
+                font-size: 11px;
+                color: #888;
+                margin-left: auto;
+            }
+
+            /* ═══ Победитель ═══ */
+            #gameOverlayV2 .gov2-winner {
+                text-align: center;
+                padding: 20px;
+                background: linear-gradient(135deg,
+                    rgba(0,184,148,0.2),
+                    rgba(108,92,231,0.15));
+                border: 1px solid rgba(0,184,148,0.4);
+                border-radius: 18px;
+                box-shadow: 0 6px 24px rgba(0,184,148,0.15);
+            }
+            #gameOverlayV2 .gov2-winner-icon {
+                font-size: 48px;
+                line-height: 1;
+                margin-bottom: 8px;
+                animation: gov2Trophy 2s ease-in-out infinite;
+            }
+            @keyframes gov2Trophy {
+                0%, 100% { transform: scale(1) rotate(0); }
+                50%      { transform: scale(1.08) rotate(-5deg); }
+            }
+            #gameOverlayV2 .gov2-winner-text {
+                font-size: 16px;
+                font-weight: 700;
+                color: #fff;
+            }
+            #gameOverlayV2 .gov2-winner-name {
+                color: #feca57;
+                font-size: 18px;
+            }
+
+            /* ═══ Форма ввода ═══ */
+            #gameOverlayV2 .gov2-input-area {
+                display: flex;
+                gap: 8px;
+                align-items: stretch;
+                position: sticky;
+                bottom: 0;
+                background: linear-gradient(180deg,
+                    rgba(10,10,15,0.6) 0%,
+                    rgba(10,10,15,0.95) 30%);
+                padding: 10px 0 0;
+                margin-top: auto;
+            }
+            #gameOverlayV2 .gov2-input {
+                flex: 1;
+                padding: 16px 18px;
+                background: rgba(255,255,255,0.06);
+                border: 2px solid rgba(108,92,231,0.4);
+                border-radius: 14px;
+                color: #fff;
+                font-size: 18px;
+                font-weight: 700;
+                letter-spacing: 2px;
+                text-transform: uppercase;
+                outline: none;
+                font-family: 'SF Mono', 'Courier New', monospace;
+                min-width: 0;
+                transition: all 0.2s;
+            }
+            #gameOverlayV2 .gov2-input:focus {
+                border-color: #00b894;
+                background: rgba(0,184,148,0.08);
+                box-shadow: 0 0 0 4px rgba(0,184,148,0.15);
+            }
+            #gameOverlayV2 .gov2-input::placeholder {
+                color: #555;
+                letter-spacing: 0;
+                text-transform: none;
+                font-family: inherit;
+                font-weight: 400;
+            }
+            #gameOverlayV2 .gov2-submit {
+                padding: 16px 24px;
+                border: none;
+                border-radius: 14px;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                color: #fff;
+                font-size: 16px;
+                font-weight: 700;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                transition: all 0.15s;
+                -webkit-tap-highlight-color: transparent;
+                font-family: inherit;
+                flex-shrink: 0;
+            }
+            #gameOverlayV2 .gov2-submit:hover {
+                background: linear-gradient(135deg, #7a6cf0, #00cfa4);
+                transform: translateY(-1px);
+                box-shadow: 0 6px 20px rgba(108,92,231,0.4);
+            }
+            #gameOverlayV2 .gov2-submit:active {
+                transform: scale(0.95);
+            }
+            #gameOverlayV2 .gov2-submit:disabled {
+                opacity: 0.5;
+                cursor: not-allowed;
+                transform: none;
+                box-shadow: none;
+            }
+
+            /* ═══ Кнопки внизу ═══ */
+            #gameOverlayV2 .gov2-footer {
+                display: flex;
+                gap: 10px;
+                padding-bottom: calc(14px + env(safe-area-inset-bottom, 0px));
+                flex-shrink: 0;
+            }
+            #gameOverlayV2 .gov2-surrender {
+                flex: 1;
+                padding: 14px;
+                border-radius: 14px;
+                border: 1px solid rgba(255,107,107,0.35);
+                background: rgba(255,107,107,0.08);
+                color: #ff6b6b;
+                font-size: 14px;
+                font-weight: 700;
+                cursor: pointer;
+                transition: all 0.15s;
+                font-family: inherit;
+                -webkit-tap-highlight-color: transparent;
+            }
+            #gameOverlayV2 .gov2-surrender:hover {
+                background: rgba(255,107,107,0.18);
+                border-color: rgba(255,107,107,0.6);
+            }
+            #gameOverlayV2 .gov2-surrender:active {
+                transform: scale(0.96);
+            }
+            #gameOverlayV2 .gov2-join {
+                flex: 1;
+                padding: 14px;
+                border-radius: 14px;
+                border: 1px solid rgba(0,184,148,0.45);
+                background: linear-gradient(135deg,
+                    rgba(0,184,148,0.2),
+                    rgba(108,92,231,0.12));
+                color: #00e5b8;
+                font-size: 14px;
+                font-weight: 700;
+                cursor: pointer;
+                transition: all 0.15s;
+                font-family: inherit;
+                -webkit-tap-highlight-color: transparent;
+            }
+            #gameOverlayV2 .gov2-join:hover {
+                background: linear-gradient(135deg,
+                    rgba(0,184,148,0.3),
+                    rgba(108,92,231,0.2));
+                border-color: rgba(0,184,148,0.7);
+                color: #fff;
+            }
+            #gameOverlayV2 .gov2-join:active {
+                transform: scale(0.96);
+            }
+
+            /* ═══════════════════════════════════════════════════
+               КНОПКА-ИНДИКАТОР РЯДОМ С ⋯
+               ═══════════════════════════════════════════════════ */
+            .input-bar .game-indicator-btn {
+                width: 48px;
+                height: 48px;
+                border-radius: 50%;
+                border: none;
+                cursor: pointer;
+                flex-shrink: 0;
+                display: none;
+                align-items: center;
+                justify-content: center;
+                font-size: 22px;
+                font-family: inherit;
+                padding: 0;
+                line-height: 1;
+                transition: all 0.25s;
+                -webkit-tap-highlight-color: transparent;
+                position: relative;
+            }
+            .input-bar .game-indicator-btn.show {
+                display: flex;
+            }
+            .input-bar .game-indicator-btn.waiting {
+                background: linear-gradient(135deg,
+                    rgba(254,202,87,0.25),
+                    rgba(255,159,67,0.18));
+                color: #feca57;
+                border: 1.5px solid rgba(254,202,87,0.5);
+                box-shadow: 0 0 12px rgba(254,202,87,0.3);
+                animation: giWaiting 2s ease-in-out infinite;
+            }
+            @keyframes giWaiting {
+                0%, 100% { box-shadow: 0 0 12px rgba(254,202,87,0.3); }
+                50%      { box-shadow: 0 0 18px rgba(254,202,87,0.55); }
+            }
+            .input-bar .game-indicator-btn.waiting:active {
+                transform: scale(0.9);
+            }
+            .input-bar .game-indicator-btn.my-turn {
+                background: linear-gradient(135deg, #00b894, #00e5b8);
+                color: #fff;
+                border: 1.5px solid rgba(0,184,148,0.9);
+                box-shadow: 0 0 16px rgba(0,184,148,0.6);
+                animation: giMyTurn 1.4s ease-in-out infinite;
+            }
+            @keyframes giMyTurn {
+                0%, 100% {
+                    box-shadow: 0 0 16px rgba(0,184,148,0.6);
+                    transform: scale(1);
+                }
+                50% {
+                    box-shadow: 0 0 24px rgba(0,184,148,1),
+                                0 0 0 5px rgba(0,184,148,0.2);
+                    transform: scale(1.05);
+                }
+            }
+            .input-bar .game-indicator-btn.my-turn:active {
+                transform: scale(0.9);
+            }
+            /* Точка-бейдж "новый ход" */
+            .input-bar .game-indicator-btn.my-turn::after {
+                content: '';
+                position: absolute;
+                top: -2px;
+                right: -2px;
+                width: 12px;
+                height: 12px;
+                border-radius: 50%;
+                background: #feca57;
+                border: 2px solid #0a0a0f;
+                box-shadow: 0 0 8px rgba(254,202,87,0.9);
+                animation: giDotPulse 1s ease-in-out infinite;
+            }
+            @keyframes giDotPulse {
+                0%, 100% { transform: scale(1); }
+                50%      { transform: scale(1.2); }
+            }
+
+            /* На мобиле — компактнее */
+            @media (max-width: 480px) {
+                .input-bar .game-indicator-btn {
+                    width: 40px;
+                    height: 40px;
+                    font-size: 18px;
+                }
+            }
+
+            /* ═══ Мобильная раскладка (кнопки снизу) ═══ */
+            @media (max-width: 600px) {
+                #gameOverlayV2 .gov2-base-word strong {
+                    font-size: 26px;
+                    letter-spacing: 3px;
+                }
+                #gameOverlayV2 .gov2-input {
+                    font-size: 16px;
+                    padding: 14px 16px;
+                }
+                #gameOverlayV2 .gov2-submit {
+                    padding: 14px 20px;
+                    font-size: 15px;
+                }
+                #gameOverlayV2 .gov2-body {
+                    padding: 12px;
+                    gap: 12px;
+                }
+            }
+
+            /* ═══ Пункт меню "Активные игры" ═══ */
+            #chatQuickAccessMenu .cqa-item[data-action="games"] .cqa-icon {
+                background: linear-gradient(135deg, rgba(254,202,87,0.25), rgba(255,159,67,0.15));
+                border-radius: 8px;
+            }
+            #chatQuickAccessMenu .cqa-count.cqa-count-hot {
+                background: linear-gradient(135deg, #feca57, #ff9f43);
+                color: #1a1a2e;
+                font-weight: 800;
+                animation: cqaHotPulse 1.6s ease-in-out infinite;
+            }
+            @keyframes cqaHotPulse {
+                0%, 100% { box-shadow: 0 0 6px rgba(254,202,87,0.6); }
+                50%      { box-shadow: 0 0 14px rgba(254,202,87,0.95); }
+            }
+
+            /* ═══ Модалка выбора игр (активные игры) ═══ */
+            #activeGamesModalV2 {
+                display: none;
+            }
+            #activeGamesModalV2.active { display: flex; }
+            #activeGamesModalV2 .agm-content {
+                background: #1a1a2e;
+                border-radius: 20px;
+                max-width: 460px;
+                width: 100%;
+                max-height: 88vh;
+                display: flex;
+                flex-direction: column;
+                border: 1px solid rgba(255,255,255,0.1);
+                box-shadow: 0 20px 60px rgba(0,0,0,0.7);
+                overflow: hidden;
+                animation: agmIn 0.25s cubic-bezier(0.22, 0.61, 0.36, 1);
+            }
+            @keyframes agmIn {
+                from { opacity: 0; transform: scale(0.94); }
+                to   { opacity: 1; transform: scale(1); }
+            }
+            #activeGamesModalV2 .agm-header {
+                display: flex;
+                align-items: center;
+                gap: 12px;
+                padding: 16px 20px;
+                border-bottom: 1px solid rgba(255,255,255,0.08);
+                background: linear-gradient(135deg, rgba(254,202,87,0.12), rgba(255,159,67,0.06));
+                flex-shrink: 0;
+            }
+            #activeGamesModalV2 .agm-header h2 {
+                flex: 1;
+                font-size: 17px;
+                font-weight: 700;
+                color: #fff;
+                margin: 0;
+            }
+            #activeGamesModalV2 .agm-close {
+                width: 34px; height: 34px;
+                border-radius: 50%;
+                border: none;
+                background: rgba(255,255,255,0.06);
+                color: #888;
+                font-size: 16px;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                flex-shrink: 0;
+            }
+            #activeGamesModalV2 .agm-close:hover {
+                background: rgba(255,107,107,0.2);
+                color: #ff6b6b;
+            }
+            #activeGamesModalV2 .agm-body {
+                flex: 1;
+                overflow-y: auto;
+                padding: 14px 16px 18px;
+                min-height: 100px;
+            }
+            #activeGamesModalV2 .agm-empty {
+                text-align: center;
+                padding: 40px 20px;
+                color: #666;
+            }
+            #activeGamesModalV2 .agm-empty-icon {
+                font-size: 56px; margin-bottom: 12px; opacity: 0.5;
+            }
+            #activeGamesModalV2 .agm-empty-title {
+                font-size: 15px; color: #aaa; font-weight: 600; margin-bottom: 6px;
+            }
+            #activeGamesModalV2 .agm-empty-sub {
+                font-size: 12px; color: #666; line-height: 1.5;
+            }
+            #activeGamesModalV2 .agm-game {
+                display: flex;
+                gap: 12px;
+                padding: 12px 14px;
+                margin-bottom: 8px;
+                background: rgba(255,255,255,0.04);
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 14px;
+                cursor: pointer;
+                transition: all 0.15s;
+                -webkit-tap-highlight-color: transparent;
+            }
+            #activeGamesModalV2 .agm-game:hover {
+                background: rgba(108,92,231,0.12);
+                border-color: rgba(108,92,231,0.35);
+            }
+            #activeGamesModalV2 .agm-game:active {
+                transform: scale(0.98);
+            }
+            #activeGamesModalV2 .agm-game.is-my-turn {
+                background: linear-gradient(135deg, rgba(0,184,148,0.12), rgba(254,202,87,0.06));
+                border-color: rgba(0,184,148,0.45);
+            }
+            #activeGamesModalV2 .agm-game-icon {
+                width: 42px; height: 42px;
+                border-radius: 10px;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 20px;
+                flex-shrink: 0;
+            }
+            #activeGamesModalV2 .agm-game.is-my-turn .agm-game-icon {
+                background: linear-gradient(135deg, #00b894, #00e5b8);
+            }
+            #activeGamesModalV2 .agm-game-body {
+                flex: 1;
+                min-width: 0;
+                display: flex;
+                flex-direction: column;
+                gap: 4px;
+            }
+            #activeGamesModalV2 .agm-game-title {
+                font-size: 14px;
+                font-weight: 700;
+                color: #fff;
+            }
+            #activeGamesModalV2 .agm-game-word {
+                font-size: 12px;
+                color: #aaa;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            #activeGamesModalV2 .agm-game-word strong {
+                color: #feca57;
+                letter-spacing: 1px;
+            }
+            #activeGamesModalV2 .agm-game-status {
+                font-size: 11px;
+                color: #888;
+            }
+            #activeGamesModalV2 .agm-game.is-my-turn .agm-game-status {
+                color: #00e5b8;
+                font-weight: 600;
+            }
+            #activeGamesModalV2 .agm-game-arrow {
+                align-self: center;
+                font-size: 20px;
+                color: rgba(255,255,255,0.3);
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОВЕРЛЕЙ — ПОСТРОЕНИЕ
+    // ═══════════════════════════════════════════════════════════
+    function ensureOverlay() {
+        if (OV.overlayEl && OV.overlayEl.isConnected) return OV.overlayEl;
+
+        const old = document.getElementById('gameOverlayV2');
+        if (old) old.remove();
+
+        const el = document.createElement('div');
+        el.id = 'gameOverlayV2';
+        el.innerHTML = `
+            <div class="gov2-header">
+                <div class="gov2-title">
+                    <span class="gov2-title-icon">🎮</span>
+                    <span>Слова из слова</span>
+                </div>
+                <button class="gov2-close" id="gov2CloseBtn" title="Закрыть">✕</button>
+            </div>
+            <div class="gov2-body" id="gov2Body"></div>
+        `;
+        document.body.appendChild(el);
+        OV.overlayEl = el;
+
+        el.querySelector('#gov2CloseBtn').addEventListener('click', closeOverlay);
+
+        // Клик по фону — не закрываем (случайно можно)
+        // (это оверлей, клик по фону игнорируем)
+
+        // ESC
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && OV.isOpen) {
+                e.preventDefault();
+                e.stopPropagation();
+                closeOverlay();
+            }
+        }, true);
+
+        return el;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОТКРЫТИЕ / ЗАКРЫТИЕ
+    // ═══════════════════════════════════════════════════════════
+    function openOverlay(msgId) {
+        if (!msgId) return;
+
+        const msg = (typeof historyState !== 'undefined' && historyState.allMessages)
+            ? historyState.allMessages.find(m => String(m.id) === String(msgId))
+            : null;
+        if (!msg || !msg.gameState) {
+            showToastSafe('❌ Игра не найдена', 2000);
             return;
         }
 
-        // Патчим через глобальный доступ к внутренностям
-        // ChatPlayerShortcut.open вызывает внутренний openMenu,
-        // но у нас нет прямого доступа. Используем MutationObserver
-        // на появление меню: как только меню открывается — 
-        // вставляем в него третий пункт.
+        ensureOverlay();
+        OV.currentMsgId = msgId;
+        OV.isOpen = true;
 
-        const observer = new MutationObserver(() => {
-            const menu = document.getElementById('chatQuickAccessMenu');
-            if (!menu || !menu.classList.contains('show')) return;
-            if (menu.querySelector('[data-action="games"]')) return;
+        renderOverlay(msg);
 
-            injectGamesItemIntoMenu(menu);
+        OV.overlayEl.classList.add('show');
+        document.body.style.overflow = 'hidden';
+
+        if (navigator.vibrate) navigator.vibrate(12);
+        if (typeof soundManager !== 'undefined') {
+            try { soundManager.play('click'); } catch (e) {}
+        }
+    }
+
+    function closeOverlay() {
+        if (!OV.isOpen) return;
+        OV.isOpen = false;
+        OV.currentMsgId = null;
+        OV.inputEl = null;
+
+        if (OV.overlayEl) {
+            OV.overlayEl.classList.remove('show');
+        }
+        document.body.style.overflow = '';
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  РЕНДЕР ОВЕРЛЕЯ
+    // ═══════════════════════════════════════════════════════════
+    function renderOverlay(msg) {
+        if (!OV.overlayEl || !msg) return;
+
+        const body = OV.overlayEl.querySelector('#gov2Body');
+        if (!body) return;
+
+        const gs = msg.gameState;
+        const isFinished = gs.status === 'finished';
+        const isMyTurn = !isFinished && gs.players[gs.currentPlayerIndex] === state.username;
+        const amIPlayer = gs.players.includes(state.username);
+        const baseWord = gs.baseWord || '';
+        const words = Array.isArray(gs.words) ? gs.words : [];
+        const players = Array.isArray(gs.players) ? gs.players : [];
+
+        // ═══ Игроки ═══
+        const scores = {};
+        players.forEach(p => scores[p] = 0);
+        words.forEach(w => {
+            if (scores[w.author] !== undefined) scores[w.author]++;
+            else scores[w.author] = 1;
         });
 
-        observer.observe(document.body, { childList: true, subtree: true });
+        const playersHtml = players.map(p => {
+            const isActive = !isFinished && gs.players[gs.currentPlayerIndex] === p;
+            const isMe = p === state.username;
+            const surrendered = gs.surrendered && gs.surrendered.includes(p);
+            const cls = [
+                'gov2-player',
+                isActive ? 'active' : '',
+                isMe ? 'me' : '',
+                surrendered ? 'surrendered' : '',
+            ].filter(Boolean).join(' ');
+            return `
+                <span class="${cls}">
+                    ${escapeHtmlSafe(isMe ? 'Вы' : p)}
+                    <span class="gov2-player-score">${scores[p] || 0}</span>
+                </span>
+            `;
+        }).join('');
 
-        // Также привязываем обработчик клика на "Активные игры"
-        document.addEventListener('click', (e) => {
-            const item = e.target.closest('#chatQuickAccessMenu [data-action="games"]');
-            if (!item) return;
-            e.stopPropagation();
-            e.preventDefault();
+        // ═══ Статус хода ═══
+        let turnStatusHtml = '';
+        if (isFinished) {
+            turnStatusHtml = '';
+        } else if (isMyTurn) {
+            turnStatusHtml = `<div class="gov2-turn-status my-turn">⚡ Ваш ход — назовите слово</div>`;
+        } else {
+            const curPlayer = gs.players[gs.currentPlayerIndex];
+            const displayName = curPlayer === state.username ? 'Вы' : curPlayer;
+            turnStatusHtml = `<div class="gov2-turn-status waiting">⏳ Ход: <strong>${escapeHtmlSafe(displayName || '—')}</strong></div>`;
+        }
 
-            // Закрываем меню
-            const overlay = document.getElementById('chatQuickAccessOverlay');
-            const menu = document.getElementById('chatQuickAccessMenu');
-            if (menu) menu.classList.remove('show');
-            if (overlay) overlay.classList.remove('show');
+        // ═══ Победитель ═══
+        let winnerHtml = '';
+        if (isFinished && gs.winner) {
+            winnerHtml = `
+                <div class="gov2-winner">
+                    <div class="gov2-winner-icon">🏆</div>
+                    <div class="gov2-winner-text">
+                        Победитель: <span class="gov2-winner-name">${escapeHtmlSafe(gs.winner === state.username ? 'Вы' : gs.winner)}</span>
+                    </div>
+                </div>
+            `;
+        }
 
-            setTimeout(openActiveGamesModal, 150);
-        }, true);
+        // ═══ Слова ═══
+        let wordsHtml = '';
+        if (words.length === 0) {
+            wordsHtml = `<div class="gov2-words-empty">Пока нет слов</div>`;
+        } else {
+            wordsHtml = words.map(w => `
+                <div class="gov2-word">
+                    <span class="gov2-word-text">${escapeHtmlSafe(w.word)}</span>
+                    <span class="gov2-word-author">${escapeHtmlSafe(w.author === state.username ? 'Вы' : w.author)}</span>
+                </div>
+            `).join('');
+        }
 
-        log('ChatPlayerShortcut пропатчен через observer');
-    }
+        // ═══ Поле ввода / кнопки ═══
+        let inputAreaHtml = '';
+        let footerHtml = '';
 
-    function injectGamesItemIntoMenu(menu) {
-        const games = getActiveGames();
-        const myTurnGames = games.filter(g => g.isMyTurn);
+        if (isFinished) {
+            inputAreaHtml = '';
+            footerHtml = '';
+        } else if (!amIPlayer) {
+            // Не участник — присоединиться
+            inputAreaHtml = '';
+            footerHtml = `
+                <div class="gov2-footer">
+                    <button class="gov2-join" id="gov2JoinBtn">➕ Присоединиться</button>
+                </div>
+            `;
+        } else if (isMyTurn) {
+            // Мой ход
+            inputAreaHtml = `
+                <div class="gov2-input-area">
+                    <input type="text"
+                           class="gov2-input"
+                           id="gov2Input"
+                           placeholder="Ваше слово..."
+                           maxlength="${gs.baseWord.length}"
+                           autocomplete="off"
+                           spellcheck="false"
+                           inputmode="text">
+                    <button class="gov2-submit" id="gov2SubmitBtn">
+                        <span>✔</span>
+                        <span>Ход</span>
+                    </button>
+                </div>
+            `;
+            footerHtml = `
+                <div class="gov2-footer">
+                    <button class="gov2-surrender" id="gov2SurrenderBtn">🏳️ Сдаться</button>
+                </div>
+            `;
+        } else {
+            // Не мой ход
+            inputAreaHtml = '';
+            footerHtml = `
+                <div class="gov2-footer">
+                    <button class="gov2-surrender" id="gov2SurrenderBtn">🏳️ Сдаться</button>
+                </div>
+            `;
+        }
 
-        const label = games.length === 0
-            ? '<small>Нет активных игр</small>'
-            : (myTurnGames.length > 0
-                ? `<small style="color:#feca57;">⚡ Ваш ход: ${myTurnGames.length}</small>`
-                : `<small>${games.length} ${pluralize(games.length, 'игра', 'игры', 'игр')}</small>`);
+        body.innerHTML = `
+            <div class="gov2-base-word">
+                <div class="gov2-base-word-label">Исходное слово</div>
+                <strong>${escapeHtmlSafe(baseWord)}</strong>
+            </div>
 
-        const countHtml = games.length > 0
-            ? `<span class="cqa-count ${myTurnGames.length > 0 ? 'cqa-count-hot' : ''}">${games.length}</span>`
-            : '';
+            ${players.length > 0 ? `<div class="gov2-players">${playersHtml}</div>` : ''}
 
-        const item = document.createElement('div');
-        item.className = 'cqa-item ' + (games.length === 0 ? 'disabled' : '');
-        item.dataset.action = 'games';
-        item.innerHTML = `
-            <span class="cqa-icon">🎮</span>
-            <div class="cqa-label">Активные игры${label}</div>
-            ${countHtml}
+            ${turnStatusHtml}
+            ${winnerHtml}
+
+            <div class="gov2-words-title">
+                Слова (${words.length})
+            </div>
+            <div class="gov2-words-list">
+                ${wordsHtml}
+            </div>
+
+            ${inputAreaHtml}
+            ${footerHtml}
         `;
-        menu.appendChild(item);
+
+        // ═══ Привязка обработчиков ═══
+        attachHandlers(msg);
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ПУЛЬСАЦИЯ КНОПКИ ⋯ ПРИ "МОЙ ХОД"
+    //  ПРИВЯЗКА ОБРАБОТЧИКОВ
     // ═══════════════════════════════════════════════════════════
-    function updateGamesButtonState() {
-        const btn = document.getElementById('chatPlayerBtn');
+    function attachHandlers(msg) {
+        const body = OV.overlayEl.querySelector('#gov2Body');
+        if (!body) return;
+
+        const submitBtn = body.querySelector('#gov2SubmitBtn');
+        const input = body.querySelector('#gov2Input');
+        const surrenderBtn = body.querySelector('#gov2SurrenderBtn');
+        const joinBtn = body.querySelector('#gov2JoinBtn');
+
+        if (input) {
+            OV.inputEl = input;
+
+            // Автофокус на поле (только в оверлее — там нет конкуренции)
+            setTimeout(() => {
+                try { input.focus({ preventScroll: true }); } catch (e) {}
+            }, 300);
+
+            // Ограничение на русские буквы и Enter для отправки
+            input.addEventListener('input', () => {
+                input.value = input.value.toUpperCase().replace(/[^А-ЯЁ]/g, '');
+            });
+
+            input.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    submitWordFromOverlay();
+                }
+            });
+        }
+
+        if (submitBtn) {
+            submitBtn.addEventListener('click', () => submitWordFromOverlay());
+        }
+
+        if (surrenderBtn) {
+            surrenderBtn.addEventListener('click', async () => {
+                await surrenderFromOverlay();
+            });
+        }
+
+        if (joinBtn) {
+            joinBtn.addEventListener('click', async () => {
+                await joinFromOverlay();
+            });
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОТПРАВКА СЛОВА
+    // ═══════════════════════════════════════════════════════════
+    async function submitWordFromOverlay() {
+        if (!OV.currentMsgId) return;
+
+        const msg = (typeof historyState !== 'undefined' && historyState.allMessages)
+            ? historyState.allMessages.find(m => String(m.id) === String(OV.currentMsgId))
+            : null;
+        if (!msg || !msg.gameState) return;
+
+        const gs = msg.gameState;
+        if (gs.status === 'finished') {
+            showToastSafe('Игра завершена', 1500);
+            return;
+        }
+
+        if (gs.players[gs.currentPlayerIndex] !== state.username) {
+            showToastSafe('⏳ Сейчас не ваш ход', 1500);
+            return;
+        }
+
+        const input = OV.inputEl;
+        if (!input) return;
+
+        const word = input.value.trim().toUpperCase();
+        if (!word) return;
+
+        // ═══ Валидация ═══
+        if (word.length < CFG.MIN_WORD_LENGTH) {
+            showToastSafe(`❌ Слишком короткое (мин. ${CFG.MIN_WORD_LENGTH})`, 2000);
+            return;
+        }
+
+        if (gs.words.some(w => w.word === word)) {
+            showToastSafe(`❌ «${word}» уже было`, 2000);
+            return;
+        }
+
+        // Проверка букв
+        const tempBase = gs.baseWord.split('');
+        for (const letter of word.split('')) {
+            const idx = tempBase.indexOf(letter);
+            if (idx === -1) {
+                showToastSafe(`❌ Буквы «${letter}» нет в слове`, 2000);
+                return;
+            }
+            tempBase.splice(idx, 1);
+        }
+
+        // ═══ Обновляем состояние ═══
+        const newGs = JSON.parse(JSON.stringify(gs));
+        newGs.words.push({ word, author: state.username });
+
+        // Переход хода
+        const activePlayers = newGs.players.filter(
+            p => !(newGs.surrendered || []).includes(p)
+        );
+        if (activePlayers.length > 1) {
+            let nextIdx = newGs.currentPlayerIndex;
+            let attempts = 0;
+            do {
+                nextIdx = (nextIdx + 1) % newGs.players.length;
+                attempts++;
+            } while ((newGs.surrendered || []).includes(newGs.players[nextIdx]) && attempts < 100);
+            newGs.currentPlayerIndex = nextIdx;
+        }
+
+        try {
+            if (input) input.disabled = true;
+
+            await persistGameState(OV.currentMsgId, newGs);
+            msg.gameState = newGs;
+
+            // Обновляем оверлей и карточку в чате
+            renderOverlay(msg);
+            updateGameCardInChat(OV.currentMsgId, msg);
+
+            showToastSafe(`✅ «${word}» принято!`, 1200);
+            if (typeof soundManager !== 'undefined') {
+                try { soundManager.play('send'); } catch (e) {}
+            }
+            if (navigator.vibrate) navigator.vibrate([10, 30, 10]);
+        } catch (e) {
+            console.error('🎮 [GamesOverlay v2] submit error:', e);
+            showToastSafe('❌ ' + (e.message || 'Ошибка'), 2500);
+            if (input) input.disabled = false;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СДАЧА
+    // ═══════════════════════════════════════════════════════════
+    async function surrenderFromOverlay() {
+        if (!OV.currentMsgId) return;
+
+        const msg = (typeof historyState !== 'undefined' && historyState.allMessages)
+            ? historyState.allMessages.find(m => String(m.id) === String(OV.currentMsgId))
+            : null;
+        if (!msg || !msg.gameState) return;
+
+        const gs = msg.gameState;
+        if (gs.status === 'finished') return;
+
+        if (!gs.players.includes(state.username)) {
+            showToastSafe('Вы не участник', 1500);
+            return;
+        }
+
+        const ok = await showConfirmModal(
+            '🏳️ Сдаться?',
+            'Вы выйдете из игры. Ход перейдёт к следующему игроку.',
+            'Сдаться', 'Отмена'
+        );
+        if (!ok) return;
+
+        const newGs = JSON.parse(JSON.stringify(gs));
+        newGs.surrendered = newGs.surrendered || [];
+        if (!newGs.surrendered.includes(state.username)) {
+            newGs.surrendered.push(state.username);
+        }
+
+        const activePlayers = newGs.players.filter(
+            p => !newGs.surrendered.includes(p)
+        );
+
+        if (activePlayers.length === 0) {
+            newGs.status = 'finished';
+            newGs.winner = null;
+        } else if (activePlayers.length === 1) {
+            newGs.status = 'finished';
+            newGs.winner = activePlayers[0];
+        } else {
+            if (newGs.surrendered.includes(newGs.players[newGs.currentPlayerIndex])) {
+                let nextIdx = newGs.currentPlayerIndex;
+                let attempts = 0;
+                do {
+                    nextIdx = (nextIdx + 1) % newGs.players.length;
+                    attempts++;
+                } while (newGs.surrendered.includes(newGs.players[nextIdx]) && attempts < 100);
+                newGs.currentPlayerIndex = nextIdx;
+            }
+        }
+
+        try {
+            await persistGameState(OV.currentMsgId, newGs);
+            msg.gameState = newGs;
+            renderOverlay(msg);
+            updateGameCardInChat(OV.currentMsgId, msg);
+            showToastSafe('🏳️ Вы сдались', 1500);
+        } catch (e) {
+            showToastSafe('❌ ' + (e.message || 'Ошибка'), 2500);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПРИСОЕДИНЕНИЕ
+    // ═══════════════════════════════════════════════════════════
+    async function joinFromOverlay() {
+        if (!OV.currentMsgId) return;
+
+        const msg = (typeof historyState !== 'undefined' && historyState.allMessages)
+            ? historyState.allMessages.find(m => String(m.id) === String(OV.currentMsgId))
+            : null;
+        if (!msg || !msg.gameState) return;
+
+        const gs = msg.gameState;
+        if (gs.status === 'finished') return;
+
+        if (gs.players.includes(state.username)) {
+            showToastSafe('Вы уже участвуете', 1500);
+            return;
+        }
+
+        const newGs = JSON.parse(JSON.stringify(gs));
+        newGs.players.push(state.username);
+        newGs.waitingForJoin = false;
+
+        try {
+            await persistGameState(OV.currentMsgId, newGs);
+            msg.gameState = newGs;
+            renderOverlay(msg);
+            updateGameCardInChat(OV.currentMsgId, msg);
+            showToastSafe('✅ Вы присоединились к игре!', 2000);
+            if (typeof soundManager !== 'undefined') {
+                try { soundManager.play('click'); } catch (e) {}
+            }
+        } catch (e) {
+            showToastSafe('❌ ' + (e.message || 'Ошибка'), 2500);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОХРАНЕНИЕ НА GITHUB
+    // ═══════════════════════════════════════════════════════════
+    async function persistGameState(msgId, newGameState) {
+        const path = getChatPath(state.chatFile);
+        const result = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
+        if (!result.exists) throw new Error('Чат не найден');
+
+        const fileContent = result.content;
+        if (fileContent.v !== CRYPTO.VERSION) throw new Error('Формат не поддерживается');
+        if (fileContent.salt !== state.salt) {
+            state.salt = fileContent.salt;
+            CRYPTO._key = await deriveKey(state.chatPassword, state.salt);
+        }
+
+        const idx = fileContent.messages.findIndex(m => String(m.id) === String(msgId));
+        if (idx === -1) throw new Error('Сообщение не найдено');
+
+        const encMsg = fileContent.messages[idx];
+        const payload = await decryptObject(encMsg.iv, encMsg.data, CRYPTO._key);
+
+        payload.gameState = newGameState;
+
+        const newIv = generateIV();
+        const plaintext = new TextEncoder().encode(JSON.stringify(payload));
+        const ciphertext = await crypto.subtle.encrypt(
+            { name: 'AES-GCM', iv: newIv }, CRYPTO._key, plaintext
+        );
+
+        fileContent.messages[idx] = {
+            id: encMsg.id,
+            time: encMsg.time,
+            iv: arrayBufferToBase64(newIv),
+            data: arrayBufferToBase64(ciphertext),
+        };
+
+        const saved = await saveFile(
+            state.token, CONFIG.repoOwner, CONFIG.repoName, path,
+            fileContent, result.sha,
+            { messageId: msgId, message: `🎮 Ход в игре` }
+        );
+
+        const newVersion = Date.now();
+        await updateMeta(state.chatFile, newVersion, fileContent.messages.length);
+        state._lastMetaVersion = newVersion;
+        state._metaEtag = null;
+        state._metaEtagsByFile[state.chatFile] = null;
+
+        state.sha = saved.blobSha;
+        state._lastCommitSha = saved.commitSha;
+        state.lastMessageCount = fileContent.messages.length;
+        state._lastActivityAt = Date.now();
+
+        log(`Игра ${msgId} обновлена`);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОБНОВЛЕНИЕ КАРТОЧКИ В ЧАТЕ (превью)
+    // ═══════════════════════════════════════════════════════════
+    function updateGameCardInChat(msgId, msg) {
+        if (typeof messagesInner === 'undefined' || !messagesInner) return;
+
+        const wrapper = messagesInner.querySelector(
+            `.message-wrapper[data-msg-id="${msgId}"]`
+        );
+        if (!wrapper) return;
+
+        const oldCard = wrapper.querySelector('.game-preview-card');
+        if (!oldCard) return;
+
+        const newHtml = buildGamePreviewHTML(msg);
+        if (!newHtml) return;
+
+        const temp = document.createElement('div');
+        temp.innerHTML = newHtml;
+        const newCard = temp.firstElementChild;
+        if (newCard) {
+            oldCard.replaceWith(newCard);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  КАРТОЧКА-ПРЕВЬЮ В ЧАТЕ (без input)
+    // ═══════════════════════════════════════════════════════════
+    function buildGamePreviewHTML(msg) {
+        const gs = msg.gameState;
+        if (!gs) return '';
+
+        const isFinished = gs.status === 'finished';
+        const isMyTurn = !isFinished && gs.players[gs.currentPlayerIndex] === state.username;
+        const amIPlayer = gs.players.includes(state.username);
+        const players = Array.isArray(gs.players) ? gs.players : [];
+        const words = Array.isArray(gs.words) ? gs.words : [];
+
+        // Счёт
+        const scores = {};
+        players.forEach(p => scores[p] = 0);
+        words.forEach(w => {
+            if (scores[w.author] !== undefined) scores[w.author]++;
+            else scores[w.author] = 1;
+        });
+
+        // Статус
+        let statusText = '';
+        let statusClass = '';
+        if (isFinished) {
+            if (gs.winner) {
+                statusText = `🏆 Победитель: ${gs.winner === state.username ? 'Вы' : gs.winner}`;
+                statusClass = 'finished';
+            } else {
+                statusText = '🏁 Игра завершена';
+                statusClass = 'finished';
+            }
+        } else if (isMyTurn) {
+            statusText = '⚡ Ваш ход';
+            statusClass = 'my-turn';
+        } else if (!amIPlayer) {
+            statusText = '👥 Присоединиться';
+            statusClass = 'waiting';
+        } else {
+            const curPlayer = gs.players[gs.currentPlayerIndex];
+            statusText = `⏳ Ход: ${curPlayer === state.username ? 'Вы' : curPlayer}`;
+            statusClass = 'waiting';
+        }
+
+        // Счёт для отображения
+        const scoreText = players.map(p => {
+            const isMe = p === state.username;
+            return `${isMe ? 'Вы' : p}: ${scores[p] || 0}`;
+        }).join(' · ');
+
+        return `
+            <div class="game-preview-card ${isFinished ? 'finished' : ''} ${statusClass}"
+                 data-game-id="${escapeHtmlSafe(msg.gameId)}"
+                 data-msg-id="${msg.id}"
+                 onclick="event.stopPropagation(); window.GamesOverlay.open(${msg.id})">
+                <div class="gpc-header">
+                    <span class="gpc-icon">🎮</span>
+                    <span class="gpc-title">Слова из слова</span>
+                    ${isFinished ? '<span class="gpc-badge">✓ Завершена</span>' : ''}
+                </div>
+                <div class="gpc-word">
+                    <span class="gpc-word-label">Слово:</span>
+                    <strong>${escapeHtmlSafe(gs.baseWord)}</strong>
+                </div>
+                <div class="gpc-players">${escapeHtmlSafe(scoreText)}</div>
+                <div class="gpc-status ${statusClass}">${escapeHtmlSafe(statusText)}</div>
+                <button class="gpc-open-btn" onclick="event.stopPropagation(); window.GamesOverlay.open(${msg.id})">
+                    🎮 Открыть игру
+                </button>
+            </div>
+        `;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СТИЛИ КАРТОЧКИ В ЧАТЕ
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('gamePreviewCardStyles')) {
+        const style = document.createElement('style');
+        style.id = 'gamePreviewCardStyles';
+        style.textContent = `
+            .game-preview-card {
+                margin: 8px 0 4px;
+                padding: 14px;
+                background: linear-gradient(135deg,
+                    rgba(108,92,231,0.18),
+                    rgba(0,184,148,0.1));
+                border: 1px solid rgba(108,92,231,0.4);
+                border-radius: 16px;
+                min-width: 260px;
+                max-width: 100%;
+                box-sizing: border-box;
+                cursor: pointer;
+                transition: all 0.2s;
+                -webkit-tap-highlight-color: transparent;
+                position: relative;
+                overflow: hidden;
+            }
+            .game-preview-card:hover {
+                background: linear-gradient(135deg,
+                    rgba(108,92,231,0.28),
+                    rgba(0,184,148,0.18));
+                border-color: rgba(108,92,231,0.65);
+                transform: translateY(-1px);
+                box-shadow: 0 6px 20px rgba(108,92,231,0.3);
+            }
+            .game-preview-card:active {
+                transform: scale(0.98);
+            }
+            .message-wrapper.own .game-preview-card {
+                background: linear-gradient(135deg,
+                    rgba(0,0,0,0.3),
+                    rgba(108,92,231,0.2));
+                border-color: rgba(167,139,250,0.5);
+            }
+            .game-preview-card.my-turn {
+                background: linear-gradient(135deg,
+                    rgba(0,184,148,0.2),
+                    rgba(254,202,87,0.12));
+                border-color: rgba(0,184,148,0.6);
+                box-shadow: 0 0 14px rgba(0,184,148,0.3);
+                animation: gpcMyTurn 2s ease-in-out infinite;
+            }
+            @keyframes gpcMyTurn {
+                0%, 100% { box-shadow: 0 0 14px rgba(0,184,148,0.3); }
+                50%      { box-shadow: 0 0 24px rgba(0,184,148,0.55); }
+            }
+            .game-preview-card.finished {
+                opacity: 0.85;
+                background: linear-gradient(135deg,
+                    rgba(0,184,148,0.12),
+                    rgba(108,92,231,0.08));
+                border-color: rgba(0,184,148,0.4);
+            }
+
+            .gpc-header {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                margin-bottom: 10px;
+                padding-bottom: 8px;
+                border-bottom: 1px solid rgba(255,255,255,0.08);
+            }
+            .gpc-icon { font-size: 20px; flex-shrink: 0; }
+            .gpc-title {
+                flex: 1;
+                font-size: 14px;
+                font-weight: 700;
+                color: #fff;
+            }
+            .gpc-badge {
+                font-size: 9px;
+                padding: 2px 6px;
+                border-radius: 6px;
+                background: rgba(0,184,148,0.25);
+                color: #00b894;
+                font-weight: 700;
+                text-transform: uppercase;
+            }
+
+            .gpc-word {
+                text-align: center;
+                padding: 8px;
+                background: rgba(0,0,0,0.25);
+                border-radius: 10px;
+                margin-bottom: 8px;
+            }
+            .gpc-word-label {
+                font-size: 10px;
+                color: #888;
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
+                margin-bottom: 3px;
+                display: block;
+            }
+            .gpc-word strong {
+                font-size: 18px;
+                font-weight: 800;
+                letter-spacing: 2px;
+                color: #feca57;
+                font-family: 'SF Mono', 'Courier New', monospace;
+                text-shadow: 0 2px 8px rgba(254,202,87,0.3);
+            }
+
+            .gpc-players {
+                font-size: 11px;
+                color: #aaa;
+                text-align: center;
+                margin-bottom: 8px;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+
+            .gpc-status {
+                font-size: 12px;
+                font-weight: 600;
+                text-align: center;
+                padding: 6px;
+                border-radius: 8px;
+                margin-bottom: 8px;
+            }
+            .gpc-status.my-turn {
+                background: linear-gradient(135deg,
+                    rgba(0,184,148,0.25),
+                    rgba(254,202,87,0.15));
+                color: #00e5b8;
+            }
+            .gpc-status.waiting {
+                background: rgba(255,255,255,0.04);
+                color: #888;
+            }
+            .gpc-status.finished {
+                background: rgba(0,184,148,0.15);
+                color: #00b894;
+            }
+
+            .gpc-open-btn {
+                width: 100%;
+                padding: 10px;
+                border-radius: 10px;
+                border: none;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                color: #fff;
+                font-size: 13px;
+                font-weight: 700;
+                cursor: pointer;
+                transition: all 0.15s;
+                font-family: inherit;
+                -webkit-tap-highlight-color: transparent;
+            }
+            .gpc-open-btn:hover {
+                background: linear-gradient(135deg, #7a6cf0, #00cfa4);
+            }
+            .gpc-open-btn:active {
+                transform: scale(0.96);
+            }
+
+            @media (max-width: 480px) {
+                .game-preview-card {
+                    min-width: 0;
+                    padding: 12px;
+                }
+                .gpc-word strong {
+                    font-size: 16px;
+                    letter-spacing: 1.5px;
+                }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧ buildMessageHTML — рендер карточки-превью
+    // ═══════════════════════════════════════════════════════════
+    const _origBuildMessageHTML = buildMessageHTML;
+    buildMessageHTML = function(msg, opts = {}) {
+        let html = _origBuildMessageHTML.call(this, msg, opts);
+        if (!msg || !msg.gameId || !msg.gameState) return html;
+
+        if (html.includes('game-preview-card')) return html;
+
+        const gameHtml = buildGamePreviewHTML(msg);
+        if (!gameHtml) return html;
+
+        const temp = document.createElement('div');
+        temp.innerHTML = html;
+        const msgEl = temp.querySelector('.message');
+        if (!msgEl) return html;
+
+        // Убираем старую карточку игры (если была из первого патча)
+        const oldGameCard = msgEl.querySelector('.game-container');
+        if (oldGameCard) oldGameCard.remove();
+
+        const commentBar = msgEl.querySelector('.image-comment-bar');
+        const reactionsRow = msgEl.querySelector('.reactions-row');
+        const timeEl = msgEl.querySelector('.time');
+        const anchor = commentBar || reactionsRow || timeEl;
+
+        if (anchor) {
+            anchor.insertAdjacentHTML('beforebegin', gameHtml);
+        } else {
+            msgEl.insertAdjacentHTML('beforeend', gameHtml);
+        }
+
+        return temp.innerHTML;
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  КНОПКА-ИНДИКАТОР РЯДОМ С ⋯
+    // ═══════════════════════════════════════════════════════════
+    function ensureGameIndicator() {
+        const inputBar = document.getElementById('inputBar');
+        if (!inputBar) return null;
+
+        let btn = document.getElementById('gameIndicatorBtn');
+        if (btn) return btn;
+
+        const quickBtn = document.getElementById('chatPlayerBtn');
+        if (!quickBtn) return null;
+
+        btn = document.createElement('button');
+        btn.className = 'game-indicator-btn';
+        btn.id = 'gameIndicatorBtn';
+        btn.type = 'button';
+        btn.title = 'Активная игра';
+        btn.innerHTML = '🎮';
+
+        // Вставляем СПРАВА от ⋯ (после неё)
+        if (quickBtn.nextSibling) {
+            inputBar.insertBefore(btn, quickBtn.nextSibling);
+        } else {
+            inputBar.appendChild(btn);
+        }
+
+        btn.addEventListener('click', () => {
+            const primary = getPrimaryGame();
+            if (!primary) {
+                showToastSafe('Нет активных игр', 1500);
+                return;
+            }
+            openOverlay(primary.msgId);
+        });
+
+        return btn;
+    }
+
+    // ─── Обновление состояния кнопки ───
+    function updateGameIndicator() {
+        if (state.currentScreen !== 'chat' || !state.chatFile) {
+            const btn = document.getElementById('gameIndicatorBtn');
+            if (btn) btn.classList.remove('show', 'my-turn', 'waiting');
+            return;
+        }
+
+        const primary = getPrimaryGame();
+
+        // Если нет игр — кнопки нет
+        if (!primary) {
+            const btn = document.getElementById('gameIndicatorBtn');
+            if (btn) btn.classList.remove('show', 'my-turn', 'waiting');
+            return;
+        }
+
+        const btn = ensureGameIndicator();
         if (!btn) return;
 
-        const games = getActiveGames();
-        const myTurn = games.filter(g => g.isMyTurn).length;
+        btn.classList.add('show');
+        btn.classList.toggle('my-turn', primary.isMyTurn);
+        btn.classList.toggle('waiting', !primary.isMyTurn);
 
-        btn.classList.toggle('has-my-turn', myTurn > 0);
+        if (primary.isMyTurn) {
+            btn.title = `🎮 Ваш ход в игре «${primary.baseWord}»`;
+        } else {
+            btn.title = `🎮 Игра «${primary.baseWord}» — ход: ${primary.currentPlayer}`;
+        }
 
-        if (myTurn > 0) {
-            btn.title = `⚡ Ваш ход в ${myTurn} ${pluralize(myTurn, 'игре', 'играх', 'играх')}`;
+        // Показываем количество активных игр как бейдж на кнопке
+        const totalGames = getActiveGames().length;
+        if (totalGames > 1) {
+            // Маленький бейдж с числом
+            let badge = btn.querySelector('.gi-count');
+            if (!badge) {
+                badge = document.createElement('span');
+                badge.className = 'gi-count';
+                badge.style.cssText = `
+                    position: absolute;
+                    bottom: -2px;
+                    right: -2px;
+                    min-width: 16px;
+                    height: 16px;
+                    padding: 0 4px;
+                    border-radius: 8px;
+                    background: #6c5ce7;
+                    color: #fff;
+                    font-size: 9px;
+                    font-weight: 700;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    border: 2px solid #0a0a0f;
+                    line-height: 1;
+                    pointer-events: none;
+                `;
+                btn.appendChild(badge);
+            }
+            badge.textContent = totalGames > 9 ? '9+' : String(totalGames);
+        } else {
+            const badge = btn.querySelector('.gi-count');
+            if (badge) badge.remove();
         }
     }
 
-    // Периодическая проверка (раз в 2 сек)
-    setInterval(() => {
-        if (state.currentScreen === 'chat' && state.chatFile) {
-            updateGamesButtonState();
-        }
-    }, 2000);
+    // Периодическое обновление
+    setInterval(updateGameIndicator, 1500);
 
-    // Также обновляем при появлении кнопки
+    // При появлении/изменении кнопки в inputBar
     const btnObserver = new MutationObserver(() => {
-        if (document.getElementById('chatPlayerBtn')) {
-            updateGamesButtonState();
+        if (document.getElementById('chatPlayerBtn') && !document.getElementById('gameIndicatorBtn')) {
+            updateGameIndicator();
         }
     });
     btnObserver.observe(document.body, { childList: true, subtree: true });
@@ -65018,7 +65828,6 @@ async function refreshWeatherManually(btn, card) {
             </div>
         `;
 
-        // Вставляем после "Нарисовать"
         const drawItem = menu.querySelector('[data-action="draw"]');
         if (drawItem && drawItem.nextSibling) {
             menu.insertBefore(item, drawItem.nextSibling);
@@ -65027,6 +65836,19 @@ async function refreshWeatherManually(btn, card) {
         }
 
         return true;
+    }
+
+    // Стили для пункта "Игра" в меню вложений
+    if (!document.getElementById('gameAttachItemStyles')) {
+        const style = document.createElement('style');
+        style.id = 'gameAttachItemStyles';
+        style.textContent = `
+            .attach-menu-item.game .icon {
+                background: linear-gradient(135deg, rgba(254,202,87,0.25), rgba(255,159,67,0.15));
+                color: #feca57;
+            }
+        `;
+        document.head.appendChild(style);
     }
 
     document.addEventListener('click', (e) => {
@@ -65065,42 +65887,62 @@ async function refreshWeatherManually(btn, card) {
             return;
         }
 
-        const existing = document.getElementById('createGameModal');
+        const existing = document.getElementById('createGameModalV2');
         if (existing) existing.remove();
 
         const modal = document.createElement('div');
-        modal.id = 'createGameModal';
+        modal.id = 'createGameModalV2';
         modal.className = 'image-modal active';
         modal.innerHTML = `
-            <div class="cgm-content" onclick="event.stopPropagation()">
-                <h2>🎮 Слова из слова</h2>
-                <div class="cgm-desc">
-                    Придумайте <strong>длинное слово</strong> (минимум 6 букв).<br>
+            <div class="form-modal-content" onclick="event.stopPropagation()" style="max-width:440px;">
+                <h2 style="font-size:19px;margin-bottom:14px;display:flex;align-items:center;gap:8px;">
+                    <span>🎮</span>
+                    <span>Слова из слова</span>
+                </h2>
+                <div style="
+                    font-size:13px;color:#aaa;line-height:1.6;
+                    margin-bottom:16px;padding:12px 14px;
+                    background:rgba(108,92,231,0.08);
+                    border:1px solid rgba(108,92,231,0.2);
+                    border-radius:12px;
+                ">
+                    Придумайте <strong style="color:#a78bfa;">длинное слово</strong> (минимум 6 букв).
                     Игроки по очереди называют слова, которые можно
                     составить из его букв. Кто придумал больше — тот и победил!
                 </div>
-                <label>Исходное слово</label>
-                <input type="text" id="cgmBaseWordInput"
+                <label style="display:block;font-size:12px;color:#999;font-weight:600;
+                              margin-bottom:6px;text-transform:uppercase;letter-spacing:0.3px;">
+                    Исходное слово
+                </label>
+                <input type="text" id="cgmv2BaseWordInput"
                        placeholder="КОРОВА"
                        maxlength="15"
                        autocomplete="off"
-                       spellcheck="false">
-                <div class="cgm-hint" id="cgmHint">
+                       spellcheck="false"
+                       style="width:100%;padding:14px 16px;
+                              background:rgba(255,255,255,0.06);
+                              border:1px solid rgba(255,255,255,0.1);
+                              border-radius:12px;color:#fff;font-size:18px;
+                              font-weight:700;letter-spacing:2px;text-align:center;
+                              text-transform:uppercase;outline:none;
+                              margin-bottom:8px;
+                              font-family:'SF Mono','Courier New',monospace;">
+                <div id="cgmv2Hint" style="font-size:11px;color:#666;margin-bottom:16px;
+                                            line-height:1.5;text-align:center;">
                     Мин. 6 букв · только русские буквы
                 </div>
                 <div class="modal-actions">
-                    <button class="btn btn-secondary" id="cgmCancelBtn">Отмена</button>
-                    <button class="btn" id="cgmStartBtn">🎮 Создать игру</button>
+                    <button class="btn btn-secondary" id="cgmv2CancelBtn">Отмена</button>
+                    <button class="btn" id="cgmv2StartBtn" disabled>🎮 Создать игру</button>
                 </div>
             </div>
         `;
         document.body.appendChild(modal);
 
-        const input = modal.querySelector('#cgmBaseWordInput');
-        const hint = modal.querySelector('#cgmHint');
-        const startBtn = modal.querySelector('#cgmStartBtn');
+        const input = modal.querySelector('#cgmv2BaseWordInput');
+        const hint = modal.querySelector('#cgmv2Hint');
+        const startBtn = modal.querySelector('#cgmv2StartBtn');
 
-        // Ограничиваем ввод только русскими буквами
         input.addEventListener('input', () => {
             input.value = input.value.toUpperCase().replace(/[^А-ЯЁ]/g, '');
             validateInput();
@@ -65110,18 +65952,18 @@ async function refreshWeatherManually(btn, card) {
             const word = input.value.trim();
             if (!word) {
                 hint.textContent = 'Мин. 6 букв · только русские буквы';
-                hint.className = 'cgm-hint';
+                hint.style.color = '#666';
                 startBtn.disabled = true;
                 return false;
             }
             if (word.length < CFG.MIN_BASE_WORD_LENGTH) {
                 hint.textContent = `Ещё ${CFG.MIN_BASE_WORD_LENGTH - word.length} ${pluralize(CFG.MIN_BASE_WORD_LENGTH - word.length, 'буква', 'буквы', 'букв')} нужно`;
-                hint.className = 'cgm-hint error';
+                hint.style.color = '#ff6b6b';
                 startBtn.disabled = true;
                 return false;
             }
             hint.textContent = `Отлично! Букв: ${word.length}`;
-            hint.className = 'cgm-hint success';
+            hint.style.color = '#00b894';
             startBtn.disabled = false;
             return true;
         }
@@ -65129,7 +65971,7 @@ async function refreshWeatherManually(btn, card) {
         validateInput();
         setTimeout(() => input.focus(), 150);
 
-        modal.querySelector('#cgmCancelBtn').addEventListener('click', () => {
+        modal.querySelector('#cgmv2CancelBtn').addEventListener('click', () => {
             modal.classList.remove('active');
             modal.remove();
         });
@@ -65153,7 +65995,7 @@ async function refreshWeatherManually(btn, card) {
                 modal.classList.remove('active');
                 modal.remove();
             } catch (e) {
-                console.error('🎮 [Games] create error:', e);
+                console.error('🎮 [GamesOverlay v2] create error:', e);
                 showToastSafe('❌ ' + (e.message || 'Ошибка'), 2500);
                 startBtn.disabled = false;
                 startBtn.textContent = '🎮 Создать игру';
@@ -65183,7 +66025,7 @@ async function refreshWeatherManually(btn, card) {
             words: [],
             status: 'active',
             startedAt: new Date().toISOString(),
-            waitingForJoin: true,     // создатель ждёт второго игрока
+            waitingForJoin: true,
         };
 
         const gamePayload = {
@@ -65192,32 +66034,19 @@ async function refreshWeatherManually(btn, card) {
             state: gameState,
         };
 
-        log('Создаём игру:', gameState);
-
-        // Отправляем через sendMessage
-        // Расширяем стандартный вызов: передаём gamePayload
-        // как 8-й аргумент (после videoPayload)
-        if (typeof sendMessage === 'function') {
-            // Проверяем, поддерживает ли sendMessage gamePayload
-            // Если нет — используем прямой путь через encryptMessage
-            await sendMessageWithGame('', null, null, null, null, null, null, gamePayload);
-        } else {
-            throw new Error('sendMessage недоступен');
+        if (typeof sendMessageWithGame !== 'function' && typeof sendMessage !== 'function') {
+            throw new Error('Отправка недоступна');
         }
+
+        await sendMessageWithGame('', null, null, null, null, null, null, gamePayload);
     }
 
     // ═══════════════════════════════════════════════════════════
     //  ОТПРАВКА СООБЩЕНИЯ С ИГРОЙ
-    //  Используем тот же механизм, что и для обычных сообщений,
-    //  но добавляем gameId/gameType/gameState в plainMsg.
     // ═══════════════════════════════════════════════════════════
     async function sendMessageWithGame(text, imageBlob, audioData, fileAttachment, audioFile, replyContext, videoPayload, gamePayload) {
-        if (!state.isAuthorized || !state.chatFile) {
-            throw new Error('Нет доступа');
-        }
-        if (state.isSending) {
-            throw new Error('Идёт отправка, подождите');
-        }
+        if (!state.isAuthorized || !state.chatFile) throw new Error('Нет доступа');
+        if (state.isSending) throw new Error('Идёт отправка, подождите');
 
         state.isSending = true;
         if (typeof sendBtn !== 'undefined') sendBtn.disabled = true;
@@ -65254,21 +66083,18 @@ async function refreshWeatherManually(btn, card) {
                 time: new Date().toISOString(),
             };
 
-            // 🆕 Игровые данные
             if (gamePayload) {
                 plainMsg.gameId = gamePayload.id;
                 plainMsg.gameType = gamePayload.type;
                 plainMsg.gameState = gamePayload.state;
             }
 
-            // Шифруем
             const encMsg = await encryptMessage(plainMsg);
             fileContent.messages.push(encMsg);
             if (fileContent.messages.length > CONFIG.maxMessages) {
                 fileContent.messages = fileContent.messages.slice(-CONFIG.maxMessages);
             }
 
-            // Сохраняем
             const saved = await saveFile(
                 state.token, CONFIG.repoOwner, CONFIG.repoName, path,
                 fileContent, sha,
@@ -65280,25 +66106,23 @@ async function refreshWeatherManually(btn, card) {
             state._metaEtag = null;
             state._metaEtagsByFile[state.chatFile] = null;
 
-            // Обновляем локальное состояние
             state.messages.push(plainMsg);
             state.sha = saved.blobSha;
             state._lastCommitSha = saved.commitSha;
             state.lastMessageCount = fileContent.messages.length;
             state._lastActivityAt = Date.now();
 
-            // Добавляем в UI
-            if (typeof appendMessages === 'function') {
-                appendMessages([plainMsg]);
-            }
-            if (typeof scrollToBottom === 'function') {
-                scrollToBottom(true);
-            }
+            if (typeof appendMessages === 'function') appendMessages([plainMsg]);
+            if (typeof scrollToBottom === 'function') scrollToBottom(true);
 
             try { if (typeof markChatAsRead === 'function') markChatAsRead(); } catch (e) {}
             try { if (typeof soundManager !== 'undefined') soundManager.play('send'); } catch (e) {}
 
             showToastSafe('🎮 Игра создана!', 2000);
+
+            // Автоматически открываем оверлей создателю
+            setTimeout(() => openOverlay(messageId), 400);
+
             return plainMsg;
 
         } finally {
@@ -65309,14 +66133,11 @@ async function refreshWeatherManually(btn, card) {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ПАТЧ encryptMessage / decryptMessage — добавляем игровые поля
+    //  ПАТЧ encryptMessage / decryptMessage — игровые поля
     // ═══════════════════════════════════════════════════════════
     if (typeof encryptMessage === 'function') {
         const _origEncrypt = encryptMessage;
         encryptMessage = async function(msg) {
-            // Если есть игровые поля — сохраняем их в payload
-            // Оригинальный encryptMessage их не знает, поэтому
-            // используем хак: оборачиваем в обёртку с payload напрямую
             if (msg.gameId) {
                 const payload = { username: msg.username, text: msg.text || '' };
                 if (msg.reactions && Object.keys(msg.reactions).length > 0) payload.reactions = msg.reactions;
@@ -65352,11 +66173,8 @@ async function refreshWeatherManually(btn, card) {
                     payload.batchIndex = msg.batchIndex;
                     payload.batchTotal = msg.batchTotal;
                 }
-                if (msg.replyTo) {
-                    payload.replyTo = msg.replyTo;
-                }
+                if (msg.replyTo) payload.replyTo = msg.replyTo;
 
-                // 🆕 Игровые поля
                 payload.gameId = msg.gameId;
                 payload.gameType = msg.gameType;
                 payload.gameState = msg.gameState;
@@ -65364,7 +66182,6 @@ async function refreshWeatherManually(btn, card) {
                 const encrypted = await encryptObject(payload, CRYPTO._key);
                 return { id: msg.id, time: msg.time, iv: encrypted.iv, data: encrypted.data };
             }
-
             return _origEncrypt.call(this, msg);
         };
     }
@@ -65374,9 +66191,6 @@ async function refreshWeatherManually(btn, card) {
         decryptMessage = async function(encMsg) {
             const msg = await _origDecrypt.call(this, encMsg);
             if (!msg) return msg;
-
-            // Если в расшифрованном payload были игровые поля —
-            // _origDecrypt их не извлекает. Расшифровываем заново.
             try {
                 const payload = await decryptObject(encMsg.iv, encMsg.data, CRYPTO._key);
                 if (payload.gameId) {
@@ -65384,554 +66198,301 @@ async function refreshWeatherManually(btn, card) {
                     msg.gameType = payload.gameType;
                     msg.gameState = payload.gameState;
                 }
-            } catch (e) {
-                // Тихо
-            }
-
+            } catch (e) {}
             return msg;
         };
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ПАТЧ buildMessageHTML — рендер карточки игры
+    //  СИНХРОНИЗАЦИЯ ОВЕРЛЕЯ С ОБНОВЛЕНИЯМИ
+    //  Когда приходит обновление через поллинг — если оверлей
+    //  открыт на этой игре, обновляем только изменяемые части.
     // ═══════════════════════════════════════════════════════════
-    const _origBuildMessageHTML = buildMessageHTML;
-    buildMessageHTML = function(msg, opts = {}) {
-        let html = _origBuildMessageHTML.call(this, msg, opts);
-        if (!msg || !msg.gameId || !msg.gameState) return html;
+    function refreshOpenOverlay() {
+        if (!OV.isOpen || !OV.currentMsgId) return;
 
-        // Проверяем, что карточка ещё не отрисована
-        if (html.includes('class="game-container"')) return html;
-
-        const gameHtml = buildGameCardHTML(msg);
-        if (!gameHtml) return html;
-
-        // Вставляем перед commentBar / reactions / time
-        const temp = document.createElement('div');
-        temp.innerHTML = html;
-        const msgEl = temp.querySelector('.message');
-        if (!msgEl) return html;
-
-        const commentBar = msgEl.querySelector('.image-comment-bar');
-        const reactionsRow = msgEl.querySelector('.reactions-row');
-        const timeEl = msgEl.querySelector('.time');
-        const anchor = commentBar || reactionsRow || timeEl;
-
-        if (anchor) {
-            anchor.insertAdjacentHTML('beforebegin', gameHtml);
-        } else {
-            msgEl.insertAdjacentHTML('beforeend', gameHtml);
-        }
-
-        return temp.innerHTML;
-    };
-
-    // ═══════════════════════════════════════════════════════════
-    //  РЕНДЕР КАРТОЧКИ ИГРЫ
-    // ═══════════════════════════════════════════════════════════
-    function buildGameCardHTML(msg) {
-        const gs = msg.gameState;
-        if (!gs) return '';
-
-        const isFinished = gs.status === 'finished';
-        const isMyTurn = !isFinished && gs.players[gs.currentPlayerIndex] === state.username;
-        const amIPlayer = gs.players.includes(state.username);
-        const baseWord = gs.baseWord || '';
-        const words = Array.isArray(gs.words) ? gs.words : [];
-        const players = Array.isArray(gs.players) ? gs.players : [];
-
-        // Заголовок
-        let badgeHtml = '';
-        if (isFinished) {
-            badgeHtml = '<span class="game-badge finished-badge">✓ Завершена</span>';
-        } else if (isMyTurn) {
-            badgeHtml = '<span class="game-badge">⚡ Ваш ход</span>';
-        }
-
-        // Игроки
-        const playersHtml = players.map(p => {
-            const isActive = !isFinished && gs.players[gs.currentPlayerIndex] === p;
-            const isMe = p === state.username;
-            const surrendered = gs.surrendered && gs.surrendered.includes(p);
-            const cls = [
-                'game-player',
-                isActive ? 'active' : '',
-                isMe ? 'me' : '',
-                surrendered ? 'surrendered' : '',
-            ].filter(Boolean).join(' ');
-            return `<span class="${cls}">${escapeHtmlSafe(p === state.username ? 'Вы' : p)}</span>`;
-        }).join('');
-
-        // Счёт
-        const scores = {};
-        players.forEach(p => scores[p] = 0);
-        words.forEach(w => {
-            if (scores[w.author] !== undefined) scores[w.author]++;
-            else scores[w.author] = 1;
-        });
-        const scoreboardHtml = players.map(p => {
-            const isMe = p === state.username;
-            return `<span class="game-score-item">
-                ${escapeHtmlSafe(isMe ? 'Вы' : p)}: <strong>${scores[p] || 0}</strong>
-            </span>`;
-        }).join('');
-
-        // Слова
-        let wordsListHtml = '';
-        if (words.length === 0) {
-            wordsListHtml = '<div class="game-words-empty">Пока нет слов</div>';
-        } else {
-            wordsListHtml = words.map(w => `
-                <div class="game-word">
-                    <span class="game-word-text">${escapeHtmlSafe(w.word)}</span>
-                    <span class="game-word-author">${escapeHtmlSafe(w.author === state.username ? 'Вы' : w.author)}</span>
-                </div>
-            `).join('');
-        }
-
-        // Победитель
-        let winnerHtml = '';
-        if (isFinished && gs.winner) {
-            winnerHtml = `
-                <div class="game-winner">
-                    <div class="game-winner-icon">🏆</div>
-                    <div class="game-winner-text">
-                        Победитель: <span class="game-winner-name">${escapeHtmlSafe(gs.winner === state.username ? 'Вы' : gs.winner)}</span>
-                    </div>
-                </div>
-            `;
-        }
-
-        // Поле ввода / ожидание / кнопки
-        let inputAreaHtml = '';
-        let footerHtml = '';
-
-        if (isFinished) {
-            // Игра завершена — только показать состояние
-            inputAreaHtml = '';
-            footerHtml = '';
-        } else if (!amIPlayer) {
-            // Не участвую — кнопка "Присоединиться"
-            inputAreaHtml = `
-                <div class="game-wait">
-                    Ход: <strong>${escapeHtmlSafe(gs.players[gs.currentPlayerIndex] || '—')}</strong>
-                </div>
-            `;
-            footerHtml = `
-                <div class="game-footer">
-                    <button class="game-join-btn" onclick="event.stopPropagation(); joinGame(${msg.id})">
-                        ➕ Присоединиться
-                    </button>
-                </div>
-            `;
-        } else if (isMyTurn) {
-            // Мой ход — поле ввода
-            inputAreaHtml = `
-                <div class="game-input-area">
-                    <input type="text"
-                           class="game-word-input"
-                           id="game-input-${msg.id}"
-                           placeholder="Ваше слово..."
-                           maxlength="15"
-                           autocomplete="off"
-                           spellcheck="false"
-                           onkeydown="if(event.key==='Enter'){event.preventDefault();submitGameWord(${msg.id});}">
-                    <button class="game-submit-btn" onclick="event.stopPropagation(); submitGameWord(${msg.id})">
-                        ✔
-                    </button>
-                </div>
-            `;
-            footerHtml = `
-                <div class="game-footer">
-                    <button class="game-surrender-btn" onclick="event.stopPropagation(); surrenderGame(${msg.id})">
-                        🏳️ Сдаться
-                    </button>
-                </div>
-            `;
-        } else {
-            // Чужой ход
-            inputAreaHtml = `
-                <div class="game-wait">
-                    Ход: <strong>${escapeHtmlSafe(gs.players[gs.currentPlayerIndex] === state.username ? 'Вы' : gs.players[gs.currentPlayerIndex])}</strong>
-                </div>
-            `;
-            footerHtml = `
-                <div class="game-footer">
-                    <button class="game-surrender-btn" onclick="event.stopPropagation(); surrenderGame(${msg.id})">
-                        🏳️ Сдаться
-                    </button>
-                </div>
-            `;
-        }
-
-        return `
-            <div class="game-container ${isFinished ? 'finished' : ''}"
-                 data-game-id="${escapeHtmlSafe(msg.gameId)}"
-                 data-msg-id="${msg.id}">
-                <div class="game-header">
-                    <span class="game-icon">🎮</span>
-                    <span class="game-title">Слова из слова</span>
-                    ${badgeHtml}
-                </div>
-
-                <div class="game-base-word">
-                    <div class="game-base-word-label">Исходное слово</div>
-                    <strong>${escapeHtmlSafe(baseWord)}</strong>
-                </div>
-
-                ${players.length > 0 ? `<div class="game-players">${playersHtml}</div>` : ''}
-                ${players.length > 0 ? `<div class="game-scoreboard">${scoreboardHtml}</div>` : ''}
-
-                <div class="game-words-list">
-                    ${wordsListHtml}
-                </div>
-
-                ${winnerHtml}
-                ${inputAreaHtml}
-                ${footerHtml}
-            </div>
-        `;
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ХОД: ОТПРАВКА СЛОВА
-    // ═══════════════════════════════════════════════════════════
-    async function submitGameWord(msgId) {
         const msg = (typeof historyState !== 'undefined' && historyState.allMessages)
-            ? historyState.allMessages.find(m => String(m.id) === String(msgId))
+            ? historyState.allMessages.find(m => String(m.id) === String(OV.currentMsgId))
             : null;
         if (!msg || !msg.gameState) {
-            showToastSafe('❌ Игра не найдена', 2000);
+            closeOverlay();
             return;
         }
 
+        // Если сейчас пользователь печатает — не перерисовываем
+        if (OV.inputEl && document.activeElement === OV.inputEl) {
+            // Обновляем только счёт и слова (не трогая input)
+            updateOverlayPartial(msg);
+            return;
+        }
+
+        // Иначе — полная перерисовка (безопасно)
+        renderOverlay(msg);
+    }
+
+    // ─── Частичное обновление оверлея (без input) ───
+    function updateOverlayPartial(msg) {
+        if (!OV.overlayEl || !msg) return;
         const gs = msg.gameState;
-        if (gs.status === 'finished') {
-            showToastSafe('Игра завершена', 1500);
-            return;
+        if (!gs) return;
+
+        const body = OV.overlayEl.querySelector('#gov2Body');
+        if (!body) return;
+
+        // Обновляем игроков (счёт)
+        const playersEl = body.querySelector('.gov2-players');
+        if (playersEl) {
+            const players = Array.isArray(gs.players) ? gs.players : [];
+            const scores = {};
+            players.forEach(p => scores[p] = 0);
+            (gs.words || []).forEach(w => {
+                if (scores[w.author] !== undefined) scores[w.author]++;
+                else scores[w.author] = 1;
+            });
+            const isFinished = gs.status === 'finished';
+
+            playersEl.innerHTML = players.map(p => {
+                const isActive = !isFinished && gs.players[gs.currentPlayerIndex] === p;
+                const isMe = p === state.username;
+                const surrendered = gs.surrendered && gs.surrendered.includes(p);
+                const cls = [
+                    'gov2-player',
+                    isActive ? 'active' : '',
+                    isMe ? 'me' : '',
+                    surrendered ? 'surrendered' : '',
+                ].filter(Boolean).join(' ');
+                return `
+                    <span class="${cls}">
+                        ${escapeHtmlSafe(isMe ? 'Вы' : p)}
+                        <span class="gov2-player-score">${scores[p] || 0}</span>
+                    </span>
+                `;
+            }).join('');
         }
 
-        if (gs.players[gs.currentPlayerIndex] !== state.username) {
-            showToastSafe('⏳ Сейчас не ваш ход', 1500);
-            return;
-        }
-
-        const input = document.getElementById(`game-input-${msgId}`);
-        if (!input) {
-            showToastSafe('❌ Поле ввода не найдено', 2000);
-            return;
-        }
-
-        const word = input.value.trim().toUpperCase();
-        if (!word) return;
-
-        // ─── Валидация ───
-        if (word.length < CFG.MIN_WORD_LENGTH) {
-            showToastSafe(`❌ Слишком короткое (мин. ${CFG.MIN_WORD_LENGTH})`, 2000);
-            return;
-        }
-
-        if (word.length > gs.baseWord.length) {
-            showToastSafe('❌ Слово длиннее исходного', 2000);
-            return;
-        }
-
-        if (gs.words.some(w => w.word === word)) {
-            showToastSafe(`❌ «${word}» уже было`, 2000);
-            return;
-        }
-
-        // Проверка букв
-        const baseLetters = gs.baseWord.split('');
-        const tempBase = [...baseLetters];
-        for (const letter of word.split('')) {
-            const idx = tempBase.indexOf(letter);
-            if (idx === -1) {
-                showToastSafe(`❌ Буквы «${letter}» нет в слове`, 2000);
-                return;
+        // Обновляем список слов
+        const wordsList = body.querySelector('.gov2-words-list');
+        if (wordsList) {
+            const words = Array.isArray(gs.words) ? gs.words : [];
+            if (words.length === 0) {
+                wordsList.innerHTML = `<div class="gov2-words-empty">Пока нет слов</div>`;
+            } else {
+                wordsList.innerHTML = words.map(w => `
+                    <div class="gov2-word">
+                        <span class="gov2-word-text">${escapeHtmlSafe(w.word)}</span>
+                        <span class="gov2-word-author">${escapeHtmlSafe(w.author === state.username ? 'Вы' : w.author)}</span>
+                    </div>
+                `).join('');
             }
-            tempBase.splice(idx, 1);
-        }
-
-        // ─── Обновляем состояние ───
-        const newGs = JSON.parse(JSON.stringify(gs));
-        newGs.words.push({ word, author: state.username });
-
-        // Переход хода к следующему
-        const activePlayers = newGs.players.filter(p => !(newGs.surrendered || []).includes(p));
-        if (activePlayers.length > 1) {
-            // Ищем следующего активного
-            let nextIdx = newGs.currentPlayerIndex;
-            let attempts = 0;
-            do {
-                nextIdx = (nextIdx + 1) % newGs.players.length;
-                attempts++;
-            } while ((newGs.surrendered || []).includes(newGs.players[nextIdx]) && attempts < 100);
-            newGs.currentPlayerIndex = nextIdx;
-        }
-
-        // ─── Сохраняем ───
-        try {
-            input.disabled = true;
-            await persistGameState(msgId, newGs);
-            msg.gameState = newGs;
-
-            // Обновляем DOM
-            updateGameInDOM(msgId, msg);
-
-            showToastSafe(`✅ «${word}» принято!`, 1200);
-            if (typeof soundManager !== 'undefined') {
-                try { soundManager.play('send'); } catch (e) {}
-            }
-        } catch (e) {
-            console.error('🎮 [Games] submit error:', e);
-            showToastSafe('❌ ' + (e.message || 'Ошибка'), 2500);
-            input.disabled = false;
         }
     }
 
-    // ═══════════════════════════════════════════════════════════
-    //  СДАЧА
-    // ═══════════════════════════════════════════════════════════
-    async function surrenderGame(msgId) {
-        const msg = (typeof historyState !== 'undefined' && historyState.allMessages)
-            ? historyState.allMessages.find(m => String(m.id) === String(msgId))
-            : null;
-        if (!msg || !msg.gameState) return;
+    // Периодическая проверка (каждые 1.5 сек)
+    setInterval(refreshOpenOverlay, 1500);
 
-        const gs = msg.gameState;
-        if (gs.status === 'finished') return;
-
-        if (!gs.players.includes(state.username)) {
-            showToastSafe('Вы не участник', 1500);
-            return;
-        }
-
-        const ok = await showConfirmModal(
-            '🏳️ Сдаться?',
-            'Вы выйдете из игры. Ход перейдёт к следующему игроку.',
-            'Сдаться', 'Отмена'
-        );
-        if (!ok) return;
-
-        const newGs = JSON.parse(JSON.stringify(gs));
-        newGs.surrendered = newGs.surrendered || [];
-        if (!newGs.surrendered.includes(state.username)) {
-            newGs.surrendered.push(state.username);
-        }
-
-        // Активные игроки (не сдавшиеся)
-        const activePlayers = newGs.players.filter(p => !newGs.surrendered.includes(p));
-
-        if (activePlayers.length === 0) {
-            // Все сдались — завершаем
-            newGs.status = 'finished';
-            newGs.winner = null;
-        } else if (activePlayers.length === 1) {
-            // Остался один — он победил
-            newGs.status = 'finished';
-            newGs.winner = activePlayers[0];
-        } else {
-            // Ход переходит к следующему активному
-            if (newGs.surrendered.includes(newGs.players[newGs.currentPlayerIndex])) {
-                let nextIdx = newGs.currentPlayerIndex;
-                let attempts = 0;
-                do {
-                    nextIdx = (nextIdx + 1) % newGs.players.length;
-                    attempts++;
-                } while (newGs.surrendered.includes(newGs.players[nextIdx]) && attempts < 100);
-                newGs.currentPlayerIndex = nextIdx;
+    // Хук на appendMessages — синхронизируем оверлей после обновлений
+    if (typeof appendMessages === 'function') {
+        const _origAppendMessages = appendMessages;
+        appendMessages = function(newMsgs) {
+            const result = _origAppendMessages.apply(this, arguments);
+            if (OV.isOpen && newMsgs && newMsgs.length > 0) {
+                const hasGameUpdate = newMsgs.some(m => String(m.id) === String(OV.currentMsgId));
+                if (hasGameUpdate) {
+                    setTimeout(refreshOpenOverlay, 100);
+                }
             }
-        }
-
-        try {
-            await persistGameState(msgId, newGs);
-            msg.gameState = newGs;
-            updateGameInDOM(msgId, msg);
-            showToastSafe('🏳️ Вы сдались', 1500);
-        } catch (e) {
-            showToastSafe('❌ ' + (e.message || 'Ошибка'), 2500);
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ПРИСОЕДИНЕНИЕ
-    // ═══════════════════════════════════════════════════════════
-    async function joinGame(msgId) {
-        const msg = (typeof historyState !== 'undefined' && historyState.allMessages)
-            ? historyState.allMessages.find(m => String(m.id) === String(msgId))
-            : null;
-        if (!msg || !msg.gameState) return;
-
-        const gs = msg.gameState;
-        if (gs.status === 'finished') return;
-
-        if (gs.players.includes(state.username)) {
-            showToastSafe('Вы уже участвуете', 1500);
-            return;
-        }
-
-        const newGs = JSON.parse(JSON.stringify(gs));
-        newGs.players.push(state.username);
-        newGs.waitingForJoin = false;
-
-        // Если до этого был только создатель — теперь он может ходить
-        // (или ход переходит к новому игроку? Логика: ходит создатель первым)
-        // Если создатель ещё не ходил — оставляем его
-        // Если игра ждала участников — начинаем с текущего хода
-
-        try {
-            await persistGameState(msgId, newGs);
-            msg.gameState = newGs;
-            updateGameInDOM(msgId, msg);
-            showToastSafe('✅ Вы присоединились к игре!', 2000);
-            if (typeof soundManager !== 'undefined') {
-                try { soundManager.play('click'); } catch (e) {}
-            }
-        } catch (e) {
-            showToastSafe('❌ ' + (e.message || 'Ошибка'), 2500);
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  СОХРАНЕНИЕ СОСТОЯНИЯ ИГРЫ НА GITHUB
-    // ═══════════════════════════════════════════════════════════
-    async function persistGameState(msgId, newGameState) {
-        const path = getChatPath(state.chatFile);
-        const result = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
-        if (!result.exists) throw new Error('Чат не найден');
-
-        const fileContent = result.content;
-        if (fileContent.v !== CRYPTO.VERSION) throw new Error('Формат не поддерживается');
-        if (fileContent.salt !== state.salt) {
-            state.salt = fileContent.salt;
-            CRYPTO._key = await deriveKey(state.chatPassword, state.salt);
-        }
-
-        const idx = fileContent.messages.findIndex(m => String(m.id) === String(msgId));
-        if (idx === -1) throw new Error('Сообщение не найдено');
-
-        // Расшифровываем сообщение
-        const encMsg = fileContent.messages[idx];
-        const payload = await decryptObject(encMsg.iv, encMsg.data, CRYPTO._key);
-
-        // Обновляем gameState
-        payload.gameState = newGameState;
-
-        // Заново шифруем
-        const newIv = generateIV();
-        const plaintext = new TextEncoder().encode(JSON.stringify(payload));
-        const ciphertext = await crypto.subtle.encrypt(
-            { name: 'AES-GCM', iv: newIv }, CRYPTO._key, plaintext
-        );
-
-        fileContent.messages[idx] = {
-            id: encMsg.id,
-            time: encMsg.time,
-            iv: arrayBufferToBase64(newIv),
-            data: arrayBufferToBase64(ciphertext),
+            return result;
         };
-
-        // Сохраняем
-        const saved = await saveFile(
-            state.token, CONFIG.repoOwner, CONFIG.repoName, path,
-            fileContent, result.sha,
-            { messageId: msgId, message: `🎮 Ход в игре` }
-        );
-
-        // Обновляем метаданные
-        const newVersion = Date.now();
-        await updateMeta(state.chatFile, newVersion, fileContent.messages.length);
-        state._lastMetaVersion = newVersion;
-        state._metaEtag = null;
-        state._metaEtagsByFile[state.chatFile] = null;
-
-        state.sha = saved.blobSha;
-        state._lastCommitSha = saved.commitSha;
-        state.lastMessageCount = fileContent.messages.length;
-        state._lastActivityAt = Date.now();
-
-        log(`Состояние игры ${msgId} сохранено`);
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ОБНОВЛЕНИЕ DOM КАРТОЧКИ ИГРЫ
+    //  ОЧИСТКА ПРИ СМЕНЕ ЧАТА / ВЫХОДЕ
     // ═══════════════════════════════════════════════════════════
-    function updateGameInDOM(msgId, msg) {
-        const wrapper = messagesInner.querySelector(
-            `.message-wrapper[data-msg-id="${msgId}"]`
-        );
-        if (!wrapper) return;
+    if (typeof enterChat === 'function') {
+        const _origEnter = enterChat;
+        enterChat = async function(...args) {
+            closeOverlay();
+            const r = await _origEnter.apply(this, args);
+            setTimeout(updateGameIndicator, 500);
+            return r;
+        };
+    }
 
-        const oldGame = wrapper.querySelector('.game-container');
-        if (!oldGame) return;
+    if (typeof backToChats === 'function') {
+        const _origBack = backToChats;
+        backToChats = function() {
+            closeOverlay();
+            return _origBack.apply(this, arguments);
+        };
+    }
 
-        const newHtml = buildGameCardHTML(msg);
-        if (!newHtml) return;
+    // ═══════════════════════════════════════════════════════════
+    //  ПУНКТ "АКТИВНЫЕ ИГРЫ" В МЕНЮ ⋯
+    //  (все игры, а не только последняя)
+    // ═══════════════════════════════════════════════════════════
+    function openAllActiveGamesModal() {
+        const games = getActiveGames();
 
-        const temp = document.createElement('div');
-        temp.innerHTML = newHtml;
-        const newGame = temp.firstElementChild;
+        const existing = document.getElementById('activeGamesModalV2');
+        if (existing) existing.remove();
 
-        if (newGame) {
-            oldGame.replaceWith(newGame);
+        const modal = document.createElement('div');
+        modal.id = 'activeGamesModalV2';
+        modal.className = 'image-modal active';
+        modal.innerHTML = `
+            <div class="agm-content" onclick="event.stopPropagation()">
+                <div class="agm-header">
+                    <h2>🎮 Активные игры</h2>
+                    <button class="agm-close" id="agmV2CloseBtn">✕</button>
+                </div>
+                <div class="agm-body" id="agmV2Body"></div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+
+        const body = modal.querySelector('#agmV2Body');
+
+        if (games.length === 0) {
+            body.innerHTML = `
+                <div class="agm-empty">
+                    <div class="agm-empty-icon">🎮</div>
+                    <div class="agm-empty-title">Нет активных игр</div>
+                    <div class="agm-empty-sub">Создайте игру через меню вложений 📎 → 🎮 Игра</div>
+                </div>
+            `;
+        } else {
+            body.innerHTML = games.map(g => {
+                const statusText = g.isMyTurn
+                    ? '⚡ Ваш ход'
+                    : `Ход: ${g.currentPlayer === state.username ? 'Вы' : g.currentPlayer}`;
+                return `
+                    <div class="agm-game ${g.isMyTurn ? 'is-my-turn' : ''}" data-msg-id="${g.msgId}">
+                        <div class="agm-game-icon">🎮</div>
+                        <div class="agm-game-body">
+                            <div class="agm-game-title">Слова из слова</div>
+                            <div class="agm-game-word">Слово: <strong>${escapeHtmlSafe(g.baseWord)}</strong> · ${g.wordsCount} ${pluralize(g.wordsCount, 'слово', 'слова', 'слов')}</div>
+                            <div class="agm-game-status">${escapeHtmlSafe(statusText)}</div>
+                        </div>
+                        <div class="agm-game-arrow">›</div>
+                    </div>
+                `;
+            }).join('');
+
+            body.querySelectorAll('.agm-game').forEach(el => {
+                el.addEventListener('click', () => {
+                    const msgId = parseInt(el.dataset.msgId, 10);
+                    if (isNaN(msgId)) return;
+                    modal.classList.remove('active');
+                    modal.remove();
+                    setTimeout(() => openOverlay(msgId), 150);
+                });
+            });
         }
+
+        modal.querySelector('#agmV2CloseBtn').addEventListener('click', () => {
+            modal.classList.remove('active');
+            modal.remove();
+        });
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) {
+                modal.classList.remove('active');
+                modal.remove();
+            }
+        });
     }
 
+    // ─── Инъекция пункта в меню ⋯ ───
+    function injectGamesMenuItem() {
+        const menu = document.getElementById('chatQuickAccessMenu');
+        if (!menu || !menu.classList.contains('show')) return;
+        if (menu.querySelector('[data-action="games"]')) return;
+
+        const games = getActiveGames();
+        const myTurnGames = games.filter(g => g.isMyTurn);
+
+        const label = games.length === 0
+            ? '<small>Нет активных игр</small>'
+            : (myTurnGames.length > 0
+                ? `<small style="color:#feca57;">⚡ Ваш ход: ${myTurnGames.length}</small>`
+                : `<small>${games.length} ${pluralize(games.length, 'игра', 'игры', 'игр')}</small>`);
+
+        const countHtml = games.length > 0
+            ? `<span class="cqa-count ${myTurnGames.length > 0 ? 'cqa-count-hot' : ''}">${games.length}</span>`
+            : '';
+
+        const item = document.createElement('div');
+        item.className = 'cqa-item ' + (games.length === 0 ? 'disabled' : '');
+        item.dataset.action = 'games';
+        item.innerHTML = `
+            <span class="cqa-icon">🎮</span>
+            <div class="cqa-label">Активные игры${label}</div>
+            ${countHtml}
+        `;
+        menu.appendChild(item);
+    }
+
+    const menuObs = new MutationObserver(() => {
+        if (document.getElementById('chatQuickAccessMenu')) {
+            injectGamesMenuItem();
+        }
+    });
+    menuObs.observe(document.body, { childList: true, subtree: true });
+
+    // Обработчик клика на "Активные игры"
+    document.addEventListener('click', (e) => {
+        const item = e.target.closest('#chatQuickAccessMenu [data-action="games"]');
+        if (!item) return;
+        e.stopPropagation();
+        e.preventDefault();
+
+        const menu = document.getElementById('chatQuickAccessMenu');
+        const overlay = document.getElementById('chatQuickAccessOverlay');
+        if (menu) menu.classList.remove('show');
+        if (overlay) overlay.classList.remove('show');
+
+        setTimeout(openAllActiveGamesModal, 150);
+    }, true);
+
     // ═══════════════════════════════════════════════════════════
-    //  ЭКСПОРТ ФУНКЦИЙ В WINDOW (для inline onclick)
+    //  ЭКСПОРТ В WINDOW
     // ═══════════════════════════════════════════════════════════
-    window.submitGameWord = submitGameWord;
-    window.surrenderGame = surrenderGame;
-    window.joinGame = joinGame;
+    window.GamesOverlay = {
+        open: (msgId) => openOverlay(msgId),
+        close: () => closeOverlay(),
+        isOpen: () => OV.isOpen,
+        currentMsgId: () => OV.currentMsgId,
+        getActiveGames: () => getActiveGames(),
+        getPrimaryGame: () => getPrimaryGame(),
+        openAllActiveGames: () => openAllActiveGamesModal(),
+        openCreateGame: () => openCreateGameModal(),
+        status: () => ({
+            isOpen: OV.isOpen,
+            currentMsgId: OV.currentMsgId,
+            activeGamesCount: getActiveGames().length,
+            primaryGame: getPrimaryGame() ? {
+                msgId: getPrimaryGame().msgId,
+                baseWord: getPrimaryGame().baseWord,
+                isMyTurn: getPrimaryGame().isMyTurn,
+            } : null,
+            indicatorVisible: !!document.querySelector('.game-indicator-btn.show'),
+        }),
+    };
 
     // ═══════════════════════════════════════════════════════════
     //  ЗАПУСК
     // ═══════════════════════════════════════════════════════════
-    setTimeout(patchChatPlayerShortcut, 3000);
-    setTimeout(patchChatPlayerShortcut, 6000);
+    setTimeout(updateGameIndicator, 3000);
+    setTimeout(updateGameIndicator, 6000);
 
-    // Первичная проверка кнопки
-    setTimeout(updateGamesButtonState, 3000);
-
-    // ═══════════════════════════════════════════════════════════
-    //  ПУБЛИЧНОЕ API
-    // ═══════════════════════════════════════════════════════════
-    window.GamesInChat = {
-        getActiveGames: () => getActiveGames(),
-        openActiveGamesModal: () => openActiveGamesModal(),
-        openCreateModal: () => openCreateGameModal(),
-        create: (baseWord) => createWordGame(baseWord),
-        submitWord: (msgId) => submitGameWord(msgId),
-        surrender: (msgId) => surrenderGame(msgId),
-        join: (msgId) => joinGame(msgId),
-        config: CFG,
-
-        status: () => {
-            const games = getActiveGames();
-            return {
-                activeCount: games.length,
-                myTurnCount: games.filter(g => g.isMyTurn).length,
-                games: games.map(g => ({
-                    msgId: g.msgId,
-                    baseWord: g.baseWord,
-                    players: g.players,
-                    currentPlayer: g.currentPlayer,
-                    isMyTurn: g.isMyTurn,
-                    wordsCount: g.wordsCount,
-                })),
-            };
-        },
-    };
-
-    console.log('🎮 [Games] Готово:');
-    console.log('   • Кнопка 🎮 в меню вложений 📎');
-    console.log('   • Игра «Слова из слова» с ходами по очереди');
-    console.log('   • Активные игры в меню ⋯ (кнопка рядом с ➤)');
-    console.log('   • Пульсация кнопки ⋯ при "ваш ход"');
-    console.log('   • API: GamesInChat.status() / .openActiveGamesModal()');
-
+    console.log('🎮 [GamesOverlay v2] Готово:');
+    console.log('   • Оверлей игры (на весь экран)');
+    console.log('   • Кнопка-индикатор справа от ⋯');
+    console.log('   • Быстрый доступ к последней активной игре');
+    console.log('   • Все игры — через ⋯ → «Активные игры»');
+    console.log('   • Сообщения в чате — только превью');
+    console.log('   • API: GamesOverlay.status()');
 })();
 </script>
+
 </body>
 </html>
