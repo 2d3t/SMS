@@ -64050,5 +64050,287 @@ async function refreshWeatherManually(btn, card) {
     console.log('   • API: RadioButtonsFix.status()');
 })();
 </script>
+
+<script>
+// ═══════════════════════════════════════════════════════════════
+// 🎮 WORD GAME WIDGET — "Слово из слова"
+// ─────────────────────────────────────────────────────────────
+// Простая асинхронная игра:
+//  1. Игрок нажимает "Создать слово"
+//  2. Выбирается (или вводится) длинное слово
+//  3. Генерируется красивая картинка-задание
+//  4. Отправляется в чат
+//  5. Другие игроки отвечают в комментариях к картинке
+//  6. Event Radar уведомляет о новых ответах
+// ═══════════════════════════════════════════════════════════════
+
+(function installWordGame() {
+    'use strict';
+
+    console.log('🎮 [WordGame] Установка…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  КОНФИГ И ДАННЫЕ
+    // ═══════════════════════════════════════════════════════════
+    const CFG = {
+        CANVAS_WIDTH: 1200,
+        CANVAS_HEIGHT: 800,
+        FONT_FAMILY: 'Arial, sans-serif',
+    };
+
+    const WORDS = [
+        'ЭЛЕКТРОСТАНЦИЯ', 'ПРОГРАММИРОВАНИЕ', 'КОНСТРУКТОР', 'ВЕЛОСИПЕД',
+        'ПУТЕШЕСТВИЕ', 'ВООБРАЖЕНИЕ', 'ВДОХНОВЕНИЕ', 'ПРИКЛЮЧЕНИЕ',
+        'ПРОИЗВОДСТВО', 'ОБРАЗОВАНИЕ', 'ЗДРАВООХРАНЕНИЕ', 'ПРЕДПРИНИМАТЕЛЬ',
+        'ИНФОРМАТИКА', 'МАТЕМАТИКА', 'ФОТОГРАФИЯ', 'АРХИТЕКТУРА',
+        'ВОДОПРОВОД', 'ПАРОХОДСТВО', 'САМОЛЕТОСТРОЕНИЕ', 'ЛИТЕРАТУРА',
+    ];
+
+    // ═══════════════════════════════════════════════════════════
+    //  ГЕНЕРАЦИЯ КАРТИНКИ
+    // ═══════════════════════════════════════════════════════════
+    async function generateGameImage(word) {
+        const canvas = document.createElement('canvas');
+        canvas.width = CFG.CANVAS_WIDTH;
+        canvas.height = CFG.CANVAS_HEIGHT;
+        const ctx = canvas.getContext('2d');
+
+        // 1. Фон с градиентом
+        const grad = ctx.createLinearGradient(0, 0, canvas.width, canvas.height);
+        grad.addColorStop(0, '#1a1a2e');
+        grad.addColorStop(1, '#2d2d5e');
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        // 2. Узор
+        drawPattern(ctx, canvas.width, canvas.height);
+
+        // 3. Заголовок
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#a78bfa';
+        ctx.font = `bold 60px ${CFG.FONT_FAMILY}`;
+        ctx.fillText('🎮 СЛОВО ИЗ СЛОВА', canvas.width / 2, 150);
+
+        // 4. Основное слово
+        ctx.fillStyle = '#ffffff';
+        ctx.font = `900 130px ${CFG.FONT_FAMILY}`;
+        ctx.shadowColor = 'rgba(0, 0, 0, 0.5)';
+        ctx.shadowBlur = 20;
+        ctx.shadowOffsetX = 0;
+        ctx.shadowOffsetY = 10;
+        ctx.fillText(word, canvas.width / 2, canvas.height / 2 + 40);
+        ctx.shadowColor = 'transparent';
+
+        // 5. Подсказка
+        ctx.fillStyle = '#cccccc';
+        ctx.font = `normal 38px ${CFG.FONT_FAMILY}`;
+        ctx.fillText('Составьте слова из этих букв', canvas.width / 2, canvas.height - 150);
+        ctx.fillText('и пишите их в комментариях!', canvas.width / 2, canvas.height - 100);
+
+        // 6. Подпись
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.4)';
+        ctx.font = `normal 24px ${CFG.FONT_FAMILY}`;
+        ctx.fillText(`Игру создал: ${state.username}`, canvas.width / 2, canvas.height - 40);
+
+        // 7. Конвертируем в Blob
+        return new Promise((resolve, reject) => {
+            canvas.toBlob(blob => {
+                if (blob) resolve(blob);
+                else reject(new Error('Canvas toBlob failed'));
+            }, 'image/jpeg', 0.92);
+        });
+    }
+
+    function drawPattern(ctx, w, h) {
+        ctx.save();
+        ctx.globalAlpha = 0.05;
+        ctx.strokeStyle = '#a78bfa';
+        ctx.lineWidth = 2;
+        const spacing = 80;
+        for (let x = 0; x < w; x += spacing) {
+            ctx.beginPath();
+            ctx.moveTo(x, 0);
+            ctx.lineTo(x, h);
+            ctx.stroke();
+        }
+        for (let y = 0; y < h; y += spacing) {
+            ctx.beginPath();
+            ctx.moveTo(0, y);
+            ctx.lineTo(w, y);
+            ctx.stroke();
+        }
+        ctx.restore();
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОТПРАВКА В ЧАТ
+    // ═══════════════════════════════════════════════════════════
+    async function sendGameToChat(word) {
+        if (!state.isAuthorized || !state.chatFile) {
+            showToast('🔒 Требуется вход в чат', 2000);
+            return;
+        }
+
+        showToast(`🎮 Создаём игру со словом «${word}»…`, 2000);
+
+        try {
+            const blob = await generateGameImage(word);
+            await sendMessage('', blob);
+            showToast('✅ Игра создана! Ждём ответов в комментариях.', 3000);
+            if (soundManager) soundManager.play('send');
+        } catch (e) {
+            console.error('🎮 [WordGame] Send error:', e);
+            showToast('❌ Не удалось создать игру', 3000);
+            if (soundManager) soundManager.play('error');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  МОДАЛЬНОЕ ОКНО ВЫБОРА
+    // ═══════════════════════════════════════════════════════════
+    function openWordGameModal() {
+        const existing = document.getElementById('wordGameModal');
+        if (existing) existing.remove();
+
+        const modal = document.createElement('div');
+        modal.id = 'wordGameModal';
+        modal.className = 'image-modal active';
+        modal.innerHTML = `
+            <div class="form-modal-content" onclick="event.stopPropagation()">
+                <h2>🎮 Игра «Слово из слова»</h2>
+                <div class="file-preview" style="color:#aaa;margin-bottom:14px;line-height:1.6;">
+                    Выберите слово, из которого все будут составлять новые слова в комментариях.
+                </div>
+                
+                <label>🖋️ Случайное слово</label>
+                <div style="display:flex;gap:10px;margin-bottom:14px;">
+                     <input type="text" id="wordGameRandomInput" value="" placeholder="Нажмите 🎲" readonly style="flex:1;background:rgba(255,255,255,0.03);text-align:center;font-weight:700;">
+                     <button class="btn btn-secondary" id="wordGameRandomBtn" style="width:50px;font-size:20px;">🎲</button>
+                </div>
+
+                <label>✍️ Или введите своё</label>
+                <input type="text" id="wordGameCustomInput" placeholder="Например: ПРОГРАММИРОВАНИЕ" maxlength="20" style="text-transform:uppercase;">
+
+                <div class="modal-actions" style="margin-top:20px;">
+                    <button class="btn btn-secondary" id="wordGameCancelBtn">Отмена</button>
+                    <button class="btn" id="wordGameStartBtn">🚀 Создать игру</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+
+        // --- Обработчики ---
+        const randomInput = modal.querySelector('#wordGameRandomInput');
+        const customInput = modal.querySelector('#wordGameCustomInput');
+        const startBtn = modal.querySelector('#wordGameStartBtn');
+
+        const closeModal = () => modal.remove();
+
+        const setRandomWord = () => {
+            const randomIndex = Math.floor(Math.random() * WORDS.length);
+            randomInput.value = WORDS[randomIndex];
+            customInput.value = '';
+        };
+        setRandomWord(); // Сразу заполним при открытии
+
+        modal.querySelector('#wordGameRandomBtn').addEventListener('click', setRandomWord);
+        modal.querySelector('#wordGameCancelBtn').addEventListener('click', closeModal);
+        modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
+
+        startBtn.addEventListener('click', () => {
+            let word = customInput.value.trim().toUpperCase();
+            if (!word) {
+                word = randomInput.value;
+            }
+            if (word.length < 5) {
+                showToast('❌ Слово должно быть не короче 5 букв', 2000);
+                return;
+            }
+            closeModal();
+            sendGameToChat(word);
+        });
+
+        setTimeout(() => customInput.focus(), 150);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ДОБАВЛЕНИЕ ПУНКТА В МЕНЮ ВЛОЖЕНИЙ
+    // ═══════════════════════════════════════════════════════════
+    function injectAttachMenuItem() {
+        const menu = document.getElementById('attachMenu');
+        if (!menu) return false;
+        if (menu.querySelector('[data-action="word-game"]')) return true;
+
+        const item = document.createElement('div');
+        item.className = 'attach-menu-item draw'; // Используем стили от "Нарисовать"
+        item.dataset.action = 'word-game';
+        item.innerHTML = `
+            <div class="icon">🎮</div>
+            <div class="text">
+                <div class="title">Слово из слова</div>
+                <div class="subtitle">Создать игру</div>
+            </div>
+        `;
+
+        // Вставляем первым
+        menu.insertBefore(item, menu.firstChild);
+
+        return true;
+    }
+
+    // Перехватываем клик по пункту "Игра"
+    document.addEventListener('click', (e) => {
+        const item = e.target.closest('.attach-menu-item[data-action="word-game"]');
+        if (!item) return;
+
+        e.stopImmediatePropagation();
+        e.preventDefault();
+
+        if (typeof toggleAttachMenu === 'function') {
+            toggleAttachMenu(false);
+        }
+        setTimeout(() => openWordGameModal(), 150);
+    }, true);
+
+    // Наблюдаем за появлением меню для инъекции
+    const observer = new MutationObserver(() => {
+        if (document.getElementById('attachMenu')) injectAttachMenuItem();
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    // Также при каждом открытии меню вложений
+    document.addEventListener('click', (e) => {
+        if (e.target.closest('#fileBtn')) {
+            setTimeout(injectAttachMenuItem, 30);
+        }
+    }, true);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ESC
+    // ═══════════════════════════════════════════════════════════
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') {
+            const modal = document.getElementById('wordGameModal');
+            if (modal && modal.classList.contains('active')) {
+                e.preventDefault();
+                e.stopPropagation();
+                modal.remove();
+            }
+        }
+    }, true);
+
+    // ═══════════════════════════════════════════════════════════
+    //  API
+    // ═══════════════════════════════════════════════════════════
+    window.WordGame = {
+        open: openWordGameModal,
+        start: (word) => sendGameToChat(word.toUpperCase()),
+        words: WORDS,
+    };
+
+    console.log('🎮 [WordGame] Готово.');
+})();
+</script>
+
 </body>
 </html>
