@@ -63608,6 +63608,447 @@ async function refreshWeatherManually(btn, card) {
     console.log('   • Догружает историю, пока не найдёт');
     console.log('   • API: TrackJumpFinal.status()');
 })();
+</script><script>
+// ═══════════════════════════════════════════════════════════════
+//  🔧 ФИКС ВИДЖЕТА РАДИО v6 — РЕЖИМ ДО ЯВНОГО ДЕЙСТВИЯ
+//  ─────────────────────────────────────────────────────────────
+//  Идея: раз пользователь нажал 🎲 — он хочет СЛУШАТЬ,
+//  а не смотреть список станций. Поэтому держим свёрнутое
+//  состояние, ПОКА ПОЛЬЗОВАТЕЛЬ САМ не тапнет по карточке.
+//
+//  • forceCollapsed = true ставится при клике на 🎲
+//  • forceCollapsed = false ТОЛЬКО когда пользователь
+//    тапнул по "пустому месту" карточки (не по кнопке)
+// ═══════════════════════════════════════════════════════════════
+
+(function fixRadioButtonsV6() {
+    'use strict';
+
+    console.log('🔧 [RadioFix v6] Установка — режим до явного действия…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОСТОЯНИЕ
+    // ═══════════════════════════════════════════════════════════
+
+    const STATE = {
+        // Активен ли режим "принудительно свёрнуто"
+        forceCollapsed: false,
+        // Когда включился
+        startedAt: 0,
+        // MutationObserver на перерисовку
+        observer: null,
+        // Флаг: пользователь сейчас тапнул по карточке (для детекта)
+        userTappedCard: false,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  СТИЛИ
+    // ═══════════════════════════════════════════════════════════
+
+    if (!document.getElementById('radioFixV6Styles')) {
+        const style = document.createElement('style');
+        style.id = 'radioFixV6Styles';
+        style.textContent = `
+            /* ═══ Убираем ✕ ═══ */
+            .widget-card.radio [data-radio-action="clear"] {
+                display: none !important;
+            }
+
+            /* ═══ 🎲 в основной панели ═══ */
+            .widget-card.radio .wc-radio-random-main {
+                background: linear-gradient(135deg,
+                    rgba(108, 92, 231, 0.18),
+                    rgba(0, 184, 148, 0.12));
+                border-color: rgba(108, 92, 231, 0.35);
+                color: #fff;
+                font-size: 18px;
+            }
+            .widget-card.radio .wc-radio-random-main:hover {
+                background: linear-gradient(135deg,
+                    rgba(108, 92, 231, 0.32),
+                    rgba(0, 184, 148, 0.22));
+                border-color: rgba(108, 92, 231, 0.6);
+            }
+            .widget-card.radio .wc-radio-random-main:active {
+                transform: scale(0.9);
+            }
+
+            /* ═══ Убираем 🎲 из фильтров ═══ */
+            .widget-card.radio .wc-radio-filters-row .wc-radio-random-btn {
+                display: none !important;
+            }
+
+            /* ═══ Жёсткое скрытие развёрнутой части ═══ */
+            .widget-card.radio.force-collapsed .wc-radio-section {
+                display: none !important;
+            }
+            .widget-card.radio.force-collapsed .wc-hint {
+                display: block !important;
+            }
+
+            @media (max-width: 480px) {
+                .widget-card.radio .wc-radio-btn {
+                    width: 36px !important;
+                    height: 36px !important;
+                    font-size: 16px !important;
+                }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ВКЛ / ВЫКЛ РЕЖИМА
+    // ═══════════════════════════════════════════════════════════
+
+    function enableForceCollapse() {
+        if (STATE.forceCollapsed) {
+            // Уже включён — просто применяем ещё раз
+            applyCollapse();
+            return;
+        }
+
+        STATE.forceCollapsed = true;
+        STATE.startedAt = Date.now();
+
+        console.log('🔒 [RadioFix v6] Режим "не разворачивать" ВКЛ');
+
+        applyCollapse();
+    }
+
+    function disableForceCollapse(reason = '') {
+        if (!STATE.forceCollapsed) return;
+
+        STATE.forceCollapsed = false;
+
+        console.log(`🔓 [RadioFix v6] Режим "не разворачивать" ВЫКЛ${reason ? ' (' + reason + ')' : ''}`);
+
+        // Снимаем CSS-класс — даём RadioWidget работать как обычно
+        document.querySelectorAll('.widget-card.radio.force-collapsed')
+            .forEach(card => card.classList.remove('force-collapsed'));
+    }
+
+    // ─── Применить сворачивание ───
+    function applyCollapse() {
+        if (!STATE.forceCollapsed) return;
+
+        try {
+            localStorage.setItem('smschat_radio_expanded', '0');
+        } catch (e) {}
+
+        document.querySelectorAll('.widget-card.radio').forEach(card => {
+            card.classList.remove('expanded');
+            card.classList.add('force-collapsed');
+
+            card.querySelectorAll('.wc-radio-section').forEach(sec => {
+                sec.style.display = 'none';
+            });
+
+            const hint = card.querySelector('.wc-hint');
+            if (hint) {
+                hint.style.display = 'block';
+                hint.textContent = '👆 Список станций';
+            }
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ГЛАВНОЕ: MutationObserver — ловит ЛЮБОЙ разворот
+    //  Работает всегда, пока forceCollapsed = true
+    // ═══════════════════════════════════════════════════════════
+
+    function attachRepaintObserver() {
+        const container = document.getElementById('chatsList');
+        if (!container) {
+            setTimeout(attachRepaintObserver, 500);
+            return;
+        }
+        if (STATE.observer) return;
+
+        STATE.observer = new MutationObserver((muts) => {
+            if (!STATE.forceCollapsed) return;
+
+            let needsCollapse = false;
+
+            muts.forEach(m => {
+                // Изменение class
+                if (m.type === 'attributes' && m.attributeName === 'class') {
+                    const el = m.target;
+                    if (el.classList && el.classList.contains('radio')
+                        && el.classList.contains('widget-card')
+                        && el.classList.contains('expanded')) {
+                        needsCollapse = true;
+                    }
+                }
+
+                // Новые узлы
+                if (m.type === 'childList') {
+                    m.addedNodes.forEach(node => {
+                        if (node.nodeType !== 1) return;
+                        if (node.classList && node.classList.contains('radio')) {
+                            needsCollapse = true;
+                        }
+                        if (node.querySelector && node.querySelector('.widget-card.radio')) {
+                            needsCollapse = true;
+                        }
+                    });
+                }
+            });
+
+            if (needsCollapse) {
+                console.log('🚫 [RadioFix v6] Пойман разворот — сворачиваю обратно');
+                requestAnimationFrame(applyCollapse);
+                setTimeout(applyCollapse, 30);
+                setTimeout(applyCollapse, 100);
+                setTimeout(applyCollapse, 300);
+            }
+        });
+
+        STATE.observer.observe(container, {
+            attributes: true,
+            attributeFilter: ['class'],
+            subtree: true,
+            childList: true,
+        });
+
+        console.log('👁 [RadioFix v6] MutationObserver на перерисовку установлен');
+    }
+    attachRepaintObserver();
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧ renderChatsList — тоже сворачиваем после рендера
+    // ═══════════════════════════════════════════════════════════
+
+    if (typeof window.renderChatsList === 'function') {
+        const _origRenderChatsList = window.renderChatsList;
+        window.renderChatsList = function() {
+            const result = _origRenderChatsList.apply(this, arguments);
+            if (STATE.forceCollapsed) {
+                requestAnimationFrame(applyCollapse);
+                setTimeout(applyCollapse, 50);
+            }
+            return result;
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  🆕 ГЛАВНОЕ ОТЛИЧИЕ ОТ v5:
+    //  Слушаем тап ПОЛЬЗОВАТЕЛЯ по карточке (вне кнопок)
+    //  → это означает "хочу развернуть" → снимаем режим
+    // ═══════════════════════════════════════════════════════════
+
+    function attachUserTapListener() {
+        const container = document.getElementById('chatsList');
+        if (!container) {
+            setTimeout(attachUserTapListener, 500);
+            return;
+        }
+        if (container._radioV6UserTapAttached) return;
+        container._radioV6UserTapAttached = true;
+
+        // Слушаем click — срабатывает ПОСЛЕ всех тачей
+        container.addEventListener('click', (e) => {
+            // Только если forceCollapsed активен
+            if (!STATE.forceCollapsed) return;
+
+            // Клик внутри карточки радио?
+            const card = e.target.closest('.widget-card.radio');
+            if (!card) return;
+
+            // Клик по кнопке — не считаем "хочу развернуть"
+            if (e.target.closest('button, select, input')) return;
+
+            // 🆕 Пользователь тапнул по пустому месту → хочет развернуть
+            console.log('👆 [RadioFix v6] Пользователь тапнул по карточке — снимаем режим');
+            disableForceCollapse('user tapped card');
+
+            // НЕ блокируем событие — пусть RadioWidget развернёт
+            // (или сделает что захочет)
+        }, { capture: false });  // bubble — после всех capture
+    }
+    attachUserTapListener();
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЗАПУСК СЛУЧАЙНОЙ СТАНЦИИ
+    // ═══════════════════════════════════════════════════════════
+
+    let _randomLockUntil = 0;
+
+    function triggerRandom() {
+        const now = Date.now();
+        if (now < _randomLockUntil) return;
+        _randomLockUntil = now + 500;
+
+        console.log('🎲 [RadioFix v6] Случайная станция + режим "не разворачивать"');
+
+        // Включаем режим ПЕРЕД запуском
+        enableForceCollapse();
+
+        // Запускаем случайную
+        if (typeof RadioWidget !== 'undefined' && typeof RadioWidget.playRandom === 'function') {
+            try {
+                RadioWidget.playRandom();
+            } catch (e) {
+                console.warn('🎲 [RadioFix v6] playRandom error:', e);
+            }
+        }
+
+        // Серия принудительных свёртываний на первое время
+        applyCollapse();
+        setTimeout(applyCollapse, 50);
+        setTimeout(applyCollapse, 150);
+        setTimeout(applyCollapse, 400);
+        setTimeout(applyCollapse, 800);
+        setTimeout(applyCollapse, 1500);
+        setTimeout(applyCollapse, 3000);
+
+        if (navigator.vibrate) navigator.vibrate(15);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ СОБЫТИЙ НА 🎲
+    // ═══════════════════════════════════════════════════════════
+
+    function isRandomBtn(el) {
+        return el && el.closest && el.closest('.wc-radio-controls [data-radio-action="random"]');
+    }
+
+    ['pointerdown', 'touchstart', 'mousedown'].forEach(evt => {
+        document.addEventListener(evt, (e) => {
+            if (!isRandomBtn(e.target)) return;
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+            const btn = e.target.closest('.wc-radio-random-main');
+            if (btn) btn.style.transform = 'scale(0.9)';
+        }, { capture: true });
+    });
+
+    ['click', 'touchend', 'pointerup', 'mouseup'].forEach(evt => {
+        document.addEventListener(evt, (e) => {
+            if (!isRandomBtn(e.target)) return;
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+            e.preventDefault();
+
+            const btn = e.target.closest('.wc-radio-random-main');
+            if (btn) btn.style.transform = '';
+
+            triggerRandom();
+        }, { capture: true, passive: false });
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    //  ДОБАВЛЕНИЕ КНОПКИ 🎲
+    // ═══════════════════════════════════════════════════════════
+
+    function attachButtonHandlers(btn) {
+        if (!btn || btn._radioFixV6Attached) return;
+        btn._radioFixV6Attached = true;
+
+        ['pointerdown', 'touchstart', 'mousedown'].forEach(evt => {
+            btn.addEventListener(evt, (e) => {
+                e.stopPropagation();
+                e.stopImmediatePropagation();
+            }, { capture: true });
+        });
+
+        ['click', 'touchend', 'pointerup', 'mouseup'].forEach(evt => {
+            btn.addEventListener(evt, (e) => {
+                e.stopPropagation();
+                e.stopImmediatePropagation();
+                e.preventDefault();
+                triggerRandom();
+            }, { capture: true, passive: false });
+        });
+    }
+
+    function ensureRandomButton() {
+        const container = document.getElementById('chatsList');
+        if (!container) return;
+
+        const radioCard = container.querySelector('.widget-card.radio');
+        if (!radioCard) return;
+
+        const controls = radioCard.querySelector('.wc-radio-controls');
+        if (!controls) return;
+
+        let btn = controls.querySelector('[data-radio-action="random"]');
+        if (btn) {
+            attachButtonHandlers(btn);
+            return;
+        }
+
+        btn = document.createElement('button');
+        btn.className = 'wc-radio-btn wc-radio-random-main';
+        btn.dataset.radioAction = 'random';
+        btn.title = 'Случайная станция';
+        btn.innerHTML = '🎲';
+
+        const nextBtn = controls.querySelector('[data-radio-action="next"]');
+        if (nextBtn) {
+            nextBtn.parentNode.insertBefore(btn, nextBtn.nextSibling);
+        } else {
+            controls.appendChild(btn);
+        }
+
+        attachButtonHandlers(btn);
+    }
+
+    const observer2 = new MutationObserver(() => {
+        requestAnimationFrame(ensureRandomButton);
+    });
+
+    function startButtonObserver() {
+        const container = document.getElementById('chatsList');
+        if (!container) {
+            setTimeout(startButtonObserver, 500);
+            return;
+        }
+        observer2.observe(container, { childList: true, subtree: true });
+    }
+    startButtonObserver();
+
+    setTimeout(ensureRandomButton, 1000);
+    setTimeout(ensureRandomButton, 3000);
+    setInterval(ensureRandomButton, 1500);
+
+    // ═══════════════════════════════════════════════════════════
+    //  УБИРАЕМ ✕
+    // ═══════════════════════════════════════════════════════════
+
+    setInterval(() => {
+        document.querySelectorAll('.widget-card.radio [data-radio-action="clear"]')
+            .forEach(btn => btn.remove());
+    }, 1500);
+
+    // ═══════════════════════════════════════════════════════════
+    //  API
+    // ═══════════════════════════════════════════════════════════
+
+    window.RadioButtonsFix = {
+        status: () => ({
+            clearBtnCount: document.querySelectorAll('.widget-card.radio [data-radio-action="clear"]').length,
+            randomBtnInControls: !!document.querySelector('.wc-radio-controls [data-radio-action="random"]'),
+            forceCollapsed: STATE.forceCollapsed,
+            forceCollapsedForMs: STATE.forceCollapsed
+                ? (Date.now() - STATE.startedAt)
+                : 0,
+            radioExpanded: document.querySelector('.widget-card.radio')?.classList.contains('expanded') || false,
+        }),
+        // Ручное управление
+        start: () => enableForceCollapse(),
+        stop: () => disableForceCollapse('manual'),
+        apply: () => applyCollapse(),
+        triggerRandom: () => triggerRandom(),
+    };
+
+    console.log('🔧 [RadioFix v6] Готово:');
+    console.log('   • 🎲 включает режим "не разворачивать"');
+    console.log('   • Режим держится ДО ТАПА ПОЛЬЗОВАТЕЛЯ по карточке');
+    console.log('   • Любая перерисовка во время режима → свёрнуто');
+    console.log('   • Пользователь тапнул по карточке → режим снят');
+    console.log('   • API: RadioButtonsFix.status()');
+})();
 </script>
 </body>
 </html>
