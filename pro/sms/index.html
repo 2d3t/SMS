@@ -69785,5 +69785,290 @@ async function refreshWeatherManually(btn, card) {
     console.log('   • API: GalleryKeyboard.blur()');
 })();
 </script>
+
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🎲 RANDOM BACKGROUNDS v2 — АВТО-ФОН ДЛЯ НОВЫХ ЧАТОВ
+//  ─────────────────────────────────────────────────────────────
+//  • При создании нового чата — сразу ставит ему случайный фон
+//  • При присоединении к чату — тоже ставит фон (если его нет)
+//  • При импорте профиля — ставит фоны новым чатам без фона
+//  • Не трогает чаты, у которых уже есть фон
+// ═══════════════════════════════════════════════════════════════
+
+(function installRandomBackgroundsV2() {
+    'use strict';
+
+    console.log('🎲 [RandomBg v2] Установка — авто-фон для новых чатов…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХЕЛПЕРЫ (те же, что в v1)
+    // ═══════════════════════════════════════════════════════════
+    function pickRandom(arr) {
+        return arr[Math.floor(Math.random() * arr.length)];
+    }
+
+    function generateRandomBackground() {
+        const patternsSource = (window.ChatsScreenBackground && ChatsScreenBackground.patterns)
+            ? ChatsScreenBackground.patterns
+            : (window.ChatBackgrounds && ChatBackgrounds.patterns)
+                ? ChatBackgrounds.patterns
+                : [];
+
+        const colorsSource = (window.ChatsScreenBackground && ChatsScreenBackground.colors)
+            ? ChatsScreenBackground.colors
+            : (window.ChatBackgrounds && ChatBackgrounds.colors)
+                ? ChatBackgrounds.colors
+                : [];
+
+        if (patternsSource.length === 0 || colorsSource.length === 0) {
+            console.warn('🎲 [RandomBg v2] Не удалось получить список узоров/цветов');
+            return null;
+        }
+
+        const usablePatterns = patternsSource.filter(p => p.id !== 'none');
+        const usableColors = colorsSource.filter(c => c.id !== 'default');
+
+        if (usablePatterns.length === 0 || usableColors.length === 0) return null;
+
+        const pattern = pickRandom(usablePatterns);
+        const bgColor = pickRandom(usableColors);
+
+        const patternColors = [
+            '#ffffff', '#a78bfa', '#00b894', '#feca57',
+            '#ff6b6b', '#5CA8FF', '#F36BE1', '#4FD166',
+        ];
+
+        return {
+            pattern: pattern.id,
+            color: bgColor.value || '',
+            patternColor: pickRandom(patternColors),
+            opacity: Math.floor(Math.random() * 11) + 5,
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПРИМЕНИТЬ К ОДНОМУ ЧАТУ (если у него нет фона)
+    // ═══════════════════════════════════════════════════════════
+    function applyRandomBgToChat(chatFile, chatName) {
+        if (!chatFile) return false;
+
+        // Модуль готов?
+        if (!window.ChatBackgrounds || typeof ChatBackgrounds.set !== 'function') {
+            console.warn('🎲 [RandomBg v2] ChatBackgrounds недоступен');
+            return false;
+        }
+
+        // Уже есть фон? — не трогаем
+        if (typeof ChatBackgrounds.has === 'function' && ChatBackgrounds.has(chatFile)) {
+            console.log(`🎲 [RandomBg v2] У «${chatName || chatFile}» уже есть фон`);
+            return false;
+        }
+
+        const bg = generateRandomBackground();
+        if (!bg) return false;
+
+        try {
+            ChatBackgrounds.set(chatFile, bg);
+            console.log(`🎲 [RandomBg v2] ✅ Фон для «${chatName || chatFile}» установлен:`, bg);
+            return true;
+        } catch (e) {
+            console.warn('🎲 [RandomBg v2] set error:', e);
+            return false;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХУК 1: СОЗДАНИЕ ЧАТА (confirmCreateChat)
+    // ═══════════════════════════════════════════════════════════
+    if (typeof confirmCreateChat === 'function') {
+        const _origConfirmCreate = confirmCreateChat;
+
+        confirmCreateChat = async function() {
+            // Запоминаем, сколько чатов было
+            const beforeCount = (state.chats || []).length;
+
+            const result = await _origConfirmCreate.call(this);
+
+            // Проверяем: появился ли новый чат?
+            const afterChats = state.chats || [];
+            if (afterChats.length > beforeCount) {
+                // Находим новый чат (обычно последний)
+                const newChat = afterChats[afterChats.length - 1];
+                if (newChat && newChat.file) {
+                    // Ставим фон (с небольшой задержкой — чтобы модуль фонов успел применить текущий)
+                    setTimeout(() => {
+                        applyRandomBgToChat(newChat.file, newChat.name);
+                    }, 400);
+                }
+            }
+
+            return result;
+        };
+
+        console.log('🎲 [RandomBg v2] patched: confirmCreateChat');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХУК 2: ПРИСОЕДИНЕНИЕ К ЧАТУ (confirmJoinChat)
+    // ═══════════════════════════════════════════════════════════
+    if (typeof confirmJoinChat === 'function') {
+        const _origConfirmJoin = confirmJoinChat;
+
+        confirmJoinChat = async function() {
+            const beforeFiles = new Set((state.chats || []).map(c => c.file));
+
+            const result = await _origConfirmJoin.call(this);
+
+            // Ищем новые чаты
+            const afterChats = state.chats || [];
+            for (const chat of afterChats) {
+                if (!beforeFiles.has(chat.file)) {
+                    // Это новый чат — ставим фон
+                    setTimeout(() => {
+                        applyRandomBgToChat(chat.file, chat.name);
+                    }, 400);
+                }
+            }
+
+            return result;
+        };
+
+        console.log('🎲 [RandomBg v2] patched: confirmJoinChat');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХУК 3: ИМПОРТ ПРОФИЛЯ (applyImport)
+    // ═══════════════════════════════════════════════════════════
+    if (typeof applyImport === 'function') {
+        const _origApplyImport = applyImport;
+
+        applyImport = function() {
+            const beforeFiles = new Set((state.chats || []).map(c => c.file));
+
+            const result = _origApplyImport.apply(this, arguments);
+
+            // Ищем новые чаты после импорта
+            const afterChats = state.chats || [];
+            const newChats = afterChats.filter(c => !beforeFiles.has(c.file));
+
+            if (newChats.length > 0) {
+                // Ставим фоны всем новым чатам с небольшой задержкой
+                newChats.forEach((chat, idx) => {
+                    setTimeout(() => {
+                        applyRandomBgToChat(chat.file, chat.name);
+                    }, 400 + idx * 60);
+                });
+            }
+
+            return result;
+        };
+
+        console.log('🎲 [RandomBg v2] patched: applyImport');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХУК 4: ПРИГЛАШЕНИЕ (handleInviteClick) — новый чат по ссылке
+    // ═══════════════════════════════════════════════════════════
+    if (typeof handleInviteClick === 'function') {
+        const _origHandleInvite = handleInviteClick;
+
+        handleInviteClick = async function(url, fileName) {
+            const beforeFiles = new Set((state.chats || []).map(c => c.file));
+
+            const result = await _origHandleInvite.call(this, url, fileName);
+
+            // Проверяем, добавился ли новый чат
+            const afterChats = state.chats || [];
+            for (const chat of afterChats) {
+                if (!beforeFiles.has(chat.file)) {
+                    setTimeout(() => {
+                        applyRandomBgToChat(chat.file, chat.name);
+                    }, 500);
+                }
+            }
+
+            return result;
+        };
+
+        console.log('🎲 [RandomBg v2] patched: handleInviteClick');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХУК 5: ПЕРВЫЙ ЗАПУСК — фоны старым чатам (из v1)
+    //  Оставляем логику: если флаг не установлен — ставим всем
+    // ═══════════════════════════════════════════════════════════
+    const RANDOM_BG_FLAG = 'smschat_random_bg_applied_v1';
+
+    setTimeout(async () => {
+        if (localStorage.getItem(RANDOM_BG_FLAG) === '1') return;
+        if (!state || !state.chats || state.chats.length === 0) return;
+        if (!window.ChatBackgrounds) return;
+
+        // Есть ли уже хоть какие-то фоны?
+        let hasChatBg = false;
+        try {
+            const raw = localStorage.getItem('chathub_chat_backgrounds');
+            const parsed = raw ? JSON.parse(raw) : {};
+            hasChatBg = Object.keys(parsed).length > 0;
+        } catch (e) {}
+
+        if (hasChatBg) {
+            localStorage.setItem(RANDOM_BG_FLAG, '1');
+            return;
+        }
+
+        // Ставим фоны всем существующим чатам
+        console.log(`🎲 [RandomBg v2] Первичная установка фонов для ${state.chats.length} чатов`);
+        for (const chat of state.chats) {
+            applyRandomBgToChat(chat.file, chat.name);
+            await new Promise(r => setTimeout(r, 50));
+        }
+
+        // Фон страницы чатов
+        if (window.ChatsScreenBackground && typeof ChatsScreenBackground.set === 'function') {
+            const raw = localStorage.getItem('chathub_chats_screen_bg');
+            if (!raw) {
+                const pageBg = generateRandomBackground();
+                if (pageBg) {
+                    ChatsScreenBackground.set(pageBg);
+                    console.log('🎲 [RandomBg v2] ✅ Фон страницы чатов установлен');
+                }
+            }
+        }
+
+        try { localStorage.setItem(RANDOM_BG_FLAG, '1'); } catch (e) {}
+        if (typeof showToast === 'function') {
+            showToast('🎨 Мы подобрали случайные фоны для вас!', 3000);
+        }
+        if (typeof renderChatsList === 'function') renderChatsList();
+    }, 5000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  API
+    // ═══════════════════════════════════════════════════════════
+    window.RandomBackgrounds = window.RandomBackgrounds || {};
+    window.RandomBackgrounds.applyToChat = (chatFile, chatName) => {
+        return applyRandomBgToChat(chatFile, chatName);
+    };
+    window.RandomBackgrounds.applyToAllMissing = () => {
+        if (!state || !state.chats) return 0;
+        let count = 0;
+        state.chats.forEach(c => {
+            if (applyRandomBgToChat(c.file, c.name)) count++;
+        });
+        if (count > 0 && typeof renderChatsList === 'function') renderChatsList();
+        return count;
+    };
+
+    console.log('🎲 [RandomBg v2] ✅ Готово:');
+    console.log('   • Новый чат → авто-фон');
+    console.log('   • Присоединение → авто-фон');
+    console.log('   • Импорт → авто-фон');
+    console.log('   • Приглашение → авто-фон');
+    console.log('   • API: RandomBackgrounds.applyToChat("chat_xxx")');
+    console.log('   • API: RandomBackgrounds.applyToAllMissing()');
+})();
+</script>
 </body>
 </html>
