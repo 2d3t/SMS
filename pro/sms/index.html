@@ -68702,6 +68702,923 @@ async function refreshWeatherManually(btn, card) {
     console.log('   • Валидация data-URL + проверка img.onload');
     console.log('   • API: AvatarGenV2.testSeed("chat_xxx")');
 })();
+// ═══════════════════════════════════════════════════════════════
+//  🎭 AVATAR EDITOR IN NAME MENU — превью + подтверждение
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: при выборе аватарки в меню «✨ Настройка имени»
+//  она применяется мгновенно, но пользователь НЕ ВИДИТ результат
+//  до захода в чат. Нет отмены, нет превью, случайный клик = беда.
+//
+//  Решение:
+//   1. Большой круглый превью 96×96 в самом меню
+//   2. Выбор файла / генерация / удаление → в ЧЕРНОВИК
+//   3. Кнопки «Отмена» и «Применить» внизу
+//   4. Стиль имени — тоже в черновик (применяется вместе)
+//   5. Старое поведение (мгновенное сохранение) — отключено
+// ═══════════════════════════════════════════════════════════════
+
+(function installAvatarEditorInNameMenu() {
+    'use strict';
+
+    console.log('🎭 [AvatarEditor] Установка…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОСТОЯНИЕ
+    // ═══════════════════════════════════════════════════════════
+    const AE = {
+        menuEl: null,
+        draft: {
+            avatarAction: null,     // null | 'set' | 'remove'
+            avatarDataUrl: null,    // для 'set'
+            styleId: null,          // текущий стиль имени (черновик)
+        },
+        // Ссылки на функции из оригинального модуля
+        getStyle: null,
+        setStyle: null,
+        applyStyleToElement: null,
+        updateChatsUserLabel: null,
+        buildMenu: null,
+        closeMenu: null,
+        renderStylesGrid: null,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  СТИЛИ
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('avatarEditorStyles')) {
+        const style = document.createElement('style');
+        style.id = 'avatarEditorStyles';
+        style.textContent = `
+            /* ═══ Блок превью аватарки в меню ═══ */
+            #usernameStyleMenu .usm-avatar-preview-block {
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                gap: 12px;
+                padding: 14px 12px 10px;
+                background: rgba(108, 92, 231, 0.06);
+                border-radius: 16px;
+                margin: 4px 4px 8px;
+                border: 1px solid rgba(108, 92, 231, 0.2);
+            }
+
+            #usernameStyleMenu .usm-avatar-preview {
+                width: 96px;
+                height: 96px;
+                border-radius: 50%;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 42px;
+                font-weight: 800;
+                color: #fff;
+                overflow: hidden;
+                box-shadow:
+                    0 8px 24px rgba(108, 92, 231, 0.4),
+                    0 0 0 3px rgba(255, 255, 255, 0.08);
+                transition: transform 0.2s, box-shadow 0.2s;
+                position: relative;
+            }
+            #usernameStyleMenu .usm-avatar-preview.has-changes::after {
+                content: '';
+                position: absolute;
+                inset: -4px;
+                border-radius: 50%;
+                border: 2px solid rgba(254, 202, 87, 0.9);
+                animation: aeDraftPulse 1.5s ease-in-out infinite;
+                pointer-events: none;
+            }
+            @keyframes aeDraftPulse {
+                0%, 100% { opacity: 0.5; }
+                50%      { opacity: 1; }
+            }
+
+            #usernameStyleMenu .usm-avatar-preview:hover {
+                transform: scale(1.03);
+                box-shadow:
+                    0 10px 28px rgba(108, 92, 231, 0.55),
+                    0 0 0 3px rgba(255, 255, 255, 0.15);
+            }
+
+            #usernameStyleMenu .usm-avatar-preview img {
+                width: 100%;
+                height: 100%;
+                object-fit: cover;
+                display: block;
+                border-radius: 50%;
+            }
+
+            #usernameStyleMenu .usm-avatar-actions {
+                display: flex;
+                gap: 6px;
+                width: 100%;
+                max-width: 280px;
+            }
+
+            #usernameStyleMenu .usm-avatar-btn {
+                flex: 1;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                gap: 3px;
+                padding: 8px 4px;
+                background: rgba(255, 255, 255, 0.05);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 11px;
+                color: #ccc;
+                font-size: 11px;
+                font-weight: 600;
+                cursor: pointer;
+                font-family: inherit;
+                transition: all 0.15s;
+                -webkit-tap-highlight-color: transparent;
+            }
+            #usernameStyleMenu .usm-avatar-btn span:first-child {
+                font-size: 18px;
+                line-height: 1;
+            }
+            #usernameStyleMenu .usm-avatar-btn:hover {
+                background: rgba(108, 92, 231, 0.2);
+                border-color: rgba(108, 92, 231, 0.4);
+                color: #fff;
+            }
+            #usernameStyleMenu .usm-avatar-btn:active {
+                transform: scale(0.95);
+            }
+            #usernameStyleMenu .usm-avatar-btn:disabled {
+                opacity: 0.35;
+                cursor: not-allowed;
+                transform: none;
+            }
+            #usernameStyleMenu .usm-avatar-btn.danger {
+                border-color: rgba(255, 107, 107, 0.25);
+                color: #ff6b6b;
+            }
+            #usernameStyleMenu .usm-avatar-btn.danger:hover {
+                background: rgba(255, 107, 107, 0.15);
+                border-color: rgba(255, 107, 107, 0.5);
+            }
+
+            /* ═══ Нижние кнопки ═══ */
+            #usernameStyleMenu .usm-footer-actions {
+                display: flex;
+                gap: 8px;
+                padding: 4px 4px 2px;
+            }
+            #usernameStyleMenu .usm-footer-actions .usm-action {
+                flex: 1;
+            }
+            #usernameStyleMenu .usm-action.primary {
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                color: #fff;
+                border: none;
+                box-shadow: 0 4px 12px rgba(108, 92, 231, 0.35);
+            }
+            #usernameStyleMenu .usm-action.primary:hover {
+                background: linear-gradient(135deg, #7a6cf0, #00cfa4);
+                transform: translateY(-1px);
+            }
+            #usernameStyleMenu .usm-action.primary:active {
+                transform: scale(0.98);
+            }
+
+            /* ═══ На узких экранах ═══ */
+            @media (max-width: 480px) {
+                #usernameStyleMenu .usm-avatar-preview {
+                    width: 80px; height: 80px; font-size: 34px;
+                }
+                #usernameStyleMenu .usm-avatar-btn {
+                    font-size: 10px; padding: 7px 2px;
+                }
+                #usernameStyleMenu .usm-avatar-btn span:first-child {
+                    font-size: 16px;
+                }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ ССЫЛОК НА ОРИГИНАЛЬНЫЕ ФУНКЦИИ
+    //  Мы не имеем доступа к внутренним функциям UsernameStyle
+    //  (они в IIFE). Но публичный API есть — window.UsernameStyle.
+    // ═══════════════════════════════════════════════════════════
+    function grabReferences() {
+        if (!window.UsernameStyle) {
+            // Если ещё не загрузился — ждём
+            return false;
+        }
+
+        AE.getStyle = window.UsernameStyle.get;
+        AE.setStyle = window.UsernameStyle.set;
+
+        // applyStyleToElement — внутренняя, но мы можем её достать
+        // через applyStyleToElement на глобальном объекте, если модуль
+        // её экспортировал. В нашем коде модуль не экспортирует
+        // applyStyleToElement и updateChatsUserLabel — но они доступны
+        // как глобальные функции (объявлены через `function` в IIFE
+        // — это локально). Поэтому используем window.__usernameStyleHooks,
+        // если он есть, или fallback через публичное API.
+        //
+        // Fallback: перерисовываем label через updateChatsUserLabel
+        // (это публичная функция, экспортирована через window).
+
+        return true;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  РЕНДЕР ПРЕВЬЮ АВАТАРКИ
+    // ═══════════════════════════════════════════════════════════
+    function renderAvatarPreview() {
+        const el = document.querySelector('#usernameStyleMenu #usmAvatarPreview');
+        if (!el) return;
+
+        const username = state.username || '?';
+        const letter = username.charAt(0).toUpperCase();
+
+        // Что показывать?
+        let dataUrl = null;
+        if (AE.draft.avatarAction === 'set') {
+            dataUrl = AE.draft.avatarDataUrl;
+        } else if (AE.draft.avatarAction === 'remove') {
+            dataUrl = null;
+        } else {
+            // без изменений — текущее
+            dataUrl = (typeof UserAvatars !== 'undefined')
+                ? UserAvatars.get(username)
+                : null;
+        }
+
+        // Рендерим
+        el.innerHTML = '';
+        if (dataUrl) {
+            const img = document.createElement('img');
+            img.src = dataUrl;
+            img.alt = '';
+            img.draggable = false;
+            el.appendChild(img);
+        } else {
+            el.textContent = letter;
+        }
+
+        // Индикатор «есть черновик»
+        const hasDraft = AE.draft.avatarAction !== null;
+        el.classList.toggle('has-changes', hasDraft);
+
+        // Активность кнопки «Удалить»
+        const removeBtn = document.querySelector('#usernameStyleMenu #usmAvatarRemoveBtn');
+        if (removeBtn) {
+            const hasCurrent = (typeof UserAvatars !== 'undefined')
+                && UserAvatars.has(username);
+            const hasDraftAvatar = AE.draft.avatarAction === 'set';
+            // Удалять можно только если есть что удалять
+            const canRemove = hasDraftAvatar
+                || (hasCurrent && AE.draft.avatarAction !== 'remove');
+            removeBtn.disabled = !canRemove;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СБРОС ЧЕРНОВИКА
+    // ═══════════════════════════════════════════════════════════
+    function resetDraft() {
+        AE.draft.avatarAction = null;
+        AE.draft.avatarDataUrl = null;
+        AE.draft.styleId = null;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕСТРОЕНИЕ HTML МЕНЮ
+    //  Мы ждём, пока UsernameStyle построит меню, и заменяем
+    //  блок «Аватарка / Удалить» + добавляем превью.
+    // ═══════════════════════════════════════════════════════════
+    function enhanceMenu() {
+        const menu = document.getElementById('usernameStyleMenu');
+        if (!menu || !menu.classList.contains('show')) return;
+        if (menu.querySelector('.usm-avatar-preview-block')) return;   // уже улучшено
+
+        AE.menuEl = menu;
+
+        // ─── 1. Инициализируем черновик ───
+        resetDraft();
+        const username = state.username || '?';
+        if (AE.getStyle) {
+            AE.draft.styleId = AE.getStyle(username);
+        }
+
+        // ─── 2. Находим старый блок «usm-actions» с кнопками Аватарка/Удалить ───
+        const oldActions = menu.querySelector('.usm-actions');
+        if (oldActions) oldActions.remove();
+
+        // ─── 3. Находим «usm-preview-box» и вставляем блок превью ПЕРЕД ним ───
+        const previewBox = menu.querySelector('.usm-preview-box');
+        if (!previewBox) return;
+
+        // ─── 4. Создаём блок превью-аватарки ───
+        const avatarBlock = document.createElement('div');
+        avatarBlock.className = 'usm-avatar-preview-block';
+        avatarBlock.innerHTML = `
+            <div class="usm-avatar-preview" id="usmAvatarPreview"></div>
+            <div class="usm-avatar-actions">
+                <button class="usm-avatar-btn" id="usmAvatarPickBtn" type="button">
+                    <span>🖼️</span>
+                    <span>Фото</span>
+                </button>
+                <button class="usm-avatar-btn" id="usmAvatarGenBtn" type="button">
+                    <span>🎨</span>
+                    <span>Авто</span>
+                </button>
+                <button class="usm-avatar-btn danger" id="usmAvatarRemoveBtn" type="button">
+                    <span>🗑️</span>
+                    <span>Удалить</span>
+                </button>
+            </div>
+        `;
+        previewBox.parentNode.insertBefore(avatarBlock, previewBox);
+
+        // ─── 5. Добавляем нижние кнопки «Отмена / Применить» ───
+        //  Вставляем в самый конец меню (после usm-styles-grid или
+        //  после последнего видимого элемента)
+        const stylesGrid = menu.querySelector('#usmStylesGrid');
+        const divider = menu.querySelector('.usm-divider');
+        const lastDivider = menu.querySelectorAll('.usm-divider');
+        const bottomAnchor = (lastDivider.length > 0)
+            ? lastDivider[lastDivider.length - 1]
+            : stylesGrid;
+
+        if (bottomAnchor && !menu.querySelector('.usm-footer-actions')) {
+            const footer = document.createElement('div');
+            footer.className = 'usm-footer-actions';
+            footer.innerHTML = `
+                <button class="usm-action" id="usmCancelBtn" type="button">
+                    Отмена
+                </button>
+                <button class="usm-action primary" id="usmApplyBtn" type="button">
+                    ✅ Применить
+                </button>
+            `;
+            bottomAnchor.parentNode.insertBefore(footer, bottomAnchor.nextSibling);
+        }
+
+        // ─── 6. Обработчики ───
+        attachHandlers();
+
+        // ─── 7. Первый рендер превью ───
+        requestAnimationFrame(() => renderAvatarPreview());
+
+        console.log('🎭 [AvatarEditor] Меню улучшено');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОБРАБОТЧИКИ КНОПОК
+    // ═══════════════════════════════════════════════════════════
+    function attachHandlers() {
+        const menu = AE.menuEl;
+        if (!menu) return;
+
+        // ─── 🖼️ Фото — выбрать файл (в черновик) ───
+        const pickBtn = menu.querySelector('#usmAvatarPickBtn');
+        if (pickBtn && !pickBtn._attached) {
+            pickBtn._attached = true;
+            pickBtn.addEventListener('click', () => {
+                const fileInput = document.getElementById('avatarFileInput');
+                // У нас есть глобальный _userAvatarFileInput (динамический)
+                // Найдём его: это <input type=file accept=image/*> без id
+                let targetInput = null;
+
+                // Пробуем через известный нам способ
+                if (window._pendingAvatarUser !== undefined) {
+                    // Уже есть система — используем её
+                }
+
+                // Ищем инпут, который создавался для аватарок пользователей
+                // Он имеет accept=image/*, style.display=none, без id
+                const allFileInputs = document.querySelectorAll('input[type="file"]');
+                for (const inp of allFileInputs) {
+                    if (!inp.id
+                        && inp.accept && inp.accept.includes('image')
+                        && inp.style.display === 'none'
+                        && !inp._isAvatarChatInput) {
+                        targetInput = inp;
+                        break;
+                    }
+                }
+
+                // Fallback — создаём свой
+                if (!targetInput) {
+                    targetInput = document.createElement('input');
+                    targetInput.type = 'file';
+                    targetInput.accept = 'image/*';
+                    targetInput.style.display = 'none';
+                    targetInput.id = '_aeAvatarFileInput';
+                    document.body.appendChild(targetInput);
+
+                    targetInput.addEventListener('change', (e) => {
+                        const file = e.target.files && e.target.files[0];
+                        e.target.value = '';
+                        if (file) handleAvatarFilePick(file);
+                    });
+                } else {
+                    // Если это глобальный инпут — переопределяем его
+                    // поведение (одноразово)
+                    if (!targetInput._aeWrapped) {
+                        targetInput._aeWrapped = true;
+                        const origChange = targetInput.onchange;
+                        targetInput.addEventListener('change', (e) => {
+                            const file = e.target.files && e.target.files[0];
+                            e.target.value = '';
+
+                            // Если меню открыто и это тот же пользователь —
+                            // работаем через наш черновик
+                            if (menu.classList.contains('show')
+                                && window._pendingAvatarUser === state.username) {
+                                window._pendingAvatarUser = null;
+                                if (file) handleAvatarFilePick(file);
+                            }
+                        }, true);   // capture — раньше встроенных
+                    }
+                }
+
+                window._pendingAvatarUser = state.username;
+                targetInput.value = '';
+                targetInput.click();
+            });
+        }
+
+        // ─── 🎨 Авто — сгенерировать (в черновик) ───
+        const genBtn = menu.querySelector('#usmAvatarGenBtn');
+        if (genBtn && !genBtn._attached) {
+            genBtn._attached = true;
+            genBtn.addEventListener('click', async () => {
+                if (genBtn.disabled) return;
+                genBtn.disabled = true;
+                const origHtml = genBtn.innerHTML;
+                genBtn.innerHTML = '<span>⏳</span><span>…</span>';
+
+                try {
+                    const username = state.username;
+                    // Используем retry-генератор v2
+                    let dataUrl = null;
+                    if (typeof AvatarGenV2 !== 'undefined' && AvatarGenV2.generate) {
+                        dataUrl = await AvatarGenV2.generate(username);
+                    } else if (typeof window.generateUserAvatar === 'function') {
+                        // Fallback — старый генератор, но он сохраняет сразу.
+                        // Мы его обойдём: сгенерируем вручную.
+                        dataUrl = await generateDirectly(username);
+                    }
+
+                    if (dataUrl) {
+                        AE.draft.avatarAction = 'set';
+                        AE.draft.avatarDataUrl = dataUrl;
+                        renderAvatarPreview();
+                        if (typeof soundManager !== 'undefined') {
+                            try { soundManager.play('click'); } catch (e) {}
+                        }
+                    } else {
+                        if (typeof showToast === 'function') {
+                            showToast('❌ Не удалось сгенерировать', 2000);
+                        }
+                    }
+                } catch (e) {
+                    console.error('🎭 [AvatarEditor] gen error:', e);
+                    if (typeof showToast === 'function') {
+                        showToast('❌ ' + (e.message || 'Ошибка'), 2500);
+                    }
+                } finally {
+                    genBtn.disabled = false;
+                    genBtn.innerHTML = origHtml;
+                }
+            });
+        }
+
+        // ─── 🗑️ Удалить (в черновик) ───
+        const removeBtn = menu.querySelector('#usmAvatarRemoveBtn');
+        if (removeBtn && !removeBtn._attached) {
+            removeBtn._attached = true;
+            removeBtn.addEventListener('click', () => {
+                if (removeBtn.disabled) return;
+                AE.draft.avatarAction = 'remove';
+                AE.draft.avatarDataUrl = null;
+                renderAvatarPreview();
+                if (typeof soundManager !== 'undefined') {
+                    try { soundManager.play('click'); } catch (e) {}
+                }
+            });
+        }
+
+        // ─── ✅ Применить ───
+        const applyBtn = menu.querySelector('#usmApplyBtn');
+        if (applyBtn && !applyBtn._attached) {
+            applyBtn._attached = true;
+            applyBtn.addEventListener('click', () => applyDraft());
+        }
+
+        // ─── ❌ Отмена ───
+        const cancelBtn = menu.querySelector('#usmCancelBtn');
+        if (cancelBtn && !cancelBtn._attached) {
+            cancelBtn._attached = true;
+            cancelBtn.addEventListener('click', () => {
+                resetDraft();
+                if (typeof UsernameStyle !== 'undefined'
+                    && typeof UsernameStyle.close === 'function') {
+                    UsernameStyle.close();
+                }
+            });
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОБРАБОТКА ВЫБОРА ФАЙЛА — В ЧЕРНОВИК
+    // ═══════════════════════════════════════════════════════════
+    async function handleAvatarFilePick(file) {
+        if (!file) return;
+        if (!file.type.startsWith('image/')) {
+            if (typeof showToast === 'function') showToast('❌ Только изображения', 2000);
+            return;
+        }
+        if (file.size > CONFIG.maxImageSize) {
+            if (typeof showToast === 'function') {
+                showToast(`❌ Максимум ${formatFileSize(CONFIG.maxImageSize)}`, 2500);
+            }
+            return;
+        }
+
+        // Визуальная загрузка на превью
+        const preview = document.querySelector('#usernameStyleMenu #usmAvatarPreview');
+        if (preview) {
+            preview.style.opacity = '0.5';
+        }
+
+        try {
+            // Сжимаем в dataURL (квадрат 128×128)
+            const dataUrl = await (typeof UserAvatars !== 'undefined'
+                && typeof UserAvatars.makeDataUrl === 'function'
+                ? UserAvatars.makeDataUrl(file)
+                : makeDataUrlFallback(file));
+
+            if (!dataUrl) throw new Error('Не удалось обработать изображение');
+
+            AE.draft.avatarAction = 'set';
+            AE.draft.avatarDataUrl = dataUrl;
+            renderAvatarPreview();
+
+            if (typeof soundManager !== 'undefined') {
+                try { soundManager.play('click'); } catch (e) {}
+            }
+            if (navigator.vibrate) navigator.vibrate(10);
+        } catch (e) {
+            console.error('🎭 [AvatarEditor] file pick error:', e);
+            if (typeof showToast === 'function') {
+                showToast('❌ ' + (e.message || 'Ошибка'), 2500);
+            }
+        } finally {
+            if (preview) {
+                preview.style.opacity = '';
+            }
+        }
+    }
+
+    // ─── Fallback: сделать dataURL из файла ───
+    function makeDataUrlFallback(file) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onerror = () => reject(new Error('Не удалось прочитать файл'));
+            reader.onload = (e) => {
+                const img = new Image();
+                img.onerror = () => reject(new Error('Невалидное изображение'));
+                img.onload = () => {
+                    const side = Math.min(img.width, img.height);
+                    const sx = (img.width - side) / 2;
+                    const sy = (img.height - side) / 2;
+                    const canvas = document.createElement('canvas');
+                    canvas.width = 128;
+                    canvas.height = 128;
+                    const ctx = canvas.getContext('2d');
+                    ctx.imageSmoothingEnabled = true;
+                    ctx.imageSmoothingQuality = 'high';
+                    ctx.drawImage(img, sx, sy, side, side, 0, 0, 128, 128);
+                    let url = canvas.toDataURL('image/jpeg', 0.85);
+                    if (url.length > 80 * 1024) {
+                        url = canvas.toDataURL('image/jpeg', 0.7);
+                    }
+                    if (url.length > 80 * 1024) {
+                        url = canvas.toDataURL('image/jpeg', 0.55);
+                    }
+                    resolve(url);
+                };
+                img.src = e.target.result;
+            };
+            reader.readAsDataURL(file);
+        });
+    }
+
+    // ─── Fallback-генерация ───
+    async function generateDirectly(username) {
+        const STYLES = ['bottts', 'avataaars', 'fun-emoji', 'micah', 'personas'];
+        const COLORS = ['6c5ce7', '00b894', 'feca57', 'ff6b6b', '5CA8FF', 'F36BE1'];
+
+        for (let attempt = 0; attempt < 3; attempt++) {
+            try {
+                const style = STYLES[Math.floor(Math.random() * STYLES.length)];
+                const color = COLORS[Math.floor(Math.random() * COLORS.length)];
+                const seed = `${username}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+                const url = `https://api.dicebear.com/7.x/${style}/svg?seed=${encodeURIComponent(seed)}&backgroundColor=${color}&size=128`;
+
+                const res = await fetch(url, { mode: 'cors', cache: 'no-store' });
+                if (!res.ok) continue;
+                const blob = await res.blob();
+                if (!blob || blob.size < 200) continue;
+
+                return await new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onloadend = () => resolve(reader.result);
+                    reader.onerror = reject;
+                    reader.readAsDataURL(blob);
+                });
+            } catch (e) {
+                await new Promise(r => setTimeout(r, 500));
+            }
+        }
+        return null;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПРИМЕНИТЬ ВСЁ
+    // ═══════════════════════════════════════════════════════════
+    function applyDraft() {
+        const username = state.username;
+        if (!username) return;
+
+        let anyChange = false;
+
+        // ─── 1. Аватарка ───
+        if (AE.draft.avatarAction === 'set' && AE.draft.avatarDataUrl) {
+            try {
+                UserAvatars.set(username, AE.draft.avatarDataUrl);
+                if (typeof refreshAllUserAvatars === 'function') {
+                    refreshAllUserAvatars(username);
+                }
+                anyChange = true;
+                console.log('🎭 [AvatarEditor] ✅ Аватарка обновлена');
+            } catch (e) {
+                console.error('🎭 [AvatarEditor] avatar save error:', e);
+                if (typeof showToast === 'function') {
+                    showToast('❌ Ошибка сохранения аватарки', 2500);
+                }
+            }
+        } else if (AE.draft.avatarAction === 'remove') {
+            try {
+                UserAvatars.remove(username);
+                if (typeof refreshAllUserAvatars === 'function') {
+                    refreshAllUserAvatars(username);
+                }
+                anyChange = true;
+                console.log('🎭 [AvatarEditor] ✅ Аватарка удалена');
+            } catch (e) {
+                console.error('🎭 [AvatarEditor] avatar remove error:', e);
+            }
+        }
+
+        // ─── 2. Стиль имени ───
+        if (AE.draft.styleId && AE.setStyle) {
+            const currentStyle = AE.getStyle ? AE.getStyle(username) : null;
+            if (currentStyle !== AE.draft.styleId) {
+                try {
+                    AE.setStyle(AE.draft.styleId, username);
+                    if (typeof updateChatsUserLabel === 'function') {
+                        updateChatsUserLabel();
+                    }
+                    anyChange = true;
+                    console.log('🎭 [AvatarEditor] ✅ Стиль имени обновлён');
+                } catch (e) {
+                    console.error('🎭 [AvatarEditor] style save error:', e);
+                }
+            }
+        }
+
+        // ─── 3. Фидбэк ───
+        if (anyChange) {
+            if (typeof showToast === 'function') showToast('✅ Сохранено', 1500);
+            if (typeof soundManager !== 'undefined') {
+                try { soundManager.play('send'); } catch (e) {}
+            }
+            if (navigator.vibrate) navigator.vibrate([15, 30, 15]);
+        } else {
+            // Ничего не менялось
+            if (typeof showToast === 'function') showToast('ℹ️ Без изменений', 1200);
+        }
+
+        // ─── 4. Сбрасываем черновик и закрываем ───
+        resetDraft();
+        if (typeof UsernameStyle !== 'undefined'
+            && typeof UsernameStyle.close === 'function') {
+            UsernameStyle.close();
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ ОТКРЫТИЯ МЕНЮ
+    // ═══════════════════════════════════════════════════════════
+    function watchForMenuOpen() {
+        const observer = new MutationObserver(() => {
+            const menu = document.getElementById('usernameStyleMenu');
+            if (menu && menu.classList.contains('show')) {
+                // Небольшая задержка — дать оригиналу дорисовать
+                setTimeout(enhanceMenu, 30);
+                setTimeout(enhanceMenu, 100);
+            } else if (menu && !menu.classList.contains('show')) {
+                // Меню закрыто — сбрасываем черновик
+                resetDraft();
+            }
+        });
+
+        observer.observe(document.body, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['class'],
+        });
+
+        console.log('🎭 [AvatarEditor] Наблюдатель за меню установлен');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ КЛИКА ПО СТИЛЮ (чтобы сохранять в черновик)
+    //  Оригинал устанавливает свой обработчик на .usm-style,
+    //  который СРАЗУ применяет стиль. Мы хотим отложить это
+    //  до «Применить».
+    //
+    //  Но оригинальный обработчик установить «в обход» сложно.
+    //  Решение: перехватываем клик в capture-фазе и меняем
+    //  поведение — обновляем только draft.styleId и визуальный
+    //  выбор, БЕЗ вызова setStyle.
+    // ═══════════════════════════════════════════════════════════
+    function interceptStyleClicks() {
+        document.addEventListener('click', (e) => {
+            const styleItem = e.target.closest('#usernameStyleMenu .usm-style');
+            if (!styleItem) return;
+            if (!AE.menuEl || !AE.menuEl.classList.contains('show')) return;
+
+            e.stopImmediatePropagation();
+            e.preventDefault();
+
+            const styleId = styleItem.dataset.styleId;
+            if (!styleId) return;
+
+            // Обновляем черновик
+            AE.draft.styleId = styleId;
+
+            // Обновляем визуальный выбор
+            AE.menuEl.querySelectorAll('.usm-style').forEach(el => {
+                el.classList.toggle('selected', el.dataset.styleId === styleId);
+            });
+
+            // Обновляем превью имени
+            const previewName = document.getElementById('usmPreviewName');
+            if (previewName) {
+                previewName.textContent = state.username || '?';
+                // Применяем стиль ТОЛЬКО к превью (визуально),
+                // не трогая глобальное состояние
+                applyStyleToPreview(previewName, styleId);
+            }
+
+            if (typeof soundManager !== 'undefined') {
+                try { soundManager.play('click'); } catch (err) {}
+            }
+            if (navigator.vibrate) navigator.vibrate(8);
+        }, true);   // ← capture
+    }
+
+    // ─── Применить стиль только к превью (без сохранения) ───
+    function applyStyleToPreview(el, styleId) {
+        // Используем ту же логику, что и оригинальный applyStyleToElement
+        // Но нам нужен доступ к данным стиля. Проще — вызвать
+        // оригинальный applyStyleToElement, если он экспортирован,
+        // иначе — повторим логику через getComputedStyle (хак).
+        //
+        // Проще всего: если есть window.UsernameStyle.styles — берём оттуда.
+        let styleDef = null;
+        if (window.UsernameStyle && Array.isArray(window.UsernameStyle.styles)) {
+            styleDef = window.UsernameStyle.styles.find(s => s.id === styleId);
+        }
+        if (!styleDef) {
+            // Fallback — сбрасываем стиль
+            el.style.background = '';
+            el.style.webkitTextFillColor = '';
+            el.style.backgroundClip = '';
+            return;
+        }
+        // Применяем CSS из определения
+        if (styleDef.solid) {
+            el.style.background = 'none';
+            el.style.webkitTextFillColor = styleDef.colors[0];
+            el.style.backgroundClip = '';
+        } else {
+            const grad = `linear-gradient(135deg, ${styleDef.colors.join(', ')})`;
+            el.style.background = styleDef.animated
+                ? `linear-gradient(90deg, ${styleDef.colors.join(', ')}, ${styleDef.colors[0]})`
+                : grad;
+            el.style.backgroundSize = styleDef.animated ? '300% 100%' : 'auto';
+            el.style.animation = styleDef.animated ? 'usernameRainbowShift 4s ease infinite' : 'none';
+            el.style.webkitTextFillColor = 'transparent';
+            el.style.backgroundClip = 'text';
+            el.style.webkitBackgroundClip = 'text';
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ГЛУШИМ СТАРЫЕ КНОПКИ «🖼️ Аватарка» и «🗑️ Удалить»
+    //  Если они где-то ещё остались (например, старая версия
+    //  успела отрисоваться до нашей) — убираем их.
+    // ═══════════════════════════════════════════════════════════
+    function killOldButtons() {
+        const menu = document.getElementById('usernameStyleMenu');
+        if (!menu) return;
+
+        // Старый блок .usm-actions (с кнопками Аватарка/Удалить)
+        const oldActions = menu.querySelector('.usm-actions');
+        if (oldActions && !oldActions.classList.contains('usm-footer-actions')) {
+            oldActions.remove();
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХУК: перерисовка меню
+    // ═══════════════════════════════════════════════════════════
+    function periodicCheck() {
+        const menu = document.getElementById('usernameStyleMenu');
+        if (!menu || !menu.classList.contains('show')) return;
+
+        killOldButtons();
+
+        // Если ещё не улучшено — улучшаем
+        if (!menu.querySelector('.usm-avatar-preview-block')) {
+            enhanceMenu();
+        }
+
+        // Проверяем индикатор черновика
+        const preview = menu.querySelector('#usmAvatarPreview');
+        if (preview) {
+            const hasDraft = AE.draft.avatarAction !== null;
+            if (hasDraft && !preview.classList.contains('has-changes')) {
+                preview.classList.add('has-changes');
+            } else if (!hasDraft && preview.classList.contains('has-changes')) {
+                preview.classList.remove('has-changes');
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ ПРЯМОГО ВЫЗОВА pickUserAvatar ИЗ МЕНЮ
+    //  Старый обработчик `#usmAvatarBtn` (если его не успели удалить)
+    //  вызывает pickUserAvatar напрямую. Мы уже переопределили
+    //  pickUserAvatar в другом патче (installAvatarFilePickerRace),
+    //  но на всякий случай.
+    // ═══════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЗАПУСК
+    // ═══════════════════════════════════════════════════════════
+    watchForMenuOpen();
+    interceptStyleClicks();
+
+    // Периодическая страховка
+    setInterval(periodicCheck, 400);
+
+    // Экспорт для отладки
+    window.AvatarEditor = {
+        status: () => ({
+            menuOpen: !!(AE.menuEl && AE.menuEl.classList.contains('show')),
+            draft: {
+                avatarAction: AE.draft.avatarAction,
+                hasDataUrl: !!AE.draft.avatarDataUrl,
+                dataUrlLength: AE.draft.avatarDataUrl ? AE.draft.avatarDataUrl.length : 0,
+                styleId: AE.draft.styleId,
+            },
+            enhanced: !!(AE.menuEl && AE.menuEl.querySelector('.usm-avatar-preview-block')),
+        }),
+        reset: resetDraft,
+        // Для отладки — открыть меню программно
+        open: () => {
+            if (typeof UsernameStyle !== 'undefined'
+                && typeof UsernameStyle.open === 'function') {
+                UsernameStyle.open();
+            }
+        },
+    };
+
+    console.log('🎭 [AvatarEditor] ✅ Готово:');
+    console.log('   • Превью аватарки в меню');
+    console.log('   • Выбор/генерация/удаление — в черновик');
+    console.log('   • Стиль имени — тоже в черновик');
+    console.log('   • Кнопки «Отмена / Применить»');
+    console.log('   • API: AvatarEditor.status() / .reset()');
+})();
+
+
+
 </script>
 </body>
 </html>
