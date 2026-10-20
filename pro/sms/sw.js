@@ -1,5 +1,5 @@
 // sw.js - Универсальный кеш + уведомления
-const CACHE_NAME = 'sms-pwa-v5-okiokitextarea-2times-games2';
+const CACHE_NAME = 'sms-pwa-v5-avatauto';
 
 const FILES_TO_CACHE = [
     '/SMS/pro/sms/index.html',
