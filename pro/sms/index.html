@@ -68322,6 +68322,386 @@ async function refreshWeatherManually(btn, card) {
     console.log('   • Все клики на кружок → наш оверлей');
     console.log('   • Кнопка «С устройства» → нативный picker');
 })();
+</script><script>
+// ═══════════════════════════════════════════════════════════════
+//  🔁 AVATAR GENERATOR v2 — RETRY WITH VALIDATION
+//  ─────────────────────────────────────────────────────────────
+//  Решает проблему «аватарка ставится только с 3-го раза»:
+//   1. Пробует до 5 раз с растущей паузой
+//   2. Меняет seed → обходит битый кэш CDN
+//   3. Меняет стиль при неудаче (bottts → avataaars → …)
+//   4. Валидирует data-URL (не пустой, не 0 байт, image/*)
+//   5. Ждёт img.onload и проверяет naturalWidth > 0
+//   6. Всегда снимает spinner в finally
+//   7. Показывает прогресс «Попытка 2/5…»
+// ═══════════════════════════════════════════════════════════════
+
+(function installAvatarGeneratorRetry() {
+    'use strict';
+
+    console.log('🔁 [AvatarGen v2] Установка retry-генератора…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  КОНФИГ
+    // ═══════════════════════════════════════════════════════════
+    const CFG = {
+        MAX_ATTEMPTS: 5,
+        BASE_DELAY_MS: 400,      // 400 → 800 → 1600 → 3200 → 6400
+        FETCH_TIMEOUT_MS: 8000,
+        MIN_DATAURL_LEN: 300,    // data:image/... длиной меньше — битая
+        MIN_IMG_SIZE: 16,        // naturalWidth/Height меньше — битая
+        // Порядок стилей для перебора
+        STYLES_ORDER: [
+            'bottts',
+            'avataaars',
+            'fun-emoji',
+            'adventurer',
+            'micah',
+            'miniavs',
+            'personas',
+            'thumbs',
+            'big-ears',
+            'lorelei',
+            'notionists',
+            'open-peeps',
+            'pixel-art',
+            'shapes',
+            'identicon',
+            'initials',
+            'croodles',
+        ],
+        COLORS: [
+            '6c5ce7', '00b894', 'feca57', 'ff6b6b',
+            '5CA8FF', 'F36BE1', '4FD166', 'B36BFF',
+            'FFA85C', '3FC9C1', '7B7FF6', 'FF516A',
+        ],
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  УТИЛИТЫ
+    // ═══════════════════════════════════════════════════════════
+    function hashString(str) {
+        let hash = 0x811c9dc5;
+        for (let i = 0; i < str.length; i++) {
+            hash ^= str.charCodeAt(i);
+            hash = (hash * 0x01000193) >>> 0;
+        }
+        return hash;
+    }
+
+    function sleep(ms) {
+        return new Promise(r => setTimeout(r, ms));
+    }
+
+    function showToastSafe(msg, dur) {
+        try { if (typeof showToast === 'function') showToast(msg, dur || 2000); } catch (e) {}
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  fetch С ТАЙМАУТОМ
+    // ═══════════════════════════════════════════════════════════
+    async function fetchWithTimeout(url, timeoutMs) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(new Error('timeout')), timeoutMs);
+        try {
+            const res = await fetch(url, {
+                mode: 'cors',
+                cache: 'no-store',          // ← ВАЖНО: обходим кэш
+                signal: controller.signal,
+            });
+            return res;
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ВАЛИДАЦИЯ DATA-URL
+    // ═══════════════════════════════════════════════════════════
+    function validateDataUrl(dataUrl) {
+        if (typeof dataUrl !== 'string') return false;
+        if (!dataUrl.startsWith('data:image/')) return false;
+        if (dataUrl.length < CFG.MIN_DATAURL_LEN) return false;
+        return true;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПРОВЕРКА, ЧТО КАРТИНКА РЕАЛЬНО РИСУЕТСЯ
+    // ═══════════════════════════════════════════════════════════
+    function validateImageLoads(dataUrl) {
+        return new Promise((resolve) => {
+            const img = new Image();
+            let done = false;
+
+            const finish = (ok) => {
+                if (done) return;
+                done = true;
+                img.onload = img.onerror = null;
+                resolve(ok);
+            };
+
+            img.onload = () => {
+                finish(img.naturalWidth >= CFG.MIN_IMG_SIZE
+                    && img.naturalHeight >= CFG.MIN_IMG_SIZE);
+            };
+            img.onerror = () => finish(false);
+
+            setTimeout(() => finish(false), 4000);
+
+            img.src = dataUrl;
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПОСТРОЕНИЕ URL (с рандомизацией)
+    // ═══════════════════════════════════════════════════════════
+    function buildAvatarUrl(seed, attempt) {
+        // При каждой попытке берём ДРУГОЙ стиль и ДРУГОЙ seed
+        const styleIdx = (hashString(seed + ':' + attempt)) % CFG.STYLES_ORDER.length;
+        const style = CFG.STYLES_ORDER[styleIdx];
+
+        const colorIdx = (hashString(seed + '::' + attempt)) % CFG.COLORS.length;
+        const bgColor = CFG.COLORS[colorIdx];
+
+        // seed с рандомом — чтобы CDN точно не отдал из кэша
+        const randomSalt = Math.random().toString(36).slice(2, 8);
+        const finalSeed = `${seed}-w${attempt}-${randomSalt}`;
+
+        return `https://api.dicebear.com/7.x/${style}/svg?seed=${encodeURIComponent(finalSeed)}&backgroundColor=${bgColor}&size=128`;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОДНА ПОПЫТКА
+    //  Возвращает { ok: true, dataUrl } или { ok: false, error }
+    // ═══════════════════════════════════════════════════════════
+    async function tryGenerateOnce(seed, attempt) {
+        const url = buildAvatarUrl(seed, attempt);
+
+        let res;
+        try {
+            res = await fetchWithTimeout(url, CFG.FETCH_TIMEOUT_MS);
+        } catch (e) {
+            return { ok: false, error: 'network: ' + (e.message || 'timeout') };
+        }
+
+        if (!res.ok) {
+            return { ok: false, error: `HTTP ${res.status}` };
+        }
+
+        let blob;
+        try {
+            blob = await res.blob();
+        } catch (e) {
+            return { ok: false, error: 'blob: ' + e.message };
+        }
+
+        if (!blob || blob.size < 200) {
+            return { ok: false, error: `empty blob (${blob ? blob.size : 0}b)` };
+        }
+
+        // ─── В data:URL ───
+        let dataUrl;
+        try {
+            dataUrl = await new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onloadend = () => resolve(reader.result);
+                reader.onerror = () => reject(new Error('read error'));
+                reader.readAsDataURL(blob);
+            });
+        } catch (e) {
+            return { ok: false, error: 'read: ' + e.message };
+        }
+
+        // ─── Валидация ───
+        if (!validateDataUrl(dataUrl)) {
+            return { ok: false, error: 'invalid data-url' };
+        }
+
+        const imgOk = await validateImageLoads(dataUrl);
+        if (!imgOk) {
+            return { ok: false, error: 'image does not load' };
+        }
+
+        return { ok: true, dataUrl };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ГЛАВНАЯ ФУНКЦИЯ: RETRY-ГЕНЕРАЦИЯ
+    // ═══════════════════════════════════════════════════════════
+    /**
+     * @param {string} seed       — обычно chatFile или username
+     * @param {function} onProgress — (attempt, max) => void (для UI)
+     * @returns {Promise<string|null>} — dataUrl или null если не удалось
+     */
+    async function generateAvatarWithRetry(seed, onProgress) {
+        if (!seed) return null;
+
+        let lastError = null;
+
+        for (let attempt = 1; attempt <= CFG.MAX_ATTEMPTS; attempt++) {
+            if (onProgress) {
+                try { onProgress(attempt, CFG.MAX_ATTEMPTS); } catch (e) {}
+            }
+
+            console.log(`🔁 [AvatarGen v2] Попытка ${attempt}/${CFG.MAX_ATTEMPTS} для «${seed}»`);
+
+            const result = await tryGenerateOnce(seed, attempt);
+
+            if (result.ok) {
+                console.log(`🔁 [AvatarGen v2] ✅ Успех с попытки ${attempt}`);
+                return result.dataUrl;
+            }
+
+            lastError = result.error;
+            console.warn(`🔁 [AvatarGen v2] Попытка ${attempt} провалилась: ${result.error}`);
+
+            // Пауза перед следующей попыткой (экспоненциально)
+            if (attempt < CFG.MAX_ATTEMPTS) {
+                const delay = CFG.BASE_DELAY_MS * Math.pow(2, attempt - 1);
+                await sleep(delay);
+            }
+        }
+
+        console.error(`🔁 [AvatarGen v2] ❌ Все ${CFG.MAX_ATTEMPTS} попыток провалились (${lastError})`);
+        return null;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ГЕНЕРАЦИЯ АВАТАРКИ ЧАТА (с retry)
+    // ═══════════════════════════════════════════════════════════
+    window.generateChatAvatar = async function(chatFile) {
+        if (!chatFile) {
+            showToastSafe('❌ Чат не указан', 1500);
+            return false;
+        }
+        const chat = state.chats.find(c => c.file === chatFile);
+        if (!chat) {
+            showToastSafe('❌ Чат не найден', 1500);
+            return false;
+        }
+
+        const displayName = chat.name || chat.file;
+        showToastSafe(`🎨 Генерируем аватарку для «${displayName}»…`, 1500);
+
+        // Прогресс в тосте
+        const dataUrl = await generateAvatarWithRetry(chatFile, (attempt, max) => {
+            if (attempt > 1) {
+                showToastSafe(`🎨 Попытка ${attempt}/${max}…`, 1000);
+            }
+        });
+
+        if (!dataUrl) {
+            showToastSafe('❌ Не удалось сгенерировать. Попробуйте ещё раз.', 3000);
+            try { if (typeof soundManager !== 'undefined') soundManager.play('error'); } catch (e) {}
+            return false;
+        }
+
+        // ─── Сохраняем ───
+        try {
+            if (typeof _avatars !== 'undefined') {
+                _avatars[chatFile] = dataUrl;
+            } else {
+                const raw = localStorage.getItem('chathub_avatars');
+                const avatars = raw ? JSON.parse(raw) : {};
+                avatars[chatFile] = dataUrl;
+                localStorage.setItem('chathub_avatars', JSON.stringify(avatars));
+            }
+            if (typeof saveAvatars === 'function') saveAvatars();
+
+            if (typeof refreshAllAvatarsForChat === 'function') {
+                refreshAllAvatarsForChat(chatFile);
+            }
+            if (state.chatFile === chatFile && typeof applyAvatarToElement === 'function') {
+                const userAvatar = document.getElementById('userAvatar');
+                if (userAvatar) applyAvatarToElement(userAvatar, chatFile);
+            }
+
+            showToastSafe('✅ Аватарка обновлена', 1500);
+            try { if (typeof soundManager !== 'undefined') soundManager.play('send'); } catch (e) {}
+            if (navigator.vibrate) navigator.vibrate([15, 30, 15]);
+            return true;
+        } catch (e) {
+            console.error('🔁 [AvatarGen v2] save error:', e);
+            showToastSafe('❌ Ошибка сохранения', 2500);
+            return false;
+        }
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ГЕНЕРАЦИЯ АВАТАРКИ ПОЛЬЗОВАТЕЛЯ (с retry)
+    // ═══════════════════════════════════════════════════════════
+    window.generateUserAvatar = async function(username) {
+        if (!username) {
+            showToastSafe('❌ Пользователь не указан', 1500);
+            return false;
+        }
+        if (typeof UserAvatars === 'undefined') {
+            showToastSafe('❌ Система аватарок недоступна', 2000);
+            return false;
+        }
+
+        const displayName = username === state.username ? 'Вы' : username;
+        showToastSafe(`🎨 Генерируем аватарку для «${displayName}»…`, 1500);
+
+        // Блокируем все кружки этого пользователя
+        const spinSelector = `.user-avatar[data-user="${CSS.escape(username)}"]`;
+        document.querySelectorAll(spinSelector).forEach(el => el.classList.add('uploading'));
+
+        try {
+            const dataUrl = await generateAvatarWithRetry(username, (attempt, max) => {
+                if (attempt > 1) {
+                    showToastSafe(`🎨 Попытка ${attempt}/${max}…`, 1000);
+                }
+            });
+
+            if (!dataUrl) {
+                showToastSafe('❌ Не удалось сгенерировать. Попробуйте ещё раз.', 3000);
+                try { if (typeof soundManager !== 'undefined') soundManager.play('error'); } catch (e) {}
+                return false;
+            }
+
+            UserAvatars.set(username, dataUrl);
+
+            if (typeof refreshAllUserAvatars === 'function') {
+                refreshAllUserAvatars(username);
+            }
+
+            showToastSafe(`✅ Аватарка для «${displayName}» установлена`, 1800);
+            try { if (typeof soundManager !== 'undefined') soundManager.play('send'); } catch (e) {}
+            if (navigator.vibrate) navigator.vibrate([15, 30, 15]);
+            return true;
+        } finally {
+            // ⚠️ ГЛАВНОЕ: всегда снимаем spinner в finally
+            document.querySelectorAll(spinSelector)
+                .forEach(el => el.classList.remove('uploading'));
+        }
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  API ДЛЯ ОТЛАДКИ
+    // ═══════════════════════════════════════════════════════════
+    window.AvatarGenV2 = {
+        generate: generateAvatarWithRetry,
+        testSeed: async (seed) => {
+            const t0 = Date.now();
+            const result = await generateAvatarWithRetry(seed || 'test-seed', (a, m) => {
+                console.log(`  попытка ${a}/${m}`);
+            });
+            return {
+                ok: !!result,
+                durationMs: Date.now() - t0,
+                dataUrlLength: result ? result.length : 0,
+            };
+        },
+        config: CFG,
+    };
+
+    console.log('🔁 [AvatarGen v2] Готово:');
+    console.log('   • generateChatAvatar / generateUserAvatar переопределены');
+    console.log('   • До 5 попыток с экспоненциальной паузой');
+    console.log('   • Валидация data-URL + проверка img.onload');
+    console.log('   • API: AvatarGenV2.testSeed("chat_xxx")');
+})();
 </script>
 </body>
 </html>
