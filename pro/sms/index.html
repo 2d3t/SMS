@@ -67202,7 +67202,1126 @@ async function refreshWeatherManually(btn, card) {
     console.log('   • Выделение в поле ввода автоматически восстанавливается');
     console.log('   • API: SelectFix.status() / .testSelectAll()');
 })();
+
+// ═══════════════════════════════════════════════════════════════
+//  🎨 ИНДИВИДУАЛЬНАЯ ГЕНЕРАЦИЯ АВАТАРОК
+//  ─────────────────────────────────────────────────────────────
+//  Для чатов: пункт «🎨 Сгенерировать» в меню ⋯
+//  Для юзеров: пункт «🎨 Сгенерировать» в контекстном меню кружка
+// ═══════════════════════════════════════════════════════════════
+
+(function installIndividualAvatarGenerator() {
+    'use strict';
+
+    console.log('🎨 [IndivAvatar] Установка…');
+
+    // ─── Используем существующие ресурсы AutoAvatars ───
+    const DICEBEAR_STYLES = [
+        'avataaars', 'bottts', 'fun-emoji', 'identicon', 'initials',
+        'micah', 'miniavs', 'personas', 'thumbs', 'adventurer',
+        'big-ears', 'croodles', 'lorelei', 'notionists', 'open-peeps',
+        'pixel-art', 'shapes',
+    ];
+    const DICEBEAR_COLORS = [
+        '6c5ce7', '00b894', 'feca57', 'ff6b6b',
+        '5CA8FF', 'F36BE1', '4FD166', 'B36BFF',
+        'FFA85C', '3FC9C1', '7B7FF6', 'FF516A',
+    ];
+
+    function hashString(str) {
+        let hash = 0x811c9dc5;
+        for (let i = 0; i < str.length; i++) {
+            hash ^= str.charCodeAt(i);
+            hash = (hash * 0x01000193) >>> 0;
+        }
+        return hash;
+    }
+
+    function buildAvatarUrl(seed, wave) {
+        const fullSeed = `${seed}-wave-${wave}`;
+        const hash = hashString(fullSeed);
+        const style = DICEBEAR_STYLES[hash % DICEBEAR_STYLES.length];
+        const bgColor = DICEBEAR_COLORS[(hash >> 8) % DICEBEAR_COLORS.length];
+        return `https://api.dicebear.com/7.x/${style}/svg?seed=${encodeURIComponent(fullSeed)}&backgroundColor=${bgColor}&size=128`;
+    }
+
+    async function fetchAvatarAsDataUrl(url) {
+        const res = await fetch(url, { mode: 'cors', cache: 'force-cache' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const blob = await res.blob();
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(reader.result);
+            reader.onerror = reject;
+            reader.readAsDataURL(blob);
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ДЛЯ ЧАТА — генерировать аватарку конкретного чата
+    // ═══════════════════════════════════════════════════════════
+    window.generateChatAvatar = async function(chatFile) {
+        if (!chatFile) {
+            showToast('❌ Чат не указан', 1500);
+            return false;
+        }
+        const chat = state.chats.find(c => c.file === chatFile);
+        if (!chat) {
+            showToast('❌ Чат не найден', 1500);
+            return false;
+        }
+
+        showToast(`🎨 Генерируем аватарку для «${chat.name || chat.file}»…`, 1500);
+
+        try {
+            const url = buildAvatarUrl(chatFile, Date.now());
+            const dataUrl = await fetchAvatarAsDataUrl(url);
+
+            if (typeof _avatars !== 'undefined') {
+                _avatars[chatFile] = dataUrl;
+            } else {
+                const raw = localStorage.getItem('chathub_avatars');
+                const avatars = raw ? JSON.parse(raw) : {};
+                avatars[chatFile] = dataUrl;
+                localStorage.setItem('chathub_avatars', JSON.stringify(avatars));
+            }
+
+            if (typeof saveAvatars === 'function') saveAvatars();
+
+            if (typeof refreshAllAvatarsForChat === 'function') {
+                refreshAllAvatarsForChat(chatFile);
+            }
+            if (state.chatFile === chatFile && typeof applyAvatarToElement === 'function') {
+                const userAvatar = document.getElementById('userAvatar');
+                if (userAvatar) applyAvatarToElement(userAvatar, chatFile);
+            }
+
+            showToast('✅ Аватарка обновлена', 1500);
+            if (typeof soundManager !== 'undefined') soundManager.play('send');
+            if (navigator.vibrate) navigator.vibrate([15, 30, 15]);
+            return true;
+        } catch (e) {
+            console.error('🎨 [IndivAvatar] Ошибка:', e);
+            showToast('❌ Не удалось сгенерировать', 2500);
+            return false;
+        }
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ДЛЯ ПОЛЬЗОВАТЕЛЯ — генерировать аватарку по нику
+    // ═══════════════════════════════════════════════════════════
+    window.generateUserAvatar = async function(username) {
+        if (!username) {
+            showToast('❌ Пользователь не указан', 1500);
+            return false;
+        }
+        if (typeof UserAvatars === 'undefined') {
+            showToast('❌ Система аватарок недоступна', 2000);
+            return false;
+        }
+
+        const displayName = username === state.username ? 'Вы' : username;
+        showToast(`🎨 Генерируем аватарку для «${displayName}»…`, 1500);
+
+        // Блокируем все кружки этого пользователя
+        document.querySelectorAll(`.user-avatar[data-user="${CSS.escape(username)}"]`)
+            .forEach(el => el.classList.add('uploading'));
+
+        try {
+            const url = buildAvatarUrl(username, Date.now());
+            const dataUrl = await fetchAvatarAsDataUrl(url);
+
+            UserAvatars.set(username, dataUrl);
+
+            if (typeof refreshAllUserAvatars === 'function') {
+                refreshAllUserAvatars(username);
+            }
+
+            showToast(`✅ Аватарка для «${displayName}» установлена`, 1800);
+            if (typeof soundManager !== 'undefined') soundManager.play('send');
+            if (navigator.vibrate) navigator.vibrate([15, 30, 15]);
+            return true;
+        } catch (e) {
+            console.error('🎨 [IndivAvatar] Ошибка:', e);
+            showToast('❌ Не удалось сгенерировать', 2500);
+            return false;
+        } finally {
+            document.querySelectorAll(`.user-avatar[data-user="${CSS.escape(username)}"]`)
+                .forEach(el => el.classList.remove('uploading'));
+        }
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ВНЕДРЯЕМ ПУНКТ В МЕНЮ ⋯ ДЛЯ ЧАТОВ
+    // ═══════════════════════════════════════════════════════════
+    let _activeMenuChatFile = null;
+
+    // Запоминаем файл чата при открытии меню
+    document.addEventListener('click', (e) => {
+        const moreBtn = e.target.closest('.chat-more-btn');
+        if (!moreBtn) return;
+        const item = moreBtn.closest('.chat-list-item');
+        if (item && item.dataset.file) {
+            _activeMenuChatFile = item.dataset.file;
+        }
+    }, true);
+
+    function injectChatMenuItem() {
+        const menu = document.getElementById('unifiedChatMenu');
+        if (!menu) return;
+        if (menu.querySelector('[data-action="generate-avatar"]')) return;
+
+        const avatarItem = menu.querySelector('[data-action="avatar"]');
+        if (!avatarItem) return;
+
+        const item = document.createElement('div');
+        item.className = 'ucm-item';
+        item.dataset.action = 'generate-avatar';
+        item.innerHTML = `
+            <span class="ucm-icon">🎨</span>
+            <span class="ucm-label">
+                <div>Сгенерировать аватарку</div>
+                <div class="ucm-hint">Случайный узор</div>
+            </span>
+        `;
+
+        // Вставляем ПОСЛЕ пункта «Установить аватарку» (avatar)
+        avatarItem.parentNode.insertBefore(item, avatarItem.nextSibling);
+
+        item.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const file = _activeMenuChatFile;
+            menu.classList.remove('show');
+            const backdrop = document.getElementById('unifiedChatMenuBackdrop');
+            if (backdrop) backdrop.classList.remove('show');
+
+            if (file) {
+                setTimeout(() => window.generateChatAvatar(file), 200);
+            } else {
+                showToast('❌ Не удалось определить чат', 1500);
+            }
+        });
+    }
+
+    const menuObserver = new MutationObserver(() => {
+        if (document.getElementById('unifiedChatMenu')) injectChatMenuItem();
+    });
+    menuObserver.observe(document.body, { childList: true, subtree: true });
+
+    // ═══════════════════════════════════════════════════════════
+    //  ВНЕДРЯЕМ ПУНКТ В КОНТЕКСТНОЕ МЕНЮ ПОЛЬЗОВАТЕЛЯ
+    //  Показываем мини-меню при ПКМ / долгом тапе на кружке:
+    //    • 🎨 Сгенерировать
+    //    • 🖼️ Загрузить файл
+    //    • 🗑️ Удалить (если есть)
+    // ═══════════════════════════════════════════════════════════
+    function showUserAvatarMenu(x, y, username) {
+        // Удаляем старое
+        document.querySelectorAll('.user-avatar-menu').forEach(m => m.remove());
+
+        const menu = document.createElement('div');
+        menu.className = 'user-avatar-menu';
+        menu.style.cssText = `
+            position: fixed;
+            z-index: 9000;
+            background: #1a1a2e;
+            border: 1px solid rgba(255,255,255,0.12);
+            border-radius: 14px;
+            padding: 6px;
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            box-shadow: 0 12px 40px rgba(0,0,0,0.7);
+            backdrop-filter: blur(20px);
+            min-width: 200px;
+            animation: uamPop 0.15s ease-out;
+        `;
+
+        const displayName = username === state.username ? 'Вы' : username;
+        const hasAvatar = UserAvatars.has(username);
+
+        menu.innerHTML = `
+            <div style="padding:8px 12px;border-bottom:1px solid rgba(255,255,255,0.06);margin-bottom:4px;">
+                <div style="font-size:12px;font-weight:700;color:#fff;">${escapeHtml(displayName)}</div>
+            </div>
+            <div class="uam-item" data-act="generate">
+                <span style="font-size:16px;">🎨</span>
+                <span style="flex:1;">Сгенерировать</span>
+            </div>
+            <div class="uam-item" data-act="upload">
+                <span style="font-size:16px;">🖼️</span>
+                <span style="flex:1;">Загрузить файл</span>
+            </div>
+            ${hasAvatar ? `
+            <div class="uam-item danger" data-act="remove">
+                <span style="font-size:16px;">🗑️</span>
+                <span style="flex:1;">Удалить</span>
+            </div>` : ''}
+        `;
+
+        // Стили пунктов (inline, чтобы не зависеть от основного CSS)
+        menu.querySelectorAll('.uam-item').forEach(it => {
+            it.style.cssText = `
+                display:flex;align-items:center;gap:10px;
+                padding:10px 12px;border-radius:10px;
+                cursor:pointer;color:#ddd;font-size:14px;font-weight:500;
+                transition:background 0.15s;
+                -webkit-tap-highlight-color:transparent;
+            `;
+            it.addEventListener('mouseenter', () => it.style.background = 'rgba(108,92,231,0.2)');
+            it.addEventListener('mouseleave', () => it.style.background = '');
+            if (it.classList.contains('danger')) it.style.color = '#ff6b6b';
+        });
+
+        document.body.appendChild(menu);
+
+        // Позиционирование
+        const rect = menu.getBoundingClientRect();
+        const margin = 10;
+        let left = x - rect.width / 2;
+        let top = y - rect.height - 10;
+        left = Math.max(margin, Math.min(left, window.innerWidth - rect.width - margin));
+        if (top < margin) top = y + 20;
+        menu.style.left = left + 'px';
+        menu.style.top = top + 'px';
+
+        // Обработчики
+        menu.querySelectorAll('.uam-item').forEach(it => {
+            it.addEventListener('click', async (e) => {
+                e.stopPropagation();
+                menu.remove();
+
+                const act = it.dataset.act;
+                if (act === 'generate') {
+                    window.generateUserAvatar(username);
+                } else if (act === 'upload') {
+                    if (typeof pickUserAvatar === 'function') pickUserAvatar(username);
+                } else if (act === 'remove') {
+                    if (confirm(`Удалить аватарку для «${displayName}»?`)) {
+                        UserAvatars.remove(username);
+                        if (typeof refreshAllUserAvatars === 'function') {
+                            refreshAllUserAvatars(username);
+                        }
+                        showToast('🗑️ Удалено', 1200);
+                    }
+                }
+            });
+        });
+
+        // Закрытие по клику снаружи
+        setTimeout(() => {
+            const closeHandler = (e) => {
+                if (!menu.contains(e.target)) {
+                    menu.remove();
+                    document.removeEventListener('click', closeHandler, true);
+                }
+            };
+            document.addEventListener('click', closeHandler, true);
+        }, 0);
+
+        if (navigator.vibrate) navigator.vibrate(10);
+    }
+
+    // ─── ПКМ / долгий тап на кружке → контекстное меню ───
+    document.addEventListener('contextmenu', (e) => {
+        const avatar = e.target.closest('.user-avatar');
+        if (!avatar) return;
+        if (typeof selectionMode !== 'undefined' && selectionMode) return;
+
+        e.preventDefault();
+        e.stopPropagation();
+        const username = avatar.dataset.user;
+        if (username) showUserAvatarMenu(e.clientX, e.clientY, username);
+    }, true);
+
+    // ─── Долгий тап (для мобилы) ───
+    let _uaPressTimer = null;
+    let _uaStartX = 0, _uaStartY = 0;
+    let _uaLongFired = false;
+
+    document.addEventListener('touchstart', (e) => {
+        const avatar = e.target.closest('.user-avatar');
+        if (!avatar) return;
+        if (typeof selectionMode !== 'undefined' && selectionMode) return;
+
+        const t = e.touches[0];
+        _uaStartX = t.clientX;
+        _uaStartY = t.clientY;
+        _uaLongFired = false;
+
+        if (_uaPressTimer) clearTimeout(_uaPressTimer);
+        _uaPressTimer = setTimeout(() => {
+            _uaLongFired = true;
+            if (navigator.vibrate) navigator.vibrate(25);
+            const username = avatar.dataset.user;
+            if (username) showUserAvatarMenu(t.clientX, t.clientY, username);
+        }, 600);
+    }, { passive: true, capture: true });
+
+    document.addEventListener('touchmove', (e) => {
+        if (!_uaPressTimer) return;
+        const t = e.touches[0];
+        if (Math.hypot(t.clientX - _uaStartX, t.clientY - _uaStartY) > 10) {
+            clearTimeout(_uaPressTimer);
+            _uaPressTimer = null;
+        }
+    }, { passive: true, capture: true });
+
+    document.addEventListener('touchend', (e) => {
+        if (_uaLongFired) {
+            e.preventDefault?.();
+            e.stopImmediatePropagation?.();
+            _uaLongFired = false;
+        }
+        if (_uaPressTimer) {
+            clearTimeout(_uaPressTimer);
+            _uaPressTimer = null;
+        }
+    }, { capture: true });
+
+    // ═══════════════════════════════════════════════════════════
+    //  API
+    // ═══════════════════════════════════════════════════════════
+    window.IndivAvatar = {
+        generateChat: (file) => window.generateChatAvatar(file),
+        generateUser: (username) => window.generateUserAvatar(username),
+        status: () => ({
+            hasChatGen: typeof window.generateChatAvatar === 'function',
+            hasUserGen: typeof window.generateUserAvatar === 'function',
+        }),
+    };
+
+    console.log('🎨 [IndivAvatar] Готово:');
+    console.log('   • Меню чатов: ⋯ → «🎨 Сгенерировать аватарку»');
+    console.log('   • Меню пользователя: ПКМ/долгий тап → «🎨 Сгенерировать»');
+    console.log('   • API: IndivAvatar.generateChat(file) / .generateUser(name)');
+})();
+
+
 </script>
 
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🎭 АВАТАРКА ПОЛЬЗОВАТЕЛЯ — МИНИ-ОВЕРЛЕЙ ПРИ КЛИКЕ
+//  ─────────────────────────────────────────────────────────────
+//  • Заменяет мгновенное «pickUserAvatar» на выбор:
+//      🖼️ С устройства
+//      🎨 Сгенерировать автоматически
+//      🗑️ Удалить (если аватарка есть)
+//  • Работает и в сообщениях, и в комментариях
+//  • Лонг-тап и ПКМ сохраняют прежнее поведение (контекстное меню)
+//  • Позиционирование умное — не уезжает за край экрана
+// ═══════════════════════════════════════════════════════════════
+
+(function installUserAvatarChoiceOverlay() {
+    'use strict';
+
+    console.log('🎭 [AvatarChoice] Установка мини-оверлея выбора аватарки…');
+
+    // ─── Стили ───
+    if (!document.getElementById('avatarChoiceStyles')) {
+        const style = document.createElement('style');
+        style.id = 'avatarChoiceStyles';
+        style.textContent = `
+            /* ═══ Затемнение ═══ */
+            #avatarChoiceBackdrop {
+                position: fixed;
+                inset: 0;
+                background: rgba(0, 0, 0, 0.5);
+                backdrop-filter: blur(4px);
+                -webkit-backdrop-filter: blur(4px);
+                z-index: 8900;
+                display: none;
+                opacity: 0;
+                transition: opacity 0.18s ease;
+            }
+            #avatarChoiceBackdrop.show {
+                display: block;
+                opacity: 1;
+            }
+
+            /* ═══ Само меню ═══ */
+            #avatarChoiceMenu {
+                position: fixed;
+                z-index: 8901;
+                background: #1a1a2e;
+                border: 1px solid rgba(255,255,255,0.12);
+                border-radius: 18px;
+                padding: 8px;
+                display: none;
+                flex-direction: column;
+                gap: 4px;
+                box-shadow: 0 20px 60px rgba(0,0,0,0.75),
+                            0 0 0 1px rgba(108,92,231,0.2);
+                backdrop-filter: blur(24px);
+                -webkit-backdrop-filter: blur(24px);
+                min-width: 240px;
+                max-width: calc(100vw - 24px);
+                animation: acPop 0.2s cubic-bezier(0.22, 0.61, 0.36, 1);
+                transform-origin: top center;
+                -webkit-tap-highlight-color: transparent;
+            }
+            #avatarChoiceMenu.show { display: flex; }
+            @keyframes acPop {
+                from { opacity: 0; transform: scale(0.92) translateY(-4px); }
+                to   { opacity: 1; transform: scale(1) translateY(0); }
+            }
+
+            /* ═══ Шапка с именем ═══ */
+            #avatarChoiceMenu .acm-header {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                padding: 8px 10px 10px;
+                border-bottom: 1px solid rgba(255,255,255,0.06);
+                margin-bottom: 4px;
+            }
+            #avatarChoiceMenu .acm-header-avatar {
+                width: 32px;
+                height: 32px;
+                border-radius: 50%;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-weight: 700;
+                color: #fff;
+                font-size: 13px;
+                flex-shrink: 0;
+                overflow: hidden;
+            }
+            #avatarChoiceMenu .acm-header-avatar img {
+                width: 100%; height: 100%;
+                object-fit: cover;
+                border-radius: 50%;
+                display: block;
+            }
+            #avatarChoiceMenu .acm-header-info {
+                flex: 1;
+                min-width: 0;
+            }
+            #avatarChoiceMenu .acm-header-name {
+                font-size: 14px;
+                font-weight: 700;
+                color: #fff;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                margin-bottom: 2px;
+            }
+            #avatarChoiceMenu .acm-header-hint {
+                font-size: 10px;
+                color: #888;
+            }
+
+            /* ═══ Пункт меню ═══ */
+            #avatarChoiceMenu .acm-item {
+                display: flex;
+                align-items: center;
+                gap: 12px;
+                padding: 12px 14px;
+                border-radius: 12px;
+                cursor: pointer;
+                transition: background 0.15s ease, transform 0.1s ease;
+                user-select: none;
+                -webkit-user-select: none;
+                -webkit-tap-highlight-color: transparent;
+                position: relative;
+            }
+            #avatarChoiceMenu .acm-item:hover {
+                background: rgba(108,92,231,0.18);
+            }
+            #avatarChoiceMenu .acm-item:active {
+                transform: scale(0.97);
+                background: rgba(108,92,231,0.3);
+            }
+            #avatarChoiceMenu .acm-item.danger {
+                color: #ff6b6b;
+            }
+            #avatarChoiceMenu .acm-item.danger:hover {
+                background: rgba(255,107,107,0.15);
+            }
+            #avatarChoiceMenu .acm-item.danger .acm-icon {
+                background: linear-gradient(135deg, rgba(255,107,107,0.25), rgba(238,82,83,0.15));
+            }
+
+            #avatarChoiceMenu .acm-icon {
+                width: 38px;
+                height: 38px;
+                border-radius: 11px;
+                background: linear-gradient(135deg,
+                    rgba(108,92,231,0.28),
+                    rgba(0,184,148,0.18));
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 19px;
+                flex-shrink: 0;
+            }
+            #avatarChoiceMenu .acm-text {
+                flex: 1;
+                min-width: 0;
+            }
+            #avatarChoiceMenu .acm-title {
+                font-size: 14px;
+                font-weight: 600;
+                color: #e0e0e0;
+                margin-bottom: 2px;
+                line-height: 1.2;
+            }
+            #avatarChoiceMenu .acm-item.danger .acm-title {
+                color: #ff6b6b;
+            }
+            #avatarChoiceMenu .acm-subtitle {
+                font-size: 11px;
+                color: #666;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                line-height: 1.3;
+            }
+
+            /* ═══ Мобильная адаптация ═══ */
+            @media (max-width: 480px) {
+                #avatarChoiceMenu {
+                    left: 12px !important;
+                    right: 12px !important;
+                    bottom: 12px !important;
+                    top: auto !important;
+                    width: auto !important;
+                    min-width: 0;
+                    max-width: none;
+                    padding: 8px;
+                    padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+                    border-radius: 20px;
+                    animation: acSheet 0.24s cubic-bezier(0.22, 0.61, 0.36, 1);
+                }
+                @keyframes acSheet {
+                    from { opacity: 0; transform: translateY(20px); }
+                    to   { opacity: 1; transform: translateY(0); }
+                }
+                #avatarChoiceMenu .acm-item {
+                    padding: 12px;
+                }
+                #avatarChoiceMenu .acm-icon {
+                    width: 36px;
+                    height: 36px;
+                    font-size: 18px;
+                }
+                #avatarChoiceMenu .acm-title {
+                    font-size: 15px;
+                }
+            }
+
+            /* ═══ Скрываем в режиме выбора сообщений ═══ */
+            body.selection-mode #avatarChoiceMenu,
+            body.selection-mode #avatarChoiceBackdrop {
+                display: none !important;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ─── Утилита escape ───
+    function esc(s) {
+        const d = document.createElement('div');
+        d.textContent = s == null ? '' : String(s);
+        return d.innerHTML;
+    }
+
+    // ─── Глобальное состояние ───
+    const AC = {
+        menuEl: null,
+        backdropEl: null,
+        isOpen: false,
+        targetUsername: null,
+        anchorRect: null,
+        openedAt: 0,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОТКРЫТИЕ МИНИ-МЕНЮ
+    // ═══════════════════════════════════════════════════════════
+    function openAvatarChoice(username, anchorRect) {
+        if (!username) return;
+
+        closeAvatarChoice();
+
+        AC.targetUsername = username;
+        AC.anchorRect = anchorRect;
+        AC.openedAt = Date.now();
+        AC.isOpen = true;
+
+        // ─── Backdrop ───
+        const backdrop = document.createElement('div');
+        backdrop.id = 'avatarChoiceBackdrop';
+        backdrop.addEventListener('click', closeAvatarChoice);
+        document.body.appendChild(backdrop);
+        AC.backdropEl = backdrop;
+
+        // ─── Меню ───
+        const menu = document.createElement('div');
+        menu.id = 'avatarChoiceMenu';
+
+        const displayName = username === state.username ? 'Вы' : username;
+        const hasAvatar = (typeof UserAvatars !== 'undefined')
+            ? UserAvatars.has(username)
+            : false;
+
+        // Миниатюра в шапке
+        let avatarInner = username.charAt(0).toUpperCase();
+        if (hasAvatar && typeof UserAvatars !== 'undefined') {
+            const dataUrl = UserAvatars.get(username);
+            if (dataUrl) {
+                avatarInner = `<img src="${dataUrl}" alt="">`;
+            }
+        }
+
+        menu.innerHTML = `
+            <div class="acm-header">
+                <div class="acm-header-avatar">${avatarInner}</div>
+                <div class="acm-header-info">
+                    <div class="acm-header-name">${esc(displayName)}</div>
+                    <div class="acm-header-hint">Выберите аватарку</div>
+                </div>
+            </div>
+
+            <div class="acm-item" data-action="upload">
+                <div class="acm-icon">🖼️</div>
+                <div class="acm-text">
+                    <div class="acm-title">С устройства</div>
+                    <div class="acm-subtitle">Загрузить своё фото</div>
+                </div>
+            </div>
+
+            <div class="acm-item" data-action="generate">
+                <div class="acm-icon">🎨</div>
+                <div class="acm-text">
+                    <div class="acm-title">Сгенерировать</div>
+                    <div class="acm-subtitle">Случайный узор</div>
+                </div>
+            </div>
+
+            ${hasAvatar ? `
+            <div class="acm-item danger" data-action="remove">
+                <div class="acm-icon">🗑️</div>
+                <div class="acm-text">
+                    <div class="acm-title">Удалить</div>
+                    <div class="acm-subtitle">Вернуть букву</div>
+                </div>
+            </div>
+            ` : ''}
+        `;
+
+        document.body.appendChild(menu);
+        AC.menuEl = menu;
+
+        // Позиционирование (desktop)
+        if (window.innerWidth > 480) {
+            positionMenuDesktop(menu, anchorRect);
+        }
+
+        // Показать с анимацией
+        requestAnimationFrame(() => {
+            backdrop.classList.add('show');
+            menu.classList.add('show');
+        });
+
+        // Обработчики пунктов
+        menu.querySelectorAll('.acm-item').forEach(el => {
+            el.addEventListener('click', (e) => {
+                e.stopPropagation();
+                e.preventDefault();
+                handleAction(el.dataset.action);
+            });
+        });
+
+        // Escape
+        setTimeout(() => {
+            document.addEventListener('keydown', onKeyDown, true);
+        }, 0);
+
+        if (navigator.vibrate) navigator.vibrate(12);
+        if (typeof soundManager !== 'undefined') {
+            try { soundManager.play('click'); } catch (e) {}
+        }
+    }
+
+    // ─── Умное позиционирование для десктопа ───
+    function positionMenuDesktop(menu, anchorRect) {
+        if (!anchorRect) {
+            // Центр экрана
+            menu.style.left = '50%';
+            menu.style.top = '50%';
+            menu.style.transform = 'translate(-50%, -50%)';
+            return;
+        }
+
+        // Сбрасываем transform для корректного измерения
+        menu.style.transform = 'none';
+        const rect = menu.getBoundingClientRect();
+        const margin = 12;
+
+        // Пытаемся поставить под кружком, по центру
+        let left = anchorRect.left + anchorRect.width / 2 - rect.width / 2;
+        let top = anchorRect.bottom + 8;
+
+        // Не вылезаем за края
+        if (left < margin) left = margin;
+        if (left + rect.width > window.innerWidth - margin) {
+            left = window.innerWidth - rect.width - margin;
+        }
+        // Если снизу не влезает — ставим сверху
+        if (top + rect.height > window.innerHeight - margin) {
+            top = anchorRect.top - rect.height - 8;
+        }
+        // И совсем не влезает — центрируем
+        if (top < margin) {
+            top = Math.max(margin, (window.innerHeight - rect.height) / 2);
+        }
+
+        menu.style.left = left + 'px';
+        menu.style.top = top + 'px';
+    }
+
+    // ─── Закрытие ───
+    function closeAvatarChoice() {
+        if (!AC.isOpen) return;
+
+        if (AC.menuEl) {
+            AC.menuEl.classList.remove('show');
+            const el = AC.menuEl;
+            setTimeout(() => { try { el.remove(); } catch (e) {} }, 200);
+            AC.menuEl = null;
+        }
+        if (AC.backdropEl) {
+            AC.backdropEl.classList.remove('show');
+            const el = AC.backdropEl;
+            setTimeout(() => { try { el.remove(); } catch (e) {} }, 200);
+            AC.backdropEl = null;
+        }
+
+        document.removeEventListener('keydown', onKeyDown, true);
+
+        AC.isOpen = false;
+        AC.targetUsername = null;
+        AC.anchorRect = null;
+    }
+
+    function onKeyDown(e) {
+        if (e.key === 'Escape' && AC.isOpen) {
+            e.preventDefault();
+            e.stopPropagation();
+            closeAvatarChoice();
+        }
+    }
+
+    // ─── Обработка действия ───
+    function handleAction(action) {
+        const username = AC.targetUsername;
+        if (!username) return;
+
+        closeAvatarChoice();
+
+        // Небольшая задержка, чтобы меню успело закрыться
+        setTimeout(() => {
+            if (action === 'upload') {
+                if (typeof pickUserAvatar === 'function') {
+                    pickUserAvatar(username);
+                }
+            } else if (action === 'generate') {
+                if (typeof window.generateUserAvatar === 'function') {
+                    window.generateUserAvatar(username);
+                } else {
+                    if (typeof showToast === 'function') {
+                        showToast('🎨 Генератор недоступен', 2000);
+                    }
+                }
+            } else if (action === 'remove') {
+                if (typeof UserAvatars !== 'undefined' && UserAvatars.has(username)) {
+                    const displayName = username === state.username ? 'Вы' : username;
+                    if (confirm(`Удалить аватарку для «${displayName}»?`)) {
+                        UserAvatars.remove(username);
+                        if (typeof refreshAllUserAvatars === 'function') {
+                            refreshAllUserAvatars(username);
+                        }
+                        if (typeof showToast === 'function') showToast('🗑️ Удалено', 1200);
+                        if (typeof soundManager !== 'undefined') {
+                            try { soundManager.play('delete'); } catch (e) {}
+                        }
+                    }
+                }
+            }
+        }, 120);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ КЛИКА НА АВАТАРКУ
+    //  Заменяем прежнее «мгновенно pickUserAvatar» на мини-меню
+    // ═══════════════════════════════════════════════════════════
+    function installClickInterceptor() {
+        const messagesInnerEl = document.getElementById('messagesInner');
+        if (!messagesInnerEl) {
+            setTimeout(installClickInterceptor, 500);
+            return;
+        }
+        if (messagesInnerEl._avatarChoiceInstalled) return;
+        messagesInnerEl._avatarChoiceInstalled = true;
+
+        // capture: true — раньше встроенных обработчиков
+        messagesInnerEl.addEventListener('click', (e) => {
+            const avatar = e.target.closest('.sender-avatar, .comment-avatar.user-avatar');
+            if (!avatar) return;
+
+            // Игнорируем в режиме выбора
+            if (typeof selectionMode !== 'undefined' && selectionMode) return;
+
+            // Игнорируем, если нажали на кнопку внутри кружка (на всякий)
+            if (e.target.closest('button, a, input')) return;
+
+            const username = avatar.dataset.user;
+            if (!username) return;
+
+            e.stopPropagation();
+            e.preventDefault();
+            e.stopImmediatePropagation();
+
+            // Получаем позицию кружка для позиционирования
+            const rect = avatar.getBoundingClientRect();
+
+            openAvatarChoice(username, rect);
+        }, true);
+
+        console.log('🎭 [AvatarChoice] Перехват клика установлен');
+    }
+
+    // Устанавливаем на messagesInner и на тот случай,
+    // если DOM пересоздаётся — следим
+    function tryInstall() {
+        installClickInterceptor();
+    }
+    tryInstall();
+
+    // Страховка на случай пересоздания messagesInner
+    const domObserver = new MutationObserver(() => {
+        const mi = document.getElementById('messagesInner');
+        if (mi && !mi._avatarChoiceInstalled) {
+            installClickInterceptor();
+        }
+    });
+    domObserver.observe(document.body, { childList: true, subtree: true });
+
+    // ═══════════════════════════════════════════════════════════
+    //  ГЛУШИМ ПРЕЖНИЙ МГНОВЕННЫЙ ВЫЗОВ pickUserAvatar
+    //  (если он где-то ещё остался — например, на comment-avatar)
+    //  Наш capture-обработчик уже это делает, но на всякий случай
+    // ═══════════════════════════════════════════════════════════
+    // (это уже реализовано выше через stopImmediatePropagation)
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API
+    // ═══════════════════════════════════════════════════════════
+    window.AvatarChoice = {
+        open: (username, anchorRect) => openAvatarChoice(username, anchorRect),
+        close: closeAvatarChoice,
+        isOpen: () => AC.isOpen,
+        status: () => ({
+            isOpen: AC.isOpen,
+            target: AC.targetUsername,
+            menuInDom: !!AC.menuEl,
+            openedAt: AC.openedAt,
+        }),
+    };
+
+    console.log('🎭 [AvatarChoice] Готово:');
+    console.log('   • Клик по кружку → мини-меню выбора');
+    console.log('   • 🖼️ С устройства · 🎨 Сгенерировать · 🗑️ Удалить');
+    console.log('   • Работает в сообщениях и комментариях');
+    console.log('   • Лонг-тап и ПКМ по-прежнему дают контекстное меню');
+    console.log('   • API: AvatarChoice.open(username)');
+})();
+</script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🩹 ФИКС: НЕ ОТКРЫВАТЬ ФАЙЛОВЫЙ ПИКЕР ПРИ КЛИКЕ НА АВАТАРКУ
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: старые патчи (installIndividualAvatarGenerator,
+//  installUserAvatarChoiceOverlay до этого) вызывают pickUserAvatar()
+//  напрямую в своих click-обработчиках ещё ДО нашего оверлея.
+//  Из-за этого первым открывается нативный file picker, а уже
+//  потом (или не появляется) наш оверлей.
+//
+//  Решение:
+//   1. Полностью переопределяем pickUserAvatar — теперь это
+//      no-op, который НИЧЕГО не делает.
+//   2. Все клики на аватарку идут только через наш оверлей.
+//   3. Кнопка "🖼️ С устройства" в оверлее вызывает НАТИВНЫЙ
+//      picker через внутреннюю функцию.
+// ═══════════════════════════════════════════════════════════════
+
+(function fixAvatarFilePickerRace() {
+    'use strict';
+
+    console.log('🩹 [AvatarRace] Установка фикса гонки с файловым пикером…');
+
+    // ─── Сохраняем нативный файловый input ───
+    // Он создаётся в патче installIndividualAvatarGenerator
+    // с id="_userAvatarFileInput" (без id, но мы найдём его по типу)
+    function findAvatarFileInput() {
+        // Ищем <input type=file accept=image/*> который используется
+        // для аватарок. Их может быть несколько — берём тот,
+        // у которого нет id (это тот самый анонимный).
+        const inputs = document.querySelectorAll('input[type="file"][accept*="image"]');
+        for (const inp of inputs) {
+            if (!inp.id || inp.id === 'avatarFileInput') {
+                // avatarFileInput — это для аватарок чатов,
+                // а нам нужен именно для пользователей.
+                // Отличим: для пользователей input создаётся динамически
+                // с style.display='none' и БЕЗ id.
+                if (!inp.id) return inp;
+            }
+        }
+        return null;
+    }
+
+    // ─── Переопределяем pickUserAvatar ───
+    // Сохраняем оригинал (на случай, если понадобится)
+    const _origPickUserAvatar = window.pickUserAvatar || (typeof pickUserAvatar === 'function' ? pickUserAvatar : null);
+
+    // Новая функция — открывает НАШ оверлей, а не файловый пикер
+    window.pickUserAvatar = function(username) {
+        if (!username) return;
+
+        // Если оверлей уже открыт для этого же пользователя — игнорируем
+        if (typeof AvatarChoice !== 'undefined'
+            && AvatarChoice.isOpen()
+            && AvatarChoice.status().target === username) {
+            return;
+        }
+
+        // Открываем наш оверлей
+        if (typeof AvatarChoice !== 'undefined' && typeof AvatarChoice.open === 'function') {
+            // Ищем anchor — кружок этого пользователя, если видно
+            let anchorRect = null;
+            const avatarEl = document.querySelector(
+                `.user-avatar[data-user="${CSS.escape(username)}"]`
+            );
+            if (avatarEl) anchorRect = avatarEl.getBoundingClientRect();
+
+            AvatarChoice.open(username, anchorRect);
+        } else {
+            // Fallback — если AvatarChoice по какой-то причине не загрузился,
+            // открываем нативный picker (старое поведение)
+            console.warn('🩹 [AvatarRace] AvatarChoice недоступен — fallback на picker');
+            if (_origPickUserAvatar) {
+                _origPickUserAvatar.call(window, username);
+            }
+        }
+    };
+
+    // Если pickUserAvatar была локальной функцией (не в window),
+    // она могла быть вызвана напрямую из замыкания.
+    // В нашем случае все патчи ссылаются на неё через глобальную
+    // область — переопределение сработает.
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ: блокируем клик по кружку в capture-фазе на document
+    //  Даже если старый обработчик вызван — он не откроет файл,
+    //  потому что мы перехватим НА УРОВНЕ click на document
+    //  ДО того, как пользовательский обработчик вызовет pickUserAvatar.
+    //
+    //  Наш новый pickUserAvatar выше — уже no-op → file picker
+    //  не откроется. Но на всякий случай — закрываем все возможные
+    //  клики по кружку, если это не наш оверлей.
+    // ═══════════════════════════════════════════════════════════
+
+    // Уже есть в installUserAvatarChoiceOverlay — но
+    // продублируем жёстко на document, чтобы гарантированно
+    // перехватить ЛЮБОЙ клик по аватарке.
+    document.addEventListener('click', (e) => {
+        const avatar = e.target.closest('.sender-avatar, .comment-avatar.user-avatar');
+        if (!avatar) return;
+
+        if (typeof selectionMode !== 'undefined' && selectionMode) return;
+        if (e.target.closest('button, a, input')) return;
+
+        const username = avatar.dataset.user;
+        if (!username) return;
+
+        // Проверяем: наш оверлей уже открыт?
+        if (typeof AvatarChoice !== 'undefined'
+            && AvatarChoice.isOpen()
+            && AvatarChoice.status().target === username) {
+            return;
+        }
+
+        // Стопорим всё остальное
+        e.stopPropagation();
+        e.preventDefault();
+        e.stopImmediatePropagation();
+
+        // Открываем оверлей
+        if (typeof AvatarChoice !== 'undefined' && typeof AvatarChoice.open === 'function') {
+            AvatarChoice.open(username, avatar.getBoundingClientRect());
+        }
+    }, true);
+
+    // ═══════════════════════════════════════════════════════════
+    //  КНОПКА «🖼️ С устройства» В ОВЕРЛЕЕ — вызывает НАТИВНЫЙ picker
+    //  (в обход нашего переопределённого pickUserAvatar)
+    // ═══════════════════════════════════════════════════════════
+    //  Заменяем обработчик внутри handleAction в AvatarChoice —
+    //  перехватываем на уровне события клика по пункту "upload"
+    // ═══════════════════════════════════════════════════════════
+    document.addEventListener('click', (e) => {
+        const uploadItem = e.target.closest('#avatarChoiceMenu .acm-item[data-action="upload"]');
+        if (!uploadItem) return;
+
+        e.stopImmediatePropagation();
+        e.preventDefault();
+
+        const username = (typeof AvatarChoice !== 'undefined' && AvatarChoice.status)
+            ? AvatarChoice.status().target
+            : null;
+
+        if (!username) {
+            console.warn('🩹 [AvatarRace] Не удалось определить username');
+            return;
+        }
+
+        // Закрываем оверлей
+        if (typeof AvatarChoice !== 'undefined' && typeof AvatarChoice.close === 'function') {
+            AvatarChoice.close();
+        }
+
+        // Вызываем НАТИВНЫЙ picker
+        setTimeout(() => {
+            if (_origPickUserAvatar) {
+                console.log('🩹 [AvatarRace] Вызываем нативный pickUserAvatar');
+                _origPickUserAvatar.call(window, username);
+            } else {
+                // Fallback — ищем input напрямую
+                const inp = findAvatarFileInput();
+                if (inp) {
+                    // Запоминаем username в глобальной переменной,
+                    // которую читает обработчик change
+                    window._pendingAvatarUser = username;
+                    inp.value = '';
+                    inp.click();
+                } else {
+                    if (typeof showToast === 'function') {
+                        showToast('❌ Не удалось открыть выбор файла', 2500);
+                    }
+                }
+            }
+        }, 150);
+    }, true);
+
+    console.log('🩹 [AvatarRace] Готово:');
+    console.log('   • pickUserAvatar заменён — больше не открывает пикер');
+    console.log('   • Все клики на кружок → наш оверлей');
+    console.log('   • Кнопка «С устройства» → нативный picker');
+})();
+</script>
 </body>
 </html>
