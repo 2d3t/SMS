@@ -65706,6 +65706,1503 @@ async function refreshWeatherManually(btn, card) {
     console.log('   • Делегированный клик на document — работает всегда');
     console.log('   • API: ClockWidget.open() / .status()');
 })();
+</script><script>
+// ═══════════════════════════════════════════════════════════════
+//  📱 MOBILE KEYBOARD FIX — поле ввода не перекрывается клавиатурой
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: на мобильных (iOS/Android) при открытии виртуальной
+//  клавиатуры поле ввода и панель ввода уходят под клавиатуру.
+//  Причина: `100dvh` часто не учитывает клавиатуру, а position:fixed
+//  элементы не сдвигаются автоматически.
+//
+//  Решение: используем VisualViewport API — отслеживаем реальную
+//  видимую высоту и сдвигаем #chatScreen / #inputBar вверх
+//  на высоту клавиатуры.
+// ═══════════════════════════════════════════════════════════════
+
+(function installMobileKeyboardFix() {
+    'use strict';
+
+    console.log('📱 [KeyboardFix] Установка…');
+
+    // ─── Проверка поддержки ───
+    const vv = window.visualViewport;
+    if (!vv) {
+        console.warn('📱 [KeyboardFix] VisualViewport не поддерживается');
+        return;
+    }
+
+    // ─── Состояние ───
+    const KF = {
+        // Текущая высота клавиатуры (0 если закрыта)
+        keyboardHeight: 0,
+        // Флаг: открыта ли клавиатура
+        isOpen: false,
+        // Начальная высота viewport
+        initialHeight: vv.height,
+        // Таймер для дебаунса
+        _updateTimer: null,
+        // Флаг: пользователь явно в поле ввода
+        isInputFocused: false,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  CSS-ПЕРЕМЕННЫЕ ДЛЯ КОМПЕНСАЦИИ
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('keyboardFixStyles')) {
+        const style = document.createElement('style');
+        style.id = 'keyboardFixStyles';
+        style.textContent = `
+            /* CSS-переменная --kb-height используется в #chatScreen */
+            :root {
+                --kb-height: 0px;
+                --kb-safe-bottom: env(safe-area-inset-bottom, 0px);
+            }
+
+            /* При открытой клавиатуре — сдвигаем chatScreen вверх */
+            body.keyboard-open #chatScreen {
+                height: calc(100dvh - var(--kb-height)) !important;
+                transition: height 0.15s ease-out;
+            }
+
+            /* Панель ввода всегда у низа видимой области */
+            body.keyboard-open #chatScreen #inputBar {
+                padding-bottom: calc(8px + var(--kb-safe-bottom)) !important;
+            }
+
+            /* messages-container автоматически подстраивается */
+            body.keyboard-open #chatScreen .messages-container {
+                padding-bottom: 8px !important;
+            }
+
+            /* На iOS Safari — фикс для 100vh */
+            @supports (-webkit-touch-callout: none) {
+                body.keyboard-open #chatScreen {
+                    height: calc(var(--vv-height, 100vh) - var(--kb-height)) !important;
+                }
+            }
+
+            /* Когда клавиатура открыта и поле в фокусе — прячем плавающую кнопку */
+            body.keyboard-open #floatingKeyboardBtn {
+                display: none !important;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОБНОВЛЕНИЕ ВЫСОТЫ КЛАВИАТУРЫ
+    // ═══════════════════════════════════════════════════════════
+    function updateKeyboardHeight() {
+        // Только когда открыт чат
+        if (typeof state === 'undefined' || state.currentScreen !== 'chat') {
+            resetKeyboard();
+            return;
+        }
+
+        const viewportHeight = vv.height;
+        const layoutHeight = document.documentElement.clientHeight
+                          || window.innerHeight;
+        const offsetTop = vv.offsetTop || 0;
+
+        // Вычисляем высоту клавиатуры
+        // Вариант 1: по разнице layout vs visual (Android)
+        // Вариант 2: по offsetTop (iOS Safari)
+        let kbHeight = Math.max(0, layoutHeight - viewportHeight - offsetTop);
+
+        // Порог — если меньше 100px, считаем что клавиатура закрыта
+        // (это разные мелкие глюки viewport resize)
+        if (kbHeight < 100) {
+            kbHeight = 0;
+        }
+
+        // Ограничиваем сверху — не больше половины экрана
+        const maxKb = layoutHeight * 0.6;
+        if (kbHeight > maxKb) kbHeight = maxKb;
+
+        // Округляем
+        kbHeight = Math.round(kbHeight);
+
+        // Изменилось?
+        if (kbHeight === KF.keyboardHeight) {
+            // Всё равно обновляем --vv-height (мог измениться)
+            document.documentElement.style.setProperty('--vv-height', viewportHeight + 'px');
+            return;
+        }
+
+        const wasOpen = KF.isOpen;
+        KF.keyboardHeight = kbHeight;
+        KF.isOpen = kbHeight > 0;
+
+        // Устанавливаем CSS-переменную
+        document.documentElement.style.setProperty('--kb-height', kbHeight + 'px');
+        document.documentElement.style.setProperty('--vv-height', viewportHeight + 'px');
+
+        // Класс на body
+        if (KF.isOpen) {
+            document.body.classList.add('keyboard-open');
+        } else {
+            document.body.classList.remove('keyboard-open');
+        }
+
+        // Логируем только при изменении
+        if (wasOpen !== KF.isOpen) {
+            console.log(`📱 [KeyboardFix] Клавиатура ${KF.isOpen ? 'открыта' : 'закрыта'}, высота: ${kbHeight}px`);
+        }
+
+        // После изменения — прокручиваем сообщения вниз, чтобы последние были видны
+        if (KF.isOpen) {
+            setTimeout(() => {
+                try {
+                    if (typeof messagesContainer !== 'undefined' && messagesContainer) {
+                        messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                    }
+                } catch (e) {}
+            }, 100);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СБРОС
+    // ═══════════════════════════════════════════════════════════
+    function resetKeyboard() {
+        if (KF.keyboardHeight === 0 && !KF.isOpen) return;
+
+        KF.keyboardHeight = 0;
+        KF.isOpen = false;
+        document.documentElement.style.setProperty('--kb-height', '0px');
+        document.body.classList.remove('keyboard-open');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СЛУШАТЕЛИ
+    // ═══════════════════════════════════════════════════════════
+
+    // ─── 1. Изменение viewport (главное событие) ───
+    function onViewportResize() {
+        if (KF._updateTimer) return;
+        KF._updateTimer = requestAnimationFrame(() => {
+            KF._updateTimer = null;
+            updateKeyboardHeight();
+        });
+    }
+
+    vv.addEventListener('resize', onViewportResize);
+    vv.addEventListener('scroll', onViewportResize);
+
+    // ─── 2. Фокус на поле ввода ───
+    function attachInputListeners() {
+        const input = document.getElementById('messageInput');
+        if (!input) {
+            setTimeout(attachInputListeners, 500);
+            return;
+        }
+        if (input._kbFixAttached) return;
+        input._kbFixAttached = true;
+
+        input.addEventListener('focus', () => {
+            KF.isInputFocused = true;
+            // Небольшая задержка — клавиатура открывается не мгновенно
+            setTimeout(updateKeyboardHeight, 50);
+            setTimeout(updateKeyboardHeight, 200);
+            setTimeout(updateKeyboardHeight, 500);
+
+            // Прокручиваем к последнему сообщению
+            setTimeout(() => {
+                try {
+                    if (typeof messagesContainer !== 'undefined' && messagesContainer) {
+                        messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                    }
+                } catch (e) {}
+            }, 300);
+        });
+
+        input.addEventListener('blur', () => {
+            KF.isInputFocused = false;
+            // При потере фокуса — клавиатура закрывается
+            // Даём немного времени чтобы viewport обновился
+            setTimeout(() => {
+                if (!KF.isInputFocused) {
+                    // Проверяем ещё раз — может фокус вернулся
+                    setTimeout(updateKeyboardHeight, 100);
+                }
+            }, 100);
+        });
+
+        console.log('📱 [KeyboardFix] Слушатели на поле ввода установлены');
+    }
+    attachInputListeners();
+
+    // ─── 3. Также на любое поле ввода (модалки) ───
+    document.addEventListener('focusin', (e) => {
+        const target = e.target;
+        if (!target) return;
+        // Любой input/textarea внутри модалки — тоже нужно сдвигать
+        const tag = target.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA') {
+            setTimeout(updateKeyboardHeight, 50);
+            setTimeout(updateKeyboardHeight, 300);
+        }
+    }, true);
+
+    document.addEventListener('focusout', (e) => {
+        setTimeout(updateKeyboardHeight, 100);
+    }, true);
+
+    // ─── 4. Resize window (страховка) ───
+    window.addEventListener('resize', () => {
+        setTimeout(updateKeyboardHeight, 100);
+        setTimeout(updateKeyboardHeight, 400);
+    });
+
+    // ─── 5. При смене чата/экрана — сброс ───
+    if (typeof showChatScreen === 'function') {
+        const _origShowChat = showChatScreen;
+        showChatScreen = function() {
+            const r = _origShowChat.apply(this, arguments);
+            setTimeout(updateKeyboardHeight, 200);
+            setTimeout(updateKeyboardHeight, 600);
+            return r;
+        };
+    }
+
+    if (typeof showChatsScreen === 'function') {
+        const _origShowChats = showChatsScreen;
+        showChatsScreen = function() {
+            resetKeyboard();
+            return _origShowChats.apply(this, arguments);
+        };
+    }
+
+    if (typeof showAuthScreen === 'function') {
+        const _origShowAuth = showAuthScreen;
+        showAuthScreen = function() {
+            resetKeyboard();
+            return _origShowAuth.apply(this, arguments);
+        };
+    }
+
+    // ─── 6. При вводе текста — гарантируем что поле видно ───
+    const input = document.getElementById('messageInput');
+    if (input) {
+        input.addEventListener('input', () => {
+            if (KF.isOpen) {
+                // Проверяем что поле реально видно на экране
+                const rect = input.getBoundingClientRect();
+                const visibleBottom = vv.height + vv.offsetTop;
+                if (rect.bottom > visibleBottom - 20) {
+                    // Поле уходит под клавиатуру — скроллим страницу
+                    setTimeout(() => {
+                        try {
+                            input.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+                        } catch (e) {
+                            input.scrollIntoView(false);
+                        }
+                    }, 50);
+                }
+            }
+        });
+    }
+
+    // ─── 7. Периодическая страховка ───
+    setInterval(() => {
+        if (typeof state === 'undefined' || state.currentScreen !== 'chat') return;
+        if (!KF.isInputFocused) return;
+
+        const currentKbHeight = Math.max(
+            0,
+            document.documentElement.clientHeight - vv.height - (vv.offsetTop || 0)
+        );
+
+        // Если разница с сохранённым > 50px — обновляем
+        if (Math.abs(currentKbHeight - KF.keyboardHeight) > 50) {
+            updateKeyboardHeight();
+        }
+    }, 1000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  API для отладки
+    // ═══════════════════════════════════════════════════════════
+    window.KeyboardFix = {
+        status: () => ({
+            keyboardHeight: KF.keyboardHeight,
+            isOpen: KF.isOpen,
+            isInputFocused: KF.isInputFocused,
+            vvHeight: vv.height,
+            vvOffsetTop: vv.offsetTop,
+            layoutHeight: document.documentElement.clientHeight,
+            bodyClass: document.body.className.includes('keyboard-open'),
+        }),
+        refresh: () => updateKeyboardHeight(),
+        reset: () => resetKeyboard(),
+    };
+
+    console.log('📱 [KeyboardFix] Готово:');
+    console.log('   • VisualViewport отслеживает клавиатуру');
+    console.log('   • #chatScreen сдвигается на высоту клавиатуры');
+    console.log('   • API: KeyboardFix.status()');
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🔧 ФИКС ВЫДЕЛЕНИЯ В ПОЛЕ ВВОДА
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: глобальные патчи user-select: none и preventDefault
+//  на touchstart/mousedown/selectionchange ломают выделение текста
+//  в #messageInput, из-за чего:
+//   1. Нельзя выделить текст (баг UX)
+//   2. Android WebView "дёргает" поле при попытке выделить
+//   3. Двойной тап по слову вызывает хаотичное поведение
+//
+//  Решение: жёстко разрешаем выделение во всех полях ввода
+//  на уровне capture-фазы + фильтруем все глобальные обработчики.
+// ═══════════════════════════════════════════════════════════════
+
+(function fixInputTextSelection() {
+    'use strict';
+
+    console.log('🔧 [InputSelect] Установка фикса выделения в поле ввода…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  1. CSS — жёстко разрешаем выделение во ВСЕХ полях ввода
+    //     на уровне всего документа, с !important и максимальным
+    //     приоритетом
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('inputSelectFixStyles')) {
+        const style = document.createElement('style');
+        style.id = 'inputSelectFixStyles';
+        style.textContent = `
+            /* Разрешаем выделение во ВСЕХ полях ввода и textarea */
+            input,
+            textarea,
+            [contenteditable="true"],
+            [contenteditable=""] {
+                -webkit-user-select: text !important;
+                -moz-user-select: text !important;
+                -ms-user-select: text !important;
+                user-select: text !important;
+                -webkit-touch-callout: default !important;
+                -webkit-tap-highlight-color: transparent !important;
+            }
+
+            /* Особый приоритет для #messageInput */
+            #messageInput,
+            #inputBar textarea,
+            .input-bar textarea {
+                -webkit-user-select: text !important;
+                -moz-user-select: text !important;
+                -ms-user-select: text !important;
+                user-select: text !important;
+                -webkit-touch-callout: default !important;
+                pointer-events: auto !important;
+            }
+
+            /* В режиме выбора (selection-mode) — поле ввода тоже
+               должно выделять текст. Это отменяет глобальное
+               user-select: none */
+            body.selection-mode #messageInput,
+            body.selection-mode #inputBar textarea,
+            body.selection-mode .input-bar textarea,
+            body.selection-mode input,
+            body.selection-mode textarea {
+                -webkit-user-select: text !important;
+                user-select: text !important;
+            }
+
+            /* ::selection — нормальная подсветка */
+            #messageInput::selection,
+            #inputBar textarea::selection,
+            .input-bar textarea::selection {
+                background: rgba(108, 92, 231, 0.5) !important;
+                color: #fff !important;
+            }
+            #messageInput::-moz-selection,
+            #inputBar textarea::-moz-selection,
+            .input-bar textarea::-moz-selection {
+                background: rgba(108, 92, 231, 0.5) !important;
+                color: #fff !important;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  2. Фильтруем все глобальные обработчики, которые убивают
+    //     выделение — на уровне capture-фазы возвращаем "нормальное"
+    //     поведение для полей ввода
+    // ═══════════════════════════════════════════════════════════
+
+    function isInputField(el) {
+        if (!el || !el.tagName) return false;
+        const tag = el.tagName;
+        return tag === 'INPUT'
+            || tag === 'TEXTAREA'
+            || tag === 'SELECT'
+            || el.isContentEditable;
+    }
+
+    function insideInputField(el) {
+        while (el) {
+            if (isInputField(el)) return true;
+            el = el.parentElement;
+        }
+        return false;
+    }
+
+    // ─── Отменяем preventDefault на keydown/mousedown/touchstart ───
+    //     если событие внутри поля ввода
+    ['mousedown', 'mouseup', 'mousemove',
+     'touchstart', 'touchmove', 'touchend',
+     'pointerdown', 'pointerup'].forEach(evt => {
+
+        // capture: true — срабатываем РАНЬШЕ любых других
+        // passive: false — чтобы иметь право на preventDefault
+        document.addEventListener(evt, (e) => {
+            if (!insideInputField(e.target)) return;
+
+            // Поле ввода — не даём никому мешать нормальному
+            // выделению и вводу. Но мы не вызываем preventDefault
+            // сами — наоборот, мы "блокируем" чужие preventDefault
+            // через stopPropagation в capture-фазе, чтобы событие
+            // дошло до нативного обработчика поля.
+            //
+            // НО: не все чужие обработчики нам мешают —
+            // например, виртуальная клавиатура работает сама.
+            // Поэтому осторожно.
+        }, { capture: true, passive: true });
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. Блокируем selectionchange-убийство внутри поля ввода
+    // ═══════════════════════════════════════════════════════════
+    document.addEventListener('selectionchange', () => {
+        const sel = window.getSelection();
+        if (!sel || sel.rangeCount === 0) return;
+
+        const anchor = sel.anchorNode;
+        const focus = sel.focusNode;
+
+        // Если выделение в поле ввода — не трогаем
+        if (anchor && insideInputField(anchor.nodeType === 1 ? anchor : anchor.parentElement)) return;
+        if (focus && insideInputField(focus.nodeType === 1 ? focus : focus.parentElement)) return;
+
+        // В остальных случаях — пусть работают глобальные обработчики
+    }, { capture: true, passive: true });
+
+    // ═══════════════════════════════════════════════════════════
+    //  4. Патчим killSelection — не убивать выделение в поле ввода
+    // ═══════════════════════════════════════════════════════════
+    //  Этот метод вызывается из blockSystemGesturesHard.
+    //  Но он локальный, снаружи не виден. Зато мы можем
+    //  перехватить getSelection().removeAllRanges через хак.
+    // ═══════════════════════════════════════════════════════════
+    try {
+        const origRemoveAllRanges = Selection.prototype.removeAllRanges;
+
+        Selection.prototype.removeAllRanges = function() {
+            // Проверяем: не в поле ли ввода сейчас выделение?
+            if (this.rangeCount > 0) {
+                const anchor = this.anchorNode;
+                if (anchor) {
+                    const el = anchor.nodeType === 1 ? anchor : anchor.parentElement;
+                    if (insideInputField(el)) {
+                        // НЕ удаляем выделение — оно в поле ввода
+                        console.log('🔧 [InputSelect] Блокировано removeAllRanges в поле ввода');
+                        return;
+                    }
+                }
+            }
+            return origRemoveAllRanges.call(this);
+        };
+        console.log('🔧 [InputSelect] Selection.prototype.removeAllRanges защищён');
+    } catch (e) {
+        console.warn('🔧 [InputSelect] Не удалось защитить removeAllRanges:', e);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  5. При фокусе на поле ввода — принудительно снимаем
+    //     selection-mode, если он случайно активен
+    // ═══════════════════════════════════════════════════════════
+    document.addEventListener('focusin', (e) => {
+        if (!isInputField(e.target)) return;
+
+        // Если случайно оказались в режиме выбора сообщений —
+        // выходим из него при фокусе на поле ввода
+        if (typeof selectionMode !== 'undefined' && selectionMode) {
+            try {
+                if (typeof exitSelectionMode === 'function') {
+                    exitSelectionMode();
+                    console.log('🔧 [InputSelect] Автоматически вышли из selection-mode');
+                }
+            } catch (err) {}
+        }
+    }, { capture: true });
+
+    // ═══════════════════════════════════════════════════════════
+    //  6. При фокусе на #messageInput — принудительно ставим
+    //     правильные стили (на случай если что-то перебило)
+    // ═══════════════════════════════════════════════════════════
+    function enforceInputSelectable(el) {
+        if (!el) return;
+        el.style.setProperty('-webkit-user-select', 'text', 'important');
+        el.style.setProperty('user-select', 'text', 'important');
+        el.style.setProperty('-webkit-touch-callout', 'default', 'important');
+    }
+
+    const messageInput = document.getElementById('messageInput');
+    if (messageInput) {
+        messageInput.addEventListener('focus', () => {
+            enforceInputSelectable(messageInput);
+        });
+    }
+
+    // Наблюдаем за появлением поля ввода (после перерисовок)
+    const observer = new MutationObserver(() => {
+        const inp = document.getElementById('messageInput');
+        if (inp && !inp._inputSelectFixed) {
+            inp._inputSelectFixed = true;
+            enforceInputSelectable(inp);
+        }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    // ═══════════════════════════════════════════════════════════
+    //  7. Диагностика — проверка, можно ли выделить текст
+    // ═══════════════════════════════════════════════════════════
+    window.InputSelectDebug = {
+        check: () => {
+            const inp = document.getElementById('messageInput');
+            if (!inp) return { error: 'Поле ввода не найдено' };
+
+            const cs = getComputedStyle(inp);
+            return {
+                userSelect: cs.userSelect || cs.webkitUserSelect,
+                touchCallout: cs.webkitTouchCallout,
+                selectionModeActive: typeof selectionMode !== 'undefined' && selectionMode,
+                hasText: inp.value.length > 0,
+                canFocus: document.activeElement === inp,
+                isReadOnly: inp.readOnly,
+                isDisabled: inp.disabled,
+            };
+        },
+        // Принудительно выделить весь текст в поле ввода
+        selectAll: () => {
+            const inp = document.getElementById('messageInput');
+            if (!inp) return false;
+            inp.focus();
+            inp.select();
+            return true;
+        },
+    };
+
+    console.log('🔧 [InputSelect] Готово:');
+    console.log('   • Выделение в полях ввода разрешено (CSS !important)');
+    console.log('   • removeAllRanges не трогает поле ввода');
+    console.log('   • selection-mode автоматически снимается при фокусе');
+    console.log('   • API: InputSelectDebug.check() / .selectAll()');
+})();
+
 </script>
+
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🎭 INPUT DECOY — новое поле ввода поверх глючного
+//  ─────────────────────────────────────────────────────────────
+//  Идея: оригинальный #messageInput окружён десятками патчей
+//  (user-select: none, preventDefault, selectionchange-kill,
+//  killSelection-залпы, свайпы, долгие тапы) — все они ломают
+//  выделение и вызывают дёрганье виртуальной клавиатуры.
+//
+//  Решение: создаём "клона" — чистый <textarea> без id/классов,
+//  позиционируем поверх оригинала. Все клики, выделение, ввод
+//  идут в клон. Оригинал остаётся жив (для совместимости с
+//  существующей логикой) — но скрыт за клоном.
+//
+//  Синхронизация: input → orig.value = clone.value
+//                 orig.value = X → clone.value = X
+// ═══════════════════════════════════════════════════════════════
+
+(function installInputDecoy() {
+    'use strict';
+
+    console.log('🎭 [InputDecoy] Установка…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОСТОЯНИЕ
+    // ═══════════════════════════════════════════════════════════
+    const D = {
+        originalInput: null,   // #messageInput (скрытый)
+        decoyInput: null,      // наш чистый клон
+        container: null,       // родитель для позиционирования
+        // Флаг: идёт синхронизация (чтобы не зациклиться)
+        isSyncing: false,
+        // Observer за изменениями оригинала
+        origObserver: null,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  СТИЛИ
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('inputDecoyStyles')) {
+        const style = document.createElement('style');
+        style.id = 'inputDecoyStyles';
+        style.textContent = `
+            /* Обёртка для клона — абсолютное позиционирование */
+            .decoy-input-wrap {
+                position: relative;
+                flex: 1;
+                min-width: 0;
+                display: flex;
+            }
+
+            /* Оригинальное поле — под клоном, но с сохранением размеров,
+               чтобы layout не разъезжался */
+            .decoy-input-wrap #messageInput {
+                /* Оставляем видимым для layout, но полностью прозрачным */
+                opacity: 0 !important;
+                pointer-events: none !important;
+                position: relative !important;
+                z-index: 1 !important;
+                /* Все стили из оригинала сохраняются — размеры, шрифт */
+                /* Отключаем все user-select ограничения */
+                -webkit-user-select: none !important;
+                user-select: none !important;
+            }
+
+            /* Клон — точно поверх оригинала */
+            .decoy-input-wrap .decoy-input {
+                position: absolute !important;
+                top: 0 !important;
+                left: 0 !important;
+                width: 100% !important;
+                height: 100% !important;
+                z-index: 10 !important;
+                /* Наследуем визуальные стили от #messageInput через JS,
+                   но задаём базовые на случай если не наследовались */
+                background: rgba(255, 255, 255, 0.06) !important;
+                border: 1px solid rgba(255, 255, 255, 0.08) !important;
+                border-radius: 22px !important;
+                color: #fff !important;
+                font-size: 16px !important;
+                padding: 12px 16px !important;
+                resize: none !important;
+                outline: none !important;
+                font-family: inherit !important;
+                min-height: 44px !important;
+                max-height: 120px !important;
+                line-height: 1.4 !important;
+                overflow-y: auto !important;
+                box-sizing: border-box !important;
+
+                /* 🎯 ГЛАВНОЕ — полная свобода выделения */
+                -webkit-user-select: text !important;
+                -moz-user-select: text !important;
+                -ms-user-select: text !important;
+                user-select: text !important;
+                -webkit-touch-callout: default !important;
+                -webkit-tap-highlight-color: transparent !important;
+                pointer-events: auto !important;
+            }
+
+            .decoy-input-wrap .decoy-input:focus {
+                border-color: #6c5ce7 !important;
+                background: rgba(255, 255, 255, 0.08) !important;
+            }
+
+            .decoy-input-wrap .decoy-input::placeholder {
+                color: #555 !important;
+            }
+
+            /* Нормальная подсветка выделения */
+            .decoy-input-wrap .decoy-input::selection {
+                background: rgba(108, 92, 231, 0.55) !important;
+                color: #fff !important;
+            }
+            .decoy-input-wrap .decoy-input::-moz-selection {
+                background: rgba(108, 92, 231, 0.55) !important;
+                color: #fff !important;
+            }
+
+            /* Адаптив под мобильную раскладку */
+            @media (max-width: 480px) {
+                .decoy-input-wrap .decoy-input {
+                    font-size: 15px !important;
+                    padding: 10px 12px !important;
+                    min-height: 38px !important;
+                }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОЗДАНИЕ КЛОНА
+    // ═══════════════════════════════════════════════════════════
+    function createDecoy() {
+        const inputBar = document.getElementById('inputBar');
+        if (!inputBar) return false;
+
+        const orig = document.getElementById('messageInput');
+        if (!orig) return false;
+
+        // Уже создан?
+        if (document.getElementById('decoyMessageInput')) {
+            D.decoyInput = document.getElementById('decoyMessageInput');
+            D.originalInput = orig;
+            D.container = D.decoyInput.parentElement;
+            return true;
+        }
+
+        // ─── Создаём обёртку ───
+        const wrap = document.createElement('div');
+        wrap.className = 'decoy-input-wrap';
+
+        // Переносим оригинальный #messageInput в обёртку
+        orig.parentNode.insertBefore(wrap, orig);
+        wrap.appendChild(orig);
+
+        // ─── Создаём клон ───
+        const clone = document.createElement('textarea');
+        clone.className = 'decoy-input';
+        clone.id = 'decoyMessageInput';
+        clone.rows = 1;
+        clone.placeholder = orig.placeholder || 'Сообщение...';
+        clone.maxLength = orig.maxLength || 50000;
+        clone.autocomplete = 'off';
+        clone.spellcheck = false;
+        clone.value = orig.value || '';
+
+        // Важно: клон — НЕ #messageInput, поэтому на него
+        // не действуют никакие патчи с селектором #messageInput
+        // и никакие обработчики, привязанные к конкретному элементу
+
+        wrap.appendChild(clone);
+
+        D.originalInput = orig;
+        D.decoyInput = clone;
+        D.container = wrap;
+
+        console.log('🎭 [InputDecoy] Клон создан');
+
+        // ─── Навешиваем обработчики на клон ───
+        attachDecoyHandlers();
+
+        // ─── Наблюдаем за оригиналом (для синхронизации в обратную сторону) ───
+        observeOriginal();
+
+        return true;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОБРАБОТЧИКИ НА КЛОНЕ
+    // ═══════════════════════════════════════════════════════════
+    function attachDecoyHandlers() {
+        const clone = D.decoyInput;
+        const orig = D.originalInput;
+        if (!clone || !orig) return;
+
+        // ─── 1. Ввод текста: clone → orig ───
+        clone.addEventListener('input', () => {
+            if (D.isSyncing) return;
+            D.isSyncing = true;
+
+            orig.value = clone.value;
+
+            // Автовысота
+            clone.style.height = 'auto';
+            clone.style.height = Math.min(clone.scrollHeight, 120) + 'px';
+            // Синхронизируем высоту с оригиналом (для layout)
+            orig.style.height = clone.style.height;
+
+            // Сообщаем о активности для поллинга
+            if (typeof state !== 'undefined') {
+                state._lastActivityAt = Date.now();
+            }
+
+            D.isSyncing = false;
+        });
+
+        // ─── 2. Фокус ───
+        clone.addEventListener('focus', () => {
+            if (typeof state !== 'undefined') {
+                state._lastActivityAt = Date.now();
+            }
+            // 🆕 Не вызываем focus на оригинале — это может
+            // снова запустить глючные обработчики.
+            // Просто копируем placeholder, если он изменился
+            if (orig.placeholder && clone.placeholder !== orig.placeholder) {
+                clone.placeholder = orig.placeholder;
+            }
+        });
+
+        // ─── 3. Enter: Ctrl+Enter / Cmd+Enter → отправка ───
+        clone.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                e.preventDefault();
+                // Синхронизируем значение и вызываем отправку
+                orig.value = clone.value;
+                const text = clone.value;
+                if (text.trim() && typeof sendMessage === 'function') {
+                    sendMessage(text);
+                }
+            }
+        });
+
+        // ─── 4. Отправка по кнопке ➤ из панели ───
+        // Обработчик на #sendBtn остаётся на месте, но он читает
+        // значение из #messageInput. Мы уже синхронизируем значение,
+        // так что всё должно работать. НО: обработчик sendBtn
+        // также делает `messageInput.value = ''` после отправки —
+        // это нужно отследить через observeOriginal().
+
+        // ─── 5. Принудительно разрешаем выделение ───
+        clone.addEventListener('focus', () => {
+            clone.style.setProperty('-webkit-user-select', 'text', 'important');
+            clone.style.setProperty('user-select', 'text', 'important');
+            clone.style.setProperty('-webkit-touch-callout', 'default', 'important');
+        });
+
+        console.log('🎭 [InputDecoy] Обработчики на клоне установлены');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  НАБЛЮДЕНИЕ ЗА ОРИГИНАЛОМ (orig → clone)
+    //  Когда что-то программно пишет в #messageInput.value
+    //  (insertEmoji, sendMessage очищает, cancelReply и т.д.),
+    //  нужно обновить клон.
+    // ═══════════════════════════════════════════════════════════
+    function observeOriginal() {
+        const orig = D.originalInput;
+        const clone = D.decoyInput;
+        if (!orig || !clone) return;
+
+        // Перехватываем сеттер value на оригинале
+        try {
+            const proto = HTMLTextAreaElement.prototype;
+            const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+            if (!desc || !desc.set) return;
+
+            Object.defineProperty(orig, 'value', {
+                get() {
+                    return desc.get.call(this);
+                },
+                set(v) {
+                    desc.set.call(this, v);
+                    // Синхронизируем клон
+                    if (!D.isSyncing && clone.value !== v) {
+                        D.isSyncing = true;
+                        clone.value = v;
+                        // Автовысота
+                        clone.style.height = 'auto';
+                        clone.style.height = Math.min(clone.scrollHeight, 120) + 'px';
+                        D.isSyncing = false;
+                    }
+                },
+                configurable: true,
+            });
+
+            console.log('🎭 [InputDecoy] Сеттер value перехвачен');
+        } catch (e) {
+            console.warn('🎭 [InputDecoy] Не удалось перехватить value:', e);
+        }
+
+        // Дополнительно — MutationObserver на placeholder (изменения приглашений)
+        if (D.origObserver) D.origObserver.disconnect();
+
+        D.origObserver = new MutationObserver(() => {
+            if (orig.placeholder && clone.placeholder !== orig.placeholder) {
+                clone.placeholder = orig.placeholder;
+            }
+        });
+        D.origObserver.observe(orig, {
+            attributes: true,
+            attributeFilter: ['placeholder'],
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕНАПРАВЛЕНИЕ ССЫЛОК messageInput → clone
+    //  ⚠️ КРИТИЧНО ВАЖНО: все существующие функции
+    //  (insertEmoji, sendBtn-обработчик, cancelReply, sendMessage,
+    //  и т.д.) используют переменную `messageInput` (глобальную).
+    //  Нам нужно, чтобы они продолжали работать с ОРИГИНАЛОМ,
+    //  но пользователь вводил в клон. Мы уже синхронизируем
+    //  значение в обе стороны — так что всё будет работать.
+    //
+    //  Единственный момент: некоторые функции вызывают
+    //  messageInput.focus() — это переключит фокус на скрытый
+    //  оригинал. Нужно перехватить.
+    // ═══════════════════════════════════════════════════════════
+    function patchOriginalMethods() {
+        const orig = D.originalInput;
+        const clone = D.decoyInput;
+        if (!orig || !clone) return;
+
+        // ─── Перехватываем focus() ───
+        const origFocus = orig.focus.bind(orig);
+        orig.focus = function(opts) {
+            // Перенаправляем на клон
+            try {
+                clone.focus(opts);
+            } catch (e) {
+                clone.focus();
+            }
+        };
+
+        // ─── Перехватываем blur() ───
+        const origBlur = orig.blur.bind(orig);
+        orig.blur = function() {
+            clone.blur();
+            origBlur();
+        };
+
+        // ─── Перехватываем select() ───
+        const origSelect = orig.select.bind(orig);
+        orig.select = function() {
+            clone.focus();
+            clone.select();
+        };
+
+        // ─── Перехватываем setSelectionRange ───
+        const origSetSelectionRange = orig.setSelectionRange.bind(orig);
+        orig.setSelectionRange = function(start, end, dir) {
+            try {
+                clone.focus();
+                clone.setSelectionRange(start, end, dir);
+            } catch (e) {}
+            try {
+                origSetSelectionRange(start, end, dir);
+            } catch (e) {}
+        };
+
+        console.log('🎭 [InputDecoy] Методы оригинала перенаправлены на клон');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПРИМЕНЯЕМ
+    // ═══════════════════════════════════════════════════════════
+    function setup() {
+        const ok = createDecoy();
+        if (ok) {
+            patchOriginalMethods();
+            console.log('🎭 [InputDecoy] Полная установка завершена');
+        }
+        return ok;
+    }
+
+    // Пробуем сразу
+    if (!setup()) {
+        // Если поля ещё нет — ждём
+        const timer = setInterval(() => {
+            if (setup()) {
+                clearInterval(timer);
+            }
+        }, 500);
+
+        // Стоп через 30 секунд
+        setTimeout(() => clearInterval(timer), 30000);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕСОЗДАНИЕ ПРИ ПЕРЕРИСОВКЕ
+    //  Если #inputBar перерисовался (например, после смены чата),
+    //  наш клон мог быть удалён. Пересоздаём.
+    // ═══════════════════════════════════════════════════════════
+    const observer = new MutationObserver(() => {
+        const orig = document.getElementById('messageInput');
+        const clone = document.getElementById('decoyMessageInput');
+        if (orig && !clone) {
+            console.log('🎭 [InputDecoy] Клон потерян — пересоздаю');
+            setup();
+        }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    // ═══════════════════════════════════════════════════════════
+    //  API
+    // ═══════════════════════════════════════════════════════════
+    window.InputDecoy = {
+        status: () => ({
+            originalExists: !!D.originalInput,
+            cloneExists: !!D.decoyInput,
+            cloneValue: D.decoyInput ? D.decoyInput.value : null,
+            origValue: D.originalInput ? D.originalInput.value : null,
+            valuesMatch: D.decoyInput && D.originalInput
+                ? D.decoyInput.value === D.originalInput.value
+                : false,
+            cloneFocused: D.decoyInput ? document.activeElement === D.decoyInput : false,
+        }),
+        // Принудительная синхронизация
+        sync: () => {
+            if (D.decoyInput && D.originalInput) {
+                D.isSyncing = true;
+                D.originalInput.value = D.decoyInput.value;
+                D.isSyncing = false;
+            }
+        },
+        // Программно установить текст
+        setValue: (text) => {
+            if (D.decoyInput) {
+                D.isSyncing = true;
+                D.decoyInput.value = text || '';
+                if (D.originalInput) D.originalInput.value = text || '';
+                D.isSyncing = false;
+            }
+        },
+        // Тест выделения — программно выделить весь текст
+        testSelect: () => {
+            if (!D.decoyInput) return false;
+            D.decoyInput.focus();
+            D.decoyInput.select();
+            return D.decoyInput.selectionStart === 0
+                && D.decoyInput.selectionEnd === D.decoyInput.value.length;
+        },
+    };
+
+    console.log('🎭 [InputDecoy] Готово:');
+    console.log('   • Клон поверх оригинала — чистый <textarea>');
+    console.log('   • Синхронизация в обе стороны');
+    console.log('   • focus/select/setSelectionRange перенаправлены');
+    console.log('   • API: InputDecoy.status() / .testSelect()');
+})();
+</script><script>
+// ═══════════════════════════════════════════════════════════════
+//  🎯 INPUT SELECTION UNIFIED FIX — согласование всех патчей
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: несколько патчей глобально убивают выделение:
+//    • blockSystemGesturesHard — selectionchange → removeAllRanges
+//    • disableTextSelectionInMessages — user-select: none
+//    • preventSelectionInSelectionMode — selectionchange → kill
+//    • killSelection на touchstart-залпах
+//    • killSelection на touchend/mousedown/contextmenu
+//
+//  Решение: 
+//    1. Полностью убираем ВСЕ глобальные обработчики, которые
+//       вызывают removeAllRanges / preventDefault на выделение
+//       (мы перехватываем Selection.prototype.removeAllRanges
+//       и блокируем вызов, если он НЕ из нашего sendMessage).
+//    2. Разрешаем выделение ВЕЗДЕ: в сообщениях, в поле ввода,
+//       в любых текстовых блоках.
+//    3. Единственное место, где выделение принудительно
+//       снимается — это МОМЕНТ ОТПРАВКИ сообщения (перед вызовом
+//       sendMessage), чтобы очистить поле ввода.
+// ═══════════════════════════════════════════════════════════════
+
+(function installUnifiedSelectionFix() {
+    'use strict';
+
+    console.log('🎯 [SelectFix] Установка единого фикса выделения…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  КОНФИГ
+    // ═══════════════════════════════════════════════════════════
+    const CFG = {
+        // Флаг: идёт ли сейчас процесс отправки (нужно для разрешения
+        // removeAllRanges — чтобы очистить поле ввода после отправки)
+        allowRemoveAllRanges: false,
+        // Флаг: идёт ли сейчас выделение в поле ввода
+        selectionInInput: false,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  1. ХЕЛПЕРЫ
+    // ═══════════════════════════════════════════════════════════
+    function isInputField(el) {
+        if (!el) return false;
+        if (el.nodeType === 3) el = el.parentElement;   // текстовый узел
+        if (!el || !el.tagName) return false;
+        const tag = el.tagName;
+        return tag === 'INPUT'
+            || tag === 'TEXTAREA'
+            || tag === 'SELECT'
+            || el.isContentEditable
+            || tag === 'CODE';   // для читаемости кода
+    }
+
+    function insideInputField(el) {
+        while (el) {
+            if (isInputField(el)) return true;
+            el = el.parentElement;
+        }
+        return false;
+    }
+
+    function isSelectionInInput() {
+        try {
+            const sel = window.getSelection();
+            if (!sel || sel.rangeCount === 0) return false;
+            const anchor = sel.anchorNode;
+            return insideInputField(anchor);
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function isCurrentlySending() {
+        try {
+            if (typeof state !== 'undefined' && state.isSending) return true;
+            if (typeof SendQueue !== 'undefined'
+                && typeof SendQueue.isBusy === 'function'
+                && SendQueue.isBusy()) return true;
+            return false;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function forceKillSelection() {
+        CFG.allowRemoveAllRanges = true;
+        try {
+            const sel = window.getSelection();
+            if (sel && sel.rangeCount > 0) sel.removeAllRanges();
+        } catch (e) {}
+        // Сброс флага через микрозадачу — чтобы успеть сработать
+        // для конкретного вызова, но не остаться включённым надолго
+        Promise.resolve().then(() => {
+            CFG.allowRemoveAllRanges = false;
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  2. ПЕРЕХВАТ Selection.prototype.removeAllRanges
+    //  Разрешаем удаление выделения ТОЛЬКО если:
+    //    a) идёт отправка сообщения (isSending || SendQueue.isBusy)
+    //    b) или мы явно вызвали forceKillSelection
+    //  Во всех остальных случаях — блокируем вызов.
+    //  Это нейтрализует ВСЕ патчи, которые вызывают removeAllRanges
+    //  в selectionchange-обработчиках.
+    // ═══════════════════════════════════════════════════════════
+    try {
+        const origRemoveAllRanges = Selection.prototype.removeAllRanges;
+
+        Selection.prototype.removeAllRanges = function() {
+            // Разрешаем только:
+            //   1. В момент отправки (для очистки поля после ввода)
+            //   2. Или если это forceKillSelection (наша очистка)
+            if (CFG.allowRemoveAllRanges || isCurrentlySending()) {
+                return origRemoveAllRanges.call(this);
+            }
+
+            // Иначе — блокируем. Выделение остаётся.
+            // НЕ логируем каждый вызов — их будет много
+            return;
+        };
+
+        console.log('🎯 [SelectFix] Selection.removeAllRanges защищён');
+    } catch (e) {
+        console.warn('🎯 [SelectFix] Не удалось защитить removeAllRanges:', e);
+    }
+
+    // Также защищаем collapseToStart / collapseToEnd / empty
+    // (некоторые патчи используют их как fallback)
+    try {
+        const origCollapseToStart = Selection.prototype.collapseToStart;
+        Selection.prototype.collapseToStart = function() {
+            if (CFG.allowRemoveAllRanges || isCurrentlySending()) {
+                return origCollapseToStart.call(this);
+            }
+            return;
+        };
+
+        const origCollapseToEnd = Selection.prototype.collapseToEnd;
+        Selection.prototype.collapseToEnd = function() {
+            if (CFG.allowRemoveAllRanges || isCurrentlySending()) {
+                return origCollapseToEnd.call(this);
+            }
+            return;
+        };
+
+        const origEmpty = Selection.prototype.empty;
+        if (typeof origEmpty === 'function') {
+            Selection.prototype.empty = function() {
+                if (CFG.allowRemoveAllRanges || isCurrentlySending()) {
+                    return origEmpty.call(this);
+                }
+                return;
+            };
+        }
+
+        console.log('🎯 [SelectFix] Selection.collapseToStart/End/empty защищены');
+    } catch (e) {}
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. CSS — жёстко разрешаем выделение ВЕЗДЕ
+    //  Перебиваем все !important user-select: none, которые
+    //  были установлены патчами выше.
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('unifiedSelectionFixStyles')) {
+        const style = document.createElement('style');
+        style.id = 'unifiedSelectionFixStyles';
+        style.textContent = `
+            /* ═══ ГЛОБАЛЬНОЕ РАЗРЕШЕНИЕ ВЫДЕЛЕНИЯ ═══ */
+            body,
+            body *,
+            .message-wrapper[data-msg-id] .message,
+            .message-wrapper[data-msg-id] .message *,
+            .message .text,
+            .message .text *,
+            .comment-text,
+            .comment-text *,
+            .reply-quote,
+            .reply-quote * {
+                -webkit-user-select: text !important;
+                -moz-user-select: text !important;
+                -ms-user-select: text !important;
+                user-select: text !important;
+                -webkit-touch-callout: default !important;
+            }
+
+            /* Особый приоритет для поля ввода */
+            #messageInput,
+            #inputBar textarea,
+            .input-bar textarea {
+                -webkit-user-select: text !important;
+                -moz-user-select: text !important;
+                -ms-user-select: text !important;
+                user-select: text !important;
+                -webkit-touch-callout: default !important;
+                pointer-events: auto !important;
+            }
+
+            /* Отменяем блокировку в режиме выбора */
+            body.selection-mode,
+            body.selection-mode * {
+                -webkit-user-select: text !important;
+                -moz-user-select: text !important;
+                -ms-user-select: text !important;
+                user-select: text !important;
+                -webkit-touch-callout: default !important;
+            }
+
+            /* Нормальная подсветка выделения */
+            ::selection {
+                background: rgba(108, 92, 231, 0.5) !important;
+                color: #fff !important;
+            }
+            ::-moz-selection {
+                background: rgba(108, 92, 231, 0.5) !important;
+                color: #fff !important;
+            }
+            #messageInput::selection,
+            #inputBar textarea::selection {
+                background: rgba(108, 92, 231, 0.6) !important;
+                color: #fff !important;
+            }
+        `;
+        document.head.appendChild(style);
+        console.log('🎯 [SelectFix] CSS разрешения выделения добавлен');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  4. ПОЛНОСТЬЮ УДАЛЯЕМ ГЛОБАЛЬНЫЕ ОБРАБОТЧИКИ,
+    //     которые убивают выделение
+    //  Мы не можем удалить их напрямую (нужны ссылки на функции),
+    //  но можем гарантировать, что их попытки removeAllRanges
+    //  будут заблокированы через пункт 2 (перехват прототипа).
+    //  Это достаточный уровень защиты.
+    // ═══════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════
+    //  5. БЛОКИРУЕМ preventDefault на keydown/mousedown/touchstart,
+    //     если это поле ввода и юзер пытается выделить текст
+    // ═══════════════════════════════════════════════════════════
+
+    // ─── touchstart / mousedown ───
+    function blockPreventDefaultInInput(e) {
+        if (!insideInputField(e.target)) return;
+        // Поле ввода — не даём чужим обработчикам ломать поведение
+        // Используем stopImmediatePropagation в capture-фазе,
+        // чтобы событие НЕ дошло до чужих preventDefault-обработчиков.
+        // НО: не блокируем полностью — иначе сломается кастомный
+        // скролл, эмодзи и т.д.
+        // Компромисс: не блокируем, но гарантируем, что
+        // выделение в поле ввода защищено через Selection.prototype.
+    }
+
+    ['mousedown', 'touchstart', 'pointerdown'].forEach(evt => {
+        document.addEventListener(evt, blockPreventDefaultInInput, {
+            capture: true,
+            passive: true,
+        });
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    //  6. УБИРАЕМ автоматический выход из selection-mode
+    //     при фокусе на поле ввода — это может быть причиной
+    //     сброса выделения и "дёрганья"
+    // ═══════════════════════════════════════════════════════════
+    // (этот код был в предыдущем патче — убираем его)
+
+    // ═══════════════════════════════════════════════════════════
+    //  7. ГЛАВНОЕ: очищаем поле ввода ТОЛЬКО в момент отправки
+    //  Оборачиваем sendBtn-обработчик и sendMessage, чтобы
+    //  выделение снималось строго в момент отправки
+    // ═══════════════════════════════════════════════════════════
+
+    // ─── 7.1. Оборачиваем sendMessage ───
+    if (typeof window.sendMessage === 'function') {
+        const _origSendMessage = window.sendMessage;
+        window.sendMessage = async function(...args) {
+            // Устанавливаем флаг — разрешаем removeAllRanges
+            CFG.allowRemoveAllRanges = true;
+
+            // Снимаем выделение (это очистит поле)
+            try {
+                const sel = window.getSelection();
+                if (sel && sel.rangeCount > 0) sel.removeAllRanges();
+            } catch (e) {}
+
+            // Вызываем оригинал
+            const result = await _origSendMessage.apply(this, args);
+
+            // Сбрасываем флаг
+            setTimeout(() => {
+                CFG.allowRemoveAllRanges = false;
+            }, 100);
+
+            return result;
+        };
+    }
+
+    // ─── 7.2. Оборачиваем клик по sendBtn ───
+    document.addEventListener('click', (e) => {
+        const sendBtn = e.target.closest('#sendBtn');
+        if (!sendBtn) return;
+
+        // Разрешаем removeAllRanges на время клика
+        CFG.allowRemoveAllRanges = true;
+        setTimeout(() => {
+            CFG.allowRemoveAllRanges = false;
+        }, 300);
+    }, true);
+
+    // ═══════════════════════════════════════════════════════════
+    //  8. ДОПОЛНИТЕЛЬНО: следим за selectionchange
+    //  и принудительно восстанавливаем выделение, если что-то
+    //  его сбросило НЕ в момент отправки
+    // ═══════════════════════════════════════════════════════════
+    let _lastSelection = null;
+    let _lastSelectionTs = 0;
+
+    document.addEventListener('selectionchange', () => {
+        // Если идёт отправка — не трогаем
+        if (CFG.allowRemoveAllRanges || isCurrentlySending()) return;
+
+        try {
+            const sel = window.getSelection();
+            if (!sel || sel.rangeCount === 0) return;
+
+            const anchor = sel.anchorNode;
+            if (!anchor) return;
+
+            const el = anchor.nodeType === 1 ? anchor : anchor.parentElement;
+
+            // Если выделение в поле ввода или в тексте сообщения —
+            // запоминаем, чтобы восстановить если что
+            if (isInputField(el)
+                || (el && el.closest && el.closest('.message-wrapper[data-msg-id]'))) {
+                // Сохраняем текущее состояние
+                CFG.selectionInInput = isInputField(el);
+                _lastSelectionTs = Date.now();
+            }
+        } catch (e) {}
+    }, { capture: true, passive: true });
+
+    // ═══════════════════════════════════════════════════════════
+    //  9. АВТО-восстановление выделения, если оно "потерялось"
+    //  Раз в 100мс проверяем: если в поле ввода был текст
+    //  выделен и вдруг перестал (не по нашей воле) — восстанавливаем
+    // ═══════════════════════════════════════════════════════════
+    let _savedSelectionRange = null;
+
+    // Следим за выделением в поле ввода
+    const input = document.getElementById('messageInput');
+    if (input) {
+        ['select', 'keyup', 'mouseup', 'touchend'].forEach(evt => {
+            input.addEventListener(evt, () => {
+                if (input.selectionStart !== input.selectionEnd) {
+                    _savedSelectionRange = {
+                        start: input.selectionStart,
+                        end: input.selectionEnd,
+                        ts: Date.now(),
+                    };
+                }
+            }, { passive: true });
+        });
+    }
+
+    // Периодическая проверка
+    setInterval(() => {
+        if (!_savedSelectionRange) return;
+        if (Date.now() - _savedSelectionRange.ts > 5000) {
+            _savedSelectionRange = null;
+            return;
+        }
+        if (CFG.allowRemoveAllRanges || isCurrentlySending()) return;
+
+        const inp = document.getElementById('messageInput');
+        if (!inp) return;
+        if (document.activeElement !== inp) return;
+
+        // Выделение потерялось, но текст в поле есть?
+        if (inp.selectionStart === inp.selectionEnd && inp.value.length > 0) {
+            // Восстанавливаем
+            try {
+                inp.setSelectionRange(
+                    _savedSelectionRange.start,
+                    _savedSelectionRange.end
+                );
+                console.log('🎯 [SelectFix] Восстановлено выделение в поле');
+            } catch (e) {}
+        }
+    }, 200);
+
+    // ═══════════════════════════════════════════════════════════
+    //  10. ДИАГНОСТИКА
+    // ═══════════════════════════════════════════════════════════
+    window.SelectFix = {
+        status: () => {
+            const sel = window.getSelection();
+            return {
+                hasSelection: sel && sel.rangeCount > 0,
+                selectionText: sel && sel.toString().slice(0, 50),
+                selectionInInput: isSelectionInInput(),
+                isSending: isCurrentlySending(),
+                allowRemoveAllRanges: CFG.allowRemoveAllRanges,
+                activeElement: document.activeElement
+                    ? (document.activeElement.id || document.activeElement.tagName)
+                    : null,
+                inputValue: (document.getElementById('messageInput') || {}).value || '',
+                inputSelectionRange: (() => {
+                    const inp = document.getElementById('messageInput');
+                    return inp ? {
+                        start: inp.selectionStart,
+                        end: inp.selectionEnd,
+                    } : null;
+                })(),
+            };
+        },
+        // Принудительно снять выделение (для отладки)
+        clearSelection: () => {
+            forceKillSelection();
+        },
+        // Тест: программно выделить весь текст в поле ввода
+        testSelectAll: () => {
+            const inp = document.getElementById('messageInput');
+            if (!inp) return false;
+            inp.focus();
+            inp.select();
+            return inp.selectionStart === 0 && inp.selectionEnd === inp.value.length;
+        },
+    };
+
+    console.log('🎯 [SelectFix] Готово:');
+    console.log('   • Selection.removeAllRanges защищён (разрешён только при отправке)');
+    console.log('   • CSS разрешает user-select: text везде');
+    console.log('   • Выделение в поле ввода автоматически восстанавливается');
+    console.log('   • API: SelectFix.status() / .testSelectAll()');
+})();
+</script>
+
 </body>
 </html>
