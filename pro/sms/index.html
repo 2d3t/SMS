@@ -69785,5 +69785,959 @@ async function refreshWeatherManually(btn, card) {
     console.log('   • API: GalleryKeyboard.blur()');
 })();
 </script>
+
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🖼️ IMAGE SEARCH FOR POSTCARDS — поиск картинок из Wikimedia
+//  ─────────────────────────────────────────────────────────────
+//  Логика взята из F.html (визуализация радио):
+//   • Wikimedia Commons API — свободные картинки
+//   • Picsum — fallback
+//   • Кэш в sessionStorage
+//  Результат интегрируется в PostcardCreator
+// ═══════════════════════════════════════════════════════════════
+
+(function installPostcardImageSearch() {
+    'use strict';
+
+    console.log('🖼️ [PostcardSearch] Установка поиска картинок…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  КОНФИГ
+    // ═══════════════════════════════════════════════════════════
+    const CFG = {
+        WIKI_API: 'https://commons.wikimedia.org/w/api.php',
+        FETCH_TIMEOUT_MS: 10000,
+        MAX_RESULTS: 24,          // сколько превью показывать в сетке
+        THUMB_WIDTH: 400,         // ширина превью в сетке
+        FULL_WIDTH: 1600,         // ширина скачиваемой картинки
+        CACHE_TTL: 1000 * 60 * 30,
+        CACHE_PREFIX: 'pc_search_',
+        SUGGESTIONS: [
+            'Природа', 'Горы', 'Море', 'Закат', 'Космос', 'Цветы',
+            'Кошки', 'Собаки', 'Город', 'Лес', 'Снег', 'Осень',
+            'Праздник', 'Любовь', 'Дружба', 'Путешествие',
+        ],
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОСТОЯНИЕ
+    // ═══════════════════════════════════════════════════════════
+    const S = {
+        modalEl: null,
+        query: '',
+        results: [],
+        loading: false,
+        // какой PostcardCreator-экземпляр использовать
+        // (мы работаем с глобальным State из PostcardCreator)
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  КЭШ (sessionStorage)
+    // ═══════════════════════════════════════════════════════════
+    function cacheGet(key) {
+        try {
+            const raw = sessionStorage.getItem(CFG.CACHE_PREFIX + key);
+            if (!raw) return null;
+            const obj = JSON.parse(raw);
+            if (Date.now() - obj.t > CFG.CACHE_TTL) {
+                sessionStorage.removeItem(CFG.CACHE_PREFIX + key);
+                return null;
+            }
+            return obj.d;
+        } catch (e) { return null; }
+    }
+
+    function cacheSet(key, data) {
+        try {
+            sessionStorage.setItem(CFG.CACHE_PREFIX + key,
+                JSON.stringify({ t: Date.now(), d: data }));
+        } catch (e) {}
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПОИСК В WIKIMEDIA COMMONS
+    // ═══════════════════════════════════════════════════════════
+    async function searchWikimedia(query, width) {
+        width = width || CFG.THUMB_WIDTH;
+        const cacheKey = 'wm_' + query + '_' + width;
+        const cached = cacheGet(cacheKey);
+        if (cached) return cached;
+
+        const params = new URLSearchParams({
+            action: 'query',
+            format: 'json',
+            origin: '*',
+            generator: 'search',
+            gsrsearch: `filetype:bitmap ${query}`,
+            gsrnamespace: '6',
+            gsrlimit: String(CFG.MAX_RESULTS),
+            prop: 'imageinfo',
+            iiprop: 'url|extmetadata',
+            iiurlwidth: String(width),
+        });
+
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), CFG.FETCH_TIMEOUT_MS);
+
+        try {
+            const res = await fetch(`${CFG.WIKI_API}?${params}`, {
+                signal: controller.signal,
+            });
+            clearTimeout(timeoutId);
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+
+            const data = await res.json();
+            const pages = Object.values(data.query?.pages || {});
+            if (!pages.length) throw new Error('empty');
+
+            const results = pages.map(p => {
+                const info = p.imageinfo?.[0];
+                if (!info) return null;
+                const thumbUrl = info.thumburl || info.url;
+                const fullUrl = info.url;
+                if (!thumbUrl || !fullUrl) return null;
+
+                const meta = info.extmetadata || {};
+                const title = (p.title || '').replace(/^File:/, '').replace(/\.[a-z]+$/i, '');
+                const author = (meta.Artist?.value || '')
+                    .replace(/<[^>]+>/g, '')
+                    .trim()
+                    .slice(0, 60);
+                const license = (meta.LicenseShortName?.value || '').trim();
+
+                return {
+                    thumbUrl,
+                    fullUrl,
+                    title,
+                    author,
+                    license,
+                    source: 'Wikimedia',
+                };
+            }).filter(Boolean);
+
+            if (!results.length) throw new Error('no images');
+            cacheSet(cacheKey, results);
+            return results;
+        } catch (e) {
+            clearTimeout(timeoutId);
+            console.warn('🖼️ [PostcardSearch] Wikimedia failed, fallback to Picsum:', e.message);
+            // Fallback — Picsum
+            const picsum = [];
+            for (let i = 0; i < 12; i++) {
+                const seed = `${encodeURIComponent(query)}_${i}`;
+                picsum.push({
+                    thumbUrl: `https://picsum.photos/seed/${seed}/400/300`,
+                    fullUrl: `https://picsum.photos/seed/${seed}/1600/1200`,
+                    title: 'Случайное фото',
+                    author: 'Picsum',
+                    license: 'Free',
+                    source: 'Picsum',
+                });
+            }
+            return picsum;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  МОДАЛКА
+    // ═══════════════════════════════════════════════════════════
+    function ensureStyles() {
+        if (document.getElementById('postcardSearchStyles')) return;
+        const style = document.createElement('style');
+        style.id = 'postcardSearchStyles';
+        style.textContent = `
+            #postcardSearchModal {
+                position: fixed;
+                inset: 0;
+                background: rgba(0, 0, 0, 0.75);
+                backdrop-filter: blur(10px);
+                -webkit-backdrop-filter: blur(10px);
+                z-index: 9500;
+                display: none;
+                flex-direction: column;
+                padding: 16px;
+                animation: pcsFadeIn 0.2s ease;
+                overflow-y: auto;
+            }
+            #postcardSearchModal.show { display: flex; }
+            @keyframes pcsFadeIn {
+                from { opacity: 0; }
+                to   { opacity: 1; }
+            }
+
+            #postcardSearchModal .pcs-content {
+                background: #1a1a2e;
+                border-radius: 22px;
+                border: 1px solid rgba(108, 92, 231, 0.4);
+                box-shadow: 0 20px 60px rgba(0, 0, 0, 0.7);
+                max-width: 900px;
+                width: 100%;
+                margin: auto;
+                padding: 20px;
+                display: flex;
+                flex-direction: column;
+                gap: 14px;
+                max-height: 92vh;
+            }
+
+            /* ─── Шапка ─── */
+            .pcs-header {
+                display: flex;
+                align-items: center;
+                gap: 12px;
+                flex-shrink: 0;
+            }
+            .pcs-title {
+                flex: 1;
+                min-width: 0;
+                font-size: 17px;
+                font-weight: 700;
+                color: #fff;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+            .pcs-close {
+                width: 36px;
+                height: 36px;
+                border-radius: 50%;
+                border: none;
+                background: rgba(255, 255, 255, 0.06);
+                color: #888;
+                font-size: 16px;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                flex-shrink: 0;
+                transition: all 0.15s;
+            }
+            .pcs-close:hover {
+                background: rgba(255, 107, 107, 0.2);
+                color: #ff6b6b;
+            }
+
+            /* ─── Поиск ─── */
+            .pcs-search-row {
+                display: flex;
+                gap: 8px;
+                flex-shrink: 0;
+            }
+            .pcs-search-input {
+                flex: 1;
+                padding: 13px 16px;
+                background: rgba(255, 255, 255, 0.06);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 14px;
+                color: #fff;
+                font-size: 15px;
+                font-family: inherit;
+                outline: none;
+                transition: border-color 0.2s;
+                min-width: 0;
+            }
+            .pcs-search-input:focus {
+                border-color: #6c5ce7;
+                background: rgba(255, 255, 255, 0.08);
+            }
+            .pcs-search-input::placeholder { color: #666; }
+            .pcs-search-btn {
+                padding: 13px 22px;
+                border-radius: 14px;
+                border: none;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                color: #fff;
+                font-size: 15px;
+                font-weight: 600;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                transition: all 0.15s;
+                font-family: inherit;
+                flex-shrink: 0;
+            }
+            .pcs-search-btn:hover {
+                background: linear-gradient(135deg, #7a6cf0, #00cfa4);
+            }
+            .pcs-search-btn:active { transform: scale(0.96); }
+            .pcs-search-btn:disabled {
+                opacity: 0.5;
+                cursor: not-allowed;
+                transform: none;
+            }
+
+            /* ─── Подсказки ─── */
+            .pcs-suggestions {
+                display: flex;
+                gap: 6px;
+                flex-wrap: wrap;
+                flex-shrink: 0;
+            }
+            .pcs-suggestion {
+                padding: 6px 12px;
+                border-radius: 16px;
+                border: 1px solid rgba(108, 92, 231, 0.3);
+                background: rgba(108, 92, 231, 0.08);
+                color: #a78bfa;
+                font-size: 12px;
+                font-weight: 600;
+                cursor: pointer;
+                transition: all 0.15s;
+                font-family: inherit;
+                white-space: nowrap;
+            }
+            .pcs-suggestion:hover {
+                background: rgba(108, 92, 231, 0.25);
+                border-color: rgba(108, 92, 231, 0.6);
+                color: #fff;
+            }
+            .pcs-suggestion:active { transform: scale(0.94); }
+
+            /* ─── Сетка результатов: ровно 2 колонки ─── */
+.pcs-grid {
+    flex: 1;
+    overflow-y: auto;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    grid-auto-rows: minmax(120px, auto);
+    gap: 10px;
+    padding: 4px 4px 4px 0;
+    min-height: 200px;
+    align-content: start;
+    align-items: start;
+}
+.pcs-grid::-webkit-scrollbar { width: 4px; }
+.pcs-grid::-webkit-scrollbar-thumb {
+    background: rgba(108, 92, 231, 0.5);
+    border-radius: 2px;
+}
+
+.pcs-grid-item {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 4 / 3;
+    height: auto;
+    border-radius: 12px;
+    overflow: hidden;
+    cursor: pointer;
+    background: rgba(0, 0, 0, 0.4);
+    transition: transform 0.15s, box-shadow 0.15s;
+    border: 2px solid transparent;
+    isolation: isolate;
+    contain: layout paint;
+    box-sizing: border-box;
+}
+.pcs-grid-item:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 20px rgba(108, 92, 231, 0.4);
+    border-color: rgba(108, 92, 231, 0.6);
+    z-index: 2;
+}
+.pcs-grid-item:active {
+    transform: scale(0.97);
+}
+.pcs-grid-item img {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+    pointer-events: none;
+}
+.pcs-grid-item .pcs-caption {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: linear-gradient(180deg, transparent, rgba(0,0,0,0.85));
+    color: #fff;
+    font-size: 10px;
+    padding: 14px 6px 5px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    pointer-events: none;
+    z-index: 1;
+}
+.pcs-grid-item .pcs-source-badge {
+    position: absolute;
+    top: 5px;
+    right: 5px;
+    background: rgba(0, 0, 0, 0.7);
+    color: #a78bfa;
+    font-size: 9px;
+    padding: 2px 6px;
+    border-radius: 6px;
+    font-weight: 600;
+    pointer-events: none;
+    z-index: 1;
+}
+
+            /* ─── Пустое / загрузка ─── */
+            .pcs-empty {
+                grid-column: 1 / -1;
+                text-align: center;
+                padding: 40px 20px;
+                color: #666;
+            }
+            .pcs-empty-icon {
+                font-size: 48px;
+                margin-bottom: 12px;
+                opacity: 0.5;
+            }
+            .pcs-empty-title {
+                font-size: 15px;
+                color: #aaa;
+                font-weight: 600;
+                margin-bottom: 6px;
+            }
+            .pcs-empty-sub {
+                font-size: 12px;
+                color: #666;
+                line-height: 1.5;
+            }
+            .pcs-spinner {
+                display: inline-block;
+                width: 36px;
+                height: 36px;
+                border: 3px solid rgba(108, 92, 231, 0.25);
+                border-top-color: #6c5ce7;
+                border-right-color: #00b894;
+                border-radius: 50%;
+                animation: pcsSpin 0.9s linear infinite;
+                margin-bottom: 12px;
+            }
+            @keyframes pcsSpin { to { transform: rotate(360deg); } }
+
+            /* ─── Футер ─── */
+            .pcs-footer {
+                display: flex;
+                gap: 10px;
+                flex-shrink: 0;
+                align-items: center;
+                justify-content: space-between;
+                font-size: 11px;
+                color: #666;
+                padding-top: 6px;
+                border-top: 1px solid rgba(255, 255, 255, 0.06);
+            }
+            .pcs-footer a {
+                color: #a78bfa;
+                text-decoration: none;
+            }
+            .pcs-footer a:hover { text-decoration: underline; }
+
+            @media (max-width: 600px) {
+    #postcardSearchModal { padding: 8px; }
+    .pcs-content { padding: 14px; border-radius: 18px; }
+    .pcs-title { font-size: 15px; }
+    .pcs-grid {
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+    }
+    .pcs-search-input { font-size: 14px; padding: 11px 14px; }
+    .pcs-search-btn { padding: 11px 16px; font-size: 14px; }
+    .pcs-suggestion { font-size: 11px; padding: 5px 10px; }
+}
+        `;
+        document.head.appendChild(style);
+    }
+
+    function ensureModal() {
+        if (S.modalEl && S.modalEl.isConnected) return S.modalEl;
+
+        ensureStyles();
+
+        const modal = document.createElement('div');
+        modal.id = 'postcardSearchModal';
+        modal.innerHTML = `
+            <div class="pcs-content" onclick="event.stopPropagation()">
+                <div class="pcs-header">
+                    <div class="pcs-title">
+                        <span>🔍</span>
+                        <span>Найти картинку для открытки</span>
+                    </div>
+                    <button class="pcs-close" id="pcsCloseBtn" title="Закрыть">✕</button>
+                </div>
+
+                <div class="pcs-search-row">
+                    <input type="text" class="pcs-search-input" id="pcsSearchInput"
+                           placeholder="Тема: закат, море, горы, коты…"
+                           autocomplete="off" maxlength="80">
+                    <button class="pcs-search-btn" id="pcsSearchBtn">
+                        <span>🔍</span>
+                        <span>Найти</span>
+                    </button>
+                </div>
+
+                <div class="pcs-suggestions" id="pcsSuggestions"></div>
+
+                <div class="pcs-grid" id="pcsGrid">
+                    <div class="pcs-empty">
+                        <div class="pcs-empty-icon">🔍</div>
+                        <div class="pcs-empty-title">Что будем искать?</div>
+                        <div class="pcs-empty-sub">
+                            Введите тему или выберите из подсказок выше.<br>
+                            Картинки берутся из Wikimedia Commons — свободные лицензии.
+                        </div>
+                    </div>
+                </div>
+
+                <div class="pcs-footer">
+                    <span>🌐 Источник: <a href="https://commons.wikimedia.org" target="_blank" rel="noopener">Wikimedia Commons</a> · Picsum</span>
+                    <span id="pcsCount"></span>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+        S.modalEl = modal;
+
+        // ─── Слушатели ───
+        modal.querySelector('#pcsCloseBtn').addEventListener('click', closeModal);
+
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) closeModal();
+        });
+
+        const input = modal.querySelector('#pcsSearchInput');
+        const searchBtn = modal.querySelector('#pcsSearchBtn');
+
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                doSearch(input.value.trim());
+            }
+        });
+
+        searchBtn.addEventListener('click', () => doSearch(input.value.trim()));
+
+        // ─── Подсказки ───
+        const suggEl = modal.querySelector('#pcsSuggestions');
+        suggEl.innerHTML = CFG.SUGGESTIONS.map(s =>
+            `<button class="pcs-suggestion" data-q="${s}">${s}</button>`
+        ).join('');
+
+        suggEl.querySelectorAll('.pcs-suggestion').forEach(btn => {
+            btn.addEventListener('click', () => {
+                input.value = btn.dataset.q;
+                doSearch(btn.dataset.q);
+            });
+        });
+
+        return modal;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОТКРЫТИЕ / ЗАКРЫТИЕ
+    // ═══════════════════════════════════════════════════════════
+    function openModal(initialQuery) {
+        ensureModal();
+        S.modalEl.classList.add('show');
+        document.body.style.overflow = 'hidden';
+
+        const input = S.modalEl.querySelector('#pcsSearchInput');
+        if (initialQuery) {
+            input.value = initialQuery;
+            doSearch(initialQuery);
+        } else {
+            setTimeout(() => input.focus(), 200);
+        }
+
+        if (navigator.vibrate) navigator.vibrate(10);
+        if (typeof soundManager !== 'undefined') {
+            try { soundManager.play('click'); } catch (e) {}
+        }
+    }
+
+    function closeModal() {
+        if (!S.modalEl) return;
+        S.modalEl.classList.remove('show');
+        document.body.style.overflow = '';
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПОИСК И ОТРИСОВКА
+    // ═══════════════════════════════════════════════════════════
+    async function doSearch(query) {
+        if (!query || S.loading) return;
+
+        S.loading = true;
+        S.query = query;
+
+        const modal = S.modalEl;
+        if (!modal) { S.loading = false; return; }
+
+        const grid = modal.querySelector('#pcsGrid');
+        const searchBtn = modal.querySelector('#pcsSearchBtn');
+        const countEl = modal.querySelector('#pcsCount');
+
+        searchBtn.disabled = true;
+        countEl.textContent = '';
+        grid.innerHTML = `
+            <div class="pcs-empty">
+                <div class="pcs-spinner"></div>
+                <div class="pcs-empty-title">Ищем «${escapeHtml(query)}»…</div>
+            </div>
+        `;
+
+        try {
+            const results = await searchWikimedia(query, CFG.THUMB_WIDTH);
+            S.results = results;
+
+            if (!results.length) {
+                grid.innerHTML = `
+                    <div class="pcs-empty">
+                        <div class="pcs-empty-icon">😕</div>
+                        <div class="pcs-empty-title">Ничего не найдено</div>
+                        <div class="pcs-empty-sub">Попробуйте другую тему</div>
+                    </div>
+                `;
+                countEl.textContent = '';
+                return;
+            }
+
+            countEl.textContent = `${results.length} результатов`;
+
+            grid.innerHTML = results.map((r, i) => `
+    <div class="pcs-grid-item" data-idx="${i}" title="${escapeHtml(r.title)}">
+        <img src="${escapeHtml(r.thumbUrl)}" alt="" loading="lazy"
+             onerror="this.style.opacity='0.2'; this.parentElement.style.background='linear-gradient(135deg,#2a2a3e,#1a1a2e)';">
+        <div class="pcs-source-badge">${escapeHtml(r.source)}</div>
+        <div class="pcs-caption">${escapeHtml(r.title || '—')}</div>
+    </div>
+`).join('');
+
+            grid.querySelectorAll('.pcs-grid-item').forEach(el => {
+                el.addEventListener('click', () => {
+                    const idx = parseInt(el.dataset.idx, 10);
+                    if (!isNaN(idx) && S.results[idx]) {
+                        selectImage(S.results[idx]);
+                    }
+                });
+            });
+
+        } catch (e) {
+            console.error('🖼️ [PostcardSearch] search error:', e);
+            grid.innerHTML = `
+                <div class="pcs-empty">
+                    <div class="pcs-empty-icon">⚠️</div>
+                    <div class="pcs-empty-title">Ошибка поиска</div>
+                    <div class="pcs-empty-sub">${escapeHtml(e.message || 'Попробуйте ещё раз')}</div>
+                </div>
+            `;
+        } finally {
+            S.loading = false;
+            searchBtn.disabled = false;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ВЫБОР КАРТИНКИ — ЗАГРУЖАЕМ ПОЛНУЮ И ПЕРЕДАЁМ В POSTCARD
+    // ═══════════════════════════════════════════════════════════
+    async function selectImage(item) {
+        if (!item || !item.fullUrl) return;
+
+        const modal = S.modalEl;
+        const grid = modal.querySelector('#pcsGrid');
+
+        // Показываем загрузку
+        grid.innerHTML = `
+            <div class="pcs-empty">
+                <div class="pcs-spinner"></div>
+                <div class="pcs-empty-title">Загружаем картинку…</div>
+                <div class="pcs-empty-sub">${escapeHtml(item.title || '')}</div>
+            </div>
+        `;
+
+        try {
+            // Загружаем полную картинку как blob
+            const controller = new AbortController();
+            const timeoutId = setTimeout(
+                () => controller.abort(new Error('timeout')),
+                CFG.FETCH_TIMEOUT_MS * 2
+            );
+
+            const res = await fetch(item.fullUrl, {
+                signal: controller.signal,
+                mode: 'cors',
+            });
+            clearTimeout(timeoutId);
+
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+
+            const blob = await res.blob();
+            if (!blob || blob.size < 1000) {
+                throw new Error('Картинка слишком маленькая');
+            }
+
+            // Проверяем, что это действительно изображение
+            if (!blob.type.startsWith('image/')) {
+                // Может быть SVG или неопознанное — попробуем по расширению
+                const ext = (item.fullUrl.split('.').pop() || '').toLowerCase();
+                if (!/^(jpg|jpeg|png|webp|gif)$/.test(ext)) {
+                    throw new Error('Не изображение');
+                }
+            }
+
+            // Сжимаем в JPEG (универсально)
+            const file = await blobToFile(blob, item.title || 'postcard_image');
+
+            // Передаём в PostcardCreator
+            applyToPostcard(file, item);
+
+            // Закрываем модалку
+            closeModal();
+
+            // Фидбэк
+            if (typeof showToast === 'function') {
+                showToast('✅ Картинка загружена', 1500);
+            }
+            if (navigator.vibrate) navigator.vibrate([15, 30, 15]);
+            if (typeof soundManager !== 'undefined') {
+                try { soundManager.play('send'); } catch (e) {}
+            }
+
+        } catch (e) {
+            console.error('🖼️ [PostcardSearch] download error:', e);
+            grid.innerHTML = `
+                <div class="pcs-empty">
+                    <div class="pcs-empty-icon">⚠️</div>
+                    <div class="pcs-empty-title">Не удалось загрузить</div>
+                    <div class="pcs-empty-sub">${escapeHtml(e.message || '')}<br>
+                    <button onclick="this.closest('.pcs-empty').querySelector('button') && null"
+                            style="margin-top:10px;padding:8px 16px;border-radius:10px;border:1px solid rgba(108,92,231,0.4);background:rgba(108,92,231,0.15);color:#a78bfa;cursor:pointer;font-family:inherit;"
+                            id="pcsRetryBtn">🔄 Попробовать снова</button></div>
+                </div>
+            `;
+            const retry = grid.querySelector('#pcsRetryBtn');
+            if (retry) {
+                retry.addEventListener('click', () => doSearch(S.query));
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  BLOB → FILE
+    // ═══════════════════════════════════════════════════════════
+    async function blobToFile(blob, baseName) {
+        // Всегда пересохраняем в JPEG — так надёжнее
+        return new Promise((resolve, reject) => {
+            const img = new Image();
+            const url = URL.createObjectURL(blob);
+
+            img.onload = () => {
+                URL.revokeObjectURL(url);
+
+                let w = img.naturalWidth;
+                let h = img.naturalHeight;
+
+                // Ограничиваем 2400px
+                const MAX = 2400;
+                if (w > MAX || h > MAX) {
+                    const r = Math.min(MAX / w, MAX / h);
+                    w = Math.round(w * r);
+                    h = Math.round(h * r);
+                }
+
+                const canvas = document.createElement('canvas');
+                canvas.width = w;
+                canvas.height = h;
+                const ctx = canvas.getContext('2d');
+                ctx.imageSmoothingEnabled = true;
+                ctx.imageSmoothingQuality = 'high';
+                ctx.drawImage(img, 0, 0, w, h);
+
+                canvas.toBlob(outBlob => {
+                    if (!outBlob) {
+                        reject(new Error('Не удалось обработать картинку'));
+                        return;
+                    }
+                    const safeName = (baseName || 'image')
+                        .replace(/[^a-zA-Zа-яА-Я0-9_\- ]/g, '_')
+                        .slice(0, 40)
+                        .trim() || 'image';
+                    resolve(new File([outBlob], safeName + '.jpg', {
+                        type: 'image/jpeg',
+                    }));
+                }, 'image/jpeg', 0.92);
+            };
+
+            img.onerror = () => {
+                URL.revokeObjectURL(url);
+                reject(new Error('Не удалось прочитать изображение'));
+            };
+
+            img.src = url;
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕДАЧА В POSTCARD CREATOR
+    //  Мы не имеем прямого доступа к State внутри IIFE
+    //  PostcardCreator. Но у него есть публичный API:
+    //    - PostcardCreator.open()
+    //    - PostcardCreator.state() (не для записи)
+    //
+    //  Правильный путь — использовать существующий
+    //  обработчик выбора файла:
+    //    handleImagePick(e) — принимает event с files
+    //
+    //  Мы имитируем событие выбора файла.
+    // ═══════════════════════════════════════════════════════════
+    function applyToPostcard(file, item) {
+        // Проверяем, что редактор открыт
+        const editor = document.getElementById('postcardEditor');
+        if (!editor || !editor.classList.contains('show')) {
+            if (typeof showToast === 'function') {
+                showToast('❌ Редактор открытки закрыт', 2000);
+            }
+            return;
+        }
+
+        // Находим скрытый file input редактора
+        const fileInput = editor.querySelector('#pcFileInput');
+        if (!fileInput) {
+            console.error('🖼️ [PostcardSearch] #pcFileInput не найден');
+            return;
+        }
+
+        // Создаём DataTransfer и подсовываем файл
+        try {
+            const dt = new DataTransfer();
+            dt.items.add(file);
+            fileInput.files = dt.files;
+
+            // Триггерим событие change
+            const evt = new Event('change', { bubbles: true });
+            fileInput.dispatchEvent(evt);
+
+            console.log('🖼️ [PostcardSearch] Файл передан в редактор:', file.name);
+        } catch (e) {
+            console.error('🖼️ [PostcardSearch] applyToPostcard error:', e);
+            if (typeof showToast === 'function') {
+                showToast('❌ Не удалось передать картинку', 2500);
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХЕЛПЕР
+    // ═══════════════════════════════════════════════════════════
+    function escapeHtml(s) {
+        const d = document.createElement('div');
+        d.textContent = s == null ? '' : String(s);
+        return d.innerHTML;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ВНЕДРЕНИЕ КНОПКИ В РЕДАКТОР ОТКРЫТКИ
+    // ═══════════════════════════════════════════════════════════
+    function injectSearchButton() {
+        const editor = document.getElementById('postcardEditor');
+        if (!editor) return false;
+        if (editor.querySelector('#pcSearchImageBtn')) return true;
+
+        // Ищем кнопку «Выбрать фото» (pcPickImageBtn)
+        const pickBtn = editor.querySelector('#pcPickImageBtn');
+        if (!pickBtn) return false;
+
+        // Создаём кнопку «Из интернета»
+        const searchBtn = document.createElement('button');
+        searchBtn.className = 'pc-btn-primary';
+        searchBtn.id = 'pcSearchImageBtn';
+        searchBtn.type = 'button';
+        searchBtn.style.cssText = `
+            width: 100%;
+            height: 44px;
+            justify-content: center;
+            border-radius: 14px;
+            margin-top: 8px;
+            background: linear-gradient(135deg, #5CA8FF, #4b7bec);
+        `;
+        searchBtn.innerHTML = `
+            <span>🔍</span>
+            <span>Найти в интернете</span>
+        `;
+
+        // Вставляем ПОСЛЕ кнопки «Выбрать фото»
+        pickBtn.parentNode.insertBefore(searchBtn, pickBtn.nextSibling);
+
+        searchBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            openModal();
+        });
+
+        console.log('🖼️ [PostcardSearch] Кнопка «Найти в интернете» добавлена');
+        return true;
+    }
+
+    // ─── Наблюдаем за появлением редактора ───
+    const observer = new MutationObserver(() => {
+        const editor = document.getElementById('postcardEditor');
+        if (editor && editor.classList.contains('show')) {
+            // Небольшая задержка — дать buildEditor дорисовать
+            setTimeout(injectSearchButton, 50);
+            setTimeout(injectSearchButton, 200);
+        }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    // ─── Также при клике по «Создать открытку» в меню ───
+    document.addEventListener('click', (e) => {
+        if (e.target.closest('.attach-menu-item[data-action="postcard"]')) {
+            setTimeout(injectSearchButton, 300);
+            setTimeout(injectSearchButton, 800);
+        }
+    }, true);
+
+    // ─── Первичная установка (вдруг редактор уже открыт) ───
+    setTimeout(injectSearchButton, 3000);
+    setTimeout(injectSearchButton, 6000);
+    setInterval(injectSearchButton, 2000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ESC — закрыть модалку поиска
+    // ═══════════════════════════════════════════════════════════
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && S.modalEl && S.modalEl.classList.contains('show')) {
+            e.preventDefault();
+            e.stopPropagation();
+            closeModal();
+        }
+    }, true);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API
+    // ═══════════════════════════════════════════════════════════
+    window.PostcardImageSearch = {
+        open: (query) => openModal(query),
+        close: closeModal,
+        search: (query) => {
+            ensureModal();
+            S.modalEl.classList.add('show');
+            document.body.style.overflow = 'hidden';
+            doSearch(query);
+        },
+        status: () => ({
+            modalOpen: !!(S.modalEl && S.modalEl.classList.contains('show')),
+            loading: S.loading,
+            query: S.query,
+            resultsCount: S.results.length,
+            buttonInjected: !!document.getElementById('pcSearchImageBtn'),
+        }),
+    };
+
+    console.log('🖼️ [PostcardSearch] Готово:');
+    console.log('   • Кнопка «🔍 Найти в интернете» в редакторе открытки');
+    console.log('   • Поиск по Wikimedia Commons + Picsum (fallback)');
+    console.log('   • API: PostcardImageSearch.open("закат")');
+})();
+</script>
+
+
 </body>
 </html>
