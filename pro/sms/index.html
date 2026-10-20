@@ -69617,8 +69617,173 @@ async function refreshWeatherManually(btn, card) {
     console.log('   • API: AvatarEditor.status() / .reset()');
 })();
 
+</script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  ⌨️ СКРЫТИЕ ВИРТУАЛЬНОЙ КЛАВИАТУРЫ ПРИ ОТКРЫТИИ ГАЛЕРЕИ
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: если поле ввода #messageInput (или его decoy-клон)
+//  в фокусе — виртуальная клавиатура остаётся висеть снизу и
+//  перекрывает галерею.
+//
+//  Решение: перед открытием #imageModal — снимаем фокус
+//  с любого активного input/textarea/contenteditable.
+//  При отрисовке галереи клавиатура уже уедет вниз.
+// ═══════════════════════════════════════════════════════════════
 
+(function installKeyboardHideOnGalleryOpen() {
+    'use strict';
 
+    console.log('⌨️ [GalleryKeyboard] Установка…');
+
+    // ─── Функция снятия фокуса ───
+    function blurActiveInput() {
+        try {
+            const active = document.activeElement;
+            if (!active) return false;
+
+            const tag = active.tagName;
+            const isInput = (
+                tag === 'INPUT' ||
+                tag === 'TEXTAREA' ||
+                tag === 'SELECT' ||
+                active.isContentEditable
+            );
+
+            if (isInput) {
+                active.blur();
+                console.log('⌨️ [GalleryKeyboard] Снят фокус с', tag);
+                return true;
+            }
+        } catch (e) {
+            console.warn('⌨️ [GalleryKeyboard] blur error:', e);
+        }
+        return false;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  1. Оборачиваем openGallery
+    // ═══════════════════════════════════════════════════════════
+    if (typeof openGallery === 'function') {
+        const _origOpenGallery = openGallery;
+
+        openGallery = async function(imageUrl) {
+            // ⬇️ Сначала снимаем фокус — клавиатура начнёт закрываться
+            blurActiveInput();
+
+            // Даём браузеру время на закрытие клавиатуры
+            // (на iOS Safari это критично — иначе галерея
+            // откроется ПОД клавиатурой, и она не уедет)
+            await new Promise(r => setTimeout(r, 100));
+
+            // Открываем галерею
+            const result = await _origOpenGallery.call(this, imageUrl);
+
+            // На всякий случай — ещё раз через 200 мс
+            setTimeout(blurActiveInput, 200);
+            setTimeout(blurActiveInput, 500);
+
+            return result;
+        };
+
+        console.log('⌨️ [GalleryKeyboard] openGallery пропатчен');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  2. Оборачиваем openImageModal (на случай прямого вызова)
+    // ═══════════════════════════════════════════════════════════
+    if (typeof openImageModal === 'function') {
+        const _origOpenImageModal = openImageModal;
+
+        openImageModal = function(imageUrl) {
+            blurActiveInput();
+            return _origOpenImageModal.call(this, imageUrl);
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. Оборачиваем openPhotoGallery (кнопка «Галерея» в ⋯)
+    // ═══════════════════════════════════════════════════════════
+    if (typeof window.openPhotoGallery === 'function') {
+        const _origOpenPhotoGallery = window.openPhotoGallery;
+
+        window.openPhotoGallery = async function() {
+            blurActiveInput();
+            await new Promise(r => setTimeout(r, 100));
+            return _origOpenPhotoGallery.call(this);
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  4. Оборачиваем openVideoModal (на всякий случай)
+    // ═══════════════════════════════════════════════════════════
+    if (typeof openVideoModal === 'function') {
+        const _origOpenVideoModal = openVideoModal;
+
+        openVideoModal = function(src, title) {
+            blurActiveInput();
+            return _origOpenVideoModal.call(this, src, title);
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  5. Глобальный «страж»: как только #imageModal становится
+    //     активным — снимаем фокус с полей ввода
+    //     (на случай если открытие было через что-то ещё)
+    // ═══════════════════════════════════════════════════════════
+    const modalObserver = new MutationObserver(() => {
+        const modal = document.getElementById('imageModal');
+        if (modal && modal.classList.contains('active')) {
+            blurActiveInput();
+        }
+    });
+
+    // Ждём появления модалки в DOM
+    function startModalObserver() {
+        const modal = document.getElementById('imageModal');
+        if (!modal) {
+            setTimeout(startModalObserver, 300);
+            return;
+        }
+        modalObserver.observe(modal, {
+            attributes: true,
+            attributeFilter: ['class'],
+        });
+        console.log('⌨️ [GalleryKeyboard] Наблюдатель за imageModal установлен');
+    }
+    startModalObserver();
+
+    // ═══════════════════════════════════════════════════════════
+    //  6. Дополнительно: на случай клика по .image-container img
+    //     напрямую (без openGallery) — перехватываем и снимаем фокус
+    // ═══════════════════════════════════════════════════════════
+    document.addEventListener('click', (e) => {
+        const imgContainer = e.target.closest('.image-container');
+        if (!imgContainer) return;
+        // Если это не кнопка play (для аудио-обложек) — снимаем фокус
+        if (e.target.closest('.audio-cover-play')) return;
+        blurActiveInput();
+    }, true);
+
+    // ═══════════════════════════════════════════════════════════
+    //  7. Публичное API
+    // ═══════════════════════════════════════════════════════════
+    window.GalleryKeyboard = {
+        blur: blurActiveInput,
+        status: () => ({
+            activeElement: document.activeElement
+                ? (document.activeElement.id || document.activeElement.tagName)
+                : null,
+            modalOpen: document.getElementById('imageModal')
+                ? document.getElementById('imageModal').classList.contains('active')
+                : false,
+        }),
+    };
+
+    console.log('⌨️ [GalleryKeyboard] ✅ Готово');
+    console.log('   • Клавиатура скрывается перед открытием галереи');
+    console.log('   • API: GalleryKeyboard.blur()');
+})();
 </script>
 </body>
 </html>
