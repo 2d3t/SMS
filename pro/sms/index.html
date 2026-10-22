@@ -58478,106 +58478,167 @@ async function refreshWeatherManually(btn, card) {
     //  lastReadId синхронизируется.
     // ═══════════════════════════════════════════════════════════
     checkUnreadForAllChats = async function() {
-        const result = {};
-        const now = Date.now();
+    const result = {};
+    const now = Date.now();
 
-        // Чаты, из которых только что вышли — игнорируем
-        const excludedFiles = new Set();
+    const tasks = state.chats.map(async (chat) => {
+        const file = chat.file;
+
         try {
-            if (typeof FIX !== 'undefined' && FIX.recentlyExited) {
-                FIX.recentlyExited.forEach((exitTs, file) => {
-                    if (now - exitTs < 8000) excludedFiles.add(file);
-                });
-            }
-        } catch (e) {}
-
-        const tasks = state.chats.map(async (chat) => {
-            const file = chat.file;
-            if (excludedFiles.has(file)) return;
-
+            const cachedEtag = state._metaEtagsByFile[file] || null;
+            let metaRes;
             try {
-                const cachedEtag = state._metaEtagsByFile[file] || null;
-                let metaRes;
-                try {
-                    metaRes = await fetchMetaFast(file, cachedEtag);
-                } catch (e) {
-                    // Сеть упала — сохраняем что было
-                    if (chat.hasUnread) {
-                        result[file] = { hasUnread: true, count: chat.unreadCount || 0 };
-                    }
-                    return;
-                }
-
-                if (metaRes.notModified) {
-                    if (chat.hasUnread) {
-                        result[file] = { hasUnread: true, count: chat.unreadCount || 0 };
-                    }
-                    return;
-                }
-
-                if (!metaRes.exists) {
-                    state._metaEtagsByFile[file] = null;
-                    return;
-                }
-
-                state._metaEtagsByFile[file] = metaRes.etag || null;
-                const metaVersion = metaRes.content && metaRes.content.version;
-                if (!metaVersion) return;
-
-                chat._lastMetaVersion = metaVersion;
-                saveChatsList();
-
-                // Если последняя прочитанная версия >= версии meta —
-                // всё прочитано, ничего не помечаем
-                const lastReadId = getLastReadId(file);
-                if (lastReadId && metaVersion <= lastReadId) {
-                    return;
-                }
-
-                // 🆕 Есть что-то новое. Помечаем как непрочитанное.
-                // Не пытаемся расшифровывать — это слишком ненадёжно
-                // (может не быть ключа, может быть ошибка сети и т.д.)
-                //
-                // Также не считаем точное количество — показываем
-                // минимум «•» (точку-бейдж), что уже привлекает внимание.
-                const prevCount = chat._lastMetaVersion
-                    ? (chat.unreadCount || 0)
-                    : 1;
-
-                // Пробуем получить реальное количество через содержимое
-                // (если можем) — но не обязательно
-                let count = 1;
-                try {
-                    const password = state.savedPasswords[file];
-                    if (password) {
-                        const path = getChatPath(file);
-                        const chatData = await fetchFile(state.token, CONFIG.repoOwner, CONFIG.repoName, path);
-                        if (chatData && chatData.exists && chatData.content) {
-                            const encMessages = chatData.content.messages || [];
-                            let unread = 0;
-                            for (const enc of encMessages) {
-                                if (!lastReadId || enc.id > lastReadId) unread++;
-                            }
-                            if (unread > 0) count = unread;
-                        }
-                    }
-                } catch (e) {
-                    // Не смогли посчитать — оставляем 1
-                }
-
-                result[file] = { hasUnread: true, count };
-
+                metaRes = await fetchMetaFast(file, cachedEtag);
             } catch (e) {
-                console.warn('🩹 [InviteFix] checkUnread error для', file, e.message);
                 if (chat.hasUnread) {
                     result[file] = { hasUnread: true, count: chat.unreadCount || 0 };
                 }
+                return;
             }
-        });
 
-        await Promise.all(tasks);
-        return result;
-    };
+            if (metaRes.notModified) {
+                if (chat.hasUnread) {
+                    result[file] = { hasUnread: true, count: chat.unreadCount || 0 };
+                }
+                return;
+            }
+
+            if (!metaRes.exists) {
+                state._metaEtagsByFile[file] = null;
+                return;
+            }
+
+            state._metaEtagsByFile[file] = metaRes.etag || null;
+            const metaVersion = metaRes.content && metaRes.content.version;
+            if (!metaVersion) return;
+
+            chat._lastMetaVersion = metaVersion;
+            saveChatsList();
+
+            // Если последняя прочитанная версия >= meta — всё прочитано
+            const lastReadId = getLastReadId(file);
+            if (lastReadId && metaVersion <= lastReadId) {
+                // ✅ сбрасываем старый бейдж, если он был
+                if (chat.hasUnread || chat.unreadCount) {
+                    delete chat.hasUnread;
+                    delete chat.unreadCount;
+                    saveChatsList();
+                }
+                return;
+            }
+
+            // ═══════════════════════════════════════════════════════
+            //  🆕 ГЛАВНОЕ: РАСШИФРОВЫВАЕМ новые и проверяем АВТОРА
+            // ═══════════════════════════════════════════════════════
+            const password = state.savedPasswords[file];
+
+            // Если пароля нет — не можем расшифровать.
+            // Консервативно: ставим бейдж (лучше показать, чем пропустить).
+            if (!password) {
+                result[file] = { hasUnread: true, count: 1 };
+                return;
+            }
+
+            // Загружаем файл чата
+            const path = getChatPath(file);
+            let chatData;
+            try {
+                chatData = await fetchFile(
+                    state.token, CONFIG.repoOwner, CONFIG.repoName, path
+                );
+            } catch (e) {
+                result[file] = { hasUnread: true, count: 1 };
+                return;
+            }
+
+            if (!chatData || !chatData.exists) return;
+
+            const content = chatData.content;
+            if (!content || content.v !== CRYPTO.VERSION || !content.salt) return;
+
+            const encMessages = content.messages || [];
+
+            // Новые (непрочитанные) сообщения
+            const newEnc = [];
+            for (const enc of encMessages) {
+                if (!lastReadId || enc.id > lastReadId) {
+                    newEnc.push(enc);
+                }
+            }
+
+            if (newEnc.length === 0) {
+                // Нет новых — фиксируем meta.version как прочитанное
+                setLastReadId(file, metaVersion);
+                return;
+            }
+
+            // ─── Деривим ключ чата ───
+            let key;
+            try {
+                key = await deriveKey(password, content.salt);
+            } catch (e) {
+                // Не смогли — ставим бейдж
+                result[file] = { hasUnread: true, count: newEnc.length };
+                return;
+            }
+
+            // ─── Расшифровываем все новые и считаем ЧУЖИЕ ───
+            let foreignCount = 0;
+            let decryptedOk = 0;
+
+            for (const enc of newEnc) {
+                try {
+                    const iv = new Uint8Array(base64ToArrayBuffer(enc.iv));
+                    const ciphertext = base64ToArrayBuffer(enc.data);
+                    const plaintext = await crypto.subtle.decrypt(
+                        { name: 'AES-GCM', iv }, key, ciphertext
+                    );
+                    const payload = JSON.parse(new TextDecoder().decode(plaintext));
+                    decryptedOk++;
+
+                    // 🎯 Если это НЕ моё сообщение — считаем чужим
+                    if (payload.username !== state.username) {
+                        foreignCount++;
+                    }
+                } catch (e) {
+                    // Не смогли расшифровать — считаем консервативно «чужим»
+                    // (лучше показать бейдж, чем пропустить)
+                    foreignCount++;
+                }
+            }
+
+            // ─── Принимаем решение ───
+            if (foreignCount === 0) {
+                // ✅ ВСЕ новые — свои. Снимаем бейдж и фиксируем прочитанным.
+                console.log(
+                    `🩹 [InviteFix] ${file}: все ${decryptedOk} новых — свои, снимаем бейдж`
+                );
+                setLastReadId(file, metaVersion);
+                if (chat.hasUnread || chat.unreadCount) {
+                    delete chat.hasUnread;
+                    delete chat.unreadCount;
+                    saveChatsList();
+                }
+                return;
+            }
+
+            // ⚠️ Есть чужие — ставим бейдж с правильным count
+            result[file] = {
+                hasUnread: true,
+                count: foreignCount,
+            };
+
+        } catch (e) {
+            console.warn('🩹 [InviteFix] checkUnread error для', file, e.message);
+            if (chat.hasUnread) {
+                result[file] = { hasUnread: true, count: chat.unreadCount || 0 };
+            }
+        }
+    });
+
+    await Promise.all(tasks);
+    return result;
+};
 
     console.log('🩹 [InviteFix] checkUnreadForAllChats упрощён:');
     console.log('   • Не пытается расшифровать каждое сообщение');
