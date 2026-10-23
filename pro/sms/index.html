@@ -5037,9 +5037,19 @@ function setLastReadId(file, messageId) {
 let _lastKnownUnreadTotal = -1;
 
 function markChatAsRead() {
-    if (!state.chatFile || historyState.allMessages.length === 0) return;
-    const lastId = historyState.allMessages[historyState.allMessages.length - 1].id;
-    setLastReadId(state.chatFile, lastId);
+    if (!state.chatFile) return;
+let lastId = null;
+if (historyState.allMessages.length > 0) {
+    lastId = historyState.allMessages[historyState.allMessages.length - 1].id;
+}
+if (state._lastMetaVersion && (!lastId || state._lastMetaVersion > lastId)) {
+    lastId = state._lastMetaVersion;
+}
+if (state._lastSentMessageId && (!lastId || state._lastSentMessageId > lastId)) {
+    lastId = state._lastSentMessageId;
+}
+if (!lastId) return;
+setLastReadId(state.chatFile, lastId);
     const idx = state.chats.findIndex(c => c.file === state.chatFile);
     if (idx >= 0) {
         delete state.chats[idx].unreadCount;
@@ -7034,11 +7044,22 @@ async function updateMeta(file, version, count) {
                 body: JSON.stringify(body),
                 cache: 'no-store',
             });
-            if (res.ok) return true;
-            if (res.status === 409) continue;
-        } catch (e) {
+            if (res.ok) {
+    const lastRead = getLastReadId(file);
+    if (!lastRead || version > lastRead) {
+        setLastReadId(file, version);
+    }
+    if (state._lastSentMessageId && version === state._lastSentMessageId) {
+        showToast('✅ Отправлено!', 1000);
+    }
+    return true;
+}
+if (res.status === 409) continue;        } catch (e) {
             console.warn(`Meta update attempt ${attempt + 1} failed:`, e.message);
         }
+    }
+    if (state._lastSentMessageId) {
+        showToast('⚠️ Не удалось подтвердить доставку — проверьте чат', 3000);
     }
     return false;
 }
@@ -7785,14 +7806,10 @@ setTimeout(() => {
     if (scrollState.isAtBottom && !_isUserScrolling) {
         scrollToBottom(true);
     }
-}, 1000);
-
-
-markChatAsRead();
-soundManager.play('click');
-soundManager.play('send');
-showToast('✅ Отправлено!', 1000);
-    } catch (error) {
+}, 1000);    markChatAsRead();
+    soundManager.play('click');
+    soundManager.play('send');
+} catch (error) {
         console.error('Ошибка:', error);
         if (error.message === 'ABORTED') {
             showToast('⏹️ Загрузка отменена', 1800);
@@ -11807,6 +11824,11 @@ async function login() {
 }
 
 function logout() {
+    if (state.isSending
+        || (typeof SendQueue !== 'undefined' && SendQueue.isBusy && SendQueue.isBusy())) {
+        const ok = confirm('Сообщение ещё отправляется.\n\nВыйти, не дожидаясь доставки?');
+        if (!ok) return;
+    }
     if (audioRecorder.isRecording) audioRecorder.cancel();
     markChatAsRead();
     stopPolling();
@@ -11863,6 +11885,20 @@ function logout() {
 
 
 function backToChats() {
+    if (state.isSending
+        || (typeof SendQueue !== 'undefined' && SendQueue.isBusy && SendQueue.isBusy())) {
+        showToast('⏳ Дожидаемся отправки…', 1800);
+        const waitExit = () => {
+            if (state.isSending
+                || (typeof SendQueue !== 'undefined' && SendQueue.isBusy && SendQueue.isBusy())) {
+                setTimeout(waitExit, 200);
+            } else {
+                backToChats();
+            }
+        };
+        setTimeout(waitExit, 200);
+        return;
+    }
     markChatAsRead();
     if (audioRecorder.isRecording) audioRecorder.cancel();
     Object.keys(audioPlayers).forEach(id => {
@@ -58622,11 +58658,22 @@ async function refreshWeatherManually(btn, card) {
                 return;
             }
 
-            // ⚠️ Есть чужие — ставим бейдж с правильным count
-            result[file] = {
-                hasUnread: true,
-                count: foreignCount,
-            };
+            if (state.chatFile === file
+    && state._lastSentMessageId
+    && metaVersion === state._lastSentMessageId) {
+    setLastReadId(file, metaVersion);
+    if (chat.hasUnread || chat.unreadCount) {
+        delete chat.hasUnread;
+        delete chat.unreadCount;
+        saveChatsList();
+    }
+    return;
+}
+
+result[file] = {
+    hasUnread: true,
+    count: foreignCount,
+};
 
         } catch (e) {
             console.warn('🩹 [InviteFix] checkUnread error для', file, e.message);
