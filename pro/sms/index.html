@@ -72000,6 +72000,1304 @@ result[file] = {
     console.log('🩹 [HeaderPaddingFix] Готово');
 })();
 
+
+// ═══════════════════════════════════════════════════════════════
+//  📢 ANNOUNCEMENT CREATOR v2 — КОЛЛАЖ + ТЕКСТ (как в открытке)
+//  ─────────────────────────────────────────────────────────────
+//  Максимально копирует логику отправки из PostcardCreator:
+//   1. Сначала склеиваем фото в единый canvas (коллаж)
+//   2. Накладываем текст поверх
+//   3. Отправляем как обычное изображение через sendMessage
+//  Никаких сложных очередей и самописных ожиданий — всё как в открытке.
+// ═══════════════════════════════════════════════════════════════
+
+(function installAnnouncementCreatorV2() {
+    'use strict';
+
+    console.log('📢 [Announcement v2] Установка (стиль открытки)…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  КОНФИГ
+    // ═══════════════════════════════════════════════════════════
+    const CFG = {
+        CANVAS_W: 1200,
+        CANVAS_H: 1200,
+        JPEG_QUALITY: 0.92,
+        MAX_PHOTOS: 4,
+        MAX_PHOTO_SIZE: 25 * 1024 * 1024,
+        TARGET_BYTES: 950 * 1024,
+        MAX_TEXT_LEN: 300,
+        FONT: 'Arial, sans-serif',
+        LAYOUTS: [
+            { id: 'single',  name: '1 фото',  icon: '🖼️', count: 1 },
+            { id: 'two',     name: '2 фото',  icon: '🖼️🖼️', count: 2 },
+            { id: 'three',   name: '3 фото',  icon: '▦', count: 3 },
+            { id: 'four',    name: '4 фото',  icon: '⊞', count: 4 },
+        ],
+        TEXT_POSITIONS: [
+            { id: 'top',    name: 'Сверху',    icon: '⬆️' },
+            { id: 'bottom', name: 'Снизу',     icon: '⬇️' },
+            { id: 'center', name: 'По центру', icon: '⬛' },
+        ],
+        PLATE_STYLES: [
+            { id: 'dark',    name: 'Тёмная',    value: 'rgba(0,0,0,0.72)' },
+            { id: 'light',   name: 'Светлая',   value: 'rgba(255,255,255,0.88)' },
+            { id: 'accent',  name: 'Акцент',    value: 'rgba(108,92,231,0.85)' },
+            { id: 'warning', name: 'Внимание',  value: 'rgba(255,159,67,0.9)' },
+            { id: 'danger',  name: 'Срочно',    value: 'rgba(238,82,83,0.9)' },
+        ],
+        TEXT_COLORS: ['#ffffff', '#000000', '#feca57', '#ff6b6b', '#00b894'],
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОСТОЯНИЕ (аналог State из PostcardCreator)
+    // ═══════════════════════════════════════════════════════════
+    const A = {
+        modalEl: null,
+        photos: [],              // [{ file, img, dataUrl }]
+        text: '',
+        layout: 'single',
+        textPosition: 'bottom',
+        plateStyle: 'dark',
+        textColor: '#ffffff',
+        textToComment: false,
+        sending: false,
+        canvasEl: null,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  СТИЛИ (оставляем те же, что были)
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('announcementStyles')) {
+        const style = document.createElement('style');
+        style.id = 'announcementStyles';
+        style.textContent = `
+            .attach-menu-item.announcement .icon {
+                background: linear-gradient(135deg,
+                    rgba(255,159,67,0.25),
+                    rgba(238,82,83,0.15));
+                color: #ff9f43;
+            }
+            #announcementModal {
+                position: fixed;
+                inset: 0;
+                background: rgba(0,0,0,0.85);
+                backdrop-filter: blur(12px);
+                -webkit-backdrop-filter: blur(12px);
+                z-index: 9300;
+                display: none;
+                flex-direction: column;
+                padding: 0;
+                animation: annFadeIn 0.25s ease;
+                overscroll-behavior: contain;
+            }
+            #announcementModal.show { display: flex; }
+            @keyframes annFadeIn {
+                from { opacity: 0; }
+                to   { opacity: 1; }
+            }
+            #announcementModal .ann-header {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                padding: 12px 14px;
+                padding-top: calc(12px + env(safe-area-inset-top, 0px));
+                background: rgba(255,255,255,0.04);
+                backdrop-filter: blur(20px);
+                -webkit-backdrop-filter: blur(20px);
+                border-bottom: 1px solid rgba(255,255,255,0.06);
+                flex-shrink: 0;
+                z-index: 10;
+            }
+            #announcementModal .ann-title {
+                flex: 1;
+                min-width: 0;
+                font-size: 16px;
+                font-weight: 700;
+                color: #fff;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+            #announcementModal .ann-btn {
+                width: 38px;
+                height: 38px;
+                border-radius: 50%;
+                border: none;
+                background: rgba(255,255,255,0.06);
+                color: #ccc;
+                font-size: 16px;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                flex-shrink: 0;
+                transition: all 0.15s;
+                font-family: inherit;
+                padding: 0;
+            }
+            #announcementModal .ann-btn:active { transform: scale(0.9); }
+            #announcementModal .ann-btn:hover {
+                background: rgba(255,255,255,0.12);
+                color: #fff;
+            }
+            #announcementModal .ann-btn-primary {
+                width: auto;
+                padding: 0 16px;
+                height: 38px;
+                border-radius: 19px;
+                background: linear-gradient(135deg, #ff9f43, #ee5253);
+                color: #fff;
+                font-size: 14px;
+                font-weight: 600;
+                display: flex;
+                align-items: center;
+                gap: 6px;
+            }
+            #announcementModal .ann-btn-primary:hover {
+                background: linear-gradient(135deg, #ffae5c, #f06261);
+            }
+            #announcementModal .ann-btn-primary:disabled {
+                opacity: 0.4;
+                cursor: not-allowed;
+                transform: none;
+            }
+            #announcementModal .ann-body {
+                flex: 1;
+                overflow-y: auto;
+                padding: 14px;
+                min-height: 0;
+                display: flex;
+                flex-direction: column;
+                gap: 14px;
+            }
+            #announcementModal .ann-body::-webkit-scrollbar { width: 4px; }
+            #announcementModal .ann-body::-webkit-scrollbar-thumb {
+                background: rgba(255,159,67,0.4);
+                border-radius: 2px;
+            }
+            #announcementModal .ann-preview-wrap {
+                background: #05050a;
+                border-radius: 16px;
+                padding: 10px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                min-height: 200px;
+                max-height: 45vh;
+                overflow: hidden;
+                position: relative;
+                border: 1px solid rgba(255,159,67,0.3);
+                flex-shrink: 0;
+            }
+            #announcementModal .ann-preview-canvas {
+                max-width: 100%;
+                max-height: 100%;
+                border-radius: 12px;
+                display: block;
+                object-fit: contain;
+                box-shadow: 0 4px 20px rgba(0,0,0,0.6);
+            }
+            #announcementModal .ann-empty {
+                text-align: center;
+                color: #666;
+                padding: 30px 20px;
+                pointer-events: none;
+            }
+            #announcementModal .ann-empty-icon {
+                font-size: 52px;
+                margin-bottom: 10px;
+                opacity: 0.5;
+            }
+            #announcementModal .ann-empty-title {
+                font-size: 15px;
+                color: #aaa;
+                margin-bottom: 6px;
+                font-weight: 600;
+            }
+            #announcementModal .ann-empty-sub {
+                font-size: 12px;
+                color: #666;
+                line-height: 1.5;
+                max-width: 280px;
+                margin: 0 auto;
+            }
+            #announcementModal .ann-section {
+                background: rgba(255,255,255,0.03);
+                border: 1px solid rgba(255,255,255,0.06);
+                border-radius: 14px;
+                padding: 12px;
+            }
+            #announcementModal .ann-label {
+                font-size: 11px;
+                color: #888;
+                text-transform: uppercase;
+                letter-spacing: 0.4px;
+                font-weight: 700;
+                margin-bottom: 10px;
+                display: flex;
+                align-items: center;
+                gap: 6px;
+            }
+            #announcementModal .ann-label-icon {
+                font-size: 13px;
+            }
+            #announcementModal .ann-layouts {
+                display: flex;
+                gap: 6px;
+            }
+            #announcementModal .ann-layout {
+                flex: 1;
+                padding: 10px 4px;
+                background: rgba(255,255,255,0.04);
+                border: 1.5px solid rgba(255,255,255,0.08);
+                border-radius: 10px;
+                cursor: pointer;
+                transition: all 0.15s;
+                text-align: center;
+                -webkit-tap-highlight-color: transparent;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                gap: 2px;
+            }
+            #announcementModal .ann-layout:hover {
+                background: rgba(255,159,67,0.1);
+                border-color: rgba(255,159,67,0.3);
+            }
+            #announcementModal .ann-layout:active { transform: scale(0.97); }
+            #announcementModal .ann-layout.selected {
+                background: linear-gradient(135deg,
+                    rgba(255,159,67,0.25),
+                    rgba(238,82,83,0.15));
+                border-color: rgba(255,159,67,0.7);
+                box-shadow: 0 0 0 3px rgba(255,159,67,0.15);
+            }
+            #announcementModal .ann-layout-icon {
+                font-size: 18px;
+                line-height: 1;
+            }
+            #announcementModal .ann-layout-name {
+                font-size: 10px;
+                color: #aaa;
+                font-weight: 600;
+            }
+            #announcementModal .ann-layout.selected .ann-layout-name {
+                color: #ff9f43;
+            }
+            #announcementModal .ann-pick-btn {
+                width: 100%;
+                padding: 14px;
+                border-radius: 12px;
+                border: 2px dashed rgba(255,159,67,0.4);
+                background: rgba(255,159,67,0.06);
+                color: #ff9f43;
+                font-size: 14px;
+                font-weight: 600;
+                cursor: pointer;
+                font-family: inherit;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                gap: 8px;
+                transition: all 0.15s;
+                -webkit-tap-highlight-color: transparent;
+            }
+            #announcementModal .ann-pick-btn:hover {
+                background: rgba(255,159,67,0.15);
+                border-color: rgba(255,159,67,0.7);
+            }
+            #announcementModal .ann-pick-btn:active { transform: scale(0.98); }
+            #announcementModal .ann-photos {
+                display: flex;
+                gap: 6px;
+                flex-wrap: wrap;
+                margin-top: 8px;
+            }
+            #announcementModal .ann-photo-item {
+                position: relative;
+                width: 60px;
+                height: 60px;
+                border-radius: 10px;
+                overflow: hidden;
+                border: 2px solid rgba(255,159,67,0.4);
+                background: rgba(0,0,0,0.3);
+                flex-shrink: 0;
+            }
+            #announcementModal .ann-photo-item img {
+                width: 100%;
+                height: 100%;
+                object-fit: cover;
+                display: block;
+            }
+            #announcementModal .ann-photo-remove {
+                position: absolute;
+                top: -6px;
+                right: -6px;
+                width: 22px;
+                height: 22px;
+                border-radius: 50%;
+                border: 2px solid #1a1a2e;
+                background: #ff6b6b;
+                color: #fff;
+                font-size: 11px;
+                font-weight: 700;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 0;
+                line-height: 1;
+            }
+            #announcementModal .ann-text-input {
+                width: 100%;
+                padding: 12px 14px;
+                background: rgba(255,255,255,0.06);
+                border: 1px solid rgba(255,255,255,0.1);
+                border-radius: 12px;
+                color: #fff;
+                font-size: 15px;
+                font-family: inherit;
+                resize: vertical;
+                outline: none;
+                min-height: 70px;
+                max-height: 150px;
+                line-height: 1.5;
+                box-sizing: border-box;
+                transition: border-color 0.2s;
+            }
+            #announcementModal .ann-text-input:focus {
+                border-color: #ff9f43;
+                background: rgba(255,255,255,0.08);
+            }
+            #announcementModal .ann-text-counter {
+                font-size: 11px;
+                color: #666;
+                text-align: right;
+                margin-top: 4px;
+                font-variant-numeric: tabular-nums;
+            }
+            #announcementModal .ann-positions {
+                display: flex;
+                gap: 6px;
+            }
+            #announcementModal .ann-pos {
+                flex: 1;
+                padding: 9px 6px;
+                background: rgba(255,255,255,0.04);
+                border: 1.5px solid rgba(255,255,255,0.08);
+                border-radius: 10px;
+                cursor: pointer;
+                transition: all 0.15s;
+                text-align: center;
+                -webkit-tap-highlight-color: transparent;
+                color: #ccc;
+                font-size: 12px;
+                font-weight: 600;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                gap: 4px;
+            }
+            #announcementModal .ann-pos:hover {
+                background: rgba(255,159,67,0.1);
+                border-color: rgba(255,159,67,0.3);
+            }
+            #announcementModal .ann-pos:active { transform: scale(0.97); }
+            #announcementModal .ann-pos.selected {
+                background: linear-gradient(135deg,
+                    rgba(255,159,67,0.25),
+                    rgba(238,82,83,0.15));
+                border-color: rgba(255,159,67,0.7);
+                color: #fff;
+            }
+            #announcementModal .ann-plates {
+                display: flex;
+                gap: 6px;
+                flex-wrap: wrap;
+            }
+            #announcementModal .ann-plate {
+                flex: 1;
+                min-width: 70px;
+                padding: 10px 6px;
+                border-radius: 10px;
+                border: 2px solid rgba(255,255,255,0.1);
+                background: rgba(255,255,255,0.04);
+                cursor: pointer;
+                transition: all 0.15s;
+                text-align: center;
+                -webkit-tap-highlight-color: transparent;
+                font-size: 11px;
+                font-weight: 600;
+                color: #ccc;
+            }
+            #announcementModal .ann-plate:hover {
+                border-color: rgba(255,159,67,0.4);
+            }
+            #announcementModal .ann-plate:active { transform: scale(0.96); }
+            #announcementModal .ann-plate.selected {
+                border-color: #ff9f43;
+                box-shadow: 0 0 0 3px rgba(255,159,67,0.2);
+                color: #fff;
+            }
+            #announcementModal .ann-colors {
+                display: flex;
+                gap: 8px;
+                flex-wrap: wrap;
+            }
+            #announcementModal .ann-color {
+                width: 32px;
+                height: 32px;
+                border-radius: 50%;
+                border: 2px solid rgba(255,255,255,0.15);
+                cursor: pointer;
+                transition: all 0.15s;
+                flex-shrink: 0;
+                position: relative;
+                -webkit-tap-highlight-color: transparent;
+            }
+            #announcementModal .ann-color:active { transform: scale(0.9); }
+            #announcementModal .ann-color.selected {
+                border-color: #fff;
+                box-shadow: 0 0 0 3px rgba(255,255,255,0.25);
+                transform: scale(1.1);
+            }
+            #announcementModal .ann-color.selected::after {
+                content: '✓';
+                position: absolute;
+                inset: 0;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                color: #fff;
+                font-size: 14px;
+                font-weight: 700;
+                text-shadow: 0 1px 3px rgba(0,0,0,0.9);
+            }
+            #announcementModal .ann-color.light.selected::after {
+                color: #333;
+                text-shadow: none;
+            }
+            #announcementModal .ann-comment-toggle {
+                display: flex;
+                align-items: flex-start;
+                gap: 10px;
+                padding: 12px 14px;
+                border-radius: 12px;
+                background: rgba(108,92,231,0.06);
+                border: 1px solid rgba(108,92,231,0.25);
+                cursor: pointer;
+                transition: all 0.15s;
+                -webkit-tap-highlight-color: transparent;
+                user-select: none;
+            }
+            #announcementModal .ann-comment-toggle:hover {
+                background: rgba(108,92,231,0.12);
+            }
+            #announcementModal .ann-comment-toggle input {
+                width: 18px;
+                height: 18px;
+                accent-color: #6c5ce7;
+                cursor: pointer;
+                margin: 2px 0 0 0;
+                flex-shrink: 0;
+            }
+            #announcementModal .ann-comment-toggle .ann-toggle-text {
+                flex: 1;
+                min-width: 0;
+            }
+            #announcementModal .ann-comment-toggle .ann-toggle-title {
+                font-size: 13px;
+                font-weight: 600;
+                color: #fff;
+                margin-bottom: 3px;
+            }
+            #announcementModal .ann-comment-toggle .ann-toggle-sub {
+                font-size: 11px;
+                color: #888;
+                line-height: 1.4;
+            }
+            #announcementModal .ann-sending {
+                position: absolute;
+                inset: 0;
+                background: rgba(0,0,0,0.88);
+                backdrop-filter: blur(10px);
+                -webkit-backdrop-filter: blur(10px);
+                display: none;
+                align-items: center;
+                justify-content: center;
+                flex-direction: column;
+                gap: 14px;
+                z-index: 20;
+            }
+            #announcementModal.sending .ann-sending {
+                display: flex;
+            }
+            #announcementModal .ann-spinner {
+                width: 44px;
+                height: 44px;
+                border: 3px solid rgba(255,159,67,0.25);
+                border-top-color: #ff9f43;
+                border-right-color: #ee5253;
+                border-radius: 50%;
+                animation: annSpin 0.9s linear infinite;
+            }
+            @keyframes annSpin { to { transform: rotate(360deg); } }
+            #announcementModal .ann-sending-text {
+                font-size: 15px;
+                font-weight: 600;
+                color: #fff;
+            }
+            #announcementModal .ann-sending-sub {
+                font-size: 12px;
+                color: #888;
+                margin-top: -6px;
+            }
+            @media (max-width: 480px) {
+                #announcementModal .ann-body { padding: 10px; gap: 10px; }
+                #announcementModal .ann-preview-wrap { max-height: 38vh; }
+                #announcementModal .ann-layout-icon { font-size: 16px; }
+                #announcementModal .ann-layout-name { font-size: 9px; }
+                #announcementModal .ann-photo-item { width: 50px; height: 50px; }
+                #announcementModal .ann-text-input { font-size: 14px; min-height: 60px; }
+                #announcementModal .ann-section { padding: 10px; }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  УТИЛИТЫ (аналогичные тем, что в PostcardCreator)
+    // ═══════════════════════════════════════════════════════════
+    function showToastSafe(msg, dur) {
+        try { if (typeof showToast === 'function') showToast(msg, dur || 2000); } catch (e) {}
+    }
+    function playSoundSafe(type) {
+        try { if (typeof soundManager !== 'undefined') soundManager.play(type); } catch (e) {}
+    }
+    function isLightColor(hex) {
+        if (!hex || hex.length < 7) return false;
+        const r = parseInt(hex.slice(1, 3), 16);
+        const g = parseInt(hex.slice(3, 5), 16);
+        const b = parseInt(hex.slice(5, 7), 16);
+        return (r * 299 + g * 587 + b * 114) / 1000 > 160;
+    }
+    function loadImage(url) {
+        return new Promise((resolve, reject) => {
+            const img = new Image();
+            img.onload = () => resolve(img);
+            img.onerror = () => reject(new Error('Не удалось загрузить'));
+            img.src = url;
+        });
+    }
+    function wrapTextLines(ctx, text, maxWidth) {
+        const paragraphs = text.split('\n');
+        const allLines = [];
+        for (const p of paragraphs) {
+            if (!p.trim()) { allLines.push(''); continue; }
+            const words = p.split(/\s+/);
+            let current = '';
+            for (const w of words) {
+                const test = current ? current + ' ' + w : w;
+                if (ctx.measureText(test).width > maxWidth && current) {
+                    allLines.push(current);
+                    current = w;
+                } else {
+                    current = test;
+                }
+            }
+            if (current) allLines.push(current);
+        }
+        return allLines;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  РИСОВАНИЕ (сначала коллаж, потом текст)
+    // ═══════════════════════════════════════════════════════════
+    function drawAnnouncement(canvas) {
+        const W = CFG.CANVAS_W;
+        const H = CFG.CANVAS_H;
+
+        const hasOverlayText = !!(A.text.trim()) && !A.textToComment;
+        const hasPhotos = A.photos.length > 0;
+
+        if (!hasPhotos) return false;
+
+        const isCollage = A.photos.length > 1;
+        let canvasH = H;
+
+        if (!isCollage && hasOverlayText) canvasH = Math.round(H * 1.15);
+        else if (isCollage && hasOverlayText) canvasH = Math.round(H * 1.1);
+
+        canvas.width = W;
+        canvas.height = canvasH;
+        const ctx = canvas.getContext('2d');
+
+        const textZoneHeight = hasOverlayText
+            ? Math.round(canvasH * (A.textPosition === 'center' ? 0 : 0.22))
+            : 0;
+
+        let photoTop = 0;
+        let photoHeight = canvasH;
+
+        if (hasOverlayText) {
+            if (A.textPosition === 'top') {
+                photoTop = textZoneHeight;
+                photoHeight = canvasH - textZoneHeight;
+            } else if (A.textPosition === 'bottom') {
+                photoTop = 0;
+                photoHeight = canvasH - textZoneHeight;
+            }
+        }
+
+        ctx.fillStyle = '#0a0a0f';
+        ctx.fillRect(0, 0, W, canvasH);
+
+        drawPhotosGrid(ctx, W, photoTop, photoHeight);
+
+        if (hasOverlayText) {
+            drawTextOverlay(ctx, W, canvasH, textZoneHeight);
+        }
+
+        return true;
+    }
+
+    function drawPhotosGrid(ctx, canvasW, zoneTop, zoneHeight) {
+        const photos = A.photos.map(p => p.img).filter(Boolean);
+        if (photos.length === 0) return;
+        const n = photos.length;
+        const gap = 6;
+
+        if (n === 1) {
+            drawCoverImage(ctx, photos[0], 0, zoneTop, canvasW, zoneHeight);
+            return;
+        }
+        if (n === 2) {
+            const halfW = (canvasW - gap) / 2;
+            drawCoverImage(ctx, photos[0], 0, zoneTop, halfW, zoneHeight);
+            drawCoverImage(ctx, photos[1], halfW + gap, zoneTop, halfW, zoneHeight);
+            return;
+        }
+        if (n === 3) {
+            const topH = (zoneHeight - gap) * 0.55;
+            const bottomH = zoneHeight - gap - topH;
+            drawCoverImage(ctx, photos[0], 0, zoneTop, canvasW, topH);
+            const halfW = (canvasW - gap) / 2;
+            drawCoverImage(ctx, photos[1], 0, zoneTop + topH + gap, halfW, bottomH);
+            drawCoverImage(ctx, photos[2], halfW + gap, zoneTop + topH + gap, halfW, bottomH);
+            return;
+        }
+        if (n >= 4) {
+            const halfW = (canvasW - gap) / 2;
+            const halfH = (zoneHeight - gap) / 2;
+            drawCoverImage(ctx, photos[0], 0, zoneTop, halfW, halfH);
+            drawCoverImage(ctx, photos[1], halfW + gap, zoneTop, halfW, halfH);
+            drawCoverImage(ctx, photos[2], 0, zoneTop + halfH + gap, halfW, halfH);
+            drawCoverImage(ctx, photos[3], halfW + gap, zoneTop + halfH + gap, halfW, halfH);
+        }
+    }
+
+    function drawCoverImage(ctx, img, x, y, w, h) {
+        const imgW = img.naturalWidth || img.width;
+        const imgH = img.naturalHeight || img.height;
+        if (!imgW || !imgH) return;
+        const scale = Math.max(w / imgW, h / imgH);
+        const dw = imgW * scale;
+        const dh = imgH * scale;
+        const dx = x + (w - dw) / 2;
+        const dy = y + (h - dh) / 2;
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(x, y, w, h);
+        ctx.clip();
+        ctx.drawImage(img, dx, dy, dw, dh);
+        ctx.restore();
+    }
+
+    function drawTextOverlay(ctx, canvasW, canvasH, textZoneHeight) {
+        const text = A.text.trim();
+        if (!text) return;
+        const plateStyle = CFG.PLATE_STYLES.find(p => p.id === A.plateStyle) || CFG.PLATE_STYLES[0];
+        const padding = 28;
+        const maxTextWidth = canvasW - padding * 2;
+        let fontSize = 52;
+        const minFontSize = 28;
+        let lines = [];
+        for (; fontSize >= minFontSize; fontSize -= 2) {
+            ctx.font = `bold ${fontSize}px ${CFG.FONT}`;
+            lines = wrapTextLines(ctx, text, maxTextWidth);
+            const lineHeight = fontSize * 1.25;
+            const totalHeight = lines.length * lineHeight;
+            const maxZoneHeight = A.textPosition === 'center'
+                ? canvasH * 0.5
+                : textZoneHeight - 20;
+            if (totalHeight <= maxZoneHeight) break;
+        }
+        if (lines.length === 0) return;
+        const lineHeight = fontSize * 1.25;
+        const totalTextHeight = lines.length * lineHeight;
+        const plateH = totalTextHeight + padding * 2;
+        let plateY = 0;
+        if (A.textPosition === 'top') plateY = (textZoneHeight - plateH) / 2;
+        else if (A.textPosition === 'bottom') plateY = canvasH - textZoneHeight + (textZoneHeight - plateH) / 2;
+        else plateY = (canvasH - plateH) / 2;
+
+        if (A.plateStyle !== 'none') {
+            ctx.fillStyle = plateStyle.value;
+            ctx.fillRect(0, plateY, canvasW, plateH);
+        }
+
+        ctx.save();
+        ctx.shadowColor = 'rgba(0,0,0,0.7)';
+        ctx.shadowBlur = 8;
+        ctx.shadowOffsetX = 0;
+        ctx.shadowOffsetY = 2;
+        ctx.fillStyle = A.textColor;
+        ctx.font = `bold ${fontSize}px ${CFG.FONT}`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        lines.forEach((line, i) => {
+            const lineY = plateY + padding + lineHeight * i + lineHeight / 2;
+            ctx.fillText(line, canvasW / 2, lineY);
+        });
+        ctx.restore();
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  UI (модалка)
+    // ═══════════════════════════════════════════════════════════
+    function ensureModal() {
+        if (A.modalEl && A.modalEl.isConnected) return A.modalEl;
+        const old = document.getElementById('announcementModal');
+        if (old) old.remove();
+
+        const modal = document.createElement('div');
+        modal.id = 'announcementModal';
+        modal.innerHTML = `
+            <div class="ann-header">
+                <button class="ann-btn" id="annCloseBtn" title="Закрыть">✕</button>
+                <div class="ann-title"><span>📢</span><span>Объявление</span></div>
+                <button class="ann-btn-primary" id="annSendBtn" disabled><span>📤</span><span>Опубликовать</span></button>
+            </div>
+            <div class="ann-body">
+                <div class="ann-preview-wrap" id="annPreviewWrap">
+                    <canvas class="ann-preview-canvas" id="annCanvas" style="display:none;"></canvas>
+                    <div class="ann-empty" id="annEmpty">
+                        <div class="ann-empty-icon">📢</div>
+                        <div class="ann-empty-title">Создайте объявление</div>
+                        <div class="ann-empty-sub">Добавьте фото и напишите текст</div>
+                    </div>
+                </div>
+                <div class="ann-section">
+                    <div class="ann-label"><span class="ann-label-icon">🖼️</span><span>Фотографии</span></div>
+                    <div class="ann-layouts" id="annLayouts"></div>
+                    <div style="height:10px;"></div>
+                    <button class="ann-pick-btn" id="annPickBtn"><span>📷</span><span id="annPickLabel">Выбрать фото</span></button>
+                    <div class="ann-photos" id="annPhotos"></div>
+                </div>
+                <div class="ann-section">
+                    <div class="ann-label"><span class="ann-label-icon">📝</span><span>Текст объявления</span></div>
+                    <textarea class="ann-text-input" id="annTextInput" placeholder="Например: Встречаемся в субботу в 15:00!" maxlength="${CFG.MAX_TEXT_LEN}" rows="3"></textarea>
+                    <div class="ann-text-counter" id="annTextCounter">0 / ${CFG.MAX_TEXT_LEN}</div>
+                </div>
+                <label class="ann-comment-toggle">
+                    <input type="checkbox" id="annCommentToggle">
+                    <div class="ann-toggle-text">
+                        <div class="ann-toggle-title">📝 Текст в первый комментарий</div>
+                        <div class="ann-toggle-sub">Текст не наложится на фото, а уйдёт комментарием</div>
+                    </div>
+                </label>
+                <div id="annTextOverlaySettings">
+                    <div class="ann-section" style="margin-bottom:10px;">
+                        <div class="ann-label"><span class="ann-label-icon">📍</span><span>Позиция текста</span></div>
+                        <div class="ann-positions" id="annPositions"></div>
+                    </div>
+                    <div class="ann-section" style="margin-bottom:10px;">
+                        <div class="ann-label"><span class="ann-label-icon">🎨</span><span>Стиль плашки</span></div>
+                        <div class="ann-plates" id="annPlates"></div>
+                    </div>
+                    <div class="ann-section">
+                        <div class="ann-label"><span class="ann-label-icon">🖌️</span><span>Цвет текста</span></div>
+                        <div class="ann-colors" id="annColors"></div>
+                    </div>
+                </div>
+            </div>
+            <div class="ann-sending">
+                <div class="ann-spinner"></div>
+                <div class="ann-sending-text">Публикуем объявление…</div>
+                <div class="ann-sending-sub">Сжатие и шифрование</div>
+            </div>
+            <input type="file" id="annFileInput" accept="image/*" multiple style="display:none;">
+        `;
+        document.body.appendChild(modal);
+        A.modalEl = modal;
+        A.canvasEl = modal.querySelector('#annCanvas');
+
+        modal.querySelector('#annCloseBtn').addEventListener('click', closeModal);
+        modal.querySelector('#annSendBtn').addEventListener('click', sendAnnouncement);
+        modal.querySelector('#annPickBtn').addEventListener('click', () => {
+            const input = modal.querySelector('#annFileInput');
+            input.value = '';
+            input.click();
+        });
+        modal.querySelector('#annFileInput').addEventListener('change', handleFilesPicked);
+
+        const textInput = modal.querySelector('#annTextInput');
+        const textCounter = modal.querySelector('#annTextCounter');
+        textInput.addEventListener('input', () => {
+            A.text = textInput.value;
+            const len = textInput.value.length;
+            textCounter.textContent = `${len} / ${CFG.MAX_TEXT_LEN}`;
+            textCounter.style.color = len > CFG.MAX_TEXT_LEN * 0.9 ? '#ff9f43' : '#666';
+            updateSendButtonState();
+            redraw();
+        });
+
+        const commentToggle = modal.querySelector('#annCommentToggle');
+        commentToggle.addEventListener('change', () => {
+            A.textToComment = commentToggle.checked;
+            updateOverlaySettingsVisibility();
+            redraw();
+        });
+
+        // Раскладки
+        const layoutsEl = modal.querySelector('#annLayouts');
+        layoutsEl.innerHTML = CFG.LAYOUTS.map(l => `
+            <div class="ann-layout" data-layout="${l.id}">
+                <div class="ann-layout-icon">${l.icon}</div>
+                <div class="ann-layout-name">${l.name}</div>
+            </div>
+        `).join('');
+        layoutsEl.querySelectorAll('.ann-layout').forEach(el => {
+            el.addEventListener('click', () => {
+                const layout = el.dataset.layout;
+                const info = CFG.LAYOUTS.find(l => l.id === layout);
+                if (!info) return;
+                if (A.photos.length > info.count) {
+                    A.photos = A.photos.slice(0, info.count);
+                    renderPhotosList();
+                }
+                A.layout = layout;
+                layoutsEl.querySelectorAll('.ann-layout').forEach(x => x.classList.toggle('selected', x.dataset.layout === layout));
+                updatePickButtonLabel();
+                updateSendButtonState();
+                redraw();
+                playSoundSafe('click');
+            });
+        });
+
+        // Позиции
+        const posEl = modal.querySelector('#annPositions');
+        posEl.innerHTML = CFG.TEXT_POSITIONS.map(p => `
+            <div class="ann-pos" data-pos="${p.id}"><span>${p.icon}</span><span>${p.name}</span></div>
+        `).join('');
+        posEl.querySelectorAll('.ann-pos').forEach(el => {
+            el.addEventListener('click', () => {
+                A.textPosition = el.dataset.pos;
+                posEl.querySelectorAll('.ann-pos').forEach(x => x.classList.toggle('selected', x.dataset.pos === A.textPosition));
+                redraw();
+                playSoundSafe('click');
+            });
+        });
+
+        // Плашки
+        const platesEl = modal.querySelector('#annPlates');
+        platesEl.innerHTML = CFG.PLATE_STYLES.map(p => `
+            <div class="ann-plate" data-plate="${p.id}" style="background:${p.value};color:${p.id === 'light' ? '#000' : '#fff'};">${p.name}</div>
+        `).join('');
+        platesEl.querySelectorAll('.ann-plate').forEach(el => {
+            el.addEventListener('click', () => {
+                A.plateStyle = el.dataset.plate;
+                platesEl.querySelectorAll('.ann-plate').forEach(x => x.classList.toggle('selected', x.dataset.plate === A.plateStyle));
+                redraw();
+                playSoundSafe('click');
+            });
+        });
+
+        // Цвета
+        const colorsEl = modal.querySelector('#annColors');
+        colorsEl.innerHTML = CFG.TEXT_COLORS.map(c => `
+            <div class="ann-color ${isLightColor(c) ? 'light' : ''} ${c === A.textColor ? 'selected' : ''}" data-color="${c}" style="background:${c};"></div>
+        `).join('');
+        colorsEl.querySelectorAll('.ann-color').forEach(el => {
+            el.addEventListener('click', () => {
+                A.textColor = el.dataset.color;
+                colorsEl.querySelectorAll('.ann-color').forEach(x => x.classList.toggle('selected', x.dataset.color === A.textColor));
+                redraw();
+                playSoundSafe('click');
+            });
+        });
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && A.modalEl && A.modalEl.classList.contains('show') && !A.sending) {
+                e.preventDefault(); e.stopPropagation(); closeModal();
+            }
+        }, true);
+
+        return modal;
+    }
+
+    function openModal() {
+        if (!state.isAuthorized || !state.chatFile) {
+            showToastSafe('🔒 Требуется вход в чат', 2000);
+            return;
+        }
+        ensureModal();
+        A.photos = []; A.text = ''; A.layout = 'single'; A.textPosition = 'bottom';
+        A.plateStyle = 'dark'; A.textColor = '#ffffff'; A.textToComment = false; A.sending = false;
+
+        A.modalEl.querySelector('#annTextInput').value = '';
+        A.modalEl.querySelector('#annTextCounter').textContent = `0 / ${CFG.MAX_TEXT_LEN}`;
+        A.modalEl.querySelector('#annCommentToggle').checked = false;
+
+        A.modalEl.querySelectorAll('.ann-layout').forEach(x => x.classList.toggle('selected', x.dataset.layout === 'single'));
+        A.modalEl.querySelectorAll('.ann-pos').forEach(x => x.classList.toggle('selected', x.dataset.pos === 'bottom'));
+        A.modalEl.querySelectorAll('.ann-plate').forEach(x => x.classList.toggle('selected', x.dataset.plate === 'dark'));
+        A.modalEl.querySelectorAll('.ann-color').forEach(x => x.classList.toggle('selected', x.dataset.color === '#ffffff'));
+
+        A.canvasEl.style.display = 'none';
+        A.modalEl.querySelector('#annEmpty').style.display = 'block';
+
+        renderPhotosList();
+        updatePickButtonLabel();
+        updateOverlaySettingsVisibility();
+        updateSendButtonState();
+
+        A.modalEl.classList.add('show');
+        A.modalEl.classList.remove('sending');
+        document.body.style.overflow = 'hidden';
+        playSoundSafe('click');
+    }
+
+    function closeModal() {
+        if (!A.modalEl || A.sending) return;
+        A.modalEl.classList.remove('show');
+        document.body.style.overflow = '';
+        A.photos = []; A.text = '';
+    }
+
+    async function handleFilesPicked(e) {
+        const files = Array.from(e.target.files || []);
+        e.target.value = '';
+        if (files.length === 0) return;
+
+        const layoutInfo = CFG.LAYOUTS.find(l => l.id === A.layout) || CFG.LAYOUTS[0];
+        const remaining = layoutInfo.count - A.photos.length;
+        if (remaining <= 0) {
+            showToastSafe(`❌ Максимум ${layoutInfo.count} фото`, 2000);
+            return;
+        }
+        const toAdd = files.slice(0, remaining);
+        if (files.length > remaining) showToastSafe(`ℹ️ Добавлено ${remaining} из ${files.length}`, 2000);
+        showToastSafe('⏳ Загрузка фото…', 1200);
+
+        for (const file of toAdd) {
+            if (!file.type.startsWith('image/')) continue;
+            if (file.size > CFG.MAX_PHOTO_SIZE) {
+                showToastSafe(`❌ ${file.name} — слишком большой`, 2000);
+                continue;
+            }
+            try {
+                const dataUrl = await fileToDataUrl(file);
+                const img = await loadImage(dataUrl);
+                A.photos.push({ file, img, dataUrl });
+            } catch (err) {
+                console.warn('📢 [Announcement] Ошибка загрузки:', file.name, err);
+            }
+        }
+
+        renderPhotosList();
+        updatePickButtonLabel();
+        updateSendButtonState();
+        redraw();
+        playSoundSafe('send');
+    }
+
+    function fileToDataUrl(file) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(reader.result);
+            reader.onerror = reject;
+            reader.readAsDataURL(file);
+        });
+    }
+
+    function renderPhotosList() {
+        if (!A.modalEl) return;
+        const list = A.modalEl.querySelector('#annPhotos');
+        if (!list) return;
+        list.innerHTML = A.photos.map((p, i) => `
+            <div class="ann-photo-item" data-idx="${i}">
+                <img src="${p.dataUrl}" alt="">
+                <button class="ann-photo-remove" data-remove="${i}" title="Удалить">✕</button>
+            </div>
+        `).join('');
+        list.querySelectorAll('.ann-photo-remove').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const idx = parseInt(btn.dataset.remove, 10);
+                if (isNaN(idx)) return;
+                A.photos.splice(idx, 1);
+                renderPhotosList();
+                updatePickButtonLabel();
+                updateSendButtonState();
+                redraw();
+                playSoundSafe('delete');
+            });
+        });
+    }
+
+    function updatePickButtonLabel() {
+        if (!A.modalEl) return;
+        const layoutInfo = CFG.LAYOUTS.find(l => l.id === A.layout) || CFG.LAYOUTS[0];
+        const label = A.modalEl.querySelector('#annPickLabel');
+        if (!label) return;
+        const remaining = layoutInfo.count - A.photos.length;
+        if (A.photos.length === 0) label.textContent = `Выбрать фото (до ${layoutInfo.count})`;
+        else if (remaining > 0) label.textContent = `Добавить ещё (осталось ${remaining})`;
+        else label.textContent = `Все ${layoutInfo.count} фото выбраны`;
+    }
+
+    function updateSendButtonState() {
+        if (!A.modalEl) return;
+        const btn = A.modalEl.querySelector('#annSendBtn');
+        if (!btn) return;
+        const hasPhotos = A.photos.length > 0;
+        const hasText = A.text.trim().length > 0;
+        const valid = hasPhotos && (!A.textToComment || hasText);
+        btn.disabled = !valid;
+    }
+
+    function updateOverlaySettingsVisibility() {
+        if (!A.modalEl) return;
+        const settings = A.modalEl.querySelector('#annTextOverlaySettings');
+        if (!settings) return;
+        settings.style.display = A.textToComment ? 'none' : 'block';
+    }
+
+    let _redrawRaf = null;
+    function redraw() {
+        if (_redrawRaf) return;
+        _redrawRaf = requestAnimationFrame(() => {
+            _redrawRaf = null;
+            if (!A.modalEl || !A.canvasEl) return;
+            if (A.photos.length === 0) {
+                A.canvasEl.style.display = 'none';
+                A.modalEl.querySelector('#annEmpty').style.display = 'block';
+                return;
+            }
+            A.canvasEl.style.display = 'block';
+            A.modalEl.querySelector('#annEmpty').style.display = 'none';
+            try { drawAnnouncement(A.canvasEl); } catch (e) { console.error(e); }
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОТПРАВКА (точно как в PostcardCreator)
+    // ═══════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════
+//  ОЖИДАНИЕ ОТПРАВКИ (как в PostcardCreator)
+// ═══════════════════════════════════════════════════════════
+function waitForSendComplete(timeoutMs = 60000) {
+    return new Promise((resolve) => {
+        const start = Date.now();
+        let sawActivity = false;
+
+        const tick = () => {
+            const isSending = (typeof state !== 'undefined' && state.isSending);
+            const queueBusy = (typeof SendQueue !== 'undefined'
+                && typeof SendQueue.isBusy === 'function'
+                && SendQueue.isBusy());
+            const autoOutbox = (typeof AutoOutbox !== 'undefined'
+                && typeof AutoOutbox.status === 'function'
+                && AutoOutbox.status().processing);
+
+            const busy = isSending || queueBusy || autoOutbox;
+
+            if (busy) sawActivity = true;
+
+            // Считаем завершённым только если была активность и она закончилась
+            if (sawActivity && !busy) {
+                resolve(true);
+                return;
+            }
+
+            // Таймаут
+            if (Date.now() - start > timeoutMs) {
+                resolve(false);
+                return;
+            }
+
+            setTimeout(tick, 200);
+        };
+
+        // Стартовая задержка — чтобы отправка точно началась
+        setTimeout(tick, 400);
+    });
+}
+
+// ═══════════════════════════════════════════════════════════
+//  ОТПРАВКА
+// ═══════════════════════════════════════════════════════════
+async function sendAnnouncement() {
+    if (A.sending) return;
+    if (!A.photos.length) { showToastSafe('❌ Добавьте фото', 2000); return; }
+    const text = A.text.trim();
+    if (A.textToComment && !text) { showToastSafe('❌ Введите текст', 2000); return; }
+    if (!state.isAuthorized || !state.chatFile) { showToastSafe('🔒 Нет доступа', 2000); return; }
+
+    A.sending = true;
+    A.modalEl.classList.add('sending');
+    const targetChatFile = state.chatFile;
+
+    try {
+        // 1. Рисуем финальный canvas
+        const finalCanvas = document.createElement('canvas');
+        if (!drawAnnouncement(finalCanvas)) throw new Error('Не удалось сформировать изображение');
+
+        // 2. В blob
+        let blob = await new Promise((resolve, reject) => {
+            finalCanvas.toBlob(b => b ? resolve(b) : reject(new Error('toBlob failed')), 'image/jpeg', CFG.JPEG_QUALITY);
+        });
+        if (!blob) throw new Error('Пустой blob');
+
+        // 3. Сжимаем при необходимости
+        if (blob.size > CFG.TARGET_BYTES) {
+            let quality = 0.82;
+            while (blob.size > CFG.TARGET_BYTES && quality >= 0.4) {
+                blob = await new Promise((resolve, reject) => {
+                    finalCanvas.toBlob(b => b ? resolve(b) : reject(new Error('toBlob failed')), 'image/jpeg', quality);
+                });
+                quality -= 0.08;
+            }
+            console.log(`📢 [Announcement] Сжато до: ${blob.size} байт`);
+        }
+
+        // 4. Запоминаем текущее количество сообщений, чтобы найти именно своё
+        const prevCount = (typeof historyState !== 'undefined' && historyState.allMessages)
+            ? historyState.allMessages.length
+            : 0;
+
+        // 5. Отправляем и ждём завершения очереди (как в PostcardCreator)
+        console.log('📢 [Announcement] Отправляем через sendMessage…');
+
+        try {
+            sendMessage('', blob);
+        } catch (e) {
+            console.error('📢 [Announcement] sendMessage threw:', e);
+            throw e;
+        }
+
+        // 6. Ждём завершения отправки
+        const ok = await waitForSendComplete(60000);
+        console.log('📢 [Announcement] waitForSendComplete →', ok);
+
+        if (!ok) {
+            // Если очередь не справилась за 60 сек — пробуем всё равно найти сообщение
+            console.warn('📢 [Announcement] Таймаут waitForSendComplete, но проверяем историю…');
+        }
+
+        // 7. Дополнительная пауза, чтобы appendMessages отрисовало сообщение
+        await new Promise(r => setTimeout(r, 800));
+
+        // 8. Если текст в комментарий — добавляем
+        if (A.textToComment && text) {
+            let lastImageMsg = null;
+            if (state.chatFile === targetChatFile
+                && typeof historyState !== 'undefined'
+                && Array.isArray(historyState.allMessages)) {
+                // Ищем с конца: наше сообщение = image + наш username,
+                // появившееся после prevCount
+                for (let i = historyState.allMessages.length - 1; i >= 0; i--) {
+                    const m = historyState.allMessages[i];
+                    if (m.username === state.username && m.image) {
+                        lastImageMsg = m;
+                        break;
+                    }
+                }
+            }
+
+            if (lastImageMsg && typeof submitComment === 'function') {
+                try {
+                    await submitComment(lastImageMsg.id, text);
+                    console.log('📢 [Announcement] Комментарий добавлен');
+                } catch (e) {
+                    console.warn('📢 [Announcement] Не удалось добавить комментарий:', e);
+                }
+            }
+        }
+
+        // 9. Успех — закрываем
+        A.sending = false;
+        A.modalEl.classList.remove('sending');
+        showToastSafe('✅ Объявление опубликовано', 2000);
+        playSoundSafe('send');
+        if (navigator.vibrate) navigator.vibrate([20, 40, 20]);
+        closeModal();
+
+    } catch (e) {
+        console.error('📢 [Announcement] Send error:', e);
+        showToastSafe('❌ Ошибка: ' + (e.message || 'неизвестно'), 3000);
+        playSoundSafe('error');
+        A.sending = false;
+        A.modalEl.classList.remove('sending');
+    }
+}
+    // ═══════════════════════════════════════════════════════════
+    //  ВНЕДРЕНИЕ ПУНКТА В МЕНЮ ВЛОЖЕНИЙ
+    // ═══════════════════════════════════════════════════════════
+    function injectAttachMenuItem() {
+        const menu = document.getElementById('attachMenu');
+        if (!menu || menu.querySelector('[data-action="announcement"]')) return;
+        const item = document.createElement('div');
+        item.className = 'attach-menu-item announcement';
+        item.dataset.action = 'announcement';
+        item.innerHTML = `<div class="icon">📢</div><div class="text"><div class="title">Объявление</div><div class="subtitle">Коллаж + текст поверх</div></div>`;
+        const postcardItem = menu.querySelector('[data-action="postcard"]');
+        if (postcardItem) postcardItem.parentNode.insertBefore(item, postcardItem);
+        else menu.insertBefore(item, menu.firstChild);
+    }
+
+    document.addEventListener('click', (e) => {
+        const item = e.target.closest('.attach-menu-item[data-action="announcement"]');
+        if (item) {
+            e.stopImmediatePropagation(); e.preventDefault();
+            if (typeof toggleAttachMenu === 'function') toggleAttachMenu(false);
+            setTimeout(() => openModal(), 150);
+        }
+    }, true);
+
+    const observer = new MutationObserver(() => {
+        if (document.getElementById('attachMenu')) injectAttachMenuItem();
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    document.addEventListener('click', (e) => {
+        if (e.target.closest('#fileBtn')) {
+            setTimeout(injectAttachMenuItem, 30);
+            setTimeout(injectAttachMenuItem, 150);
+        }
+    }, true);
+
+    setTimeout(injectAttachMenuItem, 2000);
+    setTimeout(injectAttachMenuItem, 5000);
+
+    window.AnnouncementCreator = {
+        open: openModal,
+        close: closeModal,
+        status: () => ({
+            modalOpen: !!(A.modalEl && A.modalEl.classList.contains('show')),
+            photosCount: A.photos.length,
+            layout: A.layout,
+            hasText: !!A.text.trim(),
+            textToComment: A.textToComment,
+            sending: A.sending,
+        }),
+        config: CFG,
+    };
+
+    console.log('📢 [Announcement v2] Готово');
+})();
 </script>
 
 </body>
