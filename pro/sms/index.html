@@ -71175,5 +71175,711 @@ result[file] = {
     console.log('   • API: GamesHub.openSecretCode()');
 })();
 </script>
+
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🔤 FONT SIZE CONTROL — РЕГУЛИРОВКА РАЗМЕРА ШРИФТА В ЧАТЕ
+//  ─────────────────────────────────────────────────────────────
+//  • Пункт «🔤 Размер текста» в меню действий «⋯» на экране чатов
+//  • Оверлей с плавным ползунком и живым предпросмотром
+//  • Применяется мгновенно ко всем сообщениям
+//  • Сохраняется в localStorage
+// ═══════════════════════════════════════════════════════════════
+
+(function installFontSizeControl() {
+    'use strict';
+
+    console.log('🔤 [FontSize] Установка…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  КОНФИГ
+    // ═══════════════════════════════════════════════════════════
+    const CFG = {
+        STORAGE_KEY: 'smschat_font_size',
+        DEFAULT_SIZE: 15,         // px, соответствует текущему размеру
+        MIN_SIZE: 11,
+        MAX_SIZE: 22,
+        STEP: 1,
+        PRESETS: [
+            { name: 'Мелкий', value: 12, icon: 'A' },
+            { name: 'Средний', value: 15, icon: 'A' },
+            { name: 'Крупный', value: 18, icon: 'A' },
+            { name: 'Очень крупный', value: 21, icon: 'A' },
+        ],
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОСТОЯНИЕ
+    // ═══════════════════════════════════════════════════════════
+    const FS = {
+        currentSize: CFG.DEFAULT_SIZE,
+        modalEl: null,
+        originalSize: null,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  УТИЛИТЫ
+    // ═══════════════════════════════════════════════════════════
+    function showToastSafe(msg, dur) {
+        try { if (typeof showToast === 'function') showToast(msg, dur || 2000); } catch (e) {}
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЗАГРУЗКА И ПРИМЕНЕНИЕ РАЗМЕРА
+    // ═══════════════════════════════════════════════════════════
+    function loadFontSize() {
+        try {
+            const saved = localStorage.getItem(CFG.STORAGE_KEY);
+            if (saved) {
+                const size = parseInt(saved, 10);
+                if (size >= CFG.MIN_SIZE && size <= CFG.MAX_SIZE) {
+                    FS.currentSize = size;
+                }
+            }
+        } catch (e) {
+            console.warn('🔤 [FontSize] load failed:', e);
+        }
+        console.log(`🔤 [FontSize] Загружен размер: ${FS.currentSize}px`);
+    }
+
+    function applyFontSize(size) {
+        // Устанавливаем CSS-переменную на html — все стили, использующие
+        // её, подхватят новое значение мгновенно.
+        document.documentElement.style.setProperty('--chat-font-size', size + 'px');
+        FS.currentSize = size;
+
+        // Обновляем селекторы, если они есть в DOM
+        document.querySelectorAll('[data-font-preset]').forEach(el => {
+            const presetValue = parseInt(el.dataset.fontPreset, 10);
+            el.classList.toggle('selected', presetValue === size);
+        });
+
+        const slider = document.getElementById('fontSizeSlider');
+        if (slider) slider.value = size;
+
+        const valueEl = document.getElementById('fontSizeValue');
+        if (valueEl) valueEl.textContent = size + 'px';
+
+        updatePreview();
+    }
+
+    function saveFontSize(size) {
+        try {
+            localStorage.setItem(CFG.STORAGE_KEY, String(size));
+            console.log(`🔤 [FontSize] Сохранён размер: ${size}px`);
+        } catch (e) {
+            console.warn('🔤 [FontSize] save failed:', e);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СТИЛИ (CSS)
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('fontSizeControlStyles')) {
+        const style = document.createElement('style');
+        style.id = 'fontSizeControlStyles';
+        style.textContent = `
+            /* ═══ CSS-переменная для размера шрифта ═══ */
+            :root {
+                --chat-font-size: ${CFG.DEFAULT_SIZE}px;
+            }
+
+            /* ═══ Применяем к основному тексту сообщений ═══ */
+            .message .text {
+                font-size: var(--chat-font-size) !important;
+            }
+
+            /* ═══ Комментарии чуть меньше основного текста ═══ */
+            .comment-text {
+                font-size: calc(var(--chat-font-size) * 0.86) !important;
+            }
+
+            /* ═══ Крупные эмодзи масштабируются от базового ═══ */
+            .message .text.emoji-only.emoji-1 { font-size: calc(var(--chat-font-size) * 4.2) !important; }
+            .message .text.emoji-only.emoji-2 { font-size: calc(var(--chat-font-size) * 3.4) !important; }
+            .message .text.emoji-only.emoji-3 { font-size: calc(var(--chat-font-size) * 2.6) !important; }
+
+            /* ═══ МОДАЛЬНОЕ ОКНО ═══ */
+            #fontSizeModal { display: none; }
+            #fontSizeModal.active { display: flex; }
+
+            #fontSizeModal .fs-content {
+                background: #1a1a2e;
+                border: 1px solid rgba(255,255,255,0.1);
+                border-radius: 22px;
+                padding: 0;
+                max-width: 480px;
+                width: 100%;
+                max-height: 92vh;
+                display: flex;
+                flex-direction: column;
+                box-shadow: 0 24px 72px rgba(0,0,0,0.7);
+                animation: fsModalIn 0.25s cubic-bezier(0.22, 0.61, 0.36, 1);
+                overflow: hidden;
+            }
+            @keyframes fsModalIn {
+                from { opacity: 0; transform: scale(0.94) translateY(20px); }
+                to   { opacity: 1; transform: scale(1) translateY(0); }
+            }
+
+            #fontSizeModal .fs-header {
+                display: flex;
+                align-items: center;
+                gap: 12px;
+                padding: 18px 20px;
+                border-bottom: 1px solid rgba(255,255,255,0.08);
+                background: linear-gradient(135deg, rgba(108,92,231,0.12), rgba(0,184,148,0.06));
+                flex-shrink: 0;
+            }
+            #fontSizeModal .fs-header-icon {
+                width: 42px; height: 42px;
+                border-radius: 12px;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                display: flex; align-items: center; justify-content: center;
+                font-size: 22px; flex-shrink: 0;
+                box-shadow: 0 4px 14px rgba(108,92,231,0.4);
+            }
+            #fontSizeModal .fs-header-text { flex: 1; min-width: 0; }
+            #fontSizeModal .fs-header h2 {
+                font-size: 17px; font-weight: 700; color: #fff; margin: 0 0 2px;
+            }
+            #fontSizeModal .fs-header-sub {
+                font-size: 12px; color: #888;
+            }
+            #fontSizeModal .fs-close {
+                width: 34px; height: 34px;
+                border-radius: 50%; border: none;
+                background: rgba(255,255,255,0.06);
+                color: #888; font-size: 16px; cursor: pointer;
+                display: flex; align-items: center; justify-content: center;
+                flex-shrink: 0; transition: all 0.15s;
+            }
+            #fontSizeModal .fs-close:hover {
+                background: rgba(255,107,107,0.2); color: #ff6b6b;
+            }
+
+            #fontSizeModal .fs-body {
+                flex: 1; overflow-y: auto; padding: 20px;
+                display: flex; flex-direction: column; gap: 22px;
+            }
+
+            /* ═══ Секция ═══ */
+            #fontSizeModal .fs-section-title {
+                font-size: 12px; font-weight: 700; color: #888;
+                text-transform: uppercase; letter-spacing: 0.4px;
+                margin-bottom: 12px;
+            }
+
+            /* ═══ Пресеты ═══ */
+            #fontSizeModal .fs-presets {
+                display: grid;
+                grid-template-columns: repeat(2, 1fr);
+                gap: 8px;
+            }
+            #fontSizeModal .fs-preset {
+                padding: 14px 10px;
+                background: rgba(255,255,255,0.04);
+                border: 2px solid rgba(255,255,255,0.08);
+                border-radius: 14px;
+                cursor: pointer;
+                text-align: center;
+                transition: all 0.15s;
+                -webkit-tap-highlight-color: transparent;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                gap: 4px;
+            }
+            #fontSizeModal .fs-preset:hover {
+                background: rgba(108,92,231,0.1);
+                border-color: rgba(108,92,231,0.3);
+            }
+            #fontSizeModal .fs-preset:active { transform: scale(0.97); }
+            #fontSizeModal .fs-preset.selected {
+                background: linear-gradient(135deg, rgba(108,92,231,0.25), rgba(0,184,148,0.15));
+                border-color: rgba(108,92,231,0.7);
+                box-shadow: 0 0 0 3px rgba(108,92,231,0.15);
+            }
+            #fontSizeModal .fs-preset-icon {
+                font-weight: 900;
+                color: #fff;
+                line-height: 1;
+                height: 24px;
+                display: flex;
+                align-items: center;
+            }
+            #fontSizeModal .fs-preset-name {
+                font-size: 11px;
+                color: #aaa;
+                font-weight: 600;
+            }
+            #fontSizeModal .fs-preset.selected .fs-preset-name {
+                color: #a78bfa;
+            }
+
+            /* ═══ Слайдер ═══ */
+            #fontSizeModal .fs-slider-row {
+                display: flex;
+                align-items: center;
+                gap: 14px;
+            }
+            #fontSizeModal .fs-slider-btn {
+                width: 40px; height: 40px;
+                border-radius: 50%;
+                border: 1px solid rgba(255,255,255,0.1);
+                background: rgba(255,255,255,0.06);
+                color: #ccc;
+                font-size: 20px;
+                font-weight: 700;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                flex-shrink: 0;
+                transition: all 0.15s;
+                padding: 0;
+                line-height: 1;
+            }
+            #fontSizeModal .fs-slider-btn:hover {
+                background: rgba(108,92,231,0.25);
+                border-color: rgba(108,92,231,0.5);
+                color: #fff;
+            }
+            #fontSizeModal .fs-slider-btn:active {
+                transform: scale(0.9);
+            }
+            #fontSizeModal .fs-slider-btn:disabled {
+                opacity: 0.35;
+                cursor: not-allowed;
+                transform: none;
+            }
+
+            #fontSizeModal .fs-slider {
+                flex: 1;
+                -webkit-appearance: none;
+                appearance: none;
+                height: 6px;
+                border-radius: 3px;
+                background: linear-gradient(90deg,
+                    rgba(108,92,231,0.3),
+                    rgba(108,92,231,0.9));
+                outline: none;
+                cursor: pointer;
+            }
+            #fontSizeModal .fs-slider::-webkit-slider-thumb {
+                -webkit-appearance: none;
+                appearance: none;
+                width: 24px; height: 24px;
+                border-radius: 50%;
+                background: #fff;
+                border: 2px solid #6c5ce7;
+                box-shadow: 0 2px 10px rgba(108,92,231,0.5);
+                cursor: pointer;
+                transition: transform 0.1s;
+            }
+            #fontSizeModal .fs-slider::-webkit-slider-thumb:active {
+                transform: scale(1.15);
+            }
+            #fontSizeModal .fs-slider::-moz-range-thumb {
+                width: 24px; height: 24px;
+                border-radius: 50%;
+                background: #fff;
+                border: 2px solid #6c5ce7;
+                cursor: pointer;
+            }
+            #fontSizeModal .fs-slider-value {
+                min-width: 52px;
+                text-align: right;
+                font-size: 16px;
+                font-weight: 800;
+                color: #a78bfa;
+                font-variant-numeric: tabular-nums;
+            }
+
+            /* ═══ Превью ═══ */
+            #fontSizeModal .fs-preview-box {
+                padding: 14px;
+                background: #0a0a0f;
+                border-radius: 16px;
+                border: 1px solid rgba(255,255,255,0.06);
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+            }
+            #fontSizeModal .fs-preview-label {
+                font-size: 10px;
+                color: #666;
+                text-transform: uppercase;
+                letter-spacing: 0.4px;
+                font-weight: 700;
+                margin-bottom: 2px;
+            }
+            #fontSizeModal .fs-preview-msg {
+                padding: 10px 14px;
+                border-radius: 18px;
+                max-width: 90%;
+                word-wrap: break-word;
+                line-height: 1.45;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            }
+            #fontSizeModal .fs-preview-msg.other {
+                background: rgba(42,42,62,0.88);
+                align-self: flex-start;
+                border-bottom-left-radius: 4px;
+                color: #e0e0e0;
+            }
+            #fontSizeModal .fs-preview-msg.own {
+                background: linear-gradient(135deg, #6c5ce7, #4a3f8f);
+                align-self: flex-end;
+                border-bottom-right-radius: 4px;
+                color: #fff;
+            }
+
+            /* ═══ Футер ═══ */
+            #fontSizeModal .fs-footer {
+                padding: 14px 20px 18px;
+                border-top: 1px solid rgba(255,255,255,0.06);
+                background: rgba(255,255,255,0.02);
+                flex-shrink: 0;
+                display: flex;
+                gap: 10px;
+            }
+            #fontSizeModal .fs-footer .btn {
+                flex: 1;
+                padding: 12px;
+                font-size: 14px;
+            }
+            #fontSizeModal .fs-reset-btn {
+                background: rgba(255,107,107,0.1);
+                border: 1px solid rgba(255,107,107,0.25);
+                color: #ff6b6b;
+                border-radius: 12px;
+                padding: 12px 16px;
+                font-size: 14px;
+                font-weight: 600;
+                cursor: pointer;
+                transition: all 0.15s;
+                font-family: inherit;
+                flex-shrink: 0;
+            }
+            #fontSizeModal .fs-reset-btn:hover {
+                background: rgba(255,107,107,0.2);
+                border-color: rgba(255,107,107,0.5);
+            }
+            #fontSizeModal .fs-reset-btn:active { transform: scale(0.96); }
+
+            @media (max-width: 480px) {
+                #fontSizeModal .fs-content {
+                    max-height: 94vh;
+                    border-radius: 18px 18px 0 0;
+                    max-width: 100%;
+                    margin-top: auto;
+                }
+                #fontSizeModal .fs-body { padding: 16px; gap: 18px; }
+                #fontSizeModal .fs-header { padding: 14px 16px; }
+                #fontSizeModal .fs-footer { padding: 12px 16px 16px; }
+                #fontSizeModal .fs-slider-btn {
+                    width: 36px; height: 36px; font-size: 18px;
+                }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПРЕДПРОСМОТР
+    // ═══════════════════════════════════════════════════════════
+    function updatePreview() {
+        const other = document.getElementById('fsPreviewOther');
+        const own = document.getElementById('fsPreviewOwn');
+        if (other) other.style.fontSize = FS.currentSize + 'px';
+        if (own) own.style.fontSize = FS.currentSize + 'px';
+
+        // Обновляем селекторы пресетов
+        document.querySelectorAll('#fontSizeModal [data-font-preset]').forEach(el => {
+            const v = parseInt(el.dataset.fontPreset, 10);
+            el.classList.toggle('selected', v === FS.currentSize);
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  МОДАЛЬНОЕ ОКНО
+    // ═══════════════════════════════════════════════════════════
+    function ensureModal() {
+        if (FS.modalEl && FS.modalEl.isConnected) return FS.modalEl;
+
+        const old = document.getElementById('fontSizeModal');
+        if (old) old.remove();
+
+        const modal = document.createElement('div');
+        modal.id = 'fontSizeModal';
+        modal.className = 'image-modal';
+        modal.innerHTML = `
+            <div class="fs-content" onclick="event.stopPropagation()">
+                <div class="fs-header">
+                    <div class="fs-header-icon">🔤</div>
+                    <div class="fs-header-text">
+                        <h2>Размер текста</h2>
+                        <div class="fs-header-sub">Настройте шрифт под себя</div>
+                    </div>
+                    <button class="fs-close" id="fsCloseBtn" title="Закрыть">✕</button>
+                </div>
+
+                <div class="fs-body">
+                    <!-- Пресеты -->
+                    <div>
+                        <div class="fs-section-title">Быстрый выбор</div>
+                        <div class="fs-presets" id="fsPresets">
+                            ${CFG.PRESETS.map(p => `
+                                <div class="fs-preset" data-font-preset="${p.value}">
+                                    <div class="fs-preset-icon" style="font-size:${Math.min(p.value, 20)}px;">${p.icon}</div>
+                                    <div class="fs-preset-name">${p.name}</div>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+
+                    <!-- Слайдер -->
+                    <div>
+                        <div class="fs-section-title">Точная настройка</div>
+                        <div class="fs-slider-row">
+                            <button class="fs-slider-btn" id="fsMinusBtn" title="Меньше">−</button>
+                            <input type="range" class="fs-slider"
+                                   id="fontSizeSlider"
+                                   min="${CFG.MIN_SIZE}"
+                                   max="${CFG.MAX_SIZE}"
+                                   step="${CFG.STEP}"
+                                   value="${FS.currentSize}">
+                            <button class="fs-slider-btn" id="fsPlusBtn" title="Больше">+</button>
+                            <span class="fs-slider-value" id="fontSizeValue">${FS.currentSize}px</span>
+                        </div>
+                    </div>
+
+                    <!-- Превью -->
+                    <div>
+                        <div class="fs-section-title">Предпросмотр</div>
+                        <div class="fs-preview-box">
+                            <div class="fs-preview-label">Так будет выглядеть</div>
+                            <div class="fs-preview-msg other" id="fsPreviewOther">
+                                Привет! Как тебе новый размер шрифта? 👋
+                            </div>
+                            <div class="fs-preview-msg own" id="fsPreviewOwn">
+                                Отлично, гораздо удобнее читать! 😊
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="fs-footer">
+                    <button class="fs-reset-btn" id="fsResetBtn" title="Сбросить">↺</button>
+                    <button class="btn" id="fsApplyBtn">✅ Готово</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+        FS.modalEl = modal;
+
+        // ─── Обработчики ───
+        const close = () => closeModal();
+        modal.querySelector('#fsCloseBtn').addEventListener('click', close);
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) close();
+        });
+
+        // Пресеты
+        modal.querySelectorAll('[data-font-preset]').forEach(el => {
+            el.addEventListener('click', () => {
+                const value = parseInt(el.dataset.fontPreset, 10);
+                setAndPreview(value);
+                if (navigator.vibrate) navigator.vibrate(8);
+                if (typeof soundManager !== 'undefined') {
+                    try { soundManager.play('click'); } catch (e) {}
+                }
+            });
+        });
+
+        // Слайдер
+        const slider = modal.querySelector('#fontSizeSlider');
+        slider.addEventListener('input', () => {
+            const value = parseInt(slider.value, 10);
+            setAndPreview(value);
+        });
+
+        // Кнопки +/-
+        modal.querySelector('#fsMinusBtn').addEventListener('click', () => {
+            const v = Math.max(CFG.MIN_SIZE, FS.currentSize - CFG.STEP);
+            setAndPreview(v);
+        });
+        modal.querySelector('#fsPlusBtn').addEventListener('click', () => {
+            const v = Math.min(CFG.MAX_SIZE, FS.currentSize + CFG.STEP);
+            setAndPreview(v);
+        });
+
+        // Сброс
+        modal.querySelector('#fsResetBtn').addEventListener('click', () => {
+            if (confirm('Сбросить размер шрифта по умолчанию?')) {
+                applyFontSize(CFG.DEFAULT_SIZE);
+                saveFontSize(CFG.DEFAULT_SIZE);
+                showToastSafe('↺ Размер сброшен', 1500);
+            }
+        });
+
+        // Применить / Закрыть
+        modal.querySelector('#fsApplyBtn').addEventListener('click', () => {
+            saveFontSize(FS.currentSize);
+            showToastSafe(`✅ Размер сохранён: ${FS.currentSize}px`, 1500);
+            if (typeof soundManager !== 'undefined') {
+                try { soundManager.play('send'); } catch (e) {}
+            }
+            closeModal();
+        });
+
+        // Клавиши
+        document.addEventListener('keydown', (e) => {
+            if (!modal.classList.contains('active')) return;
+            if (e.key === 'Escape') {
+                e.preventDefault();
+                e.stopPropagation();
+                closeModal();
+            } else if (e.key === 'ArrowLeft') {
+                e.preventDefault();
+                const v = Math.max(CFG.MIN_SIZE, FS.currentSize - CFG.STEP);
+                setAndPreview(v);
+            } else if (e.key === 'ArrowRight') {
+                e.preventDefault();
+                const v = Math.min(CFG.MAX_SIZE, FS.currentSize + CFG.STEP);
+                setAndPreview(v);
+            }
+        }, true);
+
+        return modal;
+    }
+
+    // ─── Обновить и показать в превью ───
+    function setAndPreview(size) {
+        applyFontSize(size);
+        const valueEl = document.getElementById('fontSizeValue');
+        if (valueEl) valueEl.textContent = size + 'px';
+        const slider = document.getElementById('fontSizeSlider');
+        if (slider) slider.value = size;
+        updatePreview();
+    }
+
+    function openModal() {
+        ensureModal();
+        FS.originalSize = FS.currentSize;
+        setAndPreview(FS.currentSize);
+        FS.modalEl.classList.add('active');
+        document.body.style.overflow = 'hidden';
+        if (navigator.vibrate) navigator.vibrate(10);
+        if (typeof soundManager !== 'undefined') {
+            try { soundManager.play('click'); } catch (e) {}
+        }
+    }
+
+    function closeModal() {
+        if (!FS.modalEl) return;
+        FS.modalEl.classList.remove('active');
+        document.body.style.overflow = '';
+        // Восстанавливаем состояние — если пользователь закрыл без сохранения
+        // (но мы применяем сразу, так что восстанавливать не нужно)
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ВНЕДРЕНИЕ ПУНКТА В МЕНЮ "⋯"
+    // ═══════════════════════════════════════════════════════════
+    function injectMenuItem() {
+        const menu = document.getElementById('chatsActionsMenu');
+        if (!menu) return false;
+        if (menu.querySelector('[data-action="font-size"]')) return true;
+
+        const item = document.createElement('div');
+        item.className = 'ucm-item';
+        item.dataset.action = 'font-size';
+        item.innerHTML = `
+            <span class="ucm-icon">🔤</span>
+            <span class="ucm-label">
+                <div>Размер текста</div>
+                <div class="ucm-hint">Настройка шрифта</div>
+            </span>
+        `;
+
+        // Вставляем после «Виджеты», если есть, иначе — после «Импорт»
+        const widgetsItem = menu.querySelector('[data-action="widgets"]');
+        const importItem = menu.querySelector('[data-action="import"]');
+        const anchor = widgetsItem || importItem;
+
+        if (anchor) {
+            anchor.parentNode.insertBefore(item, anchor.nextSibling);
+        } else {
+            menu.appendChild(item);
+        }
+
+        item.addEventListener('click', (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            menu.classList.remove('show');
+            const backdrop = document.getElementById('chatsActionsMenuBackdrop');
+            if (backdrop) backdrop.classList.remove('show');
+            setTimeout(() => openModal(), 150);
+        });
+
+        console.log('🔤 [FontSize] Пункт добавлен в меню ⋯');
+        return true;
+    }
+
+    const menuObserver = new MutationObserver(() => {
+        if (document.getElementById('chatsActionsMenu')) injectMenuItem();
+    });
+    menuObserver.observe(document.body, { childList: true, subtree: true });
+
+    document.addEventListener('click', (e) => {
+        if (e.target.closest('#chatsActionsBtn')) {
+            setTimeout(injectMenuItem, 30);
+            setTimeout(injectMenuItem, 150);
+        }
+    }, true);
+
+    setTimeout(injectMenuItem, 2000);
+    setTimeout(injectMenuItem, 5000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API
+    // ═══════════════════════════════════════════════════════════
+    window.FontSizeControl = {
+        open: openModal,
+        close: closeModal,
+        set: (size) => {
+            const v = Math.max(CFG.MIN_SIZE, Math.min(CFG.MAX_SIZE, size | 0));
+            applyFontSize(v);
+            saveFontSize(v);
+        },
+        get: () => FS.currentSize,
+        reset: () => {
+            applyFontSize(CFG.DEFAULT_SIZE);
+            saveFontSize(CFG.DEFAULT_SIZE);
+        },
+        status: () => ({
+            currentSize: FS.currentSize,
+            min: CFG.MIN_SIZE,
+            max: CFG.MAX_SIZE,
+            modalOpen: !!(FS.modalEl && FS.modalEl.classList.contains('active')),
+            menuItemInjected: !!document.querySelector('#chatsActionsMenu [data-action="font-size"]'),
+        }),
+        config: CFG,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЗАПУСК
+    // ═══════════════════════════════════════════════════════════
+    loadFontSize();
+    applyFontSize(FS.currentSize);
+
+    console.log(`🔤 [FontSize] Готово. Текущий размер: ${FS.currentSize}px`);
+    console.log('   • Пункт меню: «⋯» → «🔤 Размер текста»');
+    console.log('   • API: FontSizeControl.set(16) / .open() / .get()');
+})();
+</script>
+
 </body>
 </html>
