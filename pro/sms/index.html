@@ -73299,6 +73299,644 @@ async function sendAnnouncement() {
     console.log('📢 [Announcement v2] Готово');
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🌐 AUTO-LOCALIZATION v1
+//  Автоматически переводит интерфейс на язык устройства
+// ═══════════════════════════════════════════════════════════════
 
+(function installAutoLocalization() {
+    'use strict';
+
+    console.log('🌐 [i18n] Установка…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  КОНФИГ
+    // ═══════════════════════════════════════════════════════════
+    const CFG = {
+        STORAGE_KEY: 'smschat_language',
+        // Если язык устройства не поддерживается — используем этот
+        FALLBACK: 'ru',
+        SUPPORTED: ['ru', 'en', 'uk', 'be', 'de', 'fr', 'es', 'it', 'pt', 'pl', 'zh', 'ja', 'ko', 'tr', 'ar'],
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОПРЕДЕЛЕНИЕ ЯЗЫКА
+    // ═══════════════════════════════════════════════════════════
+    function detectDeviceLanguage() {
+        // 1. Сохранённый выбор пользователя
+        try {
+            const saved = localStorage.getItem(CFG.STORAGE_KEY);
+            if (saved && CFG.SUPPORTED.includes(saved)) {
+                console.log(`🌐 [i18n] Сохранённый язык: ${saved}`);
+                return saved;
+            }
+        } catch (e) {}
+
+        // 2. Язык устройства
+        const lang = (navigator.language || 'ru').toLowerCase();
+        const shortLang = lang.split('-')[0];
+
+        if (CFG.SUPPORTED.includes(shortLang)) {
+            console.log(`🌐 [i18n] Язык устройства: ${shortLang}`);
+            return shortLang;
+        }
+
+        // 3. Fallback
+        console.log(`🌐 [i18n] Язык не поддерживается (${lang}) — fallback: ${CFG.FALLBACK}`);
+        return CFG.FALLBACK;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СЛОВАРИ
+    //  Формат: { 'русский текст': { en: 'English', de: 'Deutsch', ... } }
+    //  Ключ — оригинальная русская строка (то, что в коде)
+    // ═══════════════════════════════════════════════════════════
+    const DICTIONARY = {
+        // ─── Общее ───
+        'Войти':           { en: 'Log in',    uk: 'Увійти',    de: 'Anmelden',   fr: 'Se connecter', es: 'Iniciar sesión', pl: 'Zaloguj' },
+        'Выйти':           { en: 'Log out',   uk: 'Вийти',     de: 'Abmelden',   fr: 'Déconnexion',   es: 'Cerrar sesión', pl: 'Wyloguj' },
+        'Отмена':          { en: 'Cancel',    uk: 'Скасувати', de: 'Abbrechen',  fr: 'Annuler',       es: 'Cancelar',      pl: 'Anuluj' },
+        'Отменить':        { en: 'Cancel',    uk: 'Скасувати', de: 'Abbrechen',  fr: 'Annuler',       es: 'Cancelar',      pl: 'Anuluj' },
+        'Сохранить':       { en: 'Save',      uk: 'Зберегти',  de: 'Speichern',  fr: 'Enregistrer',   es: 'Guardar',       pl: 'Zapisz' },
+        'Удалить':         { en: 'Delete',    uk: 'Видалити',  de: 'Löschen',    fr: 'Supprimer',     es: 'Eliminar',      pl: 'Usuń' },
+        'Удалено':         { en: 'Deleted',   uk: 'Видалено',  de: 'Gelöscht',   fr: 'Supprimé',      es: 'Eliminado',     pl: 'Usunięto' },
+        'Готово':          { en: 'Done',      uk: 'Готово',    de: 'Fertig',     fr: 'Terminé',       es: 'Listo',         pl: 'Gotowe' },
+        'Закрыть':         { en: 'Close',     uk: 'Закрити',   de: 'Schließen',  fr: 'Fermer',        es: 'Cerrar',        pl: 'Zamknij' },
+        'Закрыть все':     { en: 'Close all', uk: 'Закрити всі', de: 'Alle schließen', fr: 'Tout fermer', es: 'Cerrar todo',  pl: 'Zamknij wszystko' },
+        'Применить':       { en: 'Apply',     uk: 'Застосувати', de: 'Anwenden', fr: 'Appliquer',     es: 'Aplicar',       pl: 'Zastosuj' },
+        'Очистить':        { en: 'Clear',     uk: 'Очистити',  de: 'Löschen',    fr: 'Effacer',       es: 'Borrar',        pl: 'Wyczyść' },
+        'Найти':           { en: 'Search',    uk: 'Знайти',    de: 'Suchen',     fr: 'Rechercher',    es: 'Buscar',        pl: 'Szukaj' },
+        'Поиск':           { en: 'Search',    uk: 'Пошук',     de: 'Suche',      fr: 'Recherche',     es: 'Búsqueda',      pl: 'Szukaj' },
+        'Далее':           { en: 'Next',      uk: 'Далі',      de: 'Weiter',     fr: 'Suivant',       es: 'Siguiente',     pl: 'Dalej' },
+        'Назад':           { en: 'Back',      uk: 'Назад',     de: 'Zurück',     fr: 'Retour',        es: 'Atrás',         pl: 'Wstecz' },
+        'Пропустить':      { en: 'Skip',      uk: 'Пропустити', de: 'Überspringen', fr: 'Passer',    es: 'Saltar',        pl: 'Pomiń' },
+        'Продолжить':      { en: 'Continue',  uk: 'Продовжити', de: 'Weiter',    fr: 'Continuer',     es: 'Continuar',     pl: 'Kontynuuj' },
+        'Создать':         { en: 'Create',    uk: 'Створити',  de: 'Erstellen',  fr: 'Créer',         es: 'Crear',         pl: 'Utwórz' },
+        'Поделиться':      { en: 'Share',     uk: 'Поділитися', de: 'Teilen',    fr: 'Partager',      es: 'Compartir',     pl: 'Udostępnij' },
+        'Скачать':         { en: 'Download',  uk: 'Завантажити', de: 'Herunterladen', fr: 'Télécharger', es: 'Descargar',   pl: 'Pobierz' },
+        'Копировать':      { en: 'Copy',      uk: 'Копіювати', de: 'Kopieren',   fr: 'Copier',        es: 'Copiar',        pl: 'Kopiuj' },
+        'Скопировано':     { en: 'Copied',    uk: 'Скопійовано', de: 'Kopiert',  fr: 'Copié',         es: 'Copiado',       pl: 'Skopiowano' },
+        'Вставить':        { en: 'Paste',     uk: 'Вставити',  de: 'Einfügen',   fr: 'Coller',        es: 'Pegar',         pl: 'Wklej' },
+        'Ответить':        { en: 'Reply',     uk: 'Відповісти', de: 'Antworten', fr: 'Répondre',      es: 'Responder',     pl: 'Odpowiedz' },
+        'Редактировать':   { en: 'Edit',      uk: 'Редагувати', de: 'Bearbeiten', fr: 'Modifier',      es: 'Editar',        pl: 'Edytuj' },
+        'Переслать':       { en: 'Forward',   uk: 'Переслати', de: 'Weiterleiten', fr: 'Transférer',  es: 'Reenviar',      pl: 'Przekaż' },
+        'Выбрать':         { en: 'Select',    uk: 'Обрати',    de: 'Auswählen',  fr: 'Sélectionner',  es: 'Seleccionar',   pl: 'Wybierz' },
+        'Повторить':       { en: 'Retry',     uk: 'Повторити', de: 'Erneut',     fr: 'Réessayer',     es: 'Reintentar',    pl: 'Ponów' },
+        'Обновить':        { en: 'Refresh',   uk: 'Оновити',   de: 'Aktualisieren', fr: 'Actualiser', es: 'Actualizar',   pl: 'Odśwież' },
+        'Загрузка':        { en: 'Loading',   uk: 'Завантаження', de: 'Laden',   fr: 'Chargement',    es: 'Cargando',      pl: 'Ładowanie' },
+        'Загрузка...':     { en: 'Loading...', uk: 'Завантаження...', de: 'Laden...', fr: 'Chargement...', es: 'Cargando...', pl: 'Ładowanie...' },
+        'Ошибка':          { en: 'Error',     uk: 'Помилка',    de: 'Fehler',     fr: 'Erreur',        es: 'Error',         pl: 'Błąd' },
+        'Внимание':        { en: 'Warning',   uk: 'Увага',      de: 'Achtung',    fr: 'Attention',     es: 'Atención',      pl: 'Uwaga' },
+        'Всё':             { en: 'All',       uk: 'Все',        de: 'Alle',       fr: 'Tout',          es: 'Todo',          pl: 'Wszystko' },
+        'Всё прочитано':   { en: 'All read',  uk: 'Все прочитано', de: 'Alle gelesen', fr: 'Tout lu',   es: 'Todo leído',    pl: 'Wszystko przeczytane' },
+
+        // ─── Авторизация ───
+        'SMS Чат':                  { en: 'SMS Chat', uk: 'SMS Чат', de: 'SMS Chat', fr: 'SMS Chat', es: 'SMS Chat', pl: 'SMS Chat' },
+        'Добро пожаловать':         { en: 'Welcome', uk: 'Ласкаво просимо', de: 'Willkommen', fr: 'Bienvenue', es: 'Bienvenido', pl: 'Witaj' },
+        'Войдите в свой мессенджер':{ en: 'Log in to your messenger', uk: 'Увійдіть у свій месенджер', de: 'Melden Sie sich an', fr: 'Connectez-vous à votre messagerie', es: 'Inicia sesión en tu mensajería', pl: 'Zaloguj się do komunikatora' },
+        'Ваш логин':                { en: 'Your login', uk: 'Ваш логін', de: 'Ihr Login', fr: 'Votre identifiant', es: 'Tu usuario', pl: 'Twój login' },
+        'Введите ник':              { en: 'Enter nickname', uk: 'Введіть нікнейм', de: 'Spitzname eingeben', fr: 'Saisir un pseudo', es: 'Ingresar apodo', pl: 'Wpisz nick' },
+        'GitHub Token':             { en: 'GitHub Token', uk: 'GitHub Токен', de: 'GitHub-Token', fr: 'Jeton GitHub', es: 'Token de GitHub', pl: 'Token GitHub' },
+        'Вставьте токен доступа':   { en: 'Paste access token', uk: 'Вставте токен доступу', de: 'Zugriffstoken einfügen', fr: "Coller le jeton d'accès", es: 'Pegar token de acceso', pl: 'Wklej token dostępu' },
+        'Создать токен':            { en: 'Create token', uk: 'Створити токен', de: 'Token erstellen', fr: 'Créer un jeton', es: 'Crear token', pl: 'Utwórz token' },
+        'права':                    { en: 'permissions', uk: 'права', de: 'Rechte', fr: 'droits', es: 'permisos', pl: 'uprawnienia' },
+        'Запомнить меня на этом устройстве': { en: 'Remember me on this device', uk: "Запам'ятати мене на цьому пристрої", de: 'Auf diesem Gerät merken', fr: 'Se souvenir de moi', es: 'Recordarme', pl: 'Zapamiętaj mnie' },
+        'Неверный токен или нет доступа':   { en: 'Invalid token or no access', uk: 'Невірний токен або немає доступу', de: 'Ungültiger Token oder kein Zugriff', fr: "Jeton invalide ou accès refusé", es: 'Token inválido o sin acceso', pl: 'Nieprawidłowy token lub brak dostępu' },
+        'Очистить данные':          { en: 'Clear data', uk: 'Очистити дані', de: 'Daten löschen', fr: 'Effacer les données', es: 'Borrar datos', pl: 'Wyczyść dane' },
+
+        // ─── Список чатов ───
+        'У вас пока нет чатов':     { en: 'You have no chats yet', uk: 'У вас поки немає чатів', de: 'Sie haben noch keine Chats', fr: "Vous n'avez pas encore de chats", es: 'Aún no tienes chats', pl: 'Nie masz jeszcze czatów' },
+        'Создайте первый или присоединитесь': { en: 'Create the first one or join', uk: 'Створіть перший або приєднайтеся', de: 'Erstellen Sie den ersten oder treten Sie bei', fr: 'Créez le premier ou rejoignez', es: 'Crea el primero o únete', pl: 'Utwórz pierwszy lub dołącz' },
+        'Создать чат':              { en: 'Create chat', uk: 'Створити чат', de: 'Chat erstellen', fr: 'Créer un chat', es: 'Crear chat', pl: 'Utwórz czat' },
+        'Присоединиться к чату':    { en: 'Join chat', uk: 'Приєднатися до чату', de: 'Chat beitreten', fr: 'Rejoindre un chat', es: 'Unirse al chat', pl: 'Dołącz do czatu' },
+        'Присоединиться':           { en: 'Join', uk: 'Приєднатися', de: 'Beitreten', fr: 'Rejoindre', es: 'Unirse', pl: 'Dołącz' },
+        'Экспорт':                  { en: 'Export', uk: 'Експорт', de: 'Export', fr: 'Exporter', es: 'Exportar', pl: 'Eksport' },
+        'Импорт':                   { en: 'Import', uk: 'Імпорт', de: 'Import', fr: 'Importer', es: 'Importar', pl: 'Import' },
+        'Экспорт профиля':          { en: 'Export profile', uk: 'Експорт профілю', de: 'Profil exportieren', fr: 'Exporter le profil', es: 'Exportar perfil', pl: 'Eksportuj profil' },
+        'Импорт профиля':           { en: 'Import profile', uk: 'Імпорт профілю', de: 'Profil importieren', fr: 'Importer le profil', es: 'Importar perfil', pl: 'Importuj profil' },
+        'Очистить кеш чатов':       { en: 'Clear chat cache', uk: 'Очистити кеш чатів', de: 'Chat-Cache leeren', fr: 'Effacer le cache', es: 'Limpiar caché', pl: 'Wyczyść pamięć podręczną' },
+
+        // ─── Меню действий ───
+        'Создать чат ✚':            { en: 'Create chat ✚', uk: 'Створити чат ✚', de: 'Chat erstellen ✚', fr: 'Créer un chat ✚', es: 'Crear chat ✚', pl: 'Utwórz czat ✚' },
+        'Знакомство с программой':  { en: 'App tutorial', uk: 'Знайомство з програмою', de: 'App-Tutorial', fr: "Tutoriel de l'app", es: 'Tutorial', pl: 'Samouczek' },
+        'Виджеты':                  { en: 'Widgets', uk: 'Віджети', de: 'Widgets', fr: 'Widgets', es: 'Widgets', pl: 'Widgety' },
+        'Фон страницы':             { en: 'Page background', uk: 'Фон сторінки', de: 'Seitenhintergrund', fr: 'Fond de page', es: 'Fondo de página', pl: 'Tło strony' },
+        'Стиль карточек':           { en: 'Card style', uk: 'Стиль карток', de: 'Kartenstil', fr: 'Style de carte', es: 'Estilo de tarjetas', pl: 'Styl kart' },
+        'Размер текста':            { en: 'Text size', uk: 'Розмір тексту', de: 'Textgröße', fr: 'Taille du texte', es: 'Tamaño del texto', pl: 'Rozmiar tekstu' },
+        'Запланированные уведомления': { en: 'Scheduled notifications', uk: 'Заплановані повідомлення', de: 'Geplante Benachrichtigungen', fr: 'Notifications programmées', es: 'Notificaciones programadas', pl: 'Zaplanowane powiadomienia' },
+        'Сменить аватарки':         { en: 'Change avatars', uk: 'Змінити аватарки', de: 'Avatare ändern', fr: 'Changer les avatars', es: 'Cambiar avatares', pl: 'Zmień awatary' },
+
+        // ─── Экран чата ───
+        'Сообщение...':             { en: 'Message...', uk: 'Повідомлення...', de: 'Nachricht...', fr: 'Message...', es: 'Mensaje...', pl: 'Wiadomość...' },
+        'Сообщение':                { en: 'Message', uk: 'Повідомлення', de: 'Nachricht', fr: 'Message', es: 'Mensaje', pl: 'Wiadomość' },
+        'Отправить':                { en: 'Send', uk: 'Надіслати', de: 'Senden', fr: 'Envoyer', es: 'Enviar', pl: 'Wyślij' },
+        'Прикрепить':               { en: 'Attach', uk: 'Прикріпити', de: 'Anhängen', fr: 'Joindre', es: 'Adjuntar', pl: 'Załącz' },
+        'Эмодзи':                   { en: 'Emoji', uk: 'Емодзі', de: 'Emoji', fr: 'Emoji', es: 'Emoji', pl: 'Emoji' },
+        'К списку чатов':           { en: 'To chats', uk: 'До чатів', de: 'Zu Chats', fr: 'Aux chats', es: 'A los chats', pl: 'Do czatów' },
+        'Пригласить в чат':         { en: 'Invite to chat', uk: 'Запросити до чату', de: 'In Chat einladen', fr: 'Inviter au chat', es: 'Invitar al chat', pl: 'Zaproś do czatu' },
+        'Забыть пароль этого чата': { en: 'Forget this chat password', uk: 'Забути пароль чату', de: 'Passwort vergessen', fr: 'Oublier le mot de passe', es: 'Olvidar contraseña', pl: 'Zapomnij hasło' },
+        'Поиск в чате':             { en: 'Search in chat', uk: 'Пошук у чаті', de: 'Im Chat suchen', fr: 'Rechercher dans le chat', es: 'Buscar en el chat', pl: 'Szukaj w czacie' },
+        'История пуста':            { en: 'History is empty', uk: 'Історія порожня', de: 'Verlauf ist leer', fr: "L'historique est vide", es: 'Historial vacío', pl: 'Historia jest pusta' },
+        'Напишите первое сообщение!': { en: 'Write the first message!', uk: 'Напишіть перше повідомлення!', de: 'Schreiben Sie die erste Nachricht!', fr: 'Écrivez le premier message !', es: '¡Escribe el primer mensaje!', pl: 'Napisz pierwszą wiadomość!' },
+        'Новые сообщения':          { en: 'New messages', uk: 'Нові повідомлення', de: 'Neue Nachrichten', fr: 'Nouveaux messages', es: 'Nuevos mensajes', pl: 'Nowe wiadomości' },
+        'Начало истории':           { en: 'Beginning of history', uk: 'Початок історії', de: 'Anfang des Verlaufs', fr: "Début de l'historique", es: 'Inicio del historial', pl: 'Początek historii' },
+
+        // ─── Модалка создания чата ───
+        'Новый чат':                { en: 'New chat', uk: 'Новий чат', de: 'Neuer Chat', fr: 'Nouveau chat', es: 'Nuevo chat', pl: 'Nowy czat' },
+        'Название чата':            { en: 'Chat name', uk: 'Назва чату', de: 'Chat-Name', fr: 'Nom du chat', es: 'Nombre del chat', pl: 'Nazwa czatu' },
+        'Например: Семья':          { en: 'e.g. Family', uk: 'Наприклад: Сім\'я', de: 'z.B. Familie', fr: 'ex. Famille', es: 'ej. Familia', pl: 'np. Rodzina' },
+        'Пароль чата':              { en: 'Chat password', uk: 'Пароль чату', de: 'Chat-Passwort', fr: 'Mot de passe du chat', es: 'Contraseña del chat', pl: 'Hasło czatu' },
+        'Пароль':                   { en: 'Password', uk: 'Пароль', de: 'Passwort', fr: 'Mot de passe', es: 'Contraseña', pl: 'Hasło' },
+        'Пароль сгенерирован автоматически.': { en: 'Password generated automatically.', uk: 'Пароль згенеровано автоматично.', de: 'Passwort automatisch generiert.', fr: 'Mot de passe généré automatiquement.', es: 'Contraseña generada automáticamente.', pl: 'Hasło wygenerowane automatycznie.' },
+        'Запомните пароль':         { en: 'Remember the password', uk: "Запам'ятайте пароль", de: 'Passwort merken', fr: 'Mémorisez le mot de passe', es: 'Recuerda la contraseña', pl: 'Zapamiętaj hasło' },
+        'Восстановления нет.':      { en: 'There is no recovery.', uk: 'Відновлення немає.', de: 'Es gibt keine Wiederherstellung.', fr: 'Pas de récupération.', es: 'No hay recuperación.', pl: 'Nie ma odzyskiwania.' },
+        'Вход в чат':               { en: 'Chat login', uk: 'Вхід у чат', de: 'Chat-Anmeldung', fr: 'Connexion au chat', es: 'Entrar al chat', pl: 'Wejście do czatu' },
+        'Введите пароль':           { en: 'Enter password', uk: 'Введіть пароль', de: 'Passwort eingeben', fr: 'Saisir le mot de passe', es: 'Ingresa la contraseña', pl: 'Wpisz hasło' },
+        'Запомнить пароль для этого чата': { en: 'Remember password for this chat', uk: "Запам'ятати пароль для цього чату", de: 'Passwort für diesen Chat merken', fr: 'Mémoriser pour ce chat', es: 'Recordar contraseña', pl: 'Zapamiętaj hasło' },
+        'Войти в чат':              { en: 'Enter chat', uk: 'Увійти в чат', de: 'Chat betreten', fr: 'Entrer dans le chat', es: 'Entrar al chat', pl: 'Wejdź do czatu' },
+
+        // ─── Присоединение ───
+        'ID чата':                  { en: 'Chat ID', uk: 'ID чату', de: 'Chat-ID', fr: 'ID du chat', es: 'ID del chat', pl: 'ID czatu' },
+        'Отображаемое имя':         { en: 'Display name', uk: 'Відображуване ім\'я', de: 'Anzeigename', fr: 'Nom affiché', es: 'Nombre visible', pl: 'Nazwa wyświetlana' },
+        'Например: Семья.':         { en: 'e.g. Family.', uk: 'Наприклад: Сім\'я.', de: 'z.B. Familie.', fr: 'ex. Famille.', es: 'ej. Familia.', pl: 'np. Rodzina.' },
+        'Спросите ID у того, кто создал чат.': { en: 'Ask the chat creator for the ID.', uk: 'Запитайте ID у творця чату.', de: 'Fragen Sie den Ersteller nach der ID.', fr: 'Demandez l\'ID au créateur.', es: 'Pide el ID al creador.', pl: 'Zapytaj twórcę czatu o ID.' },
+        'Пароль для расшифровки':   { en: 'Password for decryption', uk: 'Пароль для розшифрування', de: 'Passwort zum Entschlüsseln', fr: 'Mot de passe de déchiffrement', es: 'Contraseña de descifrado', pl: 'Hasło do odszyfrowania' },
+        'Введите отображаемое имя': { en: 'Enter display name', uk: 'Введіть ім\'я', de: 'Anzeigename eingeben', fr: 'Saisir un nom', es: 'Ingresa el nombre', pl: 'Wpisz nazwę' },
+        'Только латиница, цифры, _ и -.': { en: 'Only latin, digits, _ and -.', uk: 'Тільки латиниця, цифри, _ і -.', de: 'Nur Latein, Ziffern, _ und -.', fr: 'Lettres, chiffres, _ et -.', es: 'Solo latín, dígitos, _ y -.', pl: 'Tylko łacińskie, cyfry, _ i -.' },
+
+        // ─── Аттач-меню ───
+        'Изображения':              { en: 'Images', uk: 'Зображення', de: 'Bilder', fr: 'Images', es: 'Imágenes', pl: 'Obrazy' },
+        'До 20 шт, каждая до 25 МБ': { en: 'Up to 20, 25 MB each', uk: 'До 20 шт, кожна до 25 МБ', de: 'Bis 20, je 25 MB', fr: "Jusqu'à 20, 25 Mo chacun", es: 'Hasta 20, 25 MB cada una', pl: 'Do 20, każdy do 25 MB' },
+        'Видеофайл':                { en: 'Video file', uk: 'Відеофайл', de: 'Videodatei', fr: 'Fichier vidéo', es: 'Archivo de vídeo', pl: 'Plik wideo' },
+        'MP4, MOV, WebM… до 25 МБ': { en: 'MP4, MOV, WebM… up to 25 MB', uk: 'MP4, MOV, WebM… до 25 МБ', de: 'MP4, MOV, WebM… bis 25 MB', fr: 'MP4, MOV, WebM… jusqu\'à 25 Mo', es: 'MP4, MOV, WebM… hasta 25 MB', pl: 'MP4, MOV, WebM… do 25 MB' },
+        'Аудиофайл':                { en: 'Audio file', uk: 'Аудіофайл', de: 'Audiodatei', fr: 'Fichier audio', es: 'Archivo de audio', pl: 'Plik audio' },
+        'MP3, OGG, WAV, M4A… до 25 МБ': { en: 'MP3, OGG, WAV, M4A… up to 25 MB', uk: 'MP3, OGG, WAV, M4A… до 25 МБ', de: 'MP3, OGG, WAV, M4A… bis 25 MB', fr: 'MP3, OGG, WAV, M4A… jusqu\'à 25 Mo', es: 'MP3, OGG, WAV, M4A… hasta 25 MB', pl: 'MP3, OGG, WAV, M4A… do 25 MB' },
+        'Любой файл':               { en: 'Any file', uk: 'Будь-який файл', de: 'Beliebige Datei', fr: "N'importe quel fichier", es: 'Cualquier archivo', pl: 'Dowolny plik' },
+        'ZIP, MP4, PDF… до 25 МБ':  { en: 'ZIP, MP4, PDF… up to 25 MB', uk: 'ZIP, MP4, PDF… до 25 МБ', de: 'ZIP, MP4, PDF… bis 25 MB', fr: 'ZIP, MP4, PDF… jusqu\'à 25 Mo', es: 'ZIP, MP4, PDF… hasta 25 MB', pl: 'ZIP, MP4, PDF… do 25 MB' },
+        'Документы':                { en: 'Documents', uk: 'Документи', de: 'Dokumente', fr: 'Documents', es: 'Documentos', pl: 'Dokumenty' },
+        'PDF, DOCX, XLSX, TXT':     { en: 'PDF, DOCX, XLSX, TXT', uk: 'PDF, DOCX, XLSX, TXT', de: 'PDF, DOCX, XLSX, TXT', fr: 'PDF, DOCX, XLSX, TXT', es: 'PDF, DOCX, XLSX, TXT', pl: 'PDF, DOCX, XLSX, TXT' },
+        'Создать открытку':         { en: 'Create postcard', uk: 'Створити листівку', de: 'Postkarte erstellen', fr: 'Créer une carte', es: 'Crear postal', pl: 'Utwórz pocztówkę' },
+        'Текст поверх фотографии':  { en: 'Text over photo', uk: 'Текст поверх фото', de: 'Text über Foto', fr: 'Texte sur photo', es: 'Texto sobre foto', pl: 'Tekst na zdjęciu' },
+        'Нарисовать':               { en: 'Draw', uk: 'Намалювати', de: 'Zeichnen', fr: 'Dessiner', es: 'Dibujar', pl: 'Rysuj' },
+        'Рисунок от руки':          { en: 'Freehand drawing', uk: 'Малюнок від руки', de: 'Freihandzeichnung', fr: 'Dessin à main levée', es: 'Dibujo a mano', pl: 'Rysunek odręczny' },
+        'Игры':                     { en: 'Games', uk: 'Ігри', de: 'Spiele', fr: 'Jeux', es: 'Juegos', pl: 'Gry' },
+        'Слово из слова · Стихотворение': { en: 'Word game · Poem', uk: 'Слово зі слова · Вірш', de: 'Wortspiel · Gedicht', fr: 'Jeu de mots · Poème', es: 'Juego de palabras · Poema', pl: 'Gra słowna · Wiersz' },
+        'Объявление':               { en: 'Announcement', uk: 'Оголошення', de: 'Ankündigung', fr: 'Annonce', es: 'Anuncio', pl: 'Ogłoszenie' },
+        'Коллаж + текст поверх':    { en: 'Collage + text', uk: 'Колаж + текст', de: 'Collage + Text', fr: 'Collage + texte', es: 'Collage + texto', pl: 'Kolaż + tekst' },
+
+        // ─── Настройки / подсказки ───
+        'Настройка имени':          { en: 'Name settings', uk: 'Налаштування імені', de: 'Namenseinstellungen', fr: 'Paramètres du nom', es: 'Ajustes del nombre', pl: 'Ustawienia imienia' },
+        'Так ваше имя выглядит':    { en: 'This is how your name looks', uk: 'Так виглядає ваше ім\'я', de: 'So sieht Ihr Name aus', fr: 'Voici votre nom', es: 'Así se ve tu nombre', pl: 'Tak wygląda twoje imię' },
+        'Фото':                     { en: 'Photo', uk: 'Фото', de: 'Foto', fr: 'Photo', es: 'Foto', pl: 'Zdjęcie' },
+        'Авто':                     { en: 'Auto', uk: 'Авто', de: 'Auto', fr: 'Auto', es: 'Auto', pl: 'Auto' },
+        'Нажмите, чтобы изменить':  { en: 'Tap to change', uk: 'Натисніть, щоб змінити', de: 'Zum Ändern tippen', fr: 'Touchez pour changer', es: 'Toca para cambiar', pl: 'Dotknij, aby zmienić' },
+        'Список станций':           { en: 'Station list', uk: 'Список станцій', de: 'Senderliste', fr: 'Liste des stations', es: 'Lista de emisoras', pl: 'Lista stacji' },
+        'Свернуть':                 { en: 'Collapse', uk: 'Згорнути', de: 'Einklappen', fr: 'Réduire', es: 'Contraer', pl: 'Zwiń' },
+        'Развернуть':               { en: 'Expand', uk: 'Розгорнути', de: 'Ausklappen', fr: 'Développer', es: 'Expandir', pl: 'Rozwiń' },
+        'Свернуть плеер':           { en: 'Minimize player', uk: 'Згорнути плеєр', de: 'Player minimieren', fr: 'Réduire le lecteur', es: 'Minimizar', pl: 'Zwiń odtwarzacz' },
+        'Плейлист чата':            { en: 'Chat playlist', uk: 'Плейлист чату', de: 'Chat-Playlist', fr: 'Playlist du chat', es: 'Lista del chat', pl: 'Playlista czatu' },
+        'Галерея фото':             { en: 'Photo gallery', uk: 'Галерея фото', de: 'Fotogalerie', fr: 'Galerie photo', es: 'Galería de fotos', pl: 'Galeria zdjęć' },
+        'Быстрый доступ':           { en: 'Quick access', uk: 'Швидкий доступ', de: 'Schnellzugriff', fr: 'Accès rapide', es: 'Acceso rápido', pl: 'Szybki dostęp' },
+
+        // ─── Тосты (динамика) ───
+        '✅ Отправлено!':           { en: '✅ Sent!', uk: '✅ Надіслано!', de: '✅ Gesendet!', fr: '✅ Envoyé !', es: '¡✅ Enviado!', pl: '✅ Wysłano!' },
+        '✅ Отправлено':            { en: '✅ Sent', uk: '✅ Надіслано', de: '✅ Gesendet', fr: '✅ Envoyé', es: '✅ Enviado', pl: '✅ Wysłano' },
+        '🗑️ Удалено':              { en: '🗑️ Deleted', uk: '🗑️ Видалено', de: '🗑️ Gelöscht', fr: '🗑️ Supprimé', es: '🗑️ Eliminado', pl: '🗑️ Usunięto' },
+        '📋 Скопировано':           { en: '📋 Copied', uk: '📋 Скопійовано', de: '📋 Kopiert', fr: '📋 Copié', es: '📋 Copiado', pl: '📋 Skopiowano' },
+        '📋 Пароль скопирован':     { en: '📋 Password copied', uk: '📋 Пароль скопійовано', de: '📋 Passwort kopiert', fr: '📋 Mot de passe copié', es: '📋 Contraseña copiada', pl: '📋 Hasło skopiowane' },
+        '✅ Чат создан!':           { en: '✅ Chat created!', uk: '✅ Чат створено!', de: '✅ Chat erstellt!', fr: '✅ Chat créé !', es: '¡✅ Chat creado!', pl: '✅ Czat utworzony!' },
+        '✅ Добро пожаловать':      { en: '✅ Welcome', uk: '✅ Ласкаво просимо', de: '✅ Willkommen', fr: '✅ Bienvenue', es: '✅ Bienvenido', pl: '✅ Witaj' },
+        '👋 Вы вышли':              { en: '👋 Logged out', uk: '👋 Ви вийшли', de: '👋 Abgemeldet', fr: '👋 Déconnecté', es: '👋 Sesión cerrada', pl: '👋 Wylogowano' },
+        '🌐 Соединение восстановлено': { en: '🌐 Connection restored', uk: "🌐 З'єднання відновлено", de: '🌐 Verbindung wiederhergestellt', fr: '🌐 Connexion rétablie', es: '🌐 Conexión restaurada', pl: '🌐 Połączenie przywrócone' },
+        '📵 Нет подключения':       { en: '📵 No connection', uk: '📵 Немає підключення', de: '📵 Keine Verbindung', fr: '📵 Pas de connexion', es: '📵 Sin conexión', pl: '📵 Brak połączenia' },
+        '📵 Соединение потеряно':   { en: '📵 Connection lost', uk: "📵 З'єднання втрачено", de: '📵 Verbindung verloren', fr: '📵 Connexion perdue', es: '📵 Conexión perdida', pl: '📵 Połączenie utracone' },
+        '📵 Офлайн-режим':          { en: '📵 Offline mode', uk: '📵 Офлайн-режим', de: '📵 Offline-Modus', fr: '📵 Mode hors ligne', es: '📵 Modo sin conexión', pl: '📵 Tryb offline' },
+        '⏳ Обработка...':          { en: '⏳ Processing...', uk: '⏳ Обробка...', de: '⏳ Verarbeitung...', fr: '⏳ Traitement...', es: '⏳ Procesando...', pl: '⏳ Przetwarzanie...' },
+        '⏳ Загрузка...':           { en: '⏳ Loading...', uk: '⏳ Завантаження...', de: '⏳ Laden...', fr: '⏳ Chargement...', es: '⏳ Cargando...', pl: '⏳ Ładowanie...' },
+        '📤 Сообщение в очереди':   { en: '📤 Message queued', uk: '📤 Повідомлення в черзі', de: '📤 Nachricht in Warteschlange', fr: '📤 Message en attente', es: '📤 Mensaje en cola', pl: '📤 Wiadomość w kolejce' },
+        '✅ Все события просмотрены': { en: '✅ All events viewed', uk: '✅ Усі події переглянуто', de: '✅ Alle Ereignisse gesehen', fr: '✅ Tous les événements vus', es: '✅ Todos los eventos vistos', pl: '✅ Wszystkie zdarzenia obejrzane' },
+        '❌ Ошибка':                { en: '❌ Error', uk: '❌ Помилка', de: '❌ Fehler', fr: '❌ Erreur', es: '❌ Error', pl: '❌ Błąd' },
+        '❌ Неверный пароль':       { en: '❌ Wrong password', uk: '❌ Невірний пароль', de: '❌ Falsches Passwort', fr: '❌ Mot de passe incorrect', es: '❌ Contraseña incorrecta', pl: '❌ Nieprawidłowe hasło' },
+        '❌ Неверный пароль чата':  { en: '❌ Wrong chat password', uk: '❌ Невірний пароль чату', de: '❌ Falsches Chat-Passwort', fr: '❌ Mot de passe du chat incorrect', es: '❌ Contraseña del chat incorrecta', pl: '❌ Nieprawidłowe hasło czatu' },
+        '🔐 Нужен пароль чата':     { en: '🔐 Chat password required', uk: '🔐 Потрібен пароль чату', de: '🔐 Chat-Passwort erforderlich', fr: '🔐 Mot de passe requis', es: '🔐 Se requiere contraseña', pl: '🔐 Wymagane hasło czatu' },
+        '🔒 Требуется вход в чат':  { en: '🔒 Chat login required', uk: '🔒 Потрібен вхід у чат', de: '🔒 Chat-Anmeldung erforderlich', fr: '🔒 Connexion au chat requise', es: '🔒 Se requiere iniciar sesión', pl: '🔒 Wymagane logowanie do czatu' },
+
+        // ─── Даты / время ───
+        'Сегодня':         { en: 'Today',    uk: 'Сьогодні', de: 'Heute',      fr: "Aujourd'hui", es: 'Hoy',         pl: 'Dzisiaj' },
+        'Вчера':           { en: 'Yesterday', uk: 'Вчора',   de: 'Gestern',    fr: 'Hier',        es: 'Ayer',        pl: 'Wczoraj' },
+        'Завтра':          { en: 'Tomorrow', uk: 'Завтра',   de: 'Morgen',     fr: 'Demain',      es: 'Mañana',      pl: 'Jutro' },
+        'только что':      { en: 'just now', uk: 'щойно',    de: 'gerade eben', fr: "à l'instant", es: 'ahora mismo', pl: 'przed chwilą' },
+        'мин назад':       { en: 'min ago',  uk: 'хв тому',  de: 'Min. her',   fr: 'min',         es: 'min',         pl: 'min temu' },
+        'ч назад':         { en: 'h ago',    uk: 'год тому', de: 'Std. her',   fr: 'h',           es: 'h',           pl: 'godz. temu' },
+        'дн назад':        { en: 'd ago',    uk: 'дн тому',  de: 'T. her',     fr: 'j',           es: 'd',           pl: 'dni temu' },
+
+        // ─── Погода ───
+        'Погода':          { en: 'Weather',  uk: 'Погода',   de: 'Wetter',     fr: 'Météo',       es: 'Clima',       pl: 'Pogoda' },
+        'Ясно':            { en: 'Clear',    uk: 'Ясно',     de: 'Klar',       fr: 'Clair',       es: 'Despejado',   pl: 'Bezchmurnie' },
+        'Пасмурно':        { en: 'Cloudy',   uk: 'Похмуро',  de: 'Bewölkt',    fr: 'Nuageux',     es: 'Nublado',     pl: 'Pochmurno' },
+        'Дождь':           { en: 'Rain',     uk: 'Дощ',      de: 'Regen',      fr: 'Pluie',       es: 'Lluvia',      pl: 'Deszcz' },
+        'Снег':            { en: 'Snow',     uk: 'Сніг',     de: 'Schnee',     fr: 'Neige',       es: 'Nieve',       pl: 'Śnieg' },
+        'Гроза':           { en: 'Thunderstorm', uk: 'Гроза', de: 'Gewitter',  fr: 'Orage',       es: 'Tormenta',    pl: 'Burza' },
+        'Туман':           { en: 'Fog',      uk: 'Туман',    de: 'Nebel',      fr: 'Brouillard',  es: 'Niebla',      pl: 'Mgła' },
+        'Обновить погоду': { en: 'Refresh weather', uk: 'Оновити погоду', de: 'Wetter aktualisieren', fr: 'Actualiser la météo', es: 'Actualizar clima', pl: 'Odśwież pogodę' },
+
+        // ─── Радио ───
+        'Радио':           { en: 'Radio',    uk: 'Радіо',    de: 'Radio',      fr: 'Radio',       es: 'Radio',       pl: 'Radio' },
+        'Случайная станция': { en: 'Random station', uk: 'Випадкова станція', de: 'Zufälliger Sender', fr: 'Station aléatoire', es: 'Emisora aleatoria', pl: 'Losowa stacja' },
+        'Избранное':       { en: 'Favorites', uk: 'Обране',   de: 'Favoriten',  fr: 'Favoris',     es: 'Favoritos',   pl: 'Ulubione' },
+        'Все станции':     { en: 'All stations', uk: 'Усі станції', de: 'Alle Sender', fr: 'Toutes les stations', es: 'Todas las emisoras', pl: 'Wszystkie stacje' },
+        'Все жанры':       { en: 'All genres', uk: 'Усі жанри', de: 'Alle Genres', fr: 'Tous les genres', es: 'Todos los géneros', pl: 'Wszystkie gatunki' },
+        'Все страны':      { en: 'All countries', uk: 'Усі країни', de: 'Alle Länder', fr: 'Tous les pays', es: 'Todos los países', pl: 'Wszystkie kraje' },
+
+        // ─── Настройки фона ───
+        'Фон чата':        { en: 'Chat background', uk: 'Фон чату', de: 'Chat-Hintergrund', fr: 'Fond du chat', es: 'Fondo del chat', pl: 'Tło czatu' },
+        'Узор и цвет':     { en: 'Pattern and color', uk: 'Візерунок і колір', de: 'Muster und Farbe', fr: 'Motif et couleur', es: 'Patrón y color', pl: 'Wzór i kolor' },
+        'Без узора':       { en: 'No pattern', uk: 'Без візерунка', de: 'Kein Muster', fr: 'Sans motif', es: 'Sin patrón', pl: 'Bez wzoru' },
+        'Цвет фона':       { en: 'Background color', uk: 'Колір фону', de: 'Hintergrundfarbe', fr: 'Couleur de fond', es: 'Color de fondo', pl: 'Kolor tła' },
+        'Цвет узора':      { en: 'Pattern color', uk: 'Колір візерунка', de: 'Musterfarbe', fr: 'Couleur du motif', es: 'Color del patrón', pl: 'Kolor wzoru' },
+        'Прозрачность узора': { en: 'Pattern opacity', uk: 'Прозорість візерунка', de: 'Musterdeckkraft', fr: 'Opacité du motif', es: 'Opacidad del patrón', pl: 'Krycie wzoru' },
+        'Превью':          { en: 'Preview', uk: 'Попередній перегляд', de: 'Vorschau', fr: 'Aperçu', es: 'Vista previa', pl: 'Podgląd' },
+        'Стандарт':        { en: 'Default', uk: 'Стандарт', de: 'Standard', fr: 'Par défaut', es: 'Estándar', pl: 'Domyślny' },
+        'Тёмный':          { en: 'Dark', uk: 'Темний', de: 'Dunkel', fr: 'Sombre', es: 'Oscuro', pl: 'Ciemny' },
+        'Читаемость карточек': { en: 'Card readability', uk: 'Читабельність карток', de: 'Kartenlesbarkeit', fr: 'Lisibilité des cartes', es: 'Legibilidad', pl: 'Czytelność kart' },
+
+        // ─── Голосовые / аудио ───
+        'Голосовое':       { en: 'Voice message', uk: 'Голосове', de: 'Sprachnachricht', fr: 'Message vocal', es: 'Mensaje de voz', pl: 'Wiadomość głosowa' },
+        'Голосовые':       { en: 'Voice messages', uk: 'Голосові', de: 'Sprachnachrichten', fr: 'Messages vocaux', es: 'Mensajes de voz', pl: 'Wiadomości głosowe' },
+        'Музыка':          { en: 'Music', uk: 'Музика', de: 'Musik', fr: 'Musique', es: 'Música', pl: 'Muzyka' },
+        'Аудио':           { en: 'Audio', uk: 'Аудіо', de: 'Audio', fr: 'Audio', es: 'Audio', pl: 'Audio' },
+        'Видео':           { en: 'Video', uk: 'Відео', de: 'Video', fr: 'Vidéo', es: 'Vídeo', pl: 'Wideo' },
+        'Видео-кружочек':  { en: 'Video note', uk: 'Відео-кружечок', de: 'Video-Nachricht', fr: 'Note vidéo', es: 'Vídeo circular', pl: 'Notatka wideo' },
+        'Кружочек':        { en: 'Video note', uk: 'Кружечок', de: 'Video-Nachricht', fr: 'Note vidéo', es: 'Vídeo', pl: 'Notatka' },
+        'К фото':          { en: 'To photo', uk: 'До фото', de: 'Zum Foto', fr: 'À la photo', es: 'A la foto', pl: 'Do zdjęcia' },
+        'К видео':         { en: 'To video', uk: 'До відео', de: 'Zum Video', fr: 'À la vidéo', es: 'Al vídeo', pl: 'Do wideo' },
+        'К файлу':         { en: 'To file', uk: 'До файлу', de: 'Zur Datei', fr: 'Au fichier', es: 'Al archivo', pl: 'Do pliku' },
+        'Комментировать':  { en: 'Comment', uk: 'Коментувати', de: 'Kommentieren', fr: 'Commenter', es: 'Comentar', pl: 'Komentuj' },
+
+        // ─── Игры ───
+        'Слово из слова':  { en: 'Word game', uk: 'Слово зі слова', de: 'Wortspiel', fr: 'Jeu de mots', es: 'Juego de palabras', pl: 'Gra słowna' },
+        'Стихотворение по 2 строчки': { en: 'Poem 2 lines at a time', uk: 'Вірш по 2 рядки', de: 'Gedicht 2 Zeilen', fr: 'Poème 2 lignes', es: 'Poema 2 líneas', pl: 'Wiersz po 2 linijki' },
+        'Секретный код':   { en: 'Secret code', uk: 'Секретний код', de: 'Geheimcode', fr: 'Code secret', es: 'Código secreto', pl: 'Tajny kod' },
+        'Начать':          { en: 'Start', uk: 'Почати', de: 'Starten', fr: 'Commencer', es: 'Empezar', pl: 'Start' },
+        'Загадать':        { en: 'Make a wish', uk: 'Загадати', de: 'Wünschen', fr: 'Souhaiter', es: 'Desear', pl: 'Zgadnij' },
+        'Создать игру':    { en: 'Create game', uk: 'Створити гру', de: 'Spiel erstellen', fr: 'Créer un jeu', es: 'Crear juego', pl: 'Utwórz grę' },
+        'Нарисовать':      { en: 'Draw', uk: 'Намалювати', de: 'Zeichnen', fr: 'Dessiner', es: 'Dibujar', pl: 'Rysuj' },
+        'Продолжить в комментариях!': { en: 'Continue in comments!', uk: 'Продовжте в коментарях!', de: 'In Kommentaren fortsetzen!', fr: 'Continuez dans les commentaires !', es: '¡Continúa en los comentarios!', pl: 'Kontynuuj w komentarzach!' },
+        'Составьте слова из этих букв': { en: 'Make words from these letters', uk: 'Складіть слова з цих літер', de: 'Bilden Sie Wörter aus diesen Buchstaben', fr: 'Faites des mots avec ces lettres', es: 'Forma palabras con estas letras', pl: 'Ułóż słowa z tych liter' },
+
+        // ─── Напоминания ───
+        'Новое напоминание': { en: 'New reminder', uk: 'Нове нагадування', de: 'Neue Erinnerung', fr: 'Nouveau rappel', es: 'Nuevo recordatorio', pl: 'Nowe przypomnienie' },
+        'Чат':             { en: 'Chat', uk: 'Чат', de: 'Chat', fr: 'Chat', es: 'Chat', pl: 'Czat' },
+        'Дата':            { en: 'Date', uk: 'Дата', de: 'Datum', fr: 'Date', es: 'Fecha', pl: 'Data' },
+        'Время':           { en: 'Time', uk: 'Час', de: 'Zeit', fr: 'Heure', es: 'Hora', pl: 'Czas' },
+        'Текст напоминания': { en: 'Reminder text', uk: 'Текст нагадування', de: 'Erinnerungstext', fr: 'Texte du rappel', es: 'Texto del recordatorio', pl: 'Treść przypomnienia' },
+
+        // ─── Поиск ───
+        'Начните вводить запрос…': { en: 'Start typing…', uk: 'Почніть вводити запит…', de: 'Tippen zum Suchen…', fr: 'Commencez à taper…', es: 'Empieza a escribir…', pl: 'Zacznij pisać…' },
+        'Ничего не найдено': { en: 'Nothing found', uk: 'Нічого не знайдено', de: 'Nichts gefunden', fr: 'Rien trouvé', es: 'Nada encontrado', pl: 'Nic nie znaleziono' },
+        'Минимум 2 символа…': { en: 'At least 2 characters…', uk: 'Мінімум 2 символи…', de: 'Mindestens 2 Zeichen…', fr: 'Au moins 2 caractères…', es: 'Mínimo 2 caracteres…', pl: 'Minimum 2 znaki…' },
+        'Найдено':         { en: 'Found', uk: 'Знайдено', de: 'Gefunden', fr: 'Trouvé', es: 'Encontrado', pl: 'Znaleziono' },
+
+        // ─── Меню действий с сообщением ───
+        'Копировать текст': { en: 'Copy text', uk: 'Копіювати текст', de: 'Text kopieren', fr: 'Copier le texte', es: 'Copiar texto', pl: 'Kopiuj tekst' },
+        'Выбрать несколько': { en: 'Select multiple', uk: 'Вибрати кілька', de: 'Mehrere auswählen', fr: 'Sélectionner plusieurs', es: 'Seleccionar varios', pl: 'Wybierz kilka' },
+        'Удалить все':     { en: 'Delete all', uk: 'Видалити все', de: 'Alle löschen', fr: 'Tout supprimer', es: 'Eliminar todo', pl: 'Usuń wszystko' },
+
+        // ─── Очистка кеша ───
+        'Очистка кеша':    { en: 'Clear cache', uk: 'Очищення кешу', de: 'Cache leeren', fr: 'Vider le cache', es: 'Limpiar caché', pl: 'Wyczyść pamięć' },
+        'Выберите чаты, кеш которых нужно очистить.': { en: 'Select chats whose cache to clear.', uk: 'Виберіть чати, кеш яких потрібно очистити.', de: 'Wählen Sie Chats aus, deren Cache geleert werden soll.', fr: 'Sélectionnez les chats dont le cache doit être vidé.', es: 'Selecciona los chats cuyo caché quieres borrar.', pl: 'Wybierz czaty, których pamięć wyczyścić.' },
+        'Выбрать все':     { en: 'Select all', uk: 'Вибрати все', de: 'Alle auswählen', fr: 'Tout sélectionner', es: 'Seleccionar todo', pl: 'Wybierz wszystko' },
+        'Снять все':       { en: 'Deselect all', uk: 'Зняти все', de: 'Alle abwählen', fr: 'Tout désélectionner', es: 'Deseleccionar todo', pl: 'Odznacz wszystko' },
+        'Выбрано':         { en: 'Selected', uk: 'Обрано', de: 'Ausgewählt', fr: 'Sélectionné', es: 'Seleccionado', pl: 'Wybrano' },
+
+        // ─── Экспорт / импорт ───
+        'Имя файла':       { en: 'File name', uk: 'Ім\'я файлу', de: 'Dateiname', fr: 'Nom du fichier', es: 'Nombre del archivo', pl: 'Nazwa pliku' },
+        'Включить пароли чатов': { en: 'Include chat passwords', uk: 'Включити паролі чатів', de: 'Chat-Passwörter einschließen', fr: 'Inclure les mots de passe', es: 'Incluir contraseñas', pl: 'Uwzględnij hasła' },
+        'Включить имя пользователя': { en: 'Include username', uk: 'Включити ім\'я користувача', de: 'Benutzername einschließen', fr: "Inclure le nom d'utilisateur", es: 'Incluir nombre de usuario', pl: 'Uwzględnij nazwę użytkownika' },
+        'Скачать файл':    { en: 'Download file', uk: 'Завантажити файл', de: 'Datei herunterladen', fr: 'Télécharger le fichier', es: 'Descargar archivo', pl: 'Pobierz plik' },
+        'Импортировать':   { en: 'Import', uk: 'Імпортувати', de: 'Importieren', fr: 'Importer', es: 'Importar', pl: 'Importuj' },
+        'Файл будет сохранён': { en: 'The file will be saved', uk: 'Файл буде збережено', de: 'Die Datei wird gespeichert', fr: 'Le fichier sera enregistré', es: 'El archivo se guardará', pl: 'Plik zostanie zapisany' },
+
+        // ─── Прочее ───
+        'Проверить':       { en: 'Check', uk: 'Перевірити', de: 'Prüfen', fr: 'Vérifier', es: 'Verificar', pl: 'Sprawdź' },
+        'Режим':           { en: 'Mode', uk: 'Режим', de: 'Modus', fr: 'Mode', es: 'Modo', pl: 'Tryb' },
+        'Вперёд':          { en: 'Forward', uk: 'Вперед', de: 'Vorwärts', fr: 'Avant', es: 'Adelante', pl: 'Do przodu' },
+        'Назад':           { en: 'Back', uk: 'Назад', de: 'Rückwärts', fr: 'Arrière', es: 'Atrás', pl: 'Do tyłu' },
+        'Случайно':        { en: 'Shuffle', uk: 'Випадково', de: 'Zufällig', fr: 'Aléatoire', es: 'Aleatorio', pl: 'Losowo' },
+        'Повтор':          { en: 'Repeat', uk: 'Повтор', de: 'Wiederholen', fr: 'Répéter', es: 'Repetir', pl: 'Powtórz' },
+        'Направление: вперёд': { en: 'Direction: forward', uk: 'Напрямок: вперед', de: 'Richtung: vorwärts', fr: 'Direction : avant', es: 'Dirección: adelante', pl: 'Kierunek: do przodu' },
+        'Направление: назад':  { en: 'Direction: backward', uk: 'Напрямок: назад', de: 'Richtung: rückwärts', fr: 'Direction : arrière', es: 'Dirección: atrás', pl: 'Kierunek: do tyłu' },
+
+        // ─── Плеер ───
+        'Следующий':       { en: 'Next', uk: 'Наступний', de: 'Nächster', fr: 'Suivant', es: 'Siguiente', pl: 'Następny' },
+        'Предыдущий':      { en: 'Previous', uk: 'Попередній', de: 'Vorheriger', fr: 'Précédent', es: 'Anterior', pl: 'Poprzedni' },
+        'Пауза':           { en: 'Pause', uk: 'Пауза', de: 'Pause', fr: 'Pause', es: 'Pausa', pl: 'Pauza' },
+        'Воспроизвести':   { en: 'Play', uk: 'Відтворити', de: 'Abspielen', fr: 'Lire', es: 'Reproducir', pl: 'Odtwórz' },
+        'Играет сейчас':    { en: 'Now playing', uk: 'Зараз грає', de: 'Läuft jetzt', fr: 'En lecture', es: 'Reproduciendo', pl: 'Teraz gra' },
+
+        // ─── Аватарки ───
+        'Установить аватарку': { en: 'Set avatar', uk: 'Встановити аватарку', de: 'Avatar festlegen', fr: 'Définir un avatar', es: 'Establecer avatar', pl: 'Ustaw awatar' },
+        'Сменить аватарку':    { en: 'Change avatar', uk: 'Змінити аватарку', de: 'Avatar ändern', fr: "Changer d'avatar", es: 'Cambiar avatar', pl: 'Zmień awatar' },
+        'Сгенерировать':       { en: 'Generate', uk: 'Згенерувати', de: 'Generieren', fr: 'Générer', es: 'Generar', pl: 'Wygeneruj' },
+        'Сгенерировать аватарку': { en: 'Generate avatar', uk: 'Згенерувати аватарку', de: 'Avatar generieren', fr: 'Générer un avatar', es: 'Generar avatar', pl: 'Wygeneruj awatar' },
+        'С устройства':        { en: 'From device', uk: 'З пристрою', de: 'Vom Gerät', fr: "De l'appareil", es: 'Del dispositivo', pl: 'Z urządzenia' },
+        'Видна только вам':    { en: 'Visible only to you', uk: 'Видно тільки вам', de: 'Nur für Sie sichtbar', fr: 'Visible uniquement par vous', es: 'Visible solo para ti', pl: 'Widoczne tylko dla Ciebie' },
+        'Вернуть букву':       { en: 'Return letter', uk: 'Повернути літеру', de: 'Buchstabe zurück', fr: 'Retour à la lettre', es: 'Volver a la letra', pl: 'Przywróć literę' },
+
+        // ─── Оффлайн ───
+        'Офлайн-режим':    { en: 'Offline mode', uk: 'Офлайн-режим', de: 'Offline-Modus', fr: 'Mode hors ligne', es: 'Modo sin conexión', pl: 'Tryb offline' },
+        'Только чтение':   { en: 'Read only', uk: 'Тільки читання', de: 'Nur Lesen', fr: 'Lecture seule', es: 'Solo lectura', pl: 'Tylko odczyt' },
+        'Офлайн':          { en: 'Offline', uk: 'Офлайн', de: 'Offline', fr: 'Hors ligne', es: 'Sin conexión', pl: 'Offline' },
+        'Онлайн':          { en: 'Online', uk: 'Онлайн', de: 'Online', fr: 'En ligne', es: 'En línea', pl: 'Online' },
+        'Медленно':        { en: 'Slow', uk: 'Повільно', de: 'Langsam', fr: 'Lent', es: 'Lento', pl: 'Wolno' },
+        'Сеть':            { en: 'Network', uk: 'Мережа', de: 'Netzwerk', fr: 'Réseau', es: 'Red', pl: 'Sieć' },
+        'Браузер':         { en: 'Browser', uk: 'Браузер', de: 'Browser', fr: 'Navigateur', es: 'Navegador', pl: 'Przeglądarka' },
+        'Очередь':         { en: 'Queue', uk: 'Черга', de: 'Warteschlange', fr: "File d'attente", es: 'Cola', pl: 'Kolejka' },
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ТЕКУЩИЙ ЯЗЫК
+    // ═══════════════════════════════════════════════════════════
+    let _lang = detectDeviceLanguage();
+
+    // ═══════════════════════════════════════════════════════════
+    //  ФУНКЦИЯ ПЕРЕВОДА
+    // ═══════════════════════════════════════════════════════════
+    function translate(text) {
+        if (!text || typeof text !== 'string') return text;
+        if (_lang === 'ru') return text;
+
+        const trimmed = text.trim();
+        if (!trimmed) return text;
+
+        const entry = DICTIONARY[trimmed];
+        if (!entry) return text;
+
+        const translated = entry[_lang] || entry.en || text;
+
+        // Сохраняем окружающие пробелы
+        const leadingSpace = text.match(/^\s*/)[0];
+        const trailingSpace = text.match(/\s*$/)[0];
+        return leadingSpace + translated + trailingSpace;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕВОД DOM
+    // ═══════════════════════════════════════════════════════════
+    function translateDom() {
+        if (_lang === 'ru') return;
+
+        // ─── 1. Текстовые узлы ───
+        const walker = document.createTreeWalker(
+            document.body,
+            NodeFilter.SHOW_TEXT,
+            {
+                acceptNode(node) {
+                    // Пропускаем: скрипты, стили, код, поле ввода, контент сообщений
+                    const parent = node.parentNode;
+                    if (!parent) return NodeFilter.FILTER_REJECT;
+                    const tag = parent.tagName;
+                    if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'CODE') {
+                        return NodeFilter.FILTER_REJECT;
+                    }
+                    // Не трогаем поле ввода
+                    if (parent.id === 'messageInput'
+                        || parent.id === 'decoyMessageInput'
+                        || parent.id === 'annTextInput'
+                        || parent.id === 'editMessageInput') {
+                        return NodeFilter.FILTER_REJECT;
+                    }
+                    // Не трогаем содержимое сообщений (это контент пользователя!)
+                    if (parent.closest && parent.closest('.message .text, .comment-text')) {
+                        return NodeFilter.FILTER_REJECT;
+                    }
+                    // Не трогаем имена чатов
+                    if (parent.closest && parent.closest('.chat-name, .chat-file')) {
+                        return NodeFilter.FILTER_REJECT;
+                    }
+                    // Не трогаем имена пользователей
+                    if (parent.closest && parent.closest('.sender-name, .comment-author, .rq-name, .sr-author')) {
+                        return NodeFilter.FILTER_REJECT;
+                    }
+                    // Не трогаем содержимое плеера (названия треков)
+                    if (parent.closest && parent.closest('.gp-title, .audio-track-name, .qp-track-name')) {
+                        return NodeFilter.FILTER_REJECT;
+                    }
+                    // Не трогаем содержимое поиска (там могут быть данные пользователя)
+                    if (parent.closest && parent.closest('.search-result-item .sr-text')) {
+                        return NodeFilter.FILTER_REJECT;
+                    }
+                    return NodeFilter.FILTER_ACCEPT;
+                }
+            }
+        );
+
+        const nodesToUpdate = [];
+        let node;
+        while (node = walker.nextNode()) {
+            const original = node.nodeValue;
+            const translated = translate(original);
+            if (translated !== original) {
+                nodesToUpdate.push({ node, translated });
+            }
+        }
+        nodesToUpdate.forEach(({ node, translated }) => {
+            node.nodeValue = translated;
+        });
+
+        // ─── 2. Placeholder, title, aria-label ───
+        document.querySelectorAll('[placeholder]').forEach(el => {
+            if (['messageInput', 'decoyMessageInput', 'annTextInput', 'editMessageInput', 'searchInput', 'joinChatFileInput', 'joinChatNameInput', 'joinChatPasswordInput', 'openChatPasswordInput', 'newChatDisplayNameInput', 'newChatPasswordInput', 'renameChatInput'].includes(el.id)) {
+                // placeholder в полях ввода — переводим
+                const orig = el.dataset._i18nOrigPlaceholder || el.getAttribute('placeholder');
+                if (!el.dataset._i18nOrigPlaceholder) {
+                    el.dataset._i18nOrigPlaceholder = orig;
+                }
+                const translated = translate(orig);
+                if (translated !== orig) el.setAttribute('placeholder', translated);
+            } else {
+                const orig = el.getAttribute('placeholder');
+                const translated = translate(orig);
+                if (translated !== orig) el.setAttribute('placeholder', translated);
+            }
+        });
+
+        document.querySelectorAll('[title]').forEach(el => {
+            // Не переводим title с именами/данными
+            if (el.closest && el.closest('.chat-name, .chat-file, .message, .comment-item')) return;
+            const orig = el.dataset._i18nOrigTitle || el.getAttribute('title');
+            if (!el.dataset._i18nOrigTitle) {
+                el.dataset._i18nOrigTitle = orig;
+            }
+            const translated = translate(orig);
+            if (translated !== orig) el.setAttribute('title', translated);
+        });
+
+        document.querySelectorAll('[aria-label]').forEach(el => {
+            const orig = el.dataset._i18nOrigAria || el.getAttribute('aria-label');
+            if (!el.dataset._i18nOrigAria) {
+                el.dataset._i18nOrigAria = orig;
+            }
+            const translated = translate(orig);
+            if (translated !== orig) el.setAttribute('aria-label', translated);
+        });
+
+        console.log(`🌐 [i18n] DOM переведён на ${_lang}`);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ showToast
+    // ═══════════════════════════════════════════════════════════
+    if (typeof window.showToast === 'function') {
+        const _origShowToast = window.showToast;
+        window.showToast = function(text, duration) {
+            return _origShowToast.call(this, translate(text), duration);
+        };
+        console.log('🌐 [i18n] showToast перехвачен');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ confirm / alert / prompt
+    // ═══════════════════════════════════════════════════════════
+    const _origConfirm = window.confirm;
+    window.confirm = function(msg) {
+        return _origConfirm.call(this, translate(msg));
+    };
+
+    const _origAlert = window.alert;
+    window.alert = function(msg) {
+        return _origAlert.call(this, translate(msg));
+    };
+
+    const _origPrompt = window.prompt;
+    window.prompt = function(msg, def) {
+        return _origPrompt.call(this, translate(msg), def);
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ДИНАМИЧЕСКИЙ ПЕРЕВОД НОВЫХ УЗЛОВ
+    //  MutationObserver — переводит то, что появилось после
+    //  создания модалок/меню/уведомлений
+    // ═══════════════════════════════════════════════════════════
+    let _translateTimer = null;
+    function scheduleDomTranslate() {
+        if (_translateTimer) return;
+        _translateTimer = setTimeout(() => {
+            _translateTimer = null;
+            try { translateDom(); } catch (e) { console.warn('🌐 [i18n] DOM translate error:', e); }
+        }, 50);
+    }
+
+    const domObserver = new MutationObserver((mutations) => {
+        // Не переводим, если язык — русский
+        if (_lang === 'ru') return;
+
+        let hasNew = false;
+        for (const mut of mutations) {
+            for (const node of mut.addedNodes) {
+                if (node.nodeType === 1 || node.nodeType === 3) {
+                    hasNew = true;
+                    break;
+                }
+            }
+            if (hasNew) break;
+        }
+        if (hasNew) scheduleDomTranslate();
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПРИМЕНЕНИЕ ЯЗЫКА
+    // ═══════════════════════════════════════════════════════════
+    function applyLanguage(lang) {
+        if (!CFG.SUPPORTED.includes(lang)) lang = CFG.FALLBACK;
+        _lang = lang;
+        try { localStorage.setItem(CFG.STORAGE_KEY, lang); } catch (e) {}
+
+        // Устанавливаем lang в html
+        document.documentElement.lang = lang;
+
+        // Переводим
+        translateDom();
+
+        console.log(`🌐 [i18n] Язык изменён на: ${lang}`);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  СТАРТ
+    // ═══════════════════════════════════════════════════════════
+    function init() {
+        document.documentElement.lang = _lang;
+
+        if (_lang !== 'ru') {
+            // Даём DOM построиться
+            setTimeout(translateDom, 100);
+            setTimeout(translateDom, 500);
+            setTimeout(translateDom, 1500);
+            setTimeout(translateDom, 3000);
+
+            // Наблюдаем за динамикой
+            domObserver.observe(document.body, {
+                childList: true,
+                subtree: true,
+            });
+        }
+
+        console.log(`🌐 [i18n] Инициализирован. Язык: ${_lang}`);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  API
+    // ═══════════════════════════════════════════════════════════
+    window.I18n = {
+        getLanguage: () => _lang,
+        setLanguage: (lang) => {
+            if (applyLanguage(lang)) {
+                // Перезагружаем для чистого применения
+                setTimeout(() => location.reload(), 100);
+            }
+        },
+        translate,
+        availableLanguages: CFG.SUPPORTED.slice(),
+        supportedLanguages: {
+            ru: 'Русский',
+            en: 'English',
+            uk: 'Українська',
+            be: 'Беларуская',
+            de: 'Deutsch',
+            fr: 'Français',
+            es: 'Español',
+            it: 'Italiano',
+            pt: 'Português',
+            pl: 'Polski',
+            zh: '中文',
+            ja: '日本語',
+            ko: '한국어',
+            tr: 'Türkçe',
+            ar: 'العربية',
+        },
+        status: () => ({
+            deviceLanguage: (navigator.language || '').toLowerCase(),
+            currentLanguage: _lang,
+            fallback: CFG.FALLBACK,
+            dictionarySize: Object.keys(DICTIONARY).length,
+            isRussian: _lang === 'ru',
+        }),
+    };
+
+    // ─── Запуск ───
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
+
+    console.log('🌐 [i18n] Auto-localization установлена');
+    console.log('   • Язык устройства:', navigator.language);
+    console.log('   • Текущий язык:', _lang);
+    console.log('   • Смены: I18n.setLanguage("en")');
+    console.log('   • Статус: I18n.status()');
+})();
+</script>
 </body>
 </html>
