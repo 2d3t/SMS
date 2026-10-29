@@ -73299,6 +73299,241 @@ async function sendAnnouncement() {
     console.log('📢 [Announcement v2] Готово');
 })();
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🖼️ FORCE-LATEST-PHOTO v1 — Кнопка «Галерея фото» всегда
+//  открывает САМУЮ СВЕЖУЮ фотографию в текущем чате.
+//  ─────────────────────────────────────────────────────────────
+//  • Перехватывает только клик по .cqa-item[data-action="gallery"]
+//  • Ничего больше не трогает
+//  • Берёт последнее сообщение с msg.image
+//  • Источники blob:URL (по приоритету):
+//      1) DOM .image-container img внутри wrapper-а этого сообщения
+//      2) _attachmentCache по имени вложения
+//      3) galleryState.loadedSrcs
+//      4) loadAttachment() — с ожиданием
+//  • Затем вызывает openGallery(url)
+// ═══════════════════════════════════════════════════════════════
 
+(function installForceLatestPhotoFromMenu() {
+    'use strict';
+
+    console.log('🖼️ [LatestPhoto] Установка патча перехвата «Галерея фото»…');
+
+    const CFG = {
+        WAIT_DOM_MS: 1500,        // сколько ждать появления blob:URL в DOM
+        WAIT_LOAD_MS: 8000,       // сколько ждать loadAttachment
+        DEBOUNCE_MS: 400,         // анти-двойной-тап
+    };
+
+    let _lastInvokeTs = 0;
+
+    // ─── Утилиты ───
+    function isAttachmentRefSafe(v) {
+        try { return typeof isAttachmentRef === 'function' && isAttachmentRef(v); }
+        catch (e) { return false; }
+    }
+
+    function getLastPhotoMessage() {
+        if (typeof historyState === 'undefined' || !Array.isArray(historyState.allMessages)) {
+            return null;
+        }
+        for (let i = historyState.allMessages.length - 1; i >= 0; i--) {
+            const m = historyState.allMessages[i];
+            if (m && m.image) return m;
+        }
+        return null;
+    }
+
+    // Достаём blob:URL максимально быстро из всех доступных источников
+    function resolveUrlSync(msg) {
+        if (!msg || !msg.image) return null;
+
+        // 1) inline blob:/data:
+        if (typeof msg.image === 'string'
+            && (msg.image.startsWith('blob:') || msg.image.startsWith('data:'))) {
+            return msg.image;
+        }
+
+        // 2) DOM — ищем картинку именно у этого сообщения
+        if (typeof messagesInner !== 'undefined' && messagesInner) {
+            const wrapper = messagesInner.querySelector(
+                `.message-wrapper[data-msg-id="${msg.id}"]`
+            );
+            if (wrapper) {
+                const img = wrapper.querySelector('.image-container img');
+                if (img && img.src && img.src.startsWith('blob:')) {
+                    return img.src;
+                }
+            }
+        }
+
+        // 3) _attachmentCache
+        if (typeof _attachmentCache !== 'undefined'
+            && _attachmentCache.has(msg.image)) {
+            return _attachmentCache.get(msg.image);
+        }
+
+        // 4) galleryState.loadedSrcs
+        if (typeof galleryState !== 'undefined'
+            && galleryState.loadedSrcs
+            && galleryState.loadedSrcs[msg.id]) {
+            return galleryState.loadedSrcs[msg.id];
+        }
+
+        return null;
+    }
+
+    // Ждём, пока нужный blob:URL появится в DOM (если вложения ещё грузятся)
+    function waitForUrlInDom(msg, timeoutMs) {
+        return new Promise((resolve) => {
+            const start = Date.now();
+            const tick = () => {
+                const url = resolveUrlSync(msg);
+                if (url) { resolve(url); return; }
+                if (Date.now() - start > timeoutMs) { resolve(null); return; }
+                setTimeout(tick, 100);
+            };
+            tick();
+        });
+    }
+
+    // Догружаем через loadAttachment с ожиданием
+    async function loadUrlViaLoadAttachment(msg) {
+        if (!msg || !msg.image) return null;
+        if (!state.chatFile) return null;
+        if (!isAttachmentRefSafe(msg.image)) return null;
+        if (typeof loadAttachment !== 'function') return null;
+
+        const loadPromise = loadAttachment(state.chatFile, msg.image);
+        const timeoutPromise = new Promise(r => setTimeout(() => r(null), CFG.WAIT_LOAD_MS));
+
+        try {
+            const url = await Promise.race([loadPromise, timeoutPromise]);
+            return url || null;
+        } catch (e) {
+            console.warn('🖼️ [LatestPhoto] loadAttachment error:', e);
+            return null;
+        }
+    }
+
+    // Главная функция — открыть самую новую фотографию
+    async function openLatestPhotoInChat() {
+        const now = Date.now();
+        if (now - _lastInvokeTs < CFG.DEBOUNCE_MS) return;
+        _lastInvokeTs = now;
+
+        if (!state || !state.chatFile) {
+            if (typeof showToast === 'function') showToast('🔒 Откройте чат', 1500);
+            return;
+        }
+
+        // 1. Находим последнее сообщение с фото
+        const lastMsg = getLastPhotoMessage();
+        if (!lastMsg) {
+            if (typeof showToast === 'function') showToast('📷 В этом чате нет фото', 2000);
+            return;
+        }
+
+        // 2. Пробуем взять URL синхронно
+        let url = resolveUrlSync(lastMsg);
+
+        // 3. Если нет — коротко ждём DOM (вложение может грузиться прямо сейчас)
+        if (!url) {
+            if (typeof showToast === 'function') showToast('⏳ Открываем последнее фото…', 1200);
+            url = await waitForUrlInDom(lastMsg, CFG.WAIT_DOM_MS);
+        }
+
+        // 4. Если всё ещё нет — догружаем через loadAttachment
+        if (!url) {
+            url = await loadUrlViaLoadAttachment(lastMsg);
+        }
+
+        // 5. Не удалось — сообщаем
+        if (!url) {
+            if (typeof showToast === 'function') {
+                showToast('❌ Не удалось открыть последнее фото', 2500);
+            }
+            return;
+        }
+
+        // 6. Открываем галерею. На всякий случай предварительно
+        //    подкладываем URL в loadedSrcs — чтобы первый кадр галереи
+        //    точно был именно этой самой свежей фотографией.
+        try {
+            if (typeof galleryState !== 'undefined') {
+                galleryState.loadedSrcs = galleryState.loadedSrcs || {};
+                if (!galleryState.loadedSrcs[lastMsg.id]) {
+                    galleryState.loadedSrcs[lastMsg.id] = url;
+                }
+            }
+        } catch (e) { /* ignore */ }
+
+        if (typeof openGallery === 'function') {
+            try {
+                await openGallery(url);
+                return;
+            } catch (e) {
+                console.warn('🖼️ [LatestPhoto] openGallery failed, fallback:', e);
+            }
+        }
+
+        if (typeof openImageModal === 'function') {
+            openImageModal(url);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРЕХВАТ КЛИКА ПО ПУНКТУ «Галерея фото»
+    //  Ставим capture-обработчик на документ — срабатывает
+    //  РАНЬШЕ любых других обработчиков.
+    // ═══════════════════════════════════════════════════════════
+    document.addEventListener('click', (e) => {
+        const item = e.target.closest('.cqa-item[data-action="gallery"]');
+        if (!item) return;
+
+        // Не мешаем, если пункт отключён (нет фото) — пусть
+        // отработает штатный обработчик, чтобы дать какой-то фидбэк
+        if (item.classList.contains('disabled')) return;
+
+        // Глушим всё: и наш старый обработчик, и ChatPlayerShortcut
+        e.stopImmediatePropagation();
+        e.preventDefault();
+
+        // Закрываем мини-меню (как это делает штатный код)
+        try {
+            if (typeof ChatPlayerShortcut !== 'undefined'
+                && typeof ChatPlayerShortcut.close === 'function') {
+                ChatPlayerShortcut.close();
+            }
+        } catch (err) {}
+
+        // И запускаем свою логику
+        openLatestPhotoInChat();
+    }, true);   // ⚡ capture
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API (для отладки)
+    // ═══════════════════════════════════════════════════════════
+    window.LatestPhotoMenu = {
+        open: openLatestPhotoInChat,
+        status: () => {
+            const last = getLastPhotoMessage();
+            return {
+                chatFile: state ? state.chatFile : null,
+                hasPhoto: !!last,
+                lastPhotoMsgId: last ? last.id : null,
+                lastPhotoTime: last ? last.time : null,
+                lastPhotoAttachName: last ? last.image : null,
+                resolvedNow: last ? resolveUrlSync(last) : null,
+            };
+        },
+    };
+
+    console.log('🖼️ [LatestPhoto] ✅ Готово.');
+    console.log('   • «⋯» → «Галерея фото» открывает самую СВЕЖУЮ фотографию');
+    console.log('   • API: LatestPhotoMenu.status() / .open()');
+})();
+</script>
 </body>
 </html>
