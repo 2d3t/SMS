@@ -75860,6 +75860,517 @@ async function sendAnnouncement() {
         console.log('🩹 [OldLongPressOff] confirm() для виджетов отключён');
     }
 })();
+</script><script>
+// 🔍 Погода в другом городе — компактная версия
+(function () {
+    'use strict';
+
+    const GEO = 'https://geocoding-api.open-meteo.com/v1/search';
+    const WEA = 'https://api.open-meteo.com/v1/forecast';
+
+    // ─── Стили ───
+    if (!document.getElementById('wqlStyles')) {
+        const s = document.createElement('style');
+        s.id = 'wqlStyles';
+        s.textContent = `
+            .widget-card.weather .wc-lookup-btn{
+                width:26px;height:26px;border-radius:50%;
+                border:1px solid rgba(255,255,255,.12);
+                background:rgba(255,255,255,.06);color:#aaa;
+                font-size:12px;cursor:pointer;display:flex;
+                align-items:center;justify-content:center;
+                flex-shrink:0;margin-left:4px;padding:0;line-height:1;
+                transition:.15s;-webkit-tap-highlight-color:transparent;
+            }
+            .widget-card.weather .wc-lookup-btn:hover{
+                background:rgba(92,168,255,.22);
+                border-color:rgba(92,168,255,.5);color:#fff;
+            }
+            .widget-card.weather .wc-lookup-btn:active{transform:scale(.88);}
+            #wqlOv{
+                position:fixed;inset:0;background:rgba(0,0,0,.72);
+                backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+                z-index:9350;display:none;align-items:center;
+                justify-content:center;padding:20px;
+            }
+            #wqlOv.show{display:flex;}
+            .wql-card{
+                background:#1a1a2e;border-radius:20px;
+                border:1px solid rgba(92,168,255,.35);
+                box-shadow:0 24px 72px rgba(0,0,0,.75);
+                max-width:420px;width:100%;max-height:90vh;
+                display:flex;flex-direction:column;overflow:hidden;
+                animation:wqlIn .25s cubic-bezier(.22,.61,.36,1);
+            }
+            @keyframes wqlIn{from{opacity:0;transform:scale(.94) translateY(20px)}to{opacity:1;transform:scale(1) translateY(0)}}
+            .wql-hd{
+                display:flex;align-items:center;gap:10px;padding:14px 16px;
+                border-bottom:1px solid rgba(255,255,255,.08);
+                background:linear-gradient(135deg,rgba(92,168,255,.12),rgba(108,92,231,.08));
+                flex-shrink:0;
+            }
+            .wql-hd-i{
+                width:34px;height:34px;border-radius:11px;
+                background:linear-gradient(135deg,#5CA8FF,#6c5ce7);
+                display:flex;align-items:center;justify-content:center;
+                font-size:16px;flex-shrink:0;
+            }
+            .wql-hd-t{flex:1;font-size:14px;font-weight:700;color:#fff;min-width:0;}
+            .wql-x{
+                width:30px;height:30px;border-radius:50%;border:none;
+                background:rgba(255,255,255,.06);color:#888;font-size:14px;
+                cursor:pointer;display:flex;align-items:center;justify-content:center;
+                flex-shrink:0;
+            }
+            .wql-x:hover{background:rgba(255,107,107,.2);color:#ff6b6b;}
+            .wql-bd{
+                padding:14px 16px 16px;overflow-y:auto;flex:1;min-height:0;
+                display:flex;flex-direction:column;gap:12px;
+            }
+            .wql-sr{display:flex;gap:8px;flex-shrink:0;}
+            .wql-in{
+                flex:1;padding:11px 13px;background:rgba(255,255,255,.06);
+                border:1px solid rgba(255,255,255,.1);border-radius:11px;
+                color:#fff;font-size:15px;outline:none;font-family:inherit;min-width:0;
+            }
+            .wql-in:focus{border-color:#5CA8FF;box-shadow:0 0 0 3px rgba(92,168,255,.15);}
+            .wql-in::placeholder{color:#666;}
+            .wql-btn{
+                padding:11px 16px;border-radius:11px;border:none;
+                background:linear-gradient(135deg,#5CA8FF,#6c5ce7);
+                color:#fff;font-size:14px;font-weight:600;cursor:pointer;
+                font-family:inherit;flex-shrink:0;
+            }
+            .wql-btn:active{transform:scale(.96);}
+            .wql-btn:disabled{opacity:.4;cursor:not-allowed;}
+            .wql-res{
+                display:none;flex-direction:column;gap:10px;padding:14px;
+                background:rgba(92,168,255,.06);
+                border:1px solid rgba(92,168,255,.2);border-radius:14px;
+            }
+            .wql-res.show{display:flex;}
+            .wql-loc{
+                display:flex;align-items:center;gap:8px;
+                padding-bottom:10px;border-bottom:1px dashed rgba(255,255,255,.1);
+            }
+            .wql-loc-f{font-size:22px;line-height:1;}
+            .wql-loc-i{flex:1;min-width:0;}
+            .wql-loc-n{
+                font-size:16px;font-weight:700;color:#fff;
+                margin-bottom:2px;white-space:nowrap;overflow:hidden;
+                text-overflow:ellipsis;
+            }
+            .wql-loc-s{
+                font-size:11px;color:#888;white-space:nowrap;
+                overflow:hidden;text-overflow:ellipsis;
+            }
+            .wql-mn{display:flex;align-items:center;gap:14px;}
+            .wql-mn-i{font-size:44px;line-height:1;}
+            .wql-mn-t{
+                font-size:30px;font-weight:800;color:#fff;line-height:1;
+            }
+            .wql-mn-d{font-size:12px;color:#ccc;margin-top:4px;}
+            .wql-ex{
+                display:flex;gap:10px;flex-wrap:wrap;padding-top:8px;
+                border-top:1px solid rgba(255,255,255,.06);
+                font-size:11px;color:#aaa;
+            }
+            .wql-ex strong{color:#fff;}
+            .wql-fc{
+                display:flex;gap:5px;margin-top:6px;padding-top:8px;
+                border-top:1px solid rgba(255,255,255,.06);
+            }
+            .wql-d{
+                flex:1;min-width:0;padding:7px 3px;
+                background:rgba(255,255,255,.03);
+                border:1px solid rgba(255,255,255,.06);
+                border-radius:9px;text-align:center;
+            }
+            .wql-d-l{
+                font-size:9px;color:#888;margin-bottom:3px;
+                white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+            }
+            .wql-d-i{font-size:18px;margin-bottom:3px;}
+            .wql-d-t{
+                font-size:10px;display:flex;justify-content:center;gap:3px;
+            }
+            .wql-d-x{color:#fff;font-weight:700;}
+            .wql-d-n{color:#888;}
+            .wql-err{
+                display:none;padding:12px;
+                background:rgba(255,107,107,.1);
+                border:1px solid rgba(255,107,107,.3);
+                border-radius:11px;color:#ff8a8a;
+                font-size:13px;text-align:center;
+            }
+            .wql-err.show{display:block;}
+            .wql-ld{
+                display:none;flex-direction:column;align-items:center;
+                justify-content:center;gap:10px;padding:26px 20px;
+            }
+            .wql-ld.show{display:flex;}
+            .wql-sp{
+                width:34px;height:34px;
+                border:3px solid rgba(92,168,255,.25);
+                border-top-color:#5CA8FF;border-right-color:#6c5ce7;
+                border-radius:50%;animation:wqlSp .9s linear infinite;
+            }
+            @keyframes wqlSp{to{transform:rotate(360deg)}}
+            .wql-ld-t{font-size:12px;color:#aaa;}
+            .wql-ept{text-align:center;padding:22px 18px;color:#666;}
+            .wql-ept-i{font-size:44px;margin-bottom:8px;opacity:.5;}
+            .wql-ept-t{font-size:12px;line-height:1.5;color:#888;}
+            @media(max-width:480px){
+                #wqlOv{padding:12px;}
+                .wql-card{max-height:94vh;}
+                .wql-mn-i{font-size:38px;}
+                .wql-mn-t{font-size:26px;}
+                .wql-bd{padding:12px 14px;}
+            }
+        `;
+        document.head.appendChild(s);
+    }
+
+    // ─── Хелперы ───
+    const esc = s => { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; };
+
+    function flag(cc) {
+        if (!cc || cc.length !== 2) return '🌍';
+        const A = 0x1F1E6;
+        try { return String.fromCodePoint(A + cc.charCodeAt(0) - 65, A + cc.charCodeAt(1) - 65); }
+        catch (e) { return '🌍'; }
+    }
+
+    function wdesc(code, isDay) {
+        const m = {0:['Ясно',isDay?'☀️':'🌙'],1:['Преим. ясно',isDay?'🌤️':'🌙'],2:['Перем. облачность','⛅'],3:['Пасмурно','☁️'],45:['Туман','🌫️'],48:['Туман','🌫️'],51:['Морось','🌦️'],53:['Морось','🌦️'],55:['Морось','🌦️'],61:['Дождь','🌧️'],63:['Дождь','🌧️'],65:['Дождь','🌧️'],71:['Снег','🌨️'],73:['Снег','🌨️'],75:['Снег','🌨️'],80:['Ливень','🌧️'],81:['Ливень','🌧️'],82:['Ливень','🌧️'],85:['Снегопад','❄️'],86:['Снегопад','❄️'],95:['Гроза','⛈️'],96:['Гроза с градом','⛈️'],99:['Гроза с градом','⛈️']};
+        const v = m[code] || ['—','🌡️'];
+        return { text: v[0], icon: v[1] };
+    }
+
+    async function fetchT(url, ms) {
+        const c = new AbortController();
+        const t = setTimeout(() => c.abort(), ms || 10000);
+        try { const r = await fetch(url, { signal: c.signal }); clearTimeout(t); if (!r.ok) throw new Error('HTTP ' + r.status); return await r.json(); }
+        finally { clearTimeout(t); }
+    }
+
+    async function findCity(name) {
+        const p = new URLSearchParams({ name, count: '1', language: 'ru', format: 'json' });
+        const d = await fetchT(GEO + '?' + p);
+        if (!d.results || !d.results.length) throw new Error('Город не найден');
+        const r = d.results[0];
+        return { name: r.name, country: r.country || '', cc: r.country_code || '', lat: r.latitude, lon: r.longitude, tz: r.timezone || 'auto', admin: r.admin1 || '' };
+    }
+
+    async function getWeather(lat, lon, tz) {
+        const url = WEA + `?latitude=${lat}&longitude=${lon}` +
+            `&current=temperature_2m,relative_humidity_2m,apparent_temperature,is_day,precipitation,weather_code,wind_speed_10m` +
+            `&daily=temperature_2m_max,temperature_2m_min,weather_code,precipitation_sum` +
+            `&timezone=${encodeURIComponent(tz || 'auto')}&forecast_days=4`;
+        const d = await fetchT(url);
+        const c = d.current || {}, dy = d.daily || {};
+        return {
+            temp: c.temperature_2m, feels: c.apparent_temperature, hum: c.relative_humidity_2m,
+            wind: c.wind_speed_10m, isDay: c.is_day === 1, code: c.weather_code,
+            min: dy.temperature_2m_min?.[0], max: dy.temperature_2m_max?.[0],
+            forecast: (dy.time || []).map((date, i) => ({ date, code: dy.weather_code?.[i], min: dy.temperature_2m_min?.[i], max: dy.temperature_2m_max?.[i] }))
+        };
+    }
+
+    // ─── Оверлей ───
+    let ov = null, loading = false;
+
+    function buildOv() {
+        if (ov && ov.isConnected) return ov;
+        const e = document.createElement('div');
+        e.id = 'wqlOv';
+        e.innerHTML = `
+            <div class="wql-card">
+                <div class="wql-hd">
+                    <div class="wql-hd-i">🔍</div>
+                    <div class="wql-hd-t">Погода в другом городе</div>
+                    <button class="wql-x" id="wqlX">✕</button>
+                </div>
+                <div class="wql-bd">
+                    <div class="wql-sr">
+                        <input class="wql-in" id="wqlIn" placeholder="Город (например: Париж)" maxlength="60" autocomplete="off">
+                        <button class="wql-btn" id="wqlGo">Найти</button>
+                    </div>
+                    <div class="wql-ld" id="wqlLd"><div class="wql-sp"></div><div class="wql-ld-t">Ищем город и погоду…</div></div>
+                    <div class="wql-err" id="wqlErr"></div>
+                    <div class="wql-res" id="wqlRes"></div>
+                    <div class="wql-ept" id="wqlEpt">
+                        <div class="wql-ept-i">🌍</div>
+                        <div class="wql-ept-t">Введите название города, чтобы посмотреть<br>погоду там, куда вы собираетесь</div>
+                    </div>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(e);
+        ov = e;
+
+        e.querySelector('#wqlX').addEventListener('click', close);
+        e.addEventListener('click', ev => { if (ev.target === e) close(); });
+
+        const inp = e.querySelector('#wqlIn'), btn = e.querySelector('#wqlGo');
+        inp.addEventListener('keydown', ev => { if (ev.key === 'Enter') { ev.preventDefault(); search(inp.value); } });
+        btn.addEventListener('click', () => search(inp.value));
+
+        document.addEventListener('keydown', ev => {
+            if (ev.key === 'Escape' && e.classList.contains('show')) { ev.preventDefault(); ev.stopPropagation(); close(); }
+        }, true);
+
+        return e;
+    }
+
+    function open() {
+        buildOv();
+        ov.classList.add('show');
+        document.body.style.overflow = 'hidden';
+        setTimeout(() => ov.querySelector('#wqlIn').focus(), 180);
+        try { soundManager.play('click'); } catch (e) {}
+    }
+
+    function close() {
+        if (!ov) return;
+        ov.classList.remove('show');
+        document.body.style.overflow = '';
+    }
+
+    async function search(q) {
+        if (loading) return;
+        q = String(q || '').trim();
+        if (q.length < 2) { showErr('Введите название города (мин. 2 символа)'); return; }
+
+        loading = true;
+        const e = ov, ld = e.querySelector('#wqlLd'), er = e.querySelector('#wqlErr'),
+              rs = e.querySelector('#wqlRes'), ep = e.querySelector('#wqlEpt'), btn = e.querySelector('#wqlGo');
+
+        er.classList.remove('show'); rs.classList.remove('show'); ep.style.display = 'none';
+        ld.classList.add('show'); btn.disabled = true;
+
+        try {
+            const geo = await findCity(q);
+            const w = await getWeather(geo.lat, geo.lon, geo.tz);
+            render(geo, w);
+            ld.classList.remove('show');
+            rs.classList.add('show');
+            try { soundManager.play('send'); } catch (e2) {}
+        } catch (ex) {
+            console.error('🔍 wql error:', ex);
+            ld.classList.remove('show');
+            let msg = 'Не удалось получить погоду';
+            if (ex.message.includes('не найден')) msg = `Город «${q}» не найден`;
+            else if (ex.name === 'AbortError') msg = 'Превышено время ожидания';
+            else if (ex.message) msg = ex.message;
+            showErr(msg);
+            try { soundManager.play('error'); } catch (e2) {}
+        } finally {
+            loading = false;
+            btn.disabled = false;
+        }
+    }
+
+    function showErr(msg) {
+        const e = ov; if (!e) return;
+        e.querySelector('#wqlErr').textContent = '⚠️ ' + msg;
+        e.querySelector('#wqlErr').classList.add('show');
+        e.querySelector('#wqlRes').classList.remove('show');
+        e.querySelector('#wqlEpt').style.display = 'none';
+    }
+
+    function render(geo, w) {
+        const e = ov;
+        const d = wdesc(w.code, w.isDay);
+        const f = flag(geo.cc);
+        const sub = [geo.admin, geo.country].filter(Boolean).join(', ');
+
+        const today = new Date(); today.setHours(0,0,0,0);
+        const dn = ['Вс','Пн','Вт','Ср','Чт','Пт','Сб'];
+        const fc = (w.forecast || []).slice(0, 4).map(dd => {
+            const date = new Date(dd.date + 'T00:00:00');
+            const diff = Math.round((date - today) / 86400000);
+            let lbl = dn[date.getDay()];
+            if (diff === 0) lbl = 'Сегодня'; else if (diff === 1) lbl = 'Завтра';
+            const d2 = wdesc(dd.code, true);
+            return `<div class="wql-d"><div class="wql-d-l">${lbl}</div><div class="wql-d-i">${d2.icon}</div><div class="wql-d-t"><span class="wql-d-x">${Math.round(dd.max)}°</span><span class="wql-d-n">${Math.round(dd.min)}°</span></div></div>`;
+        }).join('');
+
+        e.querySelector('#wqlRes').innerHTML = `
+            <div class="wql-loc">
+                <div class="wql-loc-f">${f}</div>
+                <div class="wql-loc-i">
+                    <div class="wql-loc-n">${esc(geo.name)}</div>
+                    <div class="wql-loc-s">${esc(sub)}</div>
+                </div>
+            </div>
+            <div class="wql-mn">
+                <div class="wql-mn-i">${d.icon}</div>
+                <div>
+                    <div class="wql-mn-t">${Math.round(w.temp)}°</div>
+                    <div class="wql-mn-d">${esc(d.text)}</div>
+                </div>
+            </div>
+            <div class="wql-ex">
+                <div>🌡️ <strong>${Math.round(w.min)}° / ${Math.round(w.max)}°</strong></div>
+                <div>🤔 <strong>${Math.round(w.feels)}°</strong></div>
+                <div>💧 <strong>${w.hum}%</strong></div>
+                <div>💨 <strong>${Math.round(w.wind)} км/ч</strong></div>
+            </div>
+            ${fc ? `<div class="wql-fc">${fc}</div>` : ''}
+        `;
+    }
+
+    // ─── Кнопка в шапке виджета погоды ───
+    function injectBtn() {
+        const c = document.getElementById('chatsList');
+        if (!c) return false;
+        const card = c.querySelector('.widget-card.weather');
+        if (!card) return false;
+        if (card.querySelector('.wc-lookup-btn')) return true;
+
+        const hd = card.querySelector('.wc-header');
+        if (!hd) return false;
+
+        const b = document.createElement('button');
+        b.className = 'wc-lookup-btn';
+        b.type = 'button';
+        b.title = 'Погода в другом городе';
+        b.textContent = '🔍';
+        b.addEventListener('click', ev => { ev.stopPropagation(); open(); });
+        hd.appendChild(b);
+        return true;
+    }
+
+    // Наблюдатель
+    new MutationObserver(() => injectBtn()).observe(document.body, { childList: true, subtree: true });
+    setInterval(injectBtn, 1500);
+    setTimeout(injectBtn, 3000);
+
+    window.WeatherQuickLookup = { open, close, search };
+    console.log('🔍 [WeatherQuickLookup] ✅ Готово');
+})();
+</script><script>
+// 🚫 Блокируем системное меню Chrome внутри оверлея быстрой погоды
+(function () {
+    'use strict';
+
+    const TARGET_SEL = '#wqlOv';
+    const EVENTS = ['contextmenu', 'selectstart', 'dragstart'];
+
+    // 1. CSS — жёстко запрещаем выделение и callout внутри оверлея
+    if (!document.getElementById('wqlNoCtxStyles')) {
+        const s = document.createElement('style');
+        s.id = 'wqlNoCtxStyles';
+        s.textContent = `
+            #wqlOv,
+            #wqlOv * {
+                -webkit-touch-callout: none !important;
+                -webkit-user-select: none !important;
+                -moz-user-select: none !important;
+                -ms-user-select: none !important;
+                user-select: none !important;
+                -webkit-tap-highlight-color: transparent !important;
+            }
+            /* Но поле ввода — можно выделять (чтобы вводить/редактировать текст) */
+            #wqlOv input#wqlIn,
+            #wqlOv input {
+                -webkit-user-select: text !important;
+                -moz-user-select: text !important;
+                -ms-user-select: text !important;
+                user-select: text !important;
+                -webkit-touch-callout: default !important;
+            }
+            #wqlOv ::selection { background: rgba(92,168,255,.45) !important; color: #fff !important; }
+            #wqlOv input::selection { background: rgba(92,168,255,.5) !important; color: #fff !important; }
+        `;
+        document.head.appendChild(s);
+    }
+
+    // 2. Перехватываем события в capture-фазе на document
+    function inOverlay(el) {
+        return !!(el && el.closest && el.closest(TARGET_SEL));
+    }
+
+    function isEditable(el) {
+        if (!el) return false;
+        const t = el.tagName;
+        return t === 'INPUT' || t === 'TEXTAREA' || el.isContentEditable;
+    }
+
+    EVENTS.forEach(evt => {
+        document.addEventListener(evt, e => {
+            if (!inOverlay(e.target)) return;
+            // Разрешаем выделение в поле ввода (это не про системное меню)
+            if (evt === 'selectstart' && isEditable(e.target)) return;
+            e.preventDefault();
+            e.stopPropagation();
+            // contextmenu возвращаем false для старых браузеров
+            if (evt === 'contextmenu') e.returnValue = false;
+        }, { capture: true, passive: false });
+    });
+
+    // 3. Долгое нажатие (Android Chrome) — гасим выделение через серию kill
+    let pressTimer = null;
+    let pressTarget = null;
+
+    function killSelection() {
+        try {
+            const sel = window.getSelection();
+            if (sel && sel.rangeCount > 0) sel.removeAllRanges();
+        } catch (e) {}
+    }
+
+    function startKillBursts() {
+        [50, 100, 200, 300, 500, 800, 1200].forEach(d => setTimeout(killSelection, d));
+    }
+
+    document.addEventListener('touchstart', e => {
+        if (!inOverlay(e.target)) return;
+        // В поле ввода — не мешаем
+        if (isEditable(e.target)) return;
+
+        pressTarget = e.target;
+        startKillBursts();
+
+        // Мягкий «kill» таймер — на случай если Chrome начнёт выделять
+        clearTimeout(pressTimer);
+        pressTimer = setTimeout(killSelection, 400);
+    }, { capture: true, passive: true });
+
+    document.addEventListener('touchmove', () => {
+        if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
+    }, { capture: true, passive: true });
+
+    document.addEventListener('touchend', () => {
+        if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
+        if (pressTarget) { killSelection(); pressTarget = null; }
+    }, { capture: true, passive: true });
+
+    document.addEventListener('touchcancel', () => {
+        if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
+        pressTarget = null;
+    }, { capture: true, passive: true });
+
+    // 4. Дополнительная страховка: если браузер всё-таки начал выделение —
+    //    снимаем его, пока оверлей открыт
+    document.addEventListener('selectionchange', () => {
+        const ov = document.getElementById('wqlOv');
+        if (!ov || !ov.classList.contains('show')) return;
+        const sel = window.getSelection();
+        if (!sel || sel.rangeCount === 0) return;
+        const node = sel.anchorNode;
+        if (!node) return;
+        const el = node.nodeType === 1 ? node : node.parentElement;
+        if (!el || !el.closest) return;
+        // Не в поле ввода и внутри оверлея — снимаем
+        if (inOverlay(el) && !isEditable(el)) {
+            sel.removeAllRanges();
+        }
+    }, { passive: true });
+
+    console.log('🚫 [WQLNoCtx] Системное меню в оверлее погоды заблокировано');
+})();
 </script>
 </body>
 </html>
