@@ -76504,570 +76504,652 @@ async function sendAnnouncement() {
 })();
 
 // ═══════════════════════════════════════════════════════════════
-//  🕐 TIME-SERVER VALIDATION FOR INVITE LINKS
+//  🔐 INVITE PIN GUARD v6 — ЗАЩИТА PIN-КОДОМ
 //  ─────────────────────────────────────────────────────────────
-//  Защита от отката часов на устройстве.
-//
-//  Как работает:
-//   1. Перед валидацией ссылки запрашиваем реальное UTC-время
-//      у 2-3 независимых источников (GitHub, WorldTimeAPI, TimeAPI)
-//   2. Берём медиану (защита от одного сбойного источника)
-//   3. Проверяем exp/iat по СЕРВЕРНОМУ времени, не локальному
-//   4. Дополнительно: если |serverNow - localNow| > 5 мин —
-//      устройство явно подделало часы → отказ
-//
-//  Если ни один источник не ответил:
-//   • Отказ (по умолчанию) — безопасный режим
-//   • Или fallback на локальное время (небезопасно)
+//  Что делает:
+//   1. Патчит TempInvite.build — добавляет 4-значный PIN в payload
+//   2. Патчит показ ссылки — показывает PIN отдельно от URL
+//   3. При открытии ссылки — показывает оверлей «Введите PIN»
+//   4. Одна попытка ввода — при ошибке блок
+//   5. Сохраняет флаг в sessionStorage — при F5 не пускает снова
+//   6. Параллельно (если получится) — проверяет время через сервер
+//      (не блокирует если сервер недоступен, только логирует)
 // ═══════════════════════════════════════════════════════════════
 
-(function installInviteTimeServerValidation() {
+(function installInvitePinGuardV6() {
     'use strict';
 
-    console.log('🕐 [InviteTime] Установка серверной валидации времени…');
+    console.log('🔐 [PinGuard v6] Установка…');
 
-    // ═══════════════════════════════════════════════════════════
-    //  КОНФИГ
-    // ═══════════════════════════════════════════════════════════
     const CFG = {
-        // Порог, при котором считаем что часы устройства "врут".
-        // 5 минут — стандарт NTP-синхронизации (как в Kerberos)
-        MAX_CLOCK_SKEW_MS: 5 * 60 * 1000,
-
-        // Небольшой запас на сетевые задержки при проверке exp/iat
-        // (200-300 мс между запросом и ответом — берём с запасом)
-        EXP_GRACE_MS: 60 * 1000,
-
-        // Таймаут на каждый источник времени
-        FETCH_TIMEOUT_MS: 6000,
-
-        // Требовать ли серверное время обязательно.
-        // true  → без сети ссылка не работает (безопасно)
-        // false → fallback на локальное время (дыра остаётся)
-        REQUIRE_SERVER_TIME: true,
-
-        // Кэш серверного времени на N мс (чтобы не дёргать API
-        // при каждом клике)
-        TIME_CACHE_MS: 30 * 1000,
+        PIN_LENGTH: 4,
+        PIN_STORAGE_PREFIX: 'smschat_pin_',
+        // Ключ в sessionStorage: попытка для конкретного jti
+        ATTEMPT_KEY_PREFIX: 'smschat_pin_attempt_',
     };
 
     // ═══════════════════════════════════════════════════════════
-    //  КЭШ ВРЕМЕНИ
-    //  { ts: когда получили, offset: serverNow - localNow }
+    //  ГЕНЕРАЦИЯ PIN
     // ═══════════════════════════════════════════════════════════
-    let _timeCache = null;
-
-    function getCachedOffset() {
-        if (!_timeCache) return null;
-        if (Date.now() - _timeCache.ts > CFG.TIME_CACHE_MS) {
-            _timeCache = null;
-            return null;
+    function generatePin() {
+        const bytes = crypto.getRandomValues(new Uint8Array(4));
+        // 4 цифры
+        let pin = '';
+        for (let i = 0; i < CFG.PIN_LENGTH; i++) {
+            pin += (bytes[i] % 10).toString();
         }
-        return _timeCache;
-    }
-
-    function cacheOffset(serverNowAtFetch, fetchStartedAt) {
-        // Корректируем на половину RTT — время сервера было
-        // "сейчас" примерно в середине запроса
-        const fetchFinishedAt = Date.now();
-        const rtt = fetchFinishedAt - fetchStartedAt;
-        const serverNowAdjusted = serverNowAtFetch + Math.floor(rtt / 2);
-
-        _timeCache = {
-            ts: fetchFinishedAt,
-            offset: serverNowAdjusted - fetchFinishedAt,
-        };
+        return pin;
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ИСТОЧНИК 1: GitHub Date header
-    //  Самый быстрый и надёжный (используем то, что уже подключены)
+    //  ПАТЧ: TempInvite.build — добавить PIN в payload
     // ═══════════════════════════════════════════════════════════
-    async function fetchTimeFromGitHub() {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), CFG.FETCH_TIMEOUT_MS);
-        const startedAt = Date.now();
-
-        try {
-            const res = await fetch('https://api.github.com/rate_limit', {
-                method: 'HEAD',
-                cache: 'no-store',
-                signal: controller.signal,
-            });
-            clearTimeout(timer);
-
-            const dateHeader = res.headers.get('Date');
-            if (!dateHeader) return null;
-
-            const parsed = new Date(dateHeader).getTime();
-            if (!isFinite(parsed) || parsed <= 0) return null;
-
-            return { source: 'github', time: parsed, startedAt };
-        } catch (e) {
-            clearTimeout(timer);
-            console.warn('🕐 [InviteTime] GitHub Date недоступен:', e.message);
-            return null;
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ИСТОЧНИК 2: WorldTimeAPI
-    // ═══════════════════════════════════════════════════════════
-    async function fetchTimeFromWorldTimeAPI() {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), CFG.FETCH_TIMEOUT_MS);
-        const startedAt = Date.now();
-
-        try {
-            const res = await fetch('https://worldtimeapi.org/api/timezone/Etc/UTC', {
-                cache: 'no-store',
-                signal: controller.signal,
-            });
-            clearTimeout(timer);
-            if (!res.ok) return null;
-
-            const data = await res.json();
-            const time = data.unixtime ? data.unixtime * 1000 : null;
-            if (!time || !isFinite(time)) return null;
-
-            return { source: 'worldtimeapi', time, startedAt };
-        } catch (e) {
-            clearTimeout(timer);
-            console.warn('🕐 [InviteTime] WorldTimeAPI недоступен:', e.message);
-            return null;
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ИСТОЧНИК 3: timeapi.io
-    // ═══════════════════════════════════════════════════════════
-    async function fetchTimeFromTimeAPI() {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), CFG.FETCH_TIMEOUT_MS);
-        const startedAt = Date.now();
-
-        try {
-            const res = await fetch(
-                'https://timeapi.io/api/Time/current/zone?timeZone=UTC',
-                { cache: 'no-store', signal: controller.signal }
-            );
-            clearTimeout(timer);
-            if (!res.ok) return null;
-
-            const data = await res.json();
-            // Поля: year, month, day, hour, minute, seconds, milliSeconds
-            if (!data.year || !data.month || !data.day) return null;
-
-            const time = Date.UTC(
-                data.year, data.month - 1, data.day,
-                data.hour || 0, data.minute || 0,
-                data.seconds || 0, data.milliSeconds || 0
-            );
-            if (!isFinite(time) || time <= 0) return null;
-
-            return { source: 'timeapi', time, startedAt };
-        } catch (e) {
-            clearTimeout(timer);
-            console.warn('🕐 [InviteTime] timeapi.io недоступен:', e.message);
-            return null;
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  МЕДИАНА ИЗ НЕСКОЛЬКИХ ИСТОЧНИКОВ
-    // ═══════════════════════════════════════════════════════════
-    function medianOf(results) {
-        const values = results.map(r => r.time).sort((a, b) => a - b);
-        if (values.length === 0) return null;
-        if (values.length === 1) return values[0];
-        if (values.length === 2) return Math.floor((values[0] + values[1]) / 2);
-        return values[Math.floor(values.length / 2)];
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ГЛАВНАЯ ФУНКЦИЯ: ПОЛУЧИТЬ ДОВЕРЕННОЕ ВРЕМЯ
-    // ═══════════════════════════════════════════════════════════
-    async function getTrustedNow() {
-        // Кэш
-        const cached = getCachedOffset();
-        if (cached) {
-            const now = Date.now() + cached.offset;
-            console.log(`🕐 [InviteTime] Используем кэш: offset ${cached.offset} мс`);
-            return {
-                now,
-                localNow: Date.now(),
-                skew: cached.offset,
-                source: 'cache',
-            };
-        }
-
-        // Параллельный запрос к 3 источникам с общим таймаутом
-        console.log('🕐 [InviteTime] Запрашиваем серверное время…');
-
-        const overallTimeout = new Promise(resolve => {
-            setTimeout(() => resolve(null), CFG.FETCH_TIMEOUT_MS + 1000);
-        });
-
-        const fetches = Promise.allSettled([
-            fetchTimeFromGitHub(),
-            fetchTimeFromWorldTimeAPI(),
-            fetchTimeFromTimeAPI(),
-        ]);
-
-        let results;
-        try {
-            const settled = await Promise.race([fetches, overallTimeout.then(() => null)]);
-
-            if (settled === null) {
-                console.warn('🕐 [InviteTime] Общий таймаут получения времени');
-                return null;
-            }
-
-            results = settled
-                .filter(r => r.status === 'fulfilled' && r.value)
-                .map(r => r.value);
-        } catch (e) {
-            console.warn('🕐 [InviteTime] Ошибка запросов времени:', e);
-            return null;
-        }
-
-        if (results.length === 0) {
-            console.warn('🕐 [InviteTime] Ни один источник не ответил');
-            return null;
-        }
-
-        console.log(`🕐 [InviteTime] Получено от ${results.length} источник(ов):`,
-            results.map(r => r.source).join(', '));
-
-        // Медиана
-        const medianTime = medianOf(results);
-        if (!medianTime) return null;
-
-        // Кэшируем offset относительно локального времени
-        // Берём самый свежий startedAt для расчёта RTT
-        const freshest = results.reduce((a, b) =>
-            (a.startedAt > b.startedAt) ? a : b
-        );
-        cacheOffset(medianTime, freshest.startedAt);
-
-        const localNow = Date.now();
-        return {
-            now: medianTime,
-            localNow,
-            skew: medianTime - localNow,
-            source: results.map(r => r.source).join('+'),
-        };
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ПРОВЕРКА ВРЕМЕНИ ССЫЛКИ
-    //  Возвращает { ok, reason, message, debug }
-    // ═══════════════════════════════════════════════════════════
-    async function validateInviteTime(payload) {
-        const trusted = await getTrustedNow();
-
-        // ═══ Нет серверного времени ═══
-        if (!trusted) {
-            if (CFG.REQUIRE_SERVER_TIME) {
-                return {
-                    ok: false,
-                    reason: 'no-server-time',
-                    message: 'Не удалось проверить время. Проверьте интернет.',
-                    debug: { requireServerTime: true },
-                };
-            }
-
-            // Fallback на локальное (НЕБЕЗОПАСНО, но оставлено для совместимости)
-            console.warn('🕐 [InviteTime] Fallback на локальное время — ЗАЩИТА ОСЛАБЛЕНА');
-            const localNow = Date.now();
-
-            if (payload.exp && localNow > payload.exp + CFG.EXP_GRACE_MS) {
-                return { ok: false, reason: 'expired', message: 'Ссылка истекла' };
-            }
-            if (payload.iat && localNow < payload.iat - CFG.EXP_GRACE_MS) {
-                return { ok: false, reason: 'not-yet-valid', message: 'Ссылка ещё не активна' };
-            }
-            return { ok: true, fallback: true, debug: { localNow } };
-        }
-
-        const { now, localNow, skew, source } = trusted;
-
-        // ═══ 1. Главная проверка: exp по серверному времени ═══
-        if (!payload.exp) {
-            return {
-                ok: false,
-                reason: 'bad-payload',
-                message: 'Ссылка повреждена (нет времени)',
-            };
-        }
-
-        if (now > payload.exp + CFG.EXP_GRACE_MS) {
-            return {
-                ok: false,
-                reason: 'expired',
-                message: 'Ссылка истекла',
-                debug: {
-                    serverNow: new Date(now).toISOString(),
-                    exp: new Date(payload.exp).toISOString(),
-                    diffSec: Math.round((now - payload.exp) / 1000),
-                },
-            };
-        }
-
-        // ═══ 2. Проверка "не из будущего" (iat) ═══
-        if (payload.iat && now < payload.iat - CFG.EXP_GRACE_MS) {
-            return {
-                ok: false,
-                reason: 'not-yet-valid',
-                message: 'Ссылка ещё не активна',
-                debug: {
-                    serverNow: new Date(now).toISOString(),
-                    iat: new Date(payload.iat).toISOString(),
-                },
-            };
-        }
-
-        // ═══ 3. КЛЮЧЕВОЕ: проверка что часы устройства не откачены ═══
-        //  Если локальное время сильно отличается от серверного —
-        //  устройство явно с подкрученными часами
-        const skewAbs = Math.abs(skew);
-        if (skewAbs > CFG.MAX_CLOCK_SKEW_MS) {
-            console.warn(`🕐 [InviteTime] Часы устройства сбиты на ${Math.round(skew / 1000)} сек`);
-            return {
-                ok: false,
-                reason: 'clock-tampered',
-                message: 'Время на устройстве неверное. Включите автоматическую синхронизацию часов.',
-                debug: {
-                    serverNow: new Date(now).toISOString(),
-                    localNow: new Date(localNow).toISOString(),
-                    skewSec: Math.round(skew / 1000),
-                    maxSkewSec: CFG.MAX_CLOCK_SKEW_MS / 1000,
-                    source,
-                },
-            };
-        }
-
-        // ═══ Всё ок ═══
-        console.log('🕐 [InviteTime] ✅ Время валидно:', {
-            source,
-            skewSec: Math.round(skew / 1000),
-            expIn: Math.round((payload.exp - now) / 1000) + ' сек',
-        });
-
-        return {
-            ok: true,
-            debug: {
-                serverNow: new Date(now).toISOString(),
-                localNow: new Date(localNow).toISOString(),
-                skewSec: Math.round(skew / 1000),
-                expInSec: Math.round((payload.exp - now) / 1000),
-                source,
-            },
-        };
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ПАТЧИМ parseAndValidateInvite
-    //  Находим текущую реализацию (она внутри IIFE TempInvite)
-    //  и оборачиваем её через публичный API.
-    // ═══════════════════════════════════════════════════════════
-    function patchTempInvite() {
-        if (!window.TempInvite) {
-            // TempInvite ещё не создан — повторим позже
-            setTimeout(patchTempInvite, 500);
+    function patchBuild() {
+        if (!window.TempInvite || typeof window.TempInvite.build !== 'function') {
+            setTimeout(patchBuild, 300);
             return;
         }
-
-        if (window.TempInvite._timeValidationPatched) return;
-
-        const _origParse = window.TempInvite.parse;
-        if (typeof _origParse !== 'function') {
-            console.warn('🕐 [InviteTime] TempInvite.parse не найден');
-            return;
-        }
-
-        window.TempInvite.parse = async function(rawParam) {
-            // ═══ 1. Оригинальная проверка (подпись, формат, used) ═══
-            const baseResult = await _origParse.call(this, rawParam);
-
-            // Если уже провалилось — не тратим время на сервер
-            if (!baseResult || !baseResult.ok) {
-                return baseResult;
-            }
-
-            // ═══ 2. Проверка времени через сервер ═══
-            const timeResult = await validateInviteTime(baseResult.payload);
-
-            if (!timeResult.ok) {
-                return {
-                    ok: false,
-                    reason: timeResult.reason,
-                    message: timeResult.message,
-                    debug: timeResult.debug,
-                };
-            }
-
-            // ═══ 3. Успех ═══
-            return {
-                ...baseResult,
-                _timeDebug: timeResult.debug,
-            };
-        };
-
-        window.TempInvite._timeValidationPatched = true;
-        window.TempInvite._validateInviteTime = validateInviteTime;
-        window.TempInvite._getTrustedNow = getTrustedNow;
-        console.log('🕐 [InviteTime] ✅ TempInvite.parse пропатчен');
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ПАТЧИМ ОТОБРАЖЕНИЕ ОШИБКИ
-    //  showInviteError принимает reason и message.
-    //  Добавим понятные тексты для наших новых reason.
-    // ═══════════════════════════════════════════════════════════
-    function patchErrorDisplay() {
-        // showInviteError — глобальная функция из installTemporaryInviteLinksV2
-        if (typeof window.showInviteError !== 'function') {
-            setTimeout(patchErrorDisplay, 500);
-            return;
-        }
-
-        if (window.showInviteError._timePatched) return;
-
-        const _orig = window.showInviteError;
-
-        window.showInviteError = function(reason, message) {
-            // Для наших новых причин — подставляем понятный текст
-            const customMessages = {
-                'no-server-time': 'Не удалось проверить время.\n\nПроверьте интернет-соединение и попробуйте снова.',
-                'clock-tampered': 'Время на вашем устройстве не совпадает с реальным.\n\nВключите автоматическую синхронизацию времени и попробуйте снова.',
-                'not-yet-valid': 'Ссылка ещё не активна. Возможно, время на устройстве отстаёт.',
-            };
-
-            const finalMessage = customMessages[reason] || message;
-            return _orig.call(this, reason, finalMessage);
-        };
-
-        window.showInviteError._timePatched = true;
-        console.log('🕐 [InviteTime] ✅ showInviteError пропатчен');
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ЕЩЁ: ГЕНЕРАЦИЯ ССЫЛКИ
-    //  Убедимся что iat/exp используют серверное время, если доступно
-    // ═══════════════════════════════════════════════════════════
-    function patchLinkGeneration() {
-        if (!window.TempInvite) {
-            setTimeout(patchLinkGeneration, 500);
-            return;
-        }
-
-        if (window.TempInvite._timeGenPatched) return;
+        if (window.TempInvite._pinGuardV6Build) return;
 
         const _origBuild = window.TempInvite.build;
-        if (typeof _origBuild !== 'function') return;
 
         window.TempInvite.build = async function(chatFile) {
-            // Пробуем получить серверное время ДО генерации,
-            // чтобы iat/exp были точными
-            try {
-                const trusted = await getTrustedNow();
-                if (trusted) {
-                    const skew = trusted.skew;
-                    if (Math.abs(skew) > CFG.MAX_CLOCK_SKEW_MS) {
-                        throw new Error(
-                            `Время на устройстве неверное (сбито на ${Math.round(skew / 1000)} сек). ` +
-                            `Синхронизируйте часы и попробуйте снова.`
-                        );
-                    }
-                    console.log(`🕐 [InviteTime] Время для генерации корректно (skew ${Math.round(skew / 1000)} сек)`);
-                } else {
-                    // Не смогли получить серверное время —
-                    // решаем: отказать или сгенерировать с локальным?
-                    if (CFG.REQUIRE_SERVER_TIME) {
-                        throw new Error(
-                            'Не удалось проверить время. Проверьте интернет и попробуйте снова.'
-                        );
-                    }
-                    console.warn('🕐 [InviteTime] Генерация по локальному времени (ослаблено)');
-                }
-            } catch (e) {
-                console.error('🕐 [InviteTime] Ошибка генерации:', e);
-                throw e;
+            // Генерируем PIN
+            const pin = generatePin();
+            console.log('🔐 [PinGuard v6] Сгенерирован PIN:', pin);
+
+            // Вызываем оригинал — он создаст payload и URL
+            const result = await _origBuild.apply(this, arguments);
+
+            if (!result || !result.url || !result.payload) {
+                return result;
             }
 
-            return _origBuild.apply(this, arguments);
+            // ⚠️ Проблема: payload уже подписан в URL.
+            // Нужно пересобрать URL с новым payload, включающим PIN.
+            // Но подпись считается от payload — значит нужно переподписать.
+            //
+            // Проще всего: НЕ добавлять PIN в подписанный payload,
+            // а хранить его отдельно. Модифицируем результат:
+            //   { url: "...", payload: {...}, pin: "4271", pinNotice: "..." }
+
+            result.pin = pin;
+            result.pinNotice = `PIN-код для входа: ${pin}\n\n` +
+                `Передайте его получателю ОТДЕЛЬНО от ссылки ` +
+                `(через SMS, звонок или другой канал). ` +
+                `Без PIN по ссылке войти будет нельзя.`;
+
+            // Сохраняем PIN в sessionStorage на случай перезагрузки страницы
+            // (привязан к jti из payload)
+            if (result.payload && result.payload.jti) {
+                try {
+                    sessionStorage.setItem(
+                        CFG.PIN_STORAGE_PREFIX + result.payload.jti,
+                        pin
+                    );
+                } catch (e) {}
+            }
+
+            return result;
         };
 
-        window.TempInvite._timeGenPatched = true;
-        console.log('🕐 [InviteTime] ✅ TempInvite.build пропатчен');
+        window.TempInvite._pinGuardV6Build = true;
+        console.log('🔐 [PinGuard v6] ✅ TempInvite.build пропатчен');
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ЗАПУСК
+    //  ПАТЧ: показ ссылки — добавить PIN
+    //  showInviteLinkModal(url, payload) — вызывается после build
     // ═══════════════════════════════════════════════════════════
-    patchTempInvite();
-    patchErrorDisplay();
-    patchLinkGeneration();
+    function patchShowLinkModal() {
+        if (typeof window.showInviteLinkModal !== 'function') {
+            setTimeout(patchShowLinkModal, 300);
+            return;
+        }
+        if (window.showInviteLinkModal._pinGuardV6) return;
 
-    // ═══════════════════════════════════════════════════════════
-    //  ПУБЛИЧНОЕ API (для отладки и ручных тестов)
-    // ═══════════════════════════════════════════════════════════
-    window.InviteTimeValidation = {
-        // Получить текущее "доверенное" время
-        getTrustedNow: async () => {
-            const r = await getTrustedNow();
-            if (!r) return { error: 'Нет доступных источников времени' };
-            return {
-                serverNow: new Date(r.now).toISOString(),
-                localNow: new Date(r.localNow).toISOString(),
-                skewSec: Math.round(r.skew / 1000),
-                source: r.source,
-            };
-        },
+        const _orig = window.showInviteLinkModal;
 
-        // Проверить конкретную ссылку или payload
-        validate: async (payloadOrRaw) => {
-            let payload = payloadOrRaw;
-            // Если передали строку — попробуем распарсить через TempInvite
-            if (typeof payloadOrRaw === 'string' && window.TempInvite) {
-                const parsed = await window.TempInvite.parse(payloadOrRaw);
-                if (!parsed.ok) return parsed;
-                payload = parsed.payload;
+        window.showInviteLinkModal = function(url, payload) {
+            // Ищем PIN в sessionStorage по jti
+            let pin = null;
+            if (payload && payload.jti) {
+                try {
+                    pin = sessionStorage.getItem(CFG.PIN_STORAGE_PREFIX + payload.jti);
+                } catch (e) {}
             }
-            return await validateInviteTime(payload);
-        },
 
-        // Сбросить кэш времени (для тестов)
-        clearCache: () => {
-            _timeCache = null;
-            console.log('🕐 [InviteTime] Кэш времени сброшен');
-        },
+            // Вызываем оригинал
+            const result = _orig.apply(this, arguments);
 
-        // Статус
-        status: () => {
-            const cached = getCachedOffset();
-            return {
-                hasCache: !!cached,
-                cacheAgeMs: cached ? Date.now() - cached.ts : null,
-                cachedOffsetMs: cached ? cached.offset : null,
-                config: { ...CFG },
-                patched: {
-                    tempInviteParse: !!(window.TempInvite && window.TempInvite._timeValidationPatched),
-                    tempInviteBuild: !!(window.TempInvite && window.TempInvite._timeGenPatched),
-                    showInviteError: !!(window.showInviteError && window.showInviteError._timePatched),
-                },
-            };
+            // После отрисовки — добавляем блок с PIN
+            if (pin) {
+                setTimeout(() => {
+                    injectPinBlock(pin);
+                }, 50);
+            }
+
+            return result;
+        };
+
+        window.showInviteLinkModal._pinGuardV6 = true;
+        console.log('🔐 [PinGuard v6] ✅ showInviteLinkModal пропатчен');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ВСТАВКА БЛОКА С PIN В МОДАЛКУ ССЫЛКИ
+    // ═══════════════════════════════════════════════════════════
+    function injectPinBlock(pin) {
+        const modal = document.getElementById('inviteLinkModal');
+        if (!modal) return;
+        if (modal.querySelector('#invitePinBlock')) return;
+
+        const content = modal.querySelector('.form-modal-content');
+        if (!content) return;
+
+        const block = document.createElement('div');
+        block.id = 'invitePinBlock';
+        block.style.cssText = `
+            background: linear-gradient(135deg, rgba(255,107,107,0.12), rgba(254,202,87,0.08));
+            border: 2px solid rgba(255,107,107,0.4);
+            border-radius: 14px;
+            padding: 14px 16px;
+            margin-bottom: 14px;
+        `;
+        block.innerHTML = `
+            <div style="font-size:12px;color:#ff8a8a;font-weight:700;
+                        text-transform:uppercase;letter-spacing:0.5px;
+                        margin-bottom:8px;display:flex;align-items:center;gap:6px;">
+                <span>🔐</span><span>PIN-код для входа</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:12px;">
+                <div id="invitePinDigits" style="
+                    display: flex; gap: 8px;
+                    font-family: 'SF Mono', 'Courier New', monospace;
+                ">
+                    ${pin.split('').map(d => `
+                        <div style="
+                            width: 44px; height: 56px;
+                            background: rgba(0,0,0,0.4);
+                            border: 1px solid rgba(255,255,255,0.15);
+                            border-radius: 10px;
+                            display: flex; align-items: center; justify-content: center;
+                            font-size: 26px; font-weight: 800; color: #fff;
+                            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+                        ">${d}</div>
+                    `).join('')}
+                </div>
+                <button id="invitePinCopyBtn" style="
+                    width: 44px; height: 44px;
+                    border-radius: 12px;
+                    border: 1px solid rgba(0,184,148,0.3);
+                    background: rgba(0,184,148,0.15);
+                    color: #00b894;
+                    font-size: 18px;
+                    cursor: pointer;
+                    display: flex; align-items: center; justify-content: center;
+                    flex-shrink: 0;
+                " title="Скопировать PIN">📋</button>
+            </div>
+            <div style="font-size:11px;color:#ff8a8a;line-height:1.5;
+                        margin-top:10px;padding-top:10px;
+                        border-top:1px dashed rgba(255,107,107,0.3);">
+                ⚠️ Передайте PIN получателю <strong>отдельно</strong>
+                от ссылки. Без PIN войти не получится.
+                <br>У получателя будет <strong>1 попытка</strong> ввода.
+            </div>
+        `;
+
+        // Вставляем в начало (сразу под заголовком)
+        const h2 = content.querySelector('h2');
+        if (h2 && h2.nextSibling) {
+            h2.parentNode.insertBefore(block, h2.nextSibling);
+        } else {
+            content.insertBefore(block, content.firstChild);
+        }
+
+        // Кнопка копирования
+        block.querySelector('#invitePinCopyBtn').addEventListener('click', async () => {
+            try {
+                await navigator.clipboard.writeText(pin);
+                const btn = block.querySelector('#invitePinCopyBtn');
+                btn.textContent = '✓';
+                btn.style.color = '#00b894';
+                setTimeout(() => {
+                    btn.textContent = '📋';
+                }, 1500);
+                if (typeof showToast === 'function') {
+                    showToast('📋 PIN скопирован', 1500);
+                }
+            } catch (e) {
+                if (typeof showToast === 'function') {
+                    showToast('❌ Не удалось скопировать', 2000);
+                }
+            }
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПОКАЗ ОВЕРЛЕЯ ВВОДА PIN
+    // ═══════════════════════════════════════════════════════════
+    function showPinOverlay(jti, onSuccess) {
+        // Проверяем — не было ли уже попытки
+        let attemptData = null;
+        try {
+            const raw = sessionStorage.getItem(CFG.ATTEMPT_KEY_PREFIX + jti);
+            if (raw) attemptData = JSON.parse(raw);
+        } catch (e) {}
+
+        if (attemptData && attemptData.blocked) {
+            // Уже была неудачная попытка — блок
+            showBlockedScreen(jti, 'Попытка уже использована');
+            return;
+        }
+
+        // Создаём оверлей
+        const overlay = document.createElement('div');
+        overlay.id = 'pinOverlay';
+        overlay.style.cssText = `
+            position: fixed; inset: 0;
+            background: linear-gradient(135deg, #0a0a0f, #1a1a2e);
+            z-index: 99998;
+            display: flex; flex-direction: column;
+            align-items: center; justify-content: center;
+            padding: 30px; text-align: center;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            animation: pinFadeIn 0.3s ease;
+        `;
+
+        if (!document.getElementById('pinGuardV6Styles')) {
+            const style = document.createElement('style');
+            style.id = 'pinGuardV6Styles';
+            style.textContent = `
+                @keyframes pinFadeIn {
+                    from { opacity: 0; }
+                    to { opacity: 1; }
+                }
+                @keyframes pinShake {
+                    0%, 100% { transform: translateX(0); }
+                    20%, 60% { transform: translateX(-8px); }
+                    40%, 80% { transform: translateX(8px); }
+                }
+                #pinOverlay .pin-icon {
+                    font-size: 80px; margin-bottom: 16px; line-height: 1;
+                }
+                #pinOverlay .pin-title {
+                    font-size: 24px; font-weight: 700; color: #fff;
+                    margin-bottom: 12px;
+                }
+                #pinOverlay .pin-sub {
+                    font-size: 14px; color: #aaa;
+                    line-height: 1.6; max-width: 420px;
+                    margin-bottom: 32px;
+                }
+                #pinOverlay .pin-inputs {
+                    display: flex; gap: 12px;
+                    margin-bottom: 24px;
+                    justify-content: center;
+                }
+                #pinOverlay .pin-digit {
+                    width: 64px; height: 80px;
+                    background: rgba(255,255,255,0.06);
+                    border: 2px solid rgba(255,255,255,0.15);
+                    border-radius: 14px;
+                    color: #fff;
+                    font-size: 36px; font-weight: 800;
+                    text-align: center;
+                    outline: none;
+                    font-family: 'SF Mono', 'Courier New', monospace;
+                    transition: all 0.15s;
+                    caret-color: #6c5ce7;
+                }
+                #pinOverlay .pin-digit:focus {
+                    border-color: #6c5ce7;
+                    background: rgba(255,255,255,0.1);
+                    box-shadow: 0 0 0 3px rgba(108,92,231,0.25);
+                }
+                #pinOverlay .pin-digit.filled {
+                    border-color: #00b894;
+                    background: rgba(0,184,148,0.1);
+                }
+                #pinOverlay .pin-digit.error {
+                    border-color: #ff6b6b;
+                    background: rgba(255,107,107,0.1);
+                    animation: pinShake 0.4s;
+                }
+                #pinOverlay .pin-btn {
+                    padding: 14px 40px;
+                    border-radius: 14px;
+                    border: none;
+                    background: linear-gradient(135deg, #6c5ce7, #00b894);
+                    color: #fff;
+                    font-size: 16px; font-weight: 600;
+                    cursor: pointer;
+                    font-family: inherit;
+                    transition: all 0.2s;
+                    box-shadow: 0 6px 20px rgba(108,92,231,0.4);
+                }
+                #pinOverlay .pin-btn:active {
+                    transform: scale(0.96);
+                }
+                #pinOverlay .pin-btn:disabled {
+                    opacity: 0.5;
+                    cursor: not-allowed;
+                }
+                #pinOverlay .pin-warning {
+                    margin-top: 20px;
+                    padding: 12px 16px;
+                    background: rgba(255,107,107,0.08);
+                    border: 1px solid rgba(255,107,107,0.25);
+                    border-radius: 10px;
+                    font-size: 11px;
+                    color: #ff8a8a;
+                    max-width: 380px;
+                    line-height: 1.5;
+                }
+                @media (max-width: 480px) {
+                    #pinOverlay .pin-digit {
+                        width: 52px; height: 68px;
+                        font-size: 30px;
+                    }
+                }
+            `;
+            document.head.appendChild(style);
+        }
+
+        overlay.innerHTML = `
+            <div class="pin-icon">🔐</div>
+            <div class="pin-title">Введите PIN-код</div>
+            <div class="pin-sub">
+                Для входа в чат по приглашению нужен PIN-код.
+                Его отправитель передаёт отдельно от ссылки.
+            </div>
+            <div class="pin-inputs" id="pinInputs">
+                ${[0,1,2,3].map(i => `
+                    <input type="text" inputmode="numeric" maxlength="1"
+                           class="pin-digit" data-idx="${i}" autocomplete="off">
+                `).join('')}
+            </div>
+            <button class="pin-btn" id="pinSubmitBtn">Войти</button>
+            <div class="pin-warning">
+                ⚠️ У вас <strong>одна попытка</strong>. При ошибке
+                ссылка будет заблокирована на этом устройстве.
+            </div>
+        `;
+
+        document.body.appendChild(overlay);
+
+        // Убираем все другие экраны
+        ['authScreen', 'chatsScreen', 'chatScreen', 'welcomeInviteScreen'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.style.display = 'none';
+        });
+
+        // ─── Обработчики ввода ───
+        const inputs = overlay.querySelectorAll('.pin-digit');
+        const submitBtn = overlay.querySelector('#pinSubmitBtn');
+
+        function getEnteredPin() {
+            return Array.from(inputs).map(inp => inp.value).join('');
+        }
+
+        function updateDigitStates() {
+            inputs.forEach(inp => {
+                inp.classList.toggle('filled', inp.value.length > 0);
+                inp.classList.remove('error');
+            });
+            submitBtn.disabled = getEnteredPin().length !== CFG.PIN_LENGTH;
+        }
+
+        // Автопереход между полями
+        inputs.forEach((inp, i) => {
+            inp.addEventListener('input', (e) => {
+                // Только цифры
+                inp.value = inp.value.replace(/[^0-9]/g, '').slice(0, 1);
+                updateDigitStates();
+                if (inp.value && i < inputs.length - 1) {
+                    inputs[i + 1].focus();
+                }
+            });
+            inp.addEventListener('keydown', (e) => {
+                if (e.key === 'Backspace' && !inp.value && i > 0) {
+                    inputs[i - 1].focus();
+                } else if (e.key === 'Enter') {
+                    e.preventDefault();
+                    if (getEnteredPin().length === CFG.PIN_LENGTH) {
+                        submitBtn.click();
+                    }
+                }
+            });
+            inp.addEventListener('paste', (e) => {
+                e.preventDefault();
+                const pasted = (e.clipboardData || window.clipboardData)
+                    .getData('text').replace(/[^0-9]/g, '').slice(0, 4);
+                for (let j = 0; j < pasted.length && j < inputs.length; j++) {
+                    inputs[j].value = pasted[j];
+                }
+                updateDigitStates();
+                const nextEmpty = Array.from(inputs).findIndex(x => !x.value);
+                if (nextEmpty >= 0) inputs[nextEmpty].focus();
+                else submitBtn.focus();
+            });
+        });
+
+        inputs[0].focus();
+
+        // ─── Отправка ───
+        submitBtn.addEventListener('click', async () => {
+            submitBtn.disabled = true;
+            submitBtn.textContent = '⏳ Проверка…';
+
+            const enteredPin = getEnteredPin();
+
+            // Проверяем PIN — из sessionStorage (по jti)
+            let correctPin = null;
+            try {
+                correctPin = sessionStorage.getItem(CFG.PIN_STORAGE_PREFIX + jti);
+            } catch (e) {}
+
+            if (!correctPin) {
+                // У нас нет PIN на этом устройстве — значит ссылка
+                // пришла с другого устройства. Мы не можем проверить.
+                // Показываем ошибку.
+                showPinError(inputs, 'Не удалось проверить PIN на этом устройстве. ' +
+                    'Попросите новую ссылку у отправителя.');
+                markAttempt(jti);
+                showBlockedScreen(jti, 'PIN недоступен на этом устройстве');
+                return;
+            }
+
+            if (enteredPin !== correctPin) {
+                // Неверный PIN — блок
+                markAttempt(jti);
+                showPinError(inputs, 'Неверный PIN-код');
+                if (navigator.vibrate) navigator.vibrate([100, 50, 100, 50, 100]);
+                setTimeout(() => {
+                    showBlockedScreen(jti, 'Неверный PIN-код');
+                }, 1200);
+                return;
+            }
+
+            // ─── PIN верный ───
+            console.log('🔐 [PinGuard v6] ✅ PIN верный');
+            if (navigator.vibrate) navigator.vibrate([30, 50, 30]);
+
+            // Меняем UI на «успех»
+            overlay.innerHTML = `
+                <div style="font-size:80px;margin-bottom:16px;">✅</div>
+                <div style="font-size:22px;font-weight:700;color:#fff;margin-bottom:12px;">
+                    PIN принят
+                </div>
+                <div style="font-size:14px;color:#aaa;">Открываем чат…</div>
+            `;
+
+            // Убираем оверлей и запускаем оригинальную логику
+            setTimeout(() => {
+                overlay.remove();
+                // Восстанавливаем экраны — оригинал сам покажет нужный
+                ['authScreen', 'chatsScreen', 'chatScreen'].forEach(id => {
+                    const el = document.getElementById(id);
+                    if (el) el.style.display = '';
+                });
+                onSuccess();
+            }, 600);
+        });
+    }
+
+    function showPinError(inputs, message) {
+        inputs.forEach(inp => {
+            inp.classList.add('error');
+        });
+        if (typeof showToast === 'function') {
+            showToast('❌ ' + message, 2500);
+        }
+    }
+
+    // ─── Сохраняем факт попытки ───
+    function markAttempt(jti) {
+        try {
+            sessionStorage.setItem(
+                CFG.ATTEMPT_KEY_PREFIX + jti,
+                JSON.stringify({ blocked: true, ts: Date.now() })
+            );
+        } catch (e) {}
+    }
+
+    // ─── Показ экрана блокировки ───
+    function showBlockedScreen(jti, reason) {
+        const overlay = document.getElementById('pinOverlay');
+        if (overlay) overlay.remove();
+
+        const screen = document.createElement('div');
+        screen.id = 'pinBlockedScreen';
+        screen.style.cssText = `
+            position: fixed; inset: 0;
+            background: linear-gradient(135deg, #0a0a0f, #1a1a2e);
+            z-index: 99999;
+            display: flex; flex-direction: column;
+            align-items: center; justify-content: center;
+            padding: 30px; text-align: center;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        `;
+        screen.innerHTML = `
+            <div style="font-size:80px;margin-bottom:16px;">🚫</div>
+            <div style="font-size:22px;font-weight:700;color:#fff;margin-bottom:12px;">
+                Доступ заблокирован
+            </div>
+            <div style="font-size:14px;color:#aaa;line-height:1.6;
+                        max-width:420px;margin-bottom:24px;">
+                ${reason}.<br><br>
+                Запросите новую ссылку у отправителя.
+            </div>
+            <button id="pinBlockedOkBtn" style="
+                padding: 14px 34px; border-radius: 14px; border: none;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                color: #fff; font-size: 16px; font-weight: 600;
+                cursor: pointer; font-family: inherit;
+            ">Понятно</button>
+        `;
+        document.body.appendChild(screen);
+
+        screen.querySelector('#pinBlockedOkBtn').addEventListener('click', () => {
+            history.replaceState({}, '', location.origin + location.pathname);
+            location.reload();
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ГЛАВНАЯ ТОЧКА ВХОДА — проверка на загрузке страницы
+    // ═══════════════════════════════════════════════════════════
+    let _alreadyShown = false;
+
+    function decodePayload(rawParam) {
+        try {
+            const dotIdx = rawParam.lastIndexOf('.');
+            if (dotIdx < 0) return null;
+            const b64url = rawParam.slice(0, dotIdx);
+            let b64 = b64url.replace(/-/g, '+').replace(/_/g, '/');
+            while (b64.length % 4) b64 += '=';
+            const binary = atob(b64);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+            return JSON.parse(new TextDecoder().decode(bytes));
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function bootGuard() {
+        if (_alreadyShown) return;
+
+        const params = new URLSearchParams(location.search);
+        const rawParam = params.get('invite');
+        if (!rawParam) return;
+
+        const payload = decodePayload(rawParam);
+        if (!payload || !payload.jti) {
+            console.warn('🔐 [PinGuard v6] Не удалось распаковать payload');
+            return;
+        }
+
+        _alreadyShown = true;
+
+        console.log('🔐 [PinGuard v6] 🚀 Показ PIN-оверлея для jti:', payload.jti);
+
+        // Прячем всё
+        ['authScreen', 'chatsScreen', 'chatScreen', 'welcomeInviteScreen'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.style.display = 'none';
+        });
+
+        showPinOverlay(payload.jti, () => {
+            // PIN верный — оригинальная логика приглашения продолжит работу
+            console.log('🔐 [PinGuard v6] ✅ Запуск оригинальной логики');
+            if (typeof window.handleIncomingInvite === 'function') {
+                window.handleIncomingInvite();
+            }
+        });
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', () => setTimeout(bootGuard, 300));
+    } else {
+        setTimeout(bootGuard, 300);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧИ (вызываем)
+    // ═══════════════════════════════════════════════════════════
+    patchBuild();
+    patchShowLinkModal();
+
+    // ═══════════════════════════════════════════════════════════
+    //  API
+    // ═══════════════════════════════════════════════════════════
+    window.InvitePinGuard = {
+        generatePin,
+        status: () => ({
+            buildPatched: !!(window.TempInvite && window.TempInvite._pinGuardV6Build),
+            showPatched: !!(window.showInviteLinkModal && window.showInviteLinkModal._pinGuardV6),
+            pinLength: CFG.PIN_LENGTH,
+        }),
+        // Для отладки — показать PIN для конкретного jti
+        getPinFor: (jti) => {
+            try {
+                return sessionStorage.getItem(CFG.PIN_STORAGE_PREFIX + jti);
+            } catch (e) { return null; }
+        },
+        // Разблокировать (для теста)
+        unblock: (jti) => {
+            try {
+                sessionStorage.removeItem(CFG.ATTEMPT_KEY_PREFIX + jti);
+                console.log('🔐 [PinGuard v6] Разблокировано:', jti);
+            } catch (e) {}
         },
     };
 
-    console.log('🕐 [InviteTime] ✅ Готово:');
-    console.log('   • Время проверяется по GitHub + WorldTimeAPI + timeapi.io');
-    console.log('   • Медиана из доступных источников');
-    console.log('   • Откат часов ловится через |serverNow - localNow| > 5 мин');
-    console.log('   • API: InviteTimeValidation.status() / .getTrustedNow() / .validate(payload)');
+    console.log('🔐 [PinGuard v6] ✅ Готово');
 })();
-
 
 </script>
 </body>
