@@ -75860,15 +75860,15 @@ async function sendAnnouncement() {
         console.log('🩹 [OldLongPressOff] confirm() для виджетов отключён');
     }
 })();
-</script><script>
-// 🔍 Погода в другом городе — компактная версия
+</script>
+<script>
+// 🔍 Погода в другом городе — с кликабельными днями
 (function () {
     'use strict';
 
     const GEO = 'https://geocoding-api.open-meteo.com/v1/search';
     const WEA = 'https://api.open-meteo.com/v1/forecast';
 
-    // ─── Стили ───
     if (!document.getElementById('wqlStyles')) {
         const s = document.createElement('style');
         s.id = 'wqlStyles';
@@ -75964,6 +75964,17 @@ async function sendAnnouncement() {
                 font-size:11px;color:#888;white-space:nowrap;
                 overflow:hidden;text-overflow:ellipsis;
             }
+            /* 🆕 Блок с текущей/выбранной погодой — плавный transition */
+            .wql-now{
+                display:flex;flex-direction:column;gap:10px;
+                transition:opacity .18s ease;
+            }
+            .wql-now.fading{opacity:0;}
+            .wql-now-title{
+                font-size:10px;color:#5CA8FF;font-weight:700;
+                text-transform:uppercase;letter-spacing:.4px;
+                margin-bottom:-4px;
+            }
             .wql-mn{display:flex;align-items:center;gap:14px;}
             .wql-mn-i{font-size:44px;line-height:1;}
             .wql-mn-t{
@@ -75976,6 +75987,7 @@ async function sendAnnouncement() {
                 font-size:11px;color:#aaa;
             }
             .wql-ex strong{color:#fff;}
+            /* 🆕 Прогноз — с кликабельными днями */
             .wql-fc{
                 display:flex;gap:5px;margin-top:6px;padding-top:8px;
                 border-top:1px solid rgba(255,255,255,.06);
@@ -75985,11 +75997,23 @@ async function sendAnnouncement() {
                 background:rgba(255,255,255,.03);
                 border:1px solid rgba(255,255,255,.06);
                 border-radius:9px;text-align:center;
+                cursor:pointer;transition:all .15s;
+                -webkit-tap-highlight-color:transparent;
+            }
+            .wql-d:hover{
+                background:rgba(255,255,255,.07);
+                border-color:rgba(255,255,255,.12);
+            }
+            .wql-d.active{
+                background:linear-gradient(135deg,rgba(92,168,255,.28),rgba(108,92,231,.18));
+                border-color:rgba(92,168,255,.55);
+                box-shadow:0 0 10px rgba(92,168,255,.25);
             }
             .wql-d-l{
                 font-size:9px;color:#888;margin-bottom:3px;
                 white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
             }
+            .wql-d.active .wql-d-l{color:#c4b5fd;font-weight:700;}
             .wql-d-i{font-size:18px;margin-bottom:3px;}
             .wql-d-t{
                 font-size:10px;display:flex;justify-content:center;gap:3px;
@@ -76031,7 +76055,6 @@ async function sendAnnouncement() {
         document.head.appendChild(s);
     }
 
-    // ─── Хелперы ───
     const esc = s => { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; };
 
     function flag(cc) {
@@ -76065,20 +76088,30 @@ async function sendAnnouncement() {
     async function getWeather(lat, lon, tz) {
         const url = WEA + `?latitude=${lat}&longitude=${lon}` +
             `&current=temperature_2m,relative_humidity_2m,apparent_temperature,is_day,precipitation,weather_code,wind_speed_10m` +
-            `&daily=temperature_2m_max,temperature_2m_min,weather_code,precipitation_sum` +
+            `&daily=temperature_2m_max,temperature_2m_min,weather_code,precipitation_sum,wind_speed_10m_max,relative_humidity_2m_mean` +
             `&timezone=${encodeURIComponent(tz || 'auto')}&forecast_days=4`;
         const d = await fetchT(url);
         const c = d.current || {}, dy = d.daily || {};
         return {
             temp: c.temperature_2m, feels: c.apparent_temperature, hum: c.relative_humidity_2m,
-            wind: c.wind_speed_10m, isDay: c.is_day === 1, code: c.weather_code,
+            wind: c.wind_speed_10m, precip: c.precipitation || 0,
+            isDay: c.is_day === 1, code: c.weather_code,
             min: dy.temperature_2m_min?.[0], max: dy.temperature_2m_max?.[0],
-            forecast: (dy.time || []).map((date, i) => ({ date, code: dy.weather_code?.[i], min: dy.temperature_2m_min?.[i], max: dy.temperature_2m_max?.[i] }))
+            forecast: (dy.time || []).map((date, i) => ({
+                date,
+                code: dy.weather_code?.[i],
+                min: dy.temperature_2m_min?.[i],
+                max: dy.temperature_2m_max?.[i],
+                precip: dy.precipitation_sum?.[i] || 0,
+                windMax: dy.wind_speed_10m_max?.[i],
+                humMean: dy.relative_humidity_2m_mean?.[i],
+            }))
         };
     }
 
-    // ─── Оверлей ───
     let ov = null, loading = false;
+    let lastGeo = null, lastWeather = null;
+    let selectedDay = 0;
 
     function buildOv() {
         if (ov && ov.isConnected) return ov;
@@ -76152,7 +76185,10 @@ async function sendAnnouncement() {
         try {
             const geo = await findCity(q);
             const w = await getWeather(geo.lat, geo.lon, geo.tz);
-            render(geo, w);
+            lastGeo = geo;
+            lastWeather = w;
+            selectedDay = 0;
+            renderFull();
             ld.classList.remove('show');
             rs.classList.add('show');
             try { soundManager.play('send'); } catch (e2) {}
@@ -76179,21 +76215,24 @@ async function sendAnnouncement() {
         e.querySelector('#wqlEpt').style.display = 'none';
     }
 
-    function render(geo, w) {
+    // 🆕 Полный рендер с кликабельными днями
+    function renderFull() {
         const e = ov;
-        const d = wdesc(w.code, w.isDay);
+        if (!lastGeo || !lastWeather) return;
+        const geo = lastGeo, w = lastWeather;
         const f = flag(geo.cc);
         const sub = [geo.admin, geo.country].filter(Boolean).join(', ');
 
         const today = new Date(); today.setHours(0,0,0,0);
         const dn = ['Вс','Пн','Вт','Ср','Чт','Пт','Сб'];
-        const fc = (w.forecast || []).slice(0, 4).map(dd => {
+        const fc = (w.forecast || []).slice(0, 4).map((dd, i) => {
             const date = new Date(dd.date + 'T00:00:00');
             const diff = Math.round((date - today) / 86400000);
             let lbl = dn[date.getDay()];
             if (diff === 0) lbl = 'Сегодня'; else if (diff === 1) lbl = 'Завтра';
             const d2 = wdesc(dd.code, true);
-            return `<div class="wql-d"><div class="wql-d-l">${lbl}</div><div class="wql-d-i">${d2.icon}</div><div class="wql-d-t"><span class="wql-d-x">${Math.round(dd.max)}°</span><span class="wql-d-n">${Math.round(dd.min)}°</span></div></div>`;
+            const active = i === selectedDay ? 'active' : '';
+            return `<div class="wql-d ${active}" data-day="${i}"><div class="wql-d-l">${lbl}</div><div class="wql-d-i">${d2.icon}</div><div class="wql-d-t"><span class="wql-d-x">${Math.round(dd.max)}°</span><span class="wql-d-n">${Math.round(dd.min)}°</span></div></div>`;
         }).join('');
 
         e.querySelector('#wqlRes').innerHTML = `
@@ -76204,21 +76243,113 @@ async function sendAnnouncement() {
                     <div class="wql-loc-s">${esc(sub)}</div>
                 </div>
             </div>
+            <div class="wql-now" id="wqlNow"></div>
+            ${fc ? `<div class="wql-fc" id="wqlFc">${fc}</div>` : ''}
+        `;
+
+        // Обработчики дней
+        e.querySelectorAll('#wqlFc .wql-d').forEach(el => {
+            el.addEventListener('click', () => {
+                const idx = parseInt(el.dataset.day, 10);
+                if (isNaN(idx) || idx === selectedDay) return;
+                selectedDay = idx;
+                animateNow();
+                e.querySelectorAll('#wqlFc .wql-d').forEach(x => {
+                    x.classList.toggle('active', parseInt(x.dataset.day, 10) === idx);
+                });
+                try { soundManager.play('click'); } catch (e2) {}
+            });
+        });
+
+        renderNow();
+    }
+
+    // 🆕 Рендер верхней части (заголовок + большая погода + доп.инфа)
+    function renderNow() {
+        const e = ov;
+        if (!lastWeather) return;
+        const w = lastWeather;
+        const nowEl = e.querySelector('#wqlNow');
+        if (!nowEl) return;
+
+        const today = new Date(); today.setHours(0,0,0,0);
+        const dn = ['Вс','Пн','Вт','Ср','Чт','Пт','Сб'];
+
+        let title, icon, temp, desc, min, max, feelsLine, humLine, windLine, precipLine;
+
+        if (selectedDay === 0) {
+            // Сегодня — текущая погода
+            const d = wdesc(w.code, w.isDay);
+            title = 'Сейчас';
+            icon = d.icon;
+            temp = Math.round(w.temp);
+            desc = d.text;
+            min = Math.round(w.min);
+            max = Math.round(w.max);
+            feelsLine = `🤔 Ощущ.: <strong>${Math.round(w.feels)}°</strong>`;
+            humLine = `💧 Влажн.: <strong>${w.hum}%</strong>`;
+            windLine = `💨 Ветер: <strong>${Math.round(w.wind)} км/ч</strong>`;
+            precipLine = w.precip > 0
+                ? `🌧️ Осадки: <strong>${w.precip.toFixed(1)} мм</strong>`
+                : '';
+        } else {
+            // Выбранный день
+            const dd = w.forecast[selectedDay];
+            if (!dd) return;
+            const d = wdesc(dd.code, true);
+            const date = new Date(dd.date + 'T00:00:00');
+            const diff = Math.round((date - today) / 86400000);
+            let lbl;
+            if (diff === 1) lbl = 'Завтра';
+            else if (diff === 2) lbl = 'Послезавтра';
+            else lbl = dn[date.getDay()] + ', ' + date.getDate() + '.' + String(date.getMonth() + 1).padStart(2, '0');
+
+            title = lbl;
+            icon = d.icon;
+            temp = Math.round(dd.max);
+            desc = d.text;
+            min = Math.round(dd.min);
+            max = Math.round(dd.max);
+            feelsLine = '';
+            humLine = dd.humMean != null
+                ? `💧 Влажн.: <strong>${Math.round(dd.humMean)}%</strong>`
+                : '';
+            windLine = dd.windMax != null
+                ? `💨 Ветер: <strong>до ${Math.round(dd.windMax)} км/ч</strong>`
+                : '';
+            precipLine = dd.precip > 0
+                ? `🌧️ Осадки: <strong>${dd.precip.toFixed(1)} мм</strong>`
+                : '<span style="color:#666;">☀️ Без осадков</span>';
+        }
+
+        nowEl.innerHTML = `
+            <div class="wql-now-title">${title}</div>
             <div class="wql-mn">
-                <div class="wql-mn-i">${d.icon}</div>
+                <div class="wql-mn-i">${icon}</div>
                 <div>
-                    <div class="wql-mn-t">${Math.round(w.temp)}°</div>
-                    <div class="wql-mn-d">${esc(d.text)}</div>
+                    <div class="wql-mn-t">${temp}°</div>
+                    <div class="wql-mn-d">${esc(desc)}</div>
                 </div>
             </div>
             <div class="wql-ex">
-                <div>🌡️ <strong>${Math.round(w.min)}° / ${Math.round(w.max)}°</strong></div>
-                <div>🤔 <strong>${Math.round(w.feels)}°</strong></div>
-                <div>💧 <strong>${w.hum}%</strong></div>
-                <div>💨 <strong>${Math.round(w.wind)} км/ч</strong></div>
+                <div>🌡️ <strong>${min}° / ${max}°</strong></div>
+                ${feelsLine ? `<div>${feelsLine}</div>` : ''}
+                ${humLine ? `<div>${humLine}</div>` : ''}
+                ${windLine ? `<div>${windLine}</div>` : ''}
+                ${precipLine ? `<div>${precipLine}</div>` : ''}
             </div>
-            ${fc ? `<div class="wql-fc">${fc}</div>` : ''}
         `;
+    }
+
+    // 🆕 Плавная смена блока при переключении дня
+    function animateNow() {
+        const nowEl = ov.querySelector('#wqlNow');
+        if (!nowEl) return;
+        nowEl.classList.add('fading');
+        setTimeout(() => {
+            renderNow();
+            nowEl.classList.remove('fading');
+        }, 180);
     }
 
     // ─── Кнопка в шапке виджета погоды ───
@@ -76242,15 +76373,15 @@ async function sendAnnouncement() {
         return true;
     }
 
-    // Наблюдатель
     new MutationObserver(() => injectBtn()).observe(document.body, { childList: true, subtree: true });
     setInterval(injectBtn, 1500);
     setTimeout(injectBtn, 3000);
 
     window.WeatherQuickLookup = { open, close, search };
-    console.log('🔍 [WeatherQuickLookup] ✅ Готово');
+    console.log('🔍 [WeatherQuickLookup v2] ✅ Готово — с кликабельными днями');
 })();
-</script><script>
+</script>
+<script>
 // 🚫 Блокируем системное меню Chrome внутри оверлея быстрой погоды
 (function () {
     'use strict';
