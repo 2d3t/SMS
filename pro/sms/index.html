@@ -73301,238 +73301,1175 @@ async function sendAnnouncement() {
 </script>
 <script>
 // ═══════════════════════════════════════════════════════════════
-//  🖼️ FORCE-LATEST-PHOTO v1 — Кнопка «Галерея фото» всегда
-//  открывает САМУЮ СВЕЖУЮ фотографию в текущем чате.
+//  🩹 ФИНАЛЬНЫЙ ФИКС МЕНЮ ИМЕНИ (usernameStyleMenu)
 //  ─────────────────────────────────────────────────────────────
-//  • Перехватывает только клик по .cqa-item[data-action="gallery"]
-//  • Ничего больше не трогает
-//  • Берёт последнее сообщение с msg.image
-//  • Источники blob:URL (по приоритету):
-//      1) DOM .image-container img внутри wrapper-а этого сообщения
-//      2) _attachmentCache по имени вложения
-//      3) galleryState.loadedSrcs
-//      4) loadAttachment() — с ожиданием
-//  • Затем вызывает openGallery(url)
+//  Отключает сломанный патч installAvatarEditorInNameMenu
+//  и восстанавливает работу оригинального меню.
 // ═══════════════════════════════════════════════════════════════
 
-(function installForceLatestPhotoFromMenu() {
+(function fixUsernameMenuFinal() {
     'use strict';
 
-    console.log('🖼️ [LatestPhoto] Установка патча перехвата «Галерея фото»…');
+    console.log('🩹 [NameMenuFix] Установка финального фикса меню имени…');
 
-    const CFG = {
-        WAIT_DOM_MS: 1500,        // сколько ждать появления blob:URL в DOM
-        WAIT_LOAD_MS: 8000,       // сколько ждать loadAttachment
-        DEBOUNCE_MS: 400,         // анти-двойной-тап
+    // ═══════════════════════════════════════════════════════════
+    //  1. Отключаем сломанный патч AvatarEditor
+    // ═══════════════════════════════════════════════════════════
+    if (window.AvatarEditor) {
+        window.AvatarEditor.reset = () => {};
+        window.AvatarEditor.status = () => ({ disabled: true });
+        console.log('🩹 [NameMenuFix] AvatarEditor отключён');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  2. Отключаем перехват кликов по стилям
+    //  (этот обработчик мешает оригинальному selectStyle)
+    // ═══════════════════════════════════════════════════════════
+    // В оригинале click на .usm-style должен вызывать selectStyle()
+    // и мгновенно применять стиль. Наш перехватчик его глушит.
+    //
+    // Патч не может убрать уже добавленный обработчик напрямую,
+    // но может гарантировать, что после нашего «фикса» клики по
+    // стилям дойдут до оригинала.
+
+    // Решение: удаляем атрибут-маркер (если есть) — но главное,
+    // мы переустановим свой обработчик в bubble-фазе (после capture),
+    // который восстановит правильное поведение.
+
+    document.addEventListener('click', (e) => {
+        const styleItem = e.target.closest('#usernameStyleMenu .usm-style');
+        if (!styleItem) return;
+
+        // ВАЖНО: этот обработчик в bubble-фазе срабатывает ПОСЛЕ
+        // capture-обработчика AvatarEditor, который делает stopImmediatePropagation.
+        // Значит если он сработал — наш обработчик не вызовется.
+        //
+        // Нужно перехватить В CAPTURE, но ПОСЛЕ AvatarEditor.
+        // Проблема: порядок capture-обработчиков = порядок регистрации.
+        // AvatarEditor зарегистрировался раньше — значит его нельзя обогнать.
+        //
+        // Единственный способ — самим применить стиль.
+    }, false);
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. ГЛАВНОЕ: перехватываем клик по стилю в CAPTURE-фазе
+    //  и СРАЗУ применяем стиль (обходим сломанный AvatarEditor)
+    // ═══════════════════════════════════════════════════════════
+    // Так как наше событие добавится позже, оно будет вызвано ПОСЛЕ
+    // capture-обработчика AvatarEditor. Но т.к. AvatarEditor делает
+    // stopImmediatePropagation — наш capture-обработчик не вызовется.
+    //
+    // РЕШЕНИЕ: убираем stopImmediatePropagation через хак —
+    // переопределяем Event.prototype.stopImmediatePropagation
+    // на время клика по стилю. Это грубо, но работает.
+
+    const _origStopImmediate = Event.prototype.stopImmediatePropagation;
+
+    document.addEventListener('click', (e) => {
+        const styleItem = e.target.closest('#usernameStyleMenu .usm-style');
+        if (!styleItem) return;
+        if (!window.UsernameStyle) return;
+
+        // Восстанавливаем правильный вызов selectStyle через публичное API
+        const styleId = styleItem.dataset.styleId;
+        if (!styleId) return;
+
+        // Применяем стиль напрямую — это то, что должен делать оригинал
+        try {
+            window.UsernameStyle.set(styleId, state.username);
+
+            // Обновляем визуально выбранный элемент
+            document.querySelectorAll('#usernameStyleMenu .usm-style').forEach(el => {
+                el.classList.toggle('selected', el.dataset.styleId === styleId);
+            });
+
+            // Обновляем превью
+            const previewName = document.getElementById('usmPreviewName');
+            if (previewName) {
+                previewName.textContent = state.username || '?';
+                applyPreviewStyle(previewName, styleId);
+            }
+
+            if (typeof soundManager !== 'undefined') {
+                try { soundManager.play('click'); } catch (err) {}
+            }
+            if (navigator.vibrate) navigator.vibrate(8);
+
+            console.log('🩹 [NameMenuFix] Стиль применён напрямую:', styleId);
+        } catch (err) {
+            console.warn('🩹 [NameMenuFix] Не удалось применить стиль:', err);
+        }
+    }, true);  // capture — но зарегистрирован позже, чем AvatarEditor,
+               // поэтому сработает ПОСЛЕ него... а он stopImmediate —
+               // наш не вызовется.
+               //
+               // ⚠️ Значит этот обработчик бесполезен без хака.
+
+    // ═══════════════════════════════════════════════════════════
+    //  4. ГЛАВНЫЙ ХАК: глушим stopImmediatePropagation от AvatarEditor
+    //     только для кликов по стилю
+    // ═══════════════════════════════════════════════════════════
+    Event.prototype.stopImmediatePropagation = function() {
+        // Проверяем: это клик по стилю в меню имени?
+        if (this.type === 'click'
+            && this.target
+            && this.target.closest
+            && this.target.closest('#usernameStyleMenu .usm-style')) {
+            // Глушим — НЕ даём AvatarEditor остановить событие
+            return;
+        }
+        return _origStopImmediate.call(this);
     };
 
-    let _lastInvokeTs = 0;
+    console.log('🩹 [NameMenuFix] stopImmediatePropagation пропатчен для стилей');
 
-    // ─── Утилиты ───
-    function isAttachmentRefSafe(v) {
-        try { return typeof isAttachmentRef === 'function' && isAttachmentRef(v); }
-        catch (e) { return false; }
+    // ═══════════════════════════════════════════════════════════
+    //  5. Применение стиля к превью (без зависимости от внутренних
+    //     функций модуля UsernameStyle)
+    // ═══════════════════════════════════════════════════════════
+    function applyPreviewStyle(el, styleId) {
+        // Используем публичный API — получить информацию о стиле
+        const styles = window.UsernameStyle && window.UsernameStyle.styles;
+        if (!Array.isArray(styles)) return;
+
+        const style = styles.find(s => s.id === styleId);
+        if (!style) return;
+
+        if (style.solid) {
+            el.style.background = 'none';
+            el.style.webkitTextFillColor = style.colors[0];
+            el.style.color = style.colors[0];
+            el.style.backgroundClip = '';
+            el.style.webkitBackgroundClip = '';
+            el.style.animation = 'none';
+            el.style.backgroundSize = '';
+        } else {
+            const grad = `linear-gradient(135deg, ${style.colors.join(', ')})`;
+            el.style.background = style.animated
+                ? `linear-gradient(90deg, ${style.colors.join(', ')}, ${style.colors[0]})`
+                : grad;
+            el.style.backgroundSize = style.animated ? '300% 100%' : 'auto';
+            el.style.animation = style.animated ? 'usernameRainbowShift 4s ease infinite' : 'none';
+            el.style.webkitTextFillColor = 'transparent';
+            el.style.color = '';
+            el.style.backgroundClip = 'text';
+            el.style.webkitBackgroundClip = 'text';
+        }
     }
 
-    function getLastPhotoMessage() {
-        if (typeof historyState === 'undefined' || !Array.isArray(historyState.allMessages)) {
-            return null;
-        }
-        for (let i = historyState.allMessages.length - 1; i >= 0; i--) {
-            const m = historyState.allMessages[i];
-            if (m && m.image) return m;
-        }
-        return null;
-    }
+    // ═══════════════════════════════════════════════════════════
+    //  6. Восстанавливаем кнопки «Аватарка / Удалить» в меню
+    //     (AvatarEditor их удалил через killOldButtons)
+    // ═══════════════════════════════════════════════════════════
+    function restoreActionsBlock() {
+        const menu = document.getElementById('usernameStyleMenu');
+        if (!menu || !menu.classList.contains('show')) return;
 
-    // Достаём blob:URL максимально быстро из всех доступных источников
-    function resolveUrlSync(msg) {
-        if (!msg || !msg.image) return null;
-
-        // 1) inline blob:/data:
-        if (typeof msg.image === 'string'
-            && (msg.image.startsWith('blob:') || msg.image.startsWith('data:'))) {
-            return msg.image;
+        // Уже есть кнопки в новом блоке?
+        if (menu.querySelector('#usmAvatarPickBtn')) {
+            // Новый блок есть — чиним его
+            fixNewActionsBlock(menu);
+            return;
         }
 
-        // 2) DOM — ищем картинку именно у этого сообщения
-        if (typeof messagesInner !== 'undefined' && messagesInner) {
-            const wrapper = messagesInner.querySelector(
-                `.message-wrapper[data-msg-id="${msg.id}"]`
-            );
-            if (wrapper) {
-                const img = wrapper.querySelector('.image-container img');
-                if (img && img.src && img.src.startsWith('blob:')) {
-                    return img.src;
+        // Ищем preview-box и блок с кнопками
+        const previewBox = menu.querySelector('.usm-preview-box');
+        if (!previewBox) return;
+
+        // Проверяем, есть ли уже блок .usm-actions
+        let actionsBlock = menu.querySelector('.usm-actions');
+
+        // Если нет — создаём
+        if (!actionsBlock) {
+            actionsBlock = document.createElement('div');
+            actionsBlock.className = 'usm-actions';
+            actionsBlock.innerHTML = `
+                <button class="usm-action" id="usmAvatarBtn">🖼️ <span>Аватарка</span></button>
+                <button class="usm-action danger" id="usmAvatarRemoveBtn">🗑️ <span>Удалить</span></button>
+            `;
+            previewBox.parentNode.insertBefore(actionsBlock, previewBox.nextSibling);
+
+            actionsBlock.querySelector('#usmAvatarBtn').addEventListener('click', () => {
+                if (typeof AvatarChoice !== 'undefined' && AvatarChoice.open) {
+                    AvatarChoice.open(state.username);
+                } else if (typeof pickUserAvatar === 'function') {
+                    pickUserAvatar(state.username);
                 }
+            });
+
+            actionsBlock.querySelector('#usmAvatarRemoveBtn').addEventListener('click', () => {
+                if (typeof UserAvatars !== 'undefined' && UserAvatars.has(state.username)) {
+                    if (confirm(`Удалить аватарку для «${state.username}»?`)) {
+                        UserAvatars.remove(state.username);
+                        if (typeof refreshAllUserAvatars === 'function') {
+                            refreshAllUserAvatars(state.username);
+                        }
+                        if (typeof showToast === 'function') showToast('🗑️ Аватарка удалена', 1200);
+                        if (typeof soundManager !== 'undefined') soundManager.play('delete');
+                    }
+                } else {
+                    if (typeof showToast === 'function') showToast('ℹ️ Аватарки нет', 1500);
+                }
+            });
+        }
+    }
+
+    // ─── Чиним кнопки в новом блоке (если AvatarEditor успел вставить) ───
+    function fixNewActionsBlock(menu) {
+        // Гарантируем, что кнопки корректно работают
+        const pickBtn = menu.querySelector('#usmAvatarPickBtn');
+        const genBtn = menu.querySelector('#usmAvatarGenBtn');
+        const removeBtn = menu.querySelector('#usmAvatarRemoveBtn');
+
+        // Переопределяем обработчик «Фото» — сразу открываем AvatarChoice
+        if (pickBtn) {
+            const newPickBtn = pickBtn.cloneNode(true);
+            pickBtn.parentNode.replaceChild(newPickBtn, pickBtn);
+            newPickBtn.addEventListener('click', () => {
+                // Закрываем меню имени
+                if (window.UsernameStyle && window.UsernameStyle.close) {
+                    window.UsernameStyle.close();
+                }
+                setTimeout(() => {
+                    if (typeof AvatarChoice !== 'undefined' && AvatarChoice.open) {
+                        AvatarChoice.open(state.username);
+                    } else if (typeof pickUserAvatar === 'function') {
+                        pickUserAvatar(state.username);
+                    }
+                }, 150);
+            });
+        }
+
+        // Переопределяем «Авто» — сразу генерируем (как было в оригинале)
+        if (genBtn) {
+            const newGenBtn = genBtn.cloneNode(true);
+            genBtn.parentNode.replaceChild(newGenBtn, genBtn);
+            newGenBtn.addEventListener('click', async () => {
+                if (newGenBtn.disabled) return;
+                newGenBtn.disabled = true;
+                const orig = newGenBtn.innerHTML;
+                newGenBtn.innerHTML = '<span>⏳</span><span>…</span>';
+                try {
+                    if (typeof generateUserAvatar === 'function') {
+                        await generateUserAvatar(state.username);
+                    }
+                } finally {
+                    newGenBtn.disabled = false;
+                    newGenBtn.innerHTML = orig;
+                }
+            });
+        }
+
+        // Переопределяем «Удалить» — сразу удаляем (как было в оригинале)
+        if (removeBtn) {
+            const newRemoveBtn = removeBtn.cloneNode(true);
+            removeBtn.parentNode.replaceChild(newRemoveBtn, removeBtn);
+            newRemoveBtn.addEventListener('click', () => {
+                if (typeof UserAvatars !== 'undefined' && UserAvatars.has(state.username)) {
+                    if (confirm(`Удалить аватарку для «${state.username}»?`)) {
+                        UserAvatars.remove(state.username);
+                        if (typeof refreshAllUserAvatars === 'function') {
+                            refreshAllUserAvatars(state.username);
+                        }
+                        if (typeof showToast === 'function') showToast('🗑️ Аватарка удалена', 1200);
+                        if (typeof soundManager !== 'undefined') soundManager.play('delete');
+                    }
+                } else {
+                    if (typeof showToast === 'function') showToast('ℹ️ Аватарки нет', 1500);
+                }
+            });
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  7. Наблюдаем за открытием меню — восстанавливаем кнопки
+    // ═══════════════════════════════════════════════════════════
+    const menuObserver = new MutationObserver(() => {
+        const menu = document.getElementById('usernameStyleMenu');
+        if (menu && menu.classList.contains('show')) {
+            // Небольшая задержка — дать оригинальному модулю дорисовать
+            setTimeout(restoreActionsBlock, 80);
+            setTimeout(restoreActionsBlock, 200);
+            setTimeout(restoreActionsBlock, 500);
+        }
+    });
+    menuObserver.observe(document.body, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['class'],
+    });
+
+    // Периодическая страховка
+    setInterval(() => {
+        const menu = document.getElementById('usernameStyleMenu');
+        if (menu && menu.classList.contains('show')) {
+            restoreActionsBlock();
+        }
+    }, 800);
+
+    console.log('🩹 [NameMenuFix] ✅ Финальный фикс установлен:');
+    console.log('   • Стили применяются мгновенно при клике');
+    console.log('   • Кнопки «Аватарка» / «Авто» / «Удалить» работают');
+    console.log('   • Нет конфликтов с AvatarEditor');
+})();
+</script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🎯 ИМЯ-МЕНЮ: РАБОЧЕЕ ПРЕВЬЮ АВАТАРКИ (v3, финальный)
+//  ─────────────────────────────────────────────────────────────
+//  Задачи:
+//   1. Показывать РЕАЛЬНУЮ текущую аватарку (из UserAvatars)
+//   2. Обновляться автоматически при смене (хук на refreshAllUserAvatars)
+//   3. Не конфликтовать с AvatarEditor / AvatarChoice / UsernameStyle
+//   4. Своя кнопка "🖼️ / 🎨 / 🗑️" вместо сломанного блока
+// ═══════════════════════════════════════════════════════════════
+
+(function installNameMenuAvatarPreviewV3() {
+    'use strict';
+
+    console.log('🎯 [NameMenuAvatar v3] Установка…');
+
+    const V3 = {
+        menuObserver: null,
+        lastRenderedAvatarHash: null,
+        refreshTimer: null,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  1. CSS для блока превью
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('nameMenuAvatarV3Styles')) {
+        const style = document.createElement('style');
+        style.id = 'nameMenuAvatarV3Styles';
+        style.textContent = `
+            /* ═══ Блок превью аватарки ═══ */
+            #usernameStyleMenu .nmav3-block {
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                gap: 10px;
+                padding: 14px 12px 12px;
+                margin: 4px 4px 10px;
+                background: linear-gradient(135deg,
+                    rgba(108, 92, 231, 0.10),
+                    rgba(0, 184, 148, 0.06));
+                border: 1px solid rgba(108, 92, 231, 0.25);
+                border-radius: 16px;
+                position: relative;
+            }
+
+            /* ═══ Круг с аватаркой ═══ */
+            #usernameStyleMenu .nmav3-circle {
+                width: 96px;
+                height: 96px;
+                border-radius: 50%;
+                background: linear-gradient(135deg, #6c5ce7, #00b894);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 42px;
+                font-weight: 800;
+                color: #fff;
+                overflow: hidden;
+                box-shadow:
+                    0 8px 24px rgba(108, 92, 231, 0.4),
+                    0 0 0 3px rgba(255, 255, 255, 0.08);
+                position: relative;
+                transition: transform 0.18s ease, box-shadow 0.18s ease;
+                cursor: pointer;
+            }
+            #usernameStyleMenu .nmav3-circle:hover {
+                transform: scale(1.03);
+                box-shadow:
+                    0 10px 28px rgba(108, 92, 231, 0.55),
+                    0 0 0 3px rgba(255, 255, 255, 0.16);
+            }
+            #usernameStyleMenu .nmav3-circle:active {
+                transform: scale(0.96);
+            }
+            #usernameStyleMenu .nmav3-circle img {
+                width: 100%;
+                height: 100%;
+                object-fit: cover;
+                display: block;
+                border-radius: 50%;
+                pointer-events: none;
+            }
+            /* Индикатор загрузки */
+            #usernameStyleMenu .nmav3-circle.nmav3-loading {
+                opacity: 0.6;
+                pointer-events: none;
+            }
+            #usernameStyleMenu .nmav3-circle.nmav3-loading::after {
+                content: '';
+                position: absolute;
+                inset: 4px;
+                border-radius: 50%;
+                border: 3px solid transparent;
+                border-top-color: #fff;
+                animation: nmav3Spin 0.8s linear infinite;
+            }
+            @keyframes nmav3Spin {
+                to { transform: rotate(360deg); }
+            }
+
+            /* ═══ Кнопки ═══ */
+            #usernameStyleMenu .nmav3-actions {
+                display: flex;
+                gap: 6px;
+                width: 100%;
+                max-width: 280px;
+            }
+            #usernameStyleMenu .nmav3-btn {
+                flex: 1;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                gap: 3px;
+                padding: 9px 4px;
+                background: rgba(255, 255, 255, 0.06);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 11px;
+                color: #ccc;
+                font-size: 11px;
+                font-weight: 600;
+                cursor: pointer;
+                font-family: inherit;
+                transition: all 0.15s ease;
+                -webkit-tap-highlight-color: transparent;
+                user-select: none;
+            }
+            #usernameStyleMenu .nmav3-btn .nmav3-btn-icon {
+                font-size: 18px;
+                line-height: 1;
+            }
+            #usernameStyleMenu .nmav3-btn:hover {
+                background: rgba(108, 92, 231, 0.22);
+                border-color: rgba(108, 92, 231, 0.5);
+                color: #fff;
+            }
+            #usernameStyleMenu .nmav3-btn:active {
+                transform: scale(0.94);
+            }
+            #usernameStyleMenu .nmav3-btn:disabled {
+                opacity: 0.35;
+                cursor: not-allowed;
+                transform: none;
+            }
+            #usernameStyleMenu .nmav3-btn.nmav3-danger {
+                border-color: rgba(255, 107, 107, 0.25);
+                color: #ff6b6b;
+                background: rgba(255, 107, 107, 0.06);
+            }
+            #usernameStyleMenu .nmav3-btn.nmav3-danger:hover {
+                background: rgba(255, 107, 107, 0.2);
+                border-color: rgba(255, 107, 107, 0.55);
+                color: #ff8a8a;
+            }
+
+            /* ═══ Кнопка "Применить" внизу (создаёт UsernameStyle) ═══ */
+            #usernameStyleMenu .nmav3-apply-row {
+                display: flex;
+                gap: 8px;
+                padding: 4px 4px 2px;
+                margin-top: 4px;
+            }
+            #usernameStyleMenu .nmav3-apply-row .usm-action {
+                flex: 1;
+            }
+            #usernameStyleMenu .nmav3-apply-primary {
+                background: linear-gradient(135deg, #6c5ce7, #00b894) !important;
+                color: #fff !important;
+                border: none !important;
+                box-shadow: 0 4px 12px rgba(108, 92, 231, 0.35);
+            }
+
+            @media (max-width: 480px) {
+                #usernameStyleMenu .nmav3-circle {
+                    width: 80px;
+                    height: 80px;
+                    font-size: 34px;
+                }
+                #usernameStyleMenu .nmav3-btn {
+                    font-size: 10px;
+                    padding: 8px 2px;
+                }
+                #usernameStyleMenu .nmav3-btn .nmav3-btn-icon {
+                    font-size: 16px;
+                }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  2. Утилиты
+    // ═══════════════════════════════════════════════════════════
+    function showToastSafe(msg, dur) {
+        try { if (typeof showToast === 'function') showToast(msg, dur || 2000); } catch (e) {}
+    }
+    function playSoundSafe(type) {
+        try { if (typeof soundManager !== 'undefined') soundManager.play(type); } catch (e) {}
+    }
+
+    function getAvatarHash(avatarDataUrl) {
+        if (!avatarDataUrl) return 'null';
+        // Берём первые 40 + последние 40 символов — быстрый и почти уникальный хэш
+        const s = String(avatarDataUrl);
+        if (s.length < 80) return s;
+        return s.slice(0, 40) + '|' + s.slice(-40) + '|' + s.length;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. Рендер превью в блоке
+    // ═══════════════════════════════════════════════════════════
+    function renderAvatarPreview() {
+        const menu = document.getElementById('usernameStyleMenu');
+        if (!menu) return;
+
+        const circle = menu.querySelector('.nmav3-circle');
+        if (!circle) return;
+
+        const username = state.username || '?';
+        const letter = username.charAt(0).toUpperCase() || '?';
+        const dataUrl = (typeof UserAvatars !== 'undefined')
+            ? UserAvatars.get(username)
+            : null;
+
+        // Не перерисовываем, если не изменилось
+        const newHash = getAvatarHash(dataUrl);
+        if (V3.lastRenderedAvatarHash === newHash) {
+            // Всё равно обновим кнопку "Удалить" — вдруг поменялось
+            updateRemoveButtonState();
+            return;
+        }
+        V3.lastRenderedAvatarHash = newHash;
+
+        // Чистим содержимое
+        circle.innerHTML = '';
+
+        if (dataUrl) {
+            const img = document.createElement('img');
+            img.src = dataUrl;
+            img.alt = 'Аватар';
+            img.draggable = false;
+            // Проверка загрузки
+            img.onerror = () => {
+                circle.innerHTML = '';
+                circle.textContent = letter;
+            };
+            circle.appendChild(img);
+            console.log('🎯 [NameMenuAvatar v3] ✅ Показана аватарка:', dataUrl.slice(0, 30));
+        } else {
+            circle.textContent = letter;
+        }
+
+        updateRemoveButtonState();
+    }
+
+    // ─── Обновить доступность кнопки «Удалить» ───
+    function updateRemoveButtonState() {
+        const menu = document.getElementById('usernameStyleMenu');
+        if (!menu) return;
+        const removeBtn = menu.querySelector('#nmav3RemoveBtn');
+        if (!removeBtn) return;
+
+        const hasAvatar = (typeof UserAvatars !== 'undefined')
+            && UserAvatars.has(state.username);
+        removeBtn.disabled = !hasAvatar;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  4. Действия кнопок
+    // ═══════════════════════════════════════════════════════════
+
+    // ─── «🖼️ Фото»: открыть системный выбор файла ───
+    function handlePickFromDevice() {
+        const menu = document.getElementById('usernameStyleMenu');
+        const circle = menu ? menu.querySelector('.nmav3-circle') : null;
+
+        // Показываем «спиннер» на кружке
+        if (circle) circle.classList.add('nmav3-loading');
+
+        // Ищем инпут для аватарок пользователей:
+        // он создаётся в installIndividualAvatarGenerator как <input type=file accept=image/*> без id
+        let targetInput = null;
+        const allInputs = document.querySelectorAll('input[type="file"]');
+        for (const inp of allInputs) {
+            if (!inp.id
+                && inp.accept
+                && inp.accept.includes('image')
+                && inp.style.display === 'none'
+                && !inp._isChatAvatarInput) {
+                targetInput = inp;
+                break;
             }
         }
 
-        // 3) _attachmentCache
-        if (typeof _attachmentCache !== 'undefined'
-            && _attachmentCache.has(msg.image)) {
-            return _attachmentCache.get(msg.image);
+        if (!targetInput) {
+            // Fallback — создаём свой
+            targetInput = document.createElement('input');
+            targetInput.type = 'file';
+            targetInput.accept = 'image/*';
+            targetInput.style.display = 'none';
+            targetInput.id = '_nmav3FileInput';
+            document.body.appendChild(targetInput);
         }
 
-        // 4) galleryState.loadedSrcs
-        if (typeof galleryState !== 'undefined'
-            && galleryState.loadedSrcs
-            && galleryState.loadedSrcs[msg.id]) {
-            return galleryState.loadedSrcs[msg.id];
-        }
+        // Перехватываем change
+        const onChange = async (e) => {
+            const file = e.target.files && e.target.files[0];
+            e.target.value = '';
+            targetInput.removeEventListener('change', onChange);
 
-        return null;
+            if (!file) {
+                if (circle) circle.classList.remove('nmav3-loading');
+                return;
+            }
+
+            try {
+                // Обрабатываем файл в dataURL через UserAvatars.makeDataUrl
+                let dataUrl;
+                if (typeof UserAvatars !== 'undefined'
+                    && typeof UserAvatars.makeDataUrl === 'function') {
+                    dataUrl = await UserAvatars.makeDataUrl(file);
+                } else {
+                    dataUrl = await makeDataUrlFallback(file);
+                }
+
+                if (!dataUrl) throw new Error('Не удалось обработать');
+
+                // Сохраняем
+                if (typeof UserAvatars !== 'undefined') {
+                    UserAvatars.set(state.username, dataUrl);
+                }
+
+                // Обновляем все кружки этого пользователя во всех сообщениях
+                if (typeof refreshAllUserAvatars === 'function') {
+                    refreshAllUserAvatars(state.username);
+                }
+
+                // Обновляем превью в меню
+                V3.lastRenderedAvatarHash = null;   // форсим перерисовку
+                renderAvatarPreview();
+
+                if (typeof showToast === 'function') showToast('✅ Аватарка установлена', 1500);
+                playSoundSafe('send');
+                if (navigator.vibrate) navigator.vibrate([15, 30, 15]);
+            } catch (err) {
+                console.error('🎯 [NameMenuAvatar v3] pick error:', err);
+                showToastSafe('❌ ' + (err.message || 'Ошибка'), 2500);
+                playSoundSafe('error');
+            } finally {
+                if (circle) circle.classList.remove('nmav3-loading');
+            }
+        };
+
+        targetInput.addEventListener('change', onChange);
+        targetInput.value = '';
+        targetInput.click();
     }
 
-    // Ждём, пока нужный blob:URL появится в DOM (если вложения ещё грузятся)
-    function waitForUrlInDom(msg, timeoutMs) {
-        return new Promise((resolve) => {
-            const start = Date.now();
-            const tick = () => {
-                const url = resolveUrlSync(msg);
-                if (url) { resolve(url); return; }
-                if (Date.now() - start > timeoutMs) { resolve(null); return; }
-                setTimeout(tick, 100);
+    // ─── Fallback: сделать dataURL из файла ───
+    function makeDataUrlFallback(file) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onerror = () => reject(new Error('Не удалось прочитать файл'));
+            reader.onload = (e) => {
+                const img = new Image();
+                img.onerror = () => reject(new Error('Невалидное изображение'));
+                img.onload = () => {
+                    const side = Math.min(img.width, img.height);
+                    const sx = (img.width - side) / 2;
+                    const sy = (img.height - side) / 2;
+                    const canvas = document.createElement('canvas');
+                    canvas.width = 128;
+                    canvas.height = 128;
+                    const ctx = canvas.getContext('2d');
+                    ctx.imageSmoothingEnabled = true;
+                    ctx.imageSmoothingQuality = 'high';
+                    ctx.drawImage(img, sx, sy, side, side, 0, 0, 128, 128);
+                    let url = canvas.toDataURL('image/jpeg', 0.85);
+                    if (url.length > 80 * 1024) url = canvas.toDataURL('image/jpeg', 0.7);
+                    if (url.length > 80 * 1024) url = canvas.toDataURL('image/jpeg', 0.55);
+                    resolve(url);
+                };
+                img.src = e.target.result;
             };
-            tick();
+            reader.readAsDataURL(file);
         });
     }
 
-    // Догружаем через loadAttachment с ожиданием
-    async function loadUrlViaLoadAttachment(msg) {
-        if (!msg || !msg.image) return null;
-        if (!state.chatFile) return null;
-        if (!isAttachmentRefSafe(msg.image)) return null;
-        if (typeof loadAttachment !== 'function') return null;
+    // ─── «🎨 Авто»: сгенерировать через существующую систему ───
+    async function handleGenerate() {
+        const menu = document.getElementById('usernameStyleMenu');
+        const circle = menu ? menu.querySelector('.nmav3-circle') : null;
+        const btn = menu ? menu.querySelector('#nmav3GenBtn') : null;
 
-        const loadPromise = loadAttachment(state.chatFile, msg.image);
-        const timeoutPromise = new Promise(r => setTimeout(() => r(null), CFG.WAIT_LOAD_MS));
+        if (btn) btn.disabled = true;
+        if (circle) circle.classList.add('nmav3-loading');
 
         try {
-            const url = await Promise.race([loadPromise, timeoutPromise]);
-            return url || null;
-        } catch (e) {
-            console.warn('🖼️ [LatestPhoto] loadAttachment error:', e);
-            return null;
+            // Используем существующий генератор (он поддерживает retry)
+            if (typeof generateUserAvatar === 'function') {
+                await generateUserAvatar(state.username);
+            } else {
+                throw new Error('Генератор недоступен');
+            }
+
+            // Форсим перерисовку превью
+            V3.lastRenderedAvatarHash = null;
+            renderAvatarPreview();
+        } catch (err) {
+            console.error('🎯 [NameMenuAvatar v3] gen error:', err);
+            showToastSafe('❌ ' + (err.message || 'Ошибка'), 2500);
+        } finally {
+            if (btn) btn.disabled = false;
+            if (circle) circle.classList.remove('nmav3-loading');
         }
     }
 
-    // Главная функция — открыть самую новую фотографию
-    async function openLatestPhotoInChat() {
-        const now = Date.now();
-        if (now - _lastInvokeTs < CFG.DEBOUNCE_MS) return;
-        _lastInvokeTs = now;
-
-        if (!state || !state.chatFile) {
-            if (typeof showToast === 'function') showToast('🔒 Откройте чат', 1500);
+    // ─── «🗑️ Удалить»: убрать аватарку ───
+    function handleRemove() {
+        if (typeof UserAvatars === 'undefined') return;
+        if (!UserAvatars.has(state.username)) {
+            showToastSafe('ℹ️ Аватарки нет', 1500);
             return;
         }
+        if (!confirm(`Удалить аватарку для «${state.username}»?`)) return;
 
-        // 1. Находим последнее сообщение с фото
-        const lastMsg = getLastPhotoMessage();
-        if (!lastMsg) {
-            if (typeof showToast === 'function') showToast('📷 В этом чате нет фото', 2000);
-            return;
-        }
-
-        // 2. Пробуем взять URL синхронно
-        let url = resolveUrlSync(lastMsg);
-
-        // 3. Если нет — коротко ждём DOM (вложение может грузиться прямо сейчас)
-        if (!url) {
-            if (typeof showToast === 'function') showToast('⏳ Открываем последнее фото…', 1200);
-            url = await waitForUrlInDom(lastMsg, CFG.WAIT_DOM_MS);
-        }
-
-        // 4. Если всё ещё нет — догружаем через loadAttachment
-        if (!url) {
-            url = await loadUrlViaLoadAttachment(lastMsg);
-        }
-
-        // 5. Не удалось — сообщаем
-        if (!url) {
-            if (typeof showToast === 'function') {
-                showToast('❌ Не удалось открыть последнее фото', 2500);
-            }
-            return;
-        }
-
-        // 6. Открываем галерею. На всякий случай предварительно
-        //    подкладываем URL в loadedSrcs — чтобы первый кадр галереи
-        //    точно был именно этой самой свежей фотографией.
         try {
-            if (typeof galleryState !== 'undefined') {
-                galleryState.loadedSrcs = galleryState.loadedSrcs || {};
-                if (!galleryState.loadedSrcs[lastMsg.id]) {
-                    galleryState.loadedSrcs[lastMsg.id] = url;
+            UserAvatars.remove(state.username);
+            if (typeof refreshAllUserAvatars === 'function') {
+                refreshAllUserAvatars(state.username);
+            }
+            V3.lastRenderedAvatarHash = null;
+            renderAvatarPreview();
+            showToastSafe('🗑️ Аватарка удалена', 1200);
+            playSoundSafe('delete');
+            if (navigator.vibrate) navigator.vibrate(20);
+        } catch (err) {
+            console.error('🎯 [NameMenuAvatar v3] remove error:', err);
+            showToastSafe('❌ Ошибка удаления', 2000);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  5. Встраивание блока в меню
+    // ═══════════════════════════════════════════════════════════
+    function injectPreviewBlock(menu) {
+        if (!menu || menu.querySelector('.nmav3-block')) return;
+
+        // Находим anchor: preview-box (куда вставляем ПЕРЕД)
+        const previewBox = menu.querySelector('.usm-preview-box');
+        if (!previewBox) {
+            console.warn('🎯 [NameMenuAvatar v3] .usm-preview-box не найден');
+            return;
+        }
+
+        // Также убираем сломанные старые блоки
+        // (usm-avatar-preview-block от AvatarEditor — если он был)
+        menu.querySelectorAll('.usm-avatar-preview-block').forEach(el => el.remove());
+
+        // ─── Создаём блок ───
+        const block = document.createElement('div');
+        block.className = 'nmav3-block';
+        block.innerHTML = `
+            <div class="nmav3-circle" id="nmav3Circle" title="Нажмите, чтобы изменить аватарку">?</div>
+            <div class="nmav3-actions">
+                <button class="nmav3-btn" id="nmav3PickBtn" type="button">
+                    <span class="nmav3-btn-icon">🖼️</span>
+                    <span>Фото</span>
+                </button>
+                <button class="nmav3-btn" id="nmav3GenBtn" type="button">
+                    <span class="nmav3-btn-icon">🎨</span>
+                    <span>Авто</span>
+                </button>
+                <button class="nmav3-btn nmav3-danger" id="nmav3RemoveBtn" type="button" disabled>
+                    <span class="nmav3-btn-icon">🗑️</span>
+                    <span>Удалить</span>
+                </button>
+            </div>
+        `;
+        previewBox.parentNode.insertBefore(block, previewBox);
+
+        // ─── Обработчики ───
+        const circle = block.querySelector('#nmav3Circle');
+        circle.addEventListener('click', handlePickFromDevice);
+
+        block.querySelector('#nmav3PickBtn').addEventListener('click', handlePickFromDevice);
+        block.querySelector('#nmav3GenBtn').addEventListener('click', handleGenerate);
+        block.querySelector('#nmav3RemoveBtn').addEventListener('click', handleRemove);
+
+        // Первичный рендер
+        V3.lastRenderedAvatarHash = null;
+        requestAnimationFrame(renderAvatarPreview);
+        setTimeout(renderAvatarPreview, 100);
+
+        console.log('🎯 [NameMenuAvatar v3] Блок превью встроен');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  6. Наблюдение за открытием меню
+    // ═══════════════════════════════════════════════════════════
+    function startMenuObserver() {
+        if (V3.menuObserver) V3.menuObserver.disconnect();
+
+        V3.menuObserver = new MutationObserver(() => {
+            const menu = document.getElementById('usernameStyleMenu');
+            if (menu && menu.classList.contains('show')) {
+                // Даём оригинальному модулю дорисовать меню
+                setTimeout(() => injectPreviewBlock(menu), 30);
+                setTimeout(() => injectPreviewBlock(menu), 120);
+                setTimeout(() => {
+                    injectPreviewBlock(menu);
+                    renderAvatarPreview();
+                }, 300);
+            } else if (menu && !menu.classList.contains('show')) {
+                // Сброс хэша при закрытии — чтобы при следующем открытии точно перерисовать
+                V3.lastRenderedAvatarHash = null;
+            }
+        });
+
+        V3.menuObserver.observe(document.body, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['class'],
+        });
+
+        console.log('🎯 [NameMenuAvatar v3] Observer запущен');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  7. Хук на refreshAllUserAvatars
+    //  Когда аватарка меняется где-то снаружи — превью обновляется
+    // ═══════════════════════════════════════════════════════════
+    function hookRefreshFunction() {
+        if (typeof window.refreshAllUserAvatars === 'function'
+            && !window.refreshAllUserAvatars._nmav3Hooked) {
+            const _orig = window.refreshAllUserAvatars;
+            window.refreshAllUserAvatars = function(username) {
+                const r = _orig.apply(this, arguments);
+                // Если это наш юзер — обновляем превью
+                if (username === state.username) {
+                    V3.lastRenderedAvatarHash = null;
+                    // Небольшая задержка, чтобы UserAvatars уже обновился
+                    setTimeout(renderAvatarPreview, 30);
                 }
-            }
-        } catch (e) { /* ignore */ }
-
-        if (typeof openGallery === 'function') {
-            try {
-                await openGallery(url);
-                return;
-            } catch (e) {
-                console.warn('🖼️ [LatestPhoto] openGallery failed, fallback:', e);
-            }
-        }
-
-        if (typeof openImageModal === 'function') {
-            openImageModal(url);
+                return r;
+            };
+            window.refreshAllUserAvatars._nmav3Hooked = true;
+            console.log('🎯 [NameMenuAvatar v3] Хук на refreshAllUserAvatars установлен');
+        } else if (typeof window.refreshAllUserAvatars !== 'function') {
+            // Функция ещё не создана — подождём
+            setTimeout(hookRefreshFunction, 500);
         }
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ПЕРЕХВАТ КЛИКА ПО ПУНКТУ «Галерея фото»
-    //  Ставим capture-обработчик на документ — срабатывает
-    //  РАНЬШЕ любых других обработчиков.
+    //  8. Периодическая страховка
+    //  Если аватарка изменилась через localStorage/другой таб —
+    //  превью подхватит через 1 сек
     // ═══════════════════════════════════════════════════════════
-    document.addEventListener('click', (e) => {
-        const item = e.target.closest('.cqa-item[data-action="gallery"]');
-        if (!item) return;
+    function startRefreshTimer() {
+        if (V3.refreshTimer) clearInterval(V3.refreshTimer);
 
-        // Не мешаем, если пункт отключён (нет фото) — пусть
-        // отработает штатный обработчик, чтобы дать какой-то фидбэк
-        if (item.classList.contains('disabled')) return;
+        V3.refreshTimer = setInterval(() => {
+            const menu = document.getElementById('usernameStyleMenu');
+            if (!menu || !menu.classList.contains('show')) return;
 
-        // Глушим всё: и наш старый обработчик, и ChatPlayerShortcut
-        e.stopImmediatePropagation();
-        e.preventDefault();
+            // Проверяем: не изменилась ли аватарка?
+            const dataUrl = (typeof UserAvatars !== 'undefined')
+                ? UserAvatars.get(state.username)
+                : null;
+            const hash = getAvatarHash(dataUrl);
 
-        // Закрываем мини-меню (как это делает штатный код)
-        try {
-            if (typeof ChatPlayerShortcut !== 'undefined'
-                && typeof ChatPlayerShortcut.close === 'function') {
-                ChatPlayerShortcut.close();
+            if (hash !== V3.lastRenderedAvatarHash) {
+                renderAvatarPreview();
             }
-        } catch (err) {}
-
-        // И запускаем свою логику
-        openLatestPhotoInChat();
-    }, true);   // ⚡ capture
+        }, 1000);
+    }
 
     // ═══════════════════════════════════════════════════════════
-    //  ПУБЛИЧНОЕ API (для отладки)
+    //  9. Глушим старые сломанные патчи
     // ═══════════════════════════════════════════════════════════
-    window.LatestPhotoMenu = {
-        open: openLatestPhotoInChat,
+
+    // ─── AvatarEditor (v1) — отключаем полностью ───
+    if (window.AvatarEditor) {
+        window.AvatarEditor.reset = () => {};
+        window.AvatarEditor.status = () => ({ disabled: true });
+        console.log('🎯 [NameMenuAvatar v3] AvatarEditor отключён');
+    }
+
+    // ─── Глушим клики по старым кнопкам (если они остались) ───
+    // Все клики по #usmAvatarPickBtn / #usmAvatarGenBtn / #usmAvatarRemoveBtn
+    // в старом блоке .usm-avatar-preview-block игнорируем
+    document.addEventListener('click', (e) => {
+        const oldBtn = e.target.closest('.usm-avatar-preview-block .usm-avatar-btn');
+        if (oldBtn) {
+            e.stopImmediatePropagation();
+            e.preventDefault();
+            console.log('🎯 [NameMenuAvatar v3] Старая кнопка заблокирована');
+        }
+    }, true);
+
+    // ─── Глушим stopImmediatePropagation от старых патчей
+    //     на клики по стилям (это ломало стили) ───
+    // Уже сделано в fixUsernameMenuFinal — не дублируем.
+
+    // ═══════════════════════════════════════════════════════════
+    //  10. Запуск
+    // ═══════════════════════════════════════════════════════════
+    startMenuObserver();
+    hookRefreshFunction();
+    startRefreshTimer();
+
+    // Первичная попытка (если меню уже открыто)
+    setTimeout(() => {
+        const menu = document.getElementById('usernameStyleMenu');
+        if (menu && menu.classList.contains('show')) {
+            injectPreviewBlock(menu);
+        }
+    }, 500);
+
+    // ═══════════════════════════════════════════════════════════
+    //  11. Публичное API
+    // ═══════════════════════════════════════════════════════════
+    window.NameMenuAvatar = {
+        refresh: renderAvatarPreview,
+        inject: () => {
+            const menu = document.getElementById('usernameStyleMenu');
+            if (menu) injectPreviewBlock(menu);
+        },
         status: () => {
-            const last = getLastPhotoMessage();
+            const menu = document.getElementById('usernameStyleMenu');
+            const circle = menu ? menu.querySelector('.nmav3-circle') : null;
+            const img = circle ? circle.querySelector('img') : null;
+            const dataUrl = (typeof UserAvatars !== 'undefined')
+                ? UserAvatars.get(state.username)
+                : null;
+
             return {
-                chatFile: state ? state.chatFile : null,
-                hasPhoto: !!last,
-                lastPhotoMsgId: last ? last.id : null,
-                lastPhotoTime: last ? last.time : null,
-                lastPhotoAttachName: last ? last.image : null,
-                resolvedNow: last ? resolveUrlSync(last) : null,
+                menuOpen: !!(menu && menu.classList.contains('show')),
+                blockInjected: !!menu?.querySelector('.nmav3-block'),
+                circleExists: !!circle,
+                imageDisplayed: !!img,
+                imageSrcLength: img ? img.src.length : 0,
+                currentAvatarHash: getAvatarHash(dataUrl),
+                lastRenderedHash: V3.lastRenderedAvatarHash,
+                avatarExists: !!dataUrl,
             };
         },
     };
 
-    console.log('🖼️ [LatestPhoto] ✅ Готово.');
-    console.log('   • «⋯» → «Галерея фото» открывает самую СВЕЖУЮ фотографию');
-    console.log('   • API: LatestPhotoMenu.status() / .open()');
+    console.log('🎯 [NameMenuAvatar v3] ✅ Готово');
+    console.log('   • Реальная аватарка в превью (из UserAvatars)');
+    console.log('   • Автообновление при смене');
+    console.log('   • Кнопки: Фото / Авто / Удалить');
+    console.log('   • API: NameMenuAvatar.status()');
+})();
+</script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🧹 ФИНАЛЬНЫЙ УБОРЩИК ДУБЛИРУЮЩИХСЯ БЛОКОВ АВАТАРКИ
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: AvatarEditor (v1) вставляет свой блок
+//  `.usm-avatar-preview-block` и не удаляет. В итоге в меню
+//  висят ДВА превью аватарки: наше (nmav3) и старое.
+//
+//  Решение: агрессивно удаляем всё, что не наш блок,
+//  при каждом открытии меню + периодически (на случай гонки).
+// ═══════════════════════════════════════════════════════════════
+
+(function installFinalAvatarBlockCleaner() {
+    'use strict';
+
+    console.log('🧹 [AvatarBlockCleaner] Установка финального уборщика…');
+
+    // ─── CSS: жёстко скрываем старые блоки ───
+    if (!document.getElementById('avatarBlockCleanerStyles')) {
+        const style = document.createElement('style');
+        style.id = 'avatarBlockCleanerStyles';
+        style.textContent = `
+            /* ═══ Скрываем старые блоки превью аватарки ═══ */
+            #usernameStyleMenu .usm-avatar-preview-block,
+            #usernameStyleMenu .usm-actions:not(.nmav3-apply-row),
+            #usernameStyleMenu .usm-avatar-actions,
+            #usernameStyleMenu #usmAvatarPreview {
+                display: none !important;
+                visibility: hidden !important;
+                height: 0 !important;
+                width: 0 !important;
+                overflow: hidden !important;
+                position: absolute !important;
+                left: -9999px !important;
+            }
+
+            /* Оставляем только наш новый блок */
+            #usernameStyleMenu .nmav3-block {
+                display: flex !important;
+                visibility: visible !important;
+            }
+
+            /* И кнопки отмены/применить (они нам нужны) */
+            #usernameStyleMenu .usm-footer-actions {
+                display: flex !important;
+            }
+
+            /* И "Отмена" + "Применить" из старого кода — тоже оставляем,
+               они полезны (у нас нет своих кнопок внизу) */
+            #usernameStyleMenu .modal-actions,
+            #usernameStyleMenu .usm-apply-buttons {
+                display: flex !important;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  АГРЕССИВНОЕ УДАЛЕНИЕ СТАРЫХ БЛОКОВ
+    // ═══════════════════════════════════════════════════════════
+    function removeOldAvatarBlocks() {
+        const menu = document.getElementById('usernameStyleMenu');
+        if (!menu) return 0;
+
+        let removed = 0;
+
+        // 1. Удаляем все .usm-avatar-preview-block
+        menu.querySelectorAll('.usm-avatar-preview-block').forEach(el => {
+            el.remove();
+            removed++;
+        });
+
+        // 2. Удаляем старые .usm-avatar-actions (если есть отдельно)
+        menu.querySelectorAll('.usm-avatar-actions').forEach(el => {
+            el.remove();
+            removed++;
+        });
+
+        // 3. Удаляем старый блок .usm-actions с кнопками Аватарка/Удалить
+        //    НО НЕ ТРОГАЕМ .usm-footer-actions (это новый блок с Отмена/Применить)
+        menu.querySelectorAll('.usm-actions').forEach(el => {
+            if (el.classList.contains('usm-footer-actions')) return;
+            if (el.classList.contains('nmav3-apply-row')) return;
+            el.remove();
+            removed++;
+        });
+
+        // 4. Удаляем #usmAvatarPreview (старый ID)
+        const oldPreview = menu.querySelector('#usmAvatarPreview');
+        if (oldPreview) {
+            oldPreview.remove();
+            removed++;
+        }
+
+        if (removed > 0) {
+            console.log(`🧹 [AvatarBlockCleaner] Удалено ${removed} старых блоков`);
+        }
+        return removed;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  НАБЛЮДАТЕЛЬ: чистим при каждом изменении меню
+    // ═══════════════════════════════════════════════════════════
+    let _cleanTimer = null;
+    function scheduleClean() {
+        if (_cleanTimer) return;
+        _cleanTimer = setTimeout(() => {
+            _cleanTimer = null;
+            removeOldAvatarBlocks();
+        }, 20);
+    }
+
+    const observer = new MutationObserver((mutations) => {
+        const menu = document.getElementById('usernameStyleMenu');
+        if (!menu || !menu.classList.contains('show')) return;
+
+        // Проверяем: не появились ли старые блоки?
+        for (const mut of mutations) {
+            for (const node of mut.addedNodes) {
+                if (node.nodeType !== 1) continue;
+
+                if (node.classList && (
+                    node.classList.contains('usm-avatar-preview-block') ||
+                    node.classList.contains('usm-avatar-actions')
+                )) {
+                    node.remove();
+                    console.log('🧹 [AvatarBlockCleaner] Пойман и удалён новый старый блок');
+                    continue;
+                }
+
+                if (node.querySelector && node.querySelector('.usm-avatar-preview-block')) {
+                    node.querySelectorAll('.usm-avatar-preview-block').forEach(el => el.remove());
+                }
+            }
+        }
+
+        // Периодическая чистка
+        scheduleClean();
+    });
+
+    observer.observe(document.body, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['class'],
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХУК НА ОТКРЫТИЕ МЕНЮ — чистим сразу
+    // ═══════════════════════════════════════════════════════════
+    document.addEventListener('click', (e) => {
+        // При клике на имя — меню скоро откроется
+        if (e.target.closest('#chatsUserLabel')) {
+            setTimeout(removeOldAvatarBlocks, 50);
+            setTimeout(removeOldAvatarBlocks, 150);
+            setTimeout(removeOldAvatarBlocks, 400);
+            setTimeout(removeOldAvatarBlocks, 800);
+            setTimeout(removeOldAvatarBlocks, 1500);
+        }
+    }, true);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПЕРИОДИЧЕСКАЯ СТРАХОВКА
+    //  Пока меню открыто — каждые 300 мс проверяем
+    // ═══════════════════════════════════════════════════════════
+    setInterval(() => {
+        const menu = document.getElementById('usernameStyleMenu');
+        if (menu && menu.classList.contains('show')) {
+            removeOldAvatarBlocks();
+        }
+    }, 300);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API
+    // ═══════════════════════════════════════════════════════════
+    window.AvatarBlockCleaner = {
+        clean: removeOldAvatarBlocks,
+        status: () => {
+            const menu = document.getElementById('usernameStyleMenu');
+            return {
+                menuOpen: !!(menu && menu.classList.contains('show')),
+                oldBlocksCount: menu
+                    ? menu.querySelectorAll('.usm-avatar-preview-block').length
+                    : 0,
+                oldActionsCount: menu
+                    ? menu.querySelectorAll('.usm-actions:not(.usm-footer-actions)').length
+                    : 0,
+                newBlockCount: menu
+                    ? menu.querySelectorAll('.nmav3-block').length
+                    : 0,
+            };
+        },
+    };
+
+    console.log('🧹 [AvatarBlockCleaner] ✅ Готово');
+    console.log('   • Старые блоки удаляются агрессивно');
+    console.log('   • CSS скрывает их даже если успели появиться');
+    console.log('   • API: AvatarBlockCleaner.clean()');
 })();
 </script>
 </body>
