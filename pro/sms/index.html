@@ -76502,6 +76502,573 @@ async function sendAnnouncement() {
 
     console.log('🚫 [WQLNoCtx] Системное меню в оверлее погоды заблокировано');
 })();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🕐 TIME-SERVER VALIDATION FOR INVITE LINKS
+//  ─────────────────────────────────────────────────────────────
+//  Защита от отката часов на устройстве.
+//
+//  Как работает:
+//   1. Перед валидацией ссылки запрашиваем реальное UTC-время
+//      у 2-3 независимых источников (GitHub, WorldTimeAPI, TimeAPI)
+//   2. Берём медиану (защита от одного сбойного источника)
+//   3. Проверяем exp/iat по СЕРВЕРНОМУ времени, не локальному
+//   4. Дополнительно: если |serverNow - localNow| > 5 мин —
+//      устройство явно подделало часы → отказ
+//
+//  Если ни один источник не ответил:
+//   • Отказ (по умолчанию) — безопасный режим
+//   • Или fallback на локальное время (небезопасно)
+// ═══════════════════════════════════════════════════════════════
+
+(function installInviteTimeServerValidation() {
+    'use strict';
+
+    console.log('🕐 [InviteTime] Установка серверной валидации времени…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  КОНФИГ
+    // ═══════════════════════════════════════════════════════════
+    const CFG = {
+        // Порог, при котором считаем что часы устройства "врут".
+        // 5 минут — стандарт NTP-синхронизации (как в Kerberos)
+        MAX_CLOCK_SKEW_MS: 5 * 60 * 1000,
+
+        // Небольшой запас на сетевые задержки при проверке exp/iat
+        // (200-300 мс между запросом и ответом — берём с запасом)
+        EXP_GRACE_MS: 60 * 1000,
+
+        // Таймаут на каждый источник времени
+        FETCH_TIMEOUT_MS: 6000,
+
+        // Требовать ли серверное время обязательно.
+        // true  → без сети ссылка не работает (безопасно)
+        // false → fallback на локальное время (дыра остаётся)
+        REQUIRE_SERVER_TIME: true,
+
+        // Кэш серверного времени на N мс (чтобы не дёргать API
+        // при каждом клике)
+        TIME_CACHE_MS: 30 * 1000,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  КЭШ ВРЕМЕНИ
+    //  { ts: когда получили, offset: serverNow - localNow }
+    // ═══════════════════════════════════════════════════════════
+    let _timeCache = null;
+
+    function getCachedOffset() {
+        if (!_timeCache) return null;
+        if (Date.now() - _timeCache.ts > CFG.TIME_CACHE_MS) {
+            _timeCache = null;
+            return null;
+        }
+        return _timeCache;
+    }
+
+    function cacheOffset(serverNowAtFetch, fetchStartedAt) {
+        // Корректируем на половину RTT — время сервера было
+        // "сейчас" примерно в середине запроса
+        const fetchFinishedAt = Date.now();
+        const rtt = fetchFinishedAt - fetchStartedAt;
+        const serverNowAdjusted = serverNowAtFetch + Math.floor(rtt / 2);
+
+        _timeCache = {
+            ts: fetchFinishedAt,
+            offset: serverNowAdjusted - fetchFinishedAt,
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ИСТОЧНИК 1: GitHub Date header
+    //  Самый быстрый и надёжный (используем то, что уже подключены)
+    // ═══════════════════════════════════════════════════════════
+    async function fetchTimeFromGitHub() {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), CFG.FETCH_TIMEOUT_MS);
+        const startedAt = Date.now();
+
+        try {
+            const res = await fetch('https://api.github.com/rate_limit', {
+                method: 'HEAD',
+                cache: 'no-store',
+                signal: controller.signal,
+            });
+            clearTimeout(timer);
+
+            const dateHeader = res.headers.get('Date');
+            if (!dateHeader) return null;
+
+            const parsed = new Date(dateHeader).getTime();
+            if (!isFinite(parsed) || parsed <= 0) return null;
+
+            return { source: 'github', time: parsed, startedAt };
+        } catch (e) {
+            clearTimeout(timer);
+            console.warn('🕐 [InviteTime] GitHub Date недоступен:', e.message);
+            return null;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ИСТОЧНИК 2: WorldTimeAPI
+    // ═══════════════════════════════════════════════════════════
+    async function fetchTimeFromWorldTimeAPI() {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), CFG.FETCH_TIMEOUT_MS);
+        const startedAt = Date.now();
+
+        try {
+            const res = await fetch('https://worldtimeapi.org/api/timezone/Etc/UTC', {
+                cache: 'no-store',
+                signal: controller.signal,
+            });
+            clearTimeout(timer);
+            if (!res.ok) return null;
+
+            const data = await res.json();
+            const time = data.unixtime ? data.unixtime * 1000 : null;
+            if (!time || !isFinite(time)) return null;
+
+            return { source: 'worldtimeapi', time, startedAt };
+        } catch (e) {
+            clearTimeout(timer);
+            console.warn('🕐 [InviteTime] WorldTimeAPI недоступен:', e.message);
+            return null;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ИСТОЧНИК 3: timeapi.io
+    // ═══════════════════════════════════════════════════════════
+    async function fetchTimeFromTimeAPI() {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), CFG.FETCH_TIMEOUT_MS);
+        const startedAt = Date.now();
+
+        try {
+            const res = await fetch(
+                'https://timeapi.io/api/Time/current/zone?timeZone=UTC',
+                { cache: 'no-store', signal: controller.signal }
+            );
+            clearTimeout(timer);
+            if (!res.ok) return null;
+
+            const data = await res.json();
+            // Поля: year, month, day, hour, minute, seconds, milliSeconds
+            if (!data.year || !data.month || !data.day) return null;
+
+            const time = Date.UTC(
+                data.year, data.month - 1, data.day,
+                data.hour || 0, data.minute || 0,
+                data.seconds || 0, data.milliSeconds || 0
+            );
+            if (!isFinite(time) || time <= 0) return null;
+
+            return { source: 'timeapi', time, startedAt };
+        } catch (e) {
+            clearTimeout(timer);
+            console.warn('🕐 [InviteTime] timeapi.io недоступен:', e.message);
+            return null;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  МЕДИАНА ИЗ НЕСКОЛЬКИХ ИСТОЧНИКОВ
+    // ═══════════════════════════════════════════════════════════
+    function medianOf(results) {
+        const values = results.map(r => r.time).sort((a, b) => a - b);
+        if (values.length === 0) return null;
+        if (values.length === 1) return values[0];
+        if (values.length === 2) return Math.floor((values[0] + values[1]) / 2);
+        return values[Math.floor(values.length / 2)];
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ГЛАВНАЯ ФУНКЦИЯ: ПОЛУЧИТЬ ДОВЕРЕННОЕ ВРЕМЯ
+    // ═══════════════════════════════════════════════════════════
+    async function getTrustedNow() {
+        // Кэш
+        const cached = getCachedOffset();
+        if (cached) {
+            const now = Date.now() + cached.offset;
+            console.log(`🕐 [InviteTime] Используем кэш: offset ${cached.offset} мс`);
+            return {
+                now,
+                localNow: Date.now(),
+                skew: cached.offset,
+                source: 'cache',
+            };
+        }
+
+        // Параллельный запрос к 3 источникам с общим таймаутом
+        console.log('🕐 [InviteTime] Запрашиваем серверное время…');
+
+        const overallTimeout = new Promise(resolve => {
+            setTimeout(() => resolve(null), CFG.FETCH_TIMEOUT_MS + 1000);
+        });
+
+        const fetches = Promise.allSettled([
+            fetchTimeFromGitHub(),
+            fetchTimeFromWorldTimeAPI(),
+            fetchTimeFromTimeAPI(),
+        ]);
+
+        let results;
+        try {
+            const settled = await Promise.race([fetches, overallTimeout.then(() => null)]);
+
+            if (settled === null) {
+                console.warn('🕐 [InviteTime] Общий таймаут получения времени');
+                return null;
+            }
+
+            results = settled
+                .filter(r => r.status === 'fulfilled' && r.value)
+                .map(r => r.value);
+        } catch (e) {
+            console.warn('🕐 [InviteTime] Ошибка запросов времени:', e);
+            return null;
+        }
+
+        if (results.length === 0) {
+            console.warn('🕐 [InviteTime] Ни один источник не ответил');
+            return null;
+        }
+
+        console.log(`🕐 [InviteTime] Получено от ${results.length} источник(ов):`,
+            results.map(r => r.source).join(', '));
+
+        // Медиана
+        const medianTime = medianOf(results);
+        if (!medianTime) return null;
+
+        // Кэшируем offset относительно локального времени
+        // Берём самый свежий startedAt для расчёта RTT
+        const freshest = results.reduce((a, b) =>
+            (a.startedAt > b.startedAt) ? a : b
+        );
+        cacheOffset(medianTime, freshest.startedAt);
+
+        const localNow = Date.now();
+        return {
+            now: medianTime,
+            localNow,
+            skew: medianTime - localNow,
+            source: results.map(r => r.source).join('+'),
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПРОВЕРКА ВРЕМЕНИ ССЫЛКИ
+    //  Возвращает { ok, reason, message, debug }
+    // ═══════════════════════════════════════════════════════════
+    async function validateInviteTime(payload) {
+        const trusted = await getTrustedNow();
+
+        // ═══ Нет серверного времени ═══
+        if (!trusted) {
+            if (CFG.REQUIRE_SERVER_TIME) {
+                return {
+                    ok: false,
+                    reason: 'no-server-time',
+                    message: 'Не удалось проверить время. Проверьте интернет.',
+                    debug: { requireServerTime: true },
+                };
+            }
+
+            // Fallback на локальное (НЕБЕЗОПАСНО, но оставлено для совместимости)
+            console.warn('🕐 [InviteTime] Fallback на локальное время — ЗАЩИТА ОСЛАБЛЕНА');
+            const localNow = Date.now();
+
+            if (payload.exp && localNow > payload.exp + CFG.EXP_GRACE_MS) {
+                return { ok: false, reason: 'expired', message: 'Ссылка истекла' };
+            }
+            if (payload.iat && localNow < payload.iat - CFG.EXP_GRACE_MS) {
+                return { ok: false, reason: 'not-yet-valid', message: 'Ссылка ещё не активна' };
+            }
+            return { ok: true, fallback: true, debug: { localNow } };
+        }
+
+        const { now, localNow, skew, source } = trusted;
+
+        // ═══ 1. Главная проверка: exp по серверному времени ═══
+        if (!payload.exp) {
+            return {
+                ok: false,
+                reason: 'bad-payload',
+                message: 'Ссылка повреждена (нет времени)',
+            };
+        }
+
+        if (now > payload.exp + CFG.EXP_GRACE_MS) {
+            return {
+                ok: false,
+                reason: 'expired',
+                message: 'Ссылка истекла',
+                debug: {
+                    serverNow: new Date(now).toISOString(),
+                    exp: new Date(payload.exp).toISOString(),
+                    diffSec: Math.round((now - payload.exp) / 1000),
+                },
+            };
+        }
+
+        // ═══ 2. Проверка "не из будущего" (iat) ═══
+        if (payload.iat && now < payload.iat - CFG.EXP_GRACE_MS) {
+            return {
+                ok: false,
+                reason: 'not-yet-valid',
+                message: 'Ссылка ещё не активна',
+                debug: {
+                    serverNow: new Date(now).toISOString(),
+                    iat: new Date(payload.iat).toISOString(),
+                },
+            };
+        }
+
+        // ═══ 3. КЛЮЧЕВОЕ: проверка что часы устройства не откачены ═══
+        //  Если локальное время сильно отличается от серверного —
+        //  устройство явно с подкрученными часами
+        const skewAbs = Math.abs(skew);
+        if (skewAbs > CFG.MAX_CLOCK_SKEW_MS) {
+            console.warn(`🕐 [InviteTime] Часы устройства сбиты на ${Math.round(skew / 1000)} сек`);
+            return {
+                ok: false,
+                reason: 'clock-tampered',
+                message: 'Время на устройстве неверное. Включите автоматическую синхронизацию часов.',
+                debug: {
+                    serverNow: new Date(now).toISOString(),
+                    localNow: new Date(localNow).toISOString(),
+                    skewSec: Math.round(skew / 1000),
+                    maxSkewSec: CFG.MAX_CLOCK_SKEW_MS / 1000,
+                    source,
+                },
+            };
+        }
+
+        // ═══ Всё ок ═══
+        console.log('🕐 [InviteTime] ✅ Время валидно:', {
+            source,
+            skewSec: Math.round(skew / 1000),
+            expIn: Math.round((payload.exp - now) / 1000) + ' сек',
+        });
+
+        return {
+            ok: true,
+            debug: {
+                serverNow: new Date(now).toISOString(),
+                localNow: new Date(localNow).toISOString(),
+                skewSec: Math.round(skew / 1000),
+                expInSec: Math.round((payload.exp - now) / 1000),
+                source,
+            },
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧИМ parseAndValidateInvite
+    //  Находим текущую реализацию (она внутри IIFE TempInvite)
+    //  и оборачиваем её через публичный API.
+    // ═══════════════════════════════════════════════════════════
+    function patchTempInvite() {
+        if (!window.TempInvite) {
+            // TempInvite ещё не создан — повторим позже
+            setTimeout(patchTempInvite, 500);
+            return;
+        }
+
+        if (window.TempInvite._timeValidationPatched) return;
+
+        const _origParse = window.TempInvite.parse;
+        if (typeof _origParse !== 'function') {
+            console.warn('🕐 [InviteTime] TempInvite.parse не найден');
+            return;
+        }
+
+        window.TempInvite.parse = async function(rawParam) {
+            // ═══ 1. Оригинальная проверка (подпись, формат, used) ═══
+            const baseResult = await _origParse.call(this, rawParam);
+
+            // Если уже провалилось — не тратим время на сервер
+            if (!baseResult || !baseResult.ok) {
+                return baseResult;
+            }
+
+            // ═══ 2. Проверка времени через сервер ═══
+            const timeResult = await validateInviteTime(baseResult.payload);
+
+            if (!timeResult.ok) {
+                return {
+                    ok: false,
+                    reason: timeResult.reason,
+                    message: timeResult.message,
+                    debug: timeResult.debug,
+                };
+            }
+
+            // ═══ 3. Успех ═══
+            return {
+                ...baseResult,
+                _timeDebug: timeResult.debug,
+            };
+        };
+
+        window.TempInvite._timeValidationPatched = true;
+        window.TempInvite._validateInviteTime = validateInviteTime;
+        window.TempInvite._getTrustedNow = getTrustedNow;
+        console.log('🕐 [InviteTime] ✅ TempInvite.parse пропатчен');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧИМ ОТОБРАЖЕНИЕ ОШИБКИ
+    //  showInviteError принимает reason и message.
+    //  Добавим понятные тексты для наших новых reason.
+    // ═══════════════════════════════════════════════════════════
+    function patchErrorDisplay() {
+        // showInviteError — глобальная функция из installTemporaryInviteLinksV2
+        if (typeof window.showInviteError !== 'function') {
+            setTimeout(patchErrorDisplay, 500);
+            return;
+        }
+
+        if (window.showInviteError._timePatched) return;
+
+        const _orig = window.showInviteError;
+
+        window.showInviteError = function(reason, message) {
+            // Для наших новых причин — подставляем понятный текст
+            const customMessages = {
+                'no-server-time': 'Не удалось проверить время.\n\nПроверьте интернет-соединение и попробуйте снова.',
+                'clock-tampered': 'Время на вашем устройстве не совпадает с реальным.\n\nВключите автоматическую синхронизацию времени и попробуйте снова.',
+                'not-yet-valid': 'Ссылка ещё не активна. Возможно, время на устройстве отстаёт.',
+            };
+
+            const finalMessage = customMessages[reason] || message;
+            return _orig.call(this, reason, finalMessage);
+        };
+
+        window.showInviteError._timePatched = true;
+        console.log('🕐 [InviteTime] ✅ showInviteError пропатчен');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЕЩЁ: ГЕНЕРАЦИЯ ССЫЛКИ
+    //  Убедимся что iat/exp используют серверное время, если доступно
+    // ═══════════════════════════════════════════════════════════
+    function patchLinkGeneration() {
+        if (!window.TempInvite) {
+            setTimeout(patchLinkGeneration, 500);
+            return;
+        }
+
+        if (window.TempInvite._timeGenPatched) return;
+
+        const _origBuild = window.TempInvite.build;
+        if (typeof _origBuild !== 'function') return;
+
+        window.TempInvite.build = async function(chatFile) {
+            // Пробуем получить серверное время ДО генерации,
+            // чтобы iat/exp были точными
+            try {
+                const trusted = await getTrustedNow();
+                if (trusted) {
+                    const skew = trusted.skew;
+                    if (Math.abs(skew) > CFG.MAX_CLOCK_SKEW_MS) {
+                        throw new Error(
+                            `Время на устройстве неверное (сбито на ${Math.round(skew / 1000)} сек). ` +
+                            `Синхронизируйте часы и попробуйте снова.`
+                        );
+                    }
+                    console.log(`🕐 [InviteTime] Время для генерации корректно (skew ${Math.round(skew / 1000)} сек)`);
+                } else {
+                    // Не смогли получить серверное время —
+                    // решаем: отказать или сгенерировать с локальным?
+                    if (CFG.REQUIRE_SERVER_TIME) {
+                        throw new Error(
+                            'Не удалось проверить время. Проверьте интернет и попробуйте снова.'
+                        );
+                    }
+                    console.warn('🕐 [InviteTime] Генерация по локальному времени (ослаблено)');
+                }
+            } catch (e) {
+                console.error('🕐 [InviteTime] Ошибка генерации:', e);
+                throw e;
+            }
+
+            return _origBuild.apply(this, arguments);
+        };
+
+        window.TempInvite._timeGenPatched = true;
+        console.log('🕐 [InviteTime] ✅ TempInvite.build пропатчен');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЗАПУСК
+    // ═══════════════════════════════════════════════════════════
+    patchTempInvite();
+    patchErrorDisplay();
+    patchLinkGeneration();
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API (для отладки и ручных тестов)
+    // ═══════════════════════════════════════════════════════════
+    window.InviteTimeValidation = {
+        // Получить текущее "доверенное" время
+        getTrustedNow: async () => {
+            const r = await getTrustedNow();
+            if (!r) return { error: 'Нет доступных источников времени' };
+            return {
+                serverNow: new Date(r.now).toISOString(),
+                localNow: new Date(r.localNow).toISOString(),
+                skewSec: Math.round(r.skew / 1000),
+                source: r.source,
+            };
+        },
+
+        // Проверить конкретную ссылку или payload
+        validate: async (payloadOrRaw) => {
+            let payload = payloadOrRaw;
+            // Если передали строку — попробуем распарсить через TempInvite
+            if (typeof payloadOrRaw === 'string' && window.TempInvite) {
+                const parsed = await window.TempInvite.parse(payloadOrRaw);
+                if (!parsed.ok) return parsed;
+                payload = parsed.payload;
+            }
+            return await validateInviteTime(payload);
+        },
+
+        // Сбросить кэш времени (для тестов)
+        clearCache: () => {
+            _timeCache = null;
+            console.log('🕐 [InviteTime] Кэш времени сброшен');
+        },
+
+        // Статус
+        status: () => {
+            const cached = getCachedOffset();
+            return {
+                hasCache: !!cached,
+                cacheAgeMs: cached ? Date.now() - cached.ts : null,
+                cachedOffsetMs: cached ? cached.offset : null,
+                config: { ...CFG },
+                patched: {
+                    tempInviteParse: !!(window.TempInvite && window.TempInvite._timeValidationPatched),
+                    tempInviteBuild: !!(window.TempInvite && window.TempInvite._timeGenPatched),
+                    showInviteError: !!(window.showInviteError && window.showInviteError._timePatched),
+                },
+            };
+        },
+    };
+
+    console.log('🕐 [InviteTime] ✅ Готово:');
+    console.log('   • Время проверяется по GitHub + WorldTimeAPI + timeapi.io');
+    console.log('   • Медиана из доступных источников');
+    console.log('   • Откат часов ловится через |serverNow - localNow| > 5 мин');
+    console.log('   • API: InviteTimeValidation.status() / .getTrustedNow() / .validate(payload)');
+})();
+
 </script>
 </body>
 </html>
