@@ -74471,6 +74471,1395 @@ async function sendAnnouncement() {
     console.log('   • CSS скрывает их даже если успели появиться');
     console.log('   • API: AvatarBlockCleaner.clean()');
 })();
+</script><script>
+// ═══════════════════════════════════════════════════════════════
+//  🩹 ФИКС v2: ПОЛНОЕ ОТКЛЮЧЕНИЕ РАДИО ПРИ УДАЛЕНИИ ВИДЖЕТА
+//  ─────────────────────────────────────────────────────────────
+//  Убиваем:
+//   1. audio-элемент (включая повторное создание)
+//   2. RadioAutoRetry (все таймеры, attachToAudio, stalled, error)
+//   3. RadioWidget.play / playStation / playRandom
+//   4. RadioPlaylist.next / prev / playByIndex / playById
+//   5. RadioWidget.play через глобальный перехватчик
+//   6. Восстанавливаем audio только если виджет снова активен
+// ═══════════════════════════════════════════════════════════════
+
+(function fixRadioPlayOnRemoveV2() {
+    'use strict';
+
+    console.log('🩹 [RadioKill v2] Установка…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОСТОЯНИЕ
+    // ═══════════════════════════════════════════════════════════
+    const KILL = {
+        active: false,          // идёт удаление / виджет неактивен
+        lastKillAt: 0,
+        watchdogTimer: null,
+        audioWatcher: null,
+        // «Пул» из уже воспроизводимых станций — чтобы
+        // восстановить если виджет вернут
+        lastStationUrl: null,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  1. ОПРЕДЕЛЯЕМ: виджет вообще активен?
+    // ═══════════════════════════════════════════════════════════
+    function isWidgetActive() {
+        try {
+            if (typeof WidgetsRegistry === 'undefined') return true;  // нет реестра = пусть живёт
+            return WidgetsRegistry.isActive('radio');
+        } catch (e) { return true; }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  2. ПОЛНОЕ УНИЧТОЖЕНИЕ AUDIO
+    //  Убираем и из DOM, и обнуляем ссылки везде
+    // ═══════════════════════════════════════════════════════════
+    function obliterateAudio() {
+        const audio = document.getElementById('radioWidgetAudio');
+        if (!audio) return false;
+
+        console.log('🩹 [RadioKill v2] Уничтожаем radioWidgetAudio');
+
+        // 1. Запоминаем URL на случай восстановления
+        if (audio.src && !audio.src.startsWith('blob:')) {
+            KILL.lastStationUrl = audio.src;
+        }
+
+        // 2. Пауза
+        try { audio.pause(); } catch (e) {}
+
+        // 3. Снимаем ВСЕ обработчики через cloneNode
+        //    (cloneNode(false) не копирует listeners)
+        let fresh = null;
+        try {
+            fresh = audio.cloneNode(false);
+            fresh.removeAttribute('src');
+            fresh.srcObject = null;
+            fresh.preload = 'none';
+            fresh.muted = true;   // чтобы точно не заиграл
+            fresh.style.display = 'none';
+        } catch (e) {}
+
+        // 4. Заменяем в DOM
+        try {
+            if (audio.parentNode) {
+                if (fresh) {
+                    audio.parentNode.replaceChild(fresh, audio);
+                } else {
+                    audio.parentNode.removeChild(audio);
+                }
+            }
+        } catch (e) {}
+
+        // 5. Сброс старого audio
+        try { audio.removeAttribute('src'); } catch (e) {}
+        try { audio.srcObject = null; } catch (e) {}
+        try { audio.load(); } catch (e) {}
+
+        // 6. Убираем «свежий» из DOM через тик
+        setTimeout(() => {
+            try {
+                if (fresh && fresh.parentNode) {
+                    fresh.parentNode.removeChild(fresh);
+                }
+            } catch (e) {}
+        }, 30);
+
+        // 7. Чистим localStorage — чтобы при возврате виджета
+        //    не заиграло с того же места
+        try {
+            localStorage.removeItem('smschat_radio_state');
+        } catch (e) {}
+
+        return true;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. ГЛОБАЛЬНЫЙ ПЕРЕХВАТЧИК audio в DOM
+    //  Если кто-то создаёт <audio id="radioWidgetAudio">,
+    //  пока виджет неактивен — НЕ ДАЁМ ему заиграть.
+    // ═══════════════════════════════════════════════════════════
+    function installAudioCreationBlocker() {
+        // Мутация: если в DOM появился audio#radioWidgetAudio,
+        // а виджета нет — немедленно глушим и удаляем
+        if (KILL.audioWatcher) KILL.audioWatcher.disconnect();
+
+        KILL.audioWatcher = new MutationObserver((mutations) => {
+            if (!KILL.active) return;
+            for (const m of mutations) {
+                for (const node of m.addedNodes) {
+                    if (node.nodeType !== 1) continue;
+                    if (node.id === 'radioWidgetAudio') {
+                        console.log('🩹 [RadioKill v2] Пойман новый audio — уничтожаем');
+                        // Глушим сразу
+                        try { node.muted = true; node.pause(); } catch (e) {}
+                        try { node.removeAttribute('src'); node.load(); } catch (e) {}
+                        try { node.remove(); } catch (e) {}
+                        // И через тик — на случай если source уже пошёл
+                        setTimeout(() => {
+                            try {
+                                if (node.parentNode) node.parentNode.removeChild(node);
+                            } catch (e) {}
+                        }, 20);
+                    }
+                }
+            }
+        });
+
+        KILL.audioWatcher.observe(document.body, {
+            childList: true,
+            subtree: true,
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  4. ПАТЧ ВСЕХ ТОЧЕК ЗАПУСКА РАДИО
+    // ═══════════════════════════════════════════════════════════
+    function patchAllRadioEntryPoints() {
+        // 4.1. RadioWidget.play
+        if (typeof RadioWidget !== 'undefined' && typeof RadioWidget.play === 'function') {
+            if (!RadioWidget.play._killed) {
+                const _origPlay = RadioWidget.play;
+                RadioWidget.play = function(id) {
+                    if (KILL.active) {
+                        console.log('🩹 [RadioKill v2] RadioWidget.play заблокирован');
+                        return;
+                    }
+                    return _origPlay.apply(this, arguments);
+                };
+                RadioWidget.play._killed = true;
+            }
+        }
+
+        // 4.2. RadioWidget.playRandom
+        if (typeof RadioWidget !== 'undefined' && typeof RadioWidget.playRandom === 'function') {
+            if (!RadioWidget.playRandom._killed) {
+                const _origPR = RadioWidget.playRandom;
+                RadioWidget.playRandom = function() {
+                    if (KILL.active) {
+                        console.log('🩹 [RadioKill v2] RadioWidget.playRandom заблокирован');
+                        return;
+                    }
+                    return _origPR.apply(this, arguments);
+                };
+                RadioWidget.playRandom._killed = true;
+            }
+        }
+
+        // 4.3. RadioWidget.toggle
+        if (typeof RadioWidget !== 'undefined' && typeof RadioWidget.toggle === 'function') {
+            if (!RadioWidget.toggle._killed) {
+                const _origT = RadioWidget.toggle;
+                RadioWidget.toggle = function() {
+                    if (KILL.active) {
+                        console.log('🩹 [RadioKill v2] RadioWidget.toggle заблокирован');
+                        return;
+                    }
+                    return _origT.apply(this, arguments);
+                };
+                RadioWidget.toggle._killed = true;
+            }
+        }
+
+        // 4.4. RadioPlaylist — всё, что может запустить воспроизведение
+        if (typeof RadioPlaylist !== 'undefined') {
+            ['next', 'prev', 'playByIndex', 'playById'].forEach(method => {
+                if (typeof RadioPlaylist[method] !== 'function') return;
+                if (RadioPlaylist[method]._killed) return;
+
+                const _orig = RadioPlaylist[method];
+                RadioPlaylist[method] = function(...args) {
+                    if (KILL.active) {
+                        console.log(`🩹 [RadioKill v2] RadioPlaylist.${method} заблокирован`);
+                        return;
+                    }
+                    return _orig.apply(this, args);
+                };
+                RadioPlaylist[method]._killed = true;
+            });
+        }
+
+        // 4.5. RadioAutoRetry
+        if (typeof RadioAutoRetry !== 'undefined') {
+            if (typeof RadioAutoRetry.start === 'function' && !RadioAutoRetry.start._killed) {
+                const _origStart = RadioAutoRetry.start;
+                RadioAutoRetry.start = function(type) {
+                    if (KILL.active) {
+                        console.log('🩹 [RadioKill v2] RadioAutoRetry.start заблокирован');
+                        return;
+                    }
+                    return _origStart.apply(this, arguments);
+                };
+                RadioAutoRetry.start._killed = true;
+            }
+
+            if (typeof RadioAutoRetry.stop === 'function') {
+                try { RadioAutoRetry.stop('widget removed'); } catch (e) {}
+            }
+        }
+
+        // 4.6. MediaSession — отдать обратно GlobalPlayer
+        if (typeof RadioPlaylist !== 'undefined'
+            && typeof RadioPlaylist.release === 'function') {
+            try { RadioPlaylist.release(); } catch (e) {}
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  5. АКТИВАЦИЯ / ДЕАКТИВАЦИЯ KILL
+    // ═══════════════════════════════════════════════════════════
+    function activateKill(reason) {
+        KILL.active = true;
+        KILL.lastKillAt = Date.now();
+        console.log(`🩹 [RadioKill v2] KILL активирован (${reason})`);
+
+        // 1. Убиваем audio
+        obliterateAudio();
+
+        // 2. Убиваем ещё раз через 100, 500, 1500, 3000, 6000 мс
+        //    (на случай если RadioAutoRetry создаст новый)
+        [100, 500, 1500, 3000, 6000, 12000].forEach(delay => {
+            setTimeout(() => {
+                if (!KILL.active) return;
+                if (isWidgetActive()) return;   // виджет вернули — не трогаем
+                obliterateAudio();
+            }, delay);
+        });
+
+        // 3. Запускаем watchdog (каждые 500 мс)
+        startWatchdog();
+    }
+
+    function deactivateKill(reason) {
+        if (!KILL.active) return;
+        KILL.active = false;
+        console.log(`🩹 [RadioKill v2] KILL деактивирован (${reason})`);
+
+        stopWatchdog();
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  6. WATCHDOG — каждые 500 мс проверяем
+    // ═══════════════════════════════════════════════════════════
+    function startWatchdog() {
+        if (KILL.watchdogTimer) return;
+        KILL.watchdogTimer = setInterval(() => {
+            // Если виджет активен — снимаем KILL
+            if (isWidgetActive()) {
+                if (KILL.active) {
+                    deactivateKill('widget restored');
+                }
+                return;
+            }
+
+            // Если виджет НЕ активен — глушим всё
+            const audio = document.getElementById('radioWidgetAudio');
+            if (audio) {
+                if (!audio.paused || audio.src) {
+                    console.log('🩹 [RadioKill v2] Watchdog: audio найден — глушим');
+                    try { audio.muted = true; audio.pause(); } catch (e) {}
+                    try { audio.removeAttribute('src'); audio.load(); } catch (e) {}
+                    try { audio.remove(); } catch (e) {}
+                }
+            }
+        }, 500);
+    }
+
+    function stopWatchdog() {
+        if (KILL.watchdogTimer) {
+            clearInterval(KILL.watchdogTimer);
+            KILL.watchdogTimer = null;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  7. ПЕРЕХВАТ WidgetsRegistry.remove ДЛЯ 'radio'
+    // ═══════════════════════════════════════════════════════════
+    if (typeof WidgetsRegistry !== 'undefined' && typeof WidgetsRegistry.remove === 'function') {
+        const _origRemove = WidgetsRegistry.remove;
+        WidgetsRegistry.remove = function(id) {
+            if (id === 'radio') {
+                console.log('🩹 [RadioKill v2] Перехвачено remove(radio)');
+                activateKill('WidgetsRegistry.remove');
+            }
+            const result = _origRemove.apply(this, arguments);
+            if (id === 'radio') {
+                // Ещё раз через 50 мс — после перерисовки
+                setTimeout(() => {
+                    if (KILL.active) obliterateAudio();
+                }, 50);
+                setTimeout(() => {
+                    if (KILL.active) obliterateAudio();
+                }, 300);
+            }
+            return result;
+        };
+        console.log('🩹 [RadioKill v2] WidgetsRegistry.remove пропатчен');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  8. ПЕРЕХВАТ WidgetsRegistry.add — если radio вернули,
+    //     снимаем KILL
+    // ═══════════════════════════════════════════════════════════
+    if (typeof WidgetsRegistry !== 'undefined' && typeof WidgetsRegistry.add === 'function') {
+        const _origAdd = WidgetsRegistry.add;
+        WidgetsRegistry.add = function(id) {
+            const result = _origAdd.apply(this, arguments);
+            if (id === 'radio') {
+                console.log('🩹 [RadioKill v2] Виджет radio восстановлен — снимаем KILL');
+                deactivateKill('WidgetsRegistry.add');
+            }
+            return result;
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  9. ГЛОБАЛЬНЫЙ ПЕРЕХВАТ AUDIO.play() — БОМБА
+    //  Даже если кто-то получил audio и вызывает play() —
+    //  мы не даём, если виджета нет.
+    //  Это перехват на уровне прототипа — работает для ВСЕХ audio.
+    // ═══════════════════════════════════════════════════════════
+    try {
+        const origPlay = HTMLMediaElement.prototype.play;
+
+        HTMLMediaElement.prototype.play = function() {
+            // Это radio-audio?
+            if (this.id === 'radioWidgetAudio' && !isWidgetActive()) {
+                console.log('🩹 [RadioKill v2] Перехвачен play() на radioWidgetAudio — виджет неактивен');
+                return Promise.reject(new Error('Radio widget inactive'));
+            }
+            return origPlay.apply(this, arguments);
+        };
+
+        console.log('🩹 [RadioKill v2] HTMLMediaElement.prototype.play перехвачен');
+    } catch (e) {
+        console.warn('🩹 [RadioKill v2] Не удалось перехватить play():', e);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  10. ЕЩЁ ОДНА СТРАХОВКА: глобальный обработчик
+    //  media event 'play' на audio с id=radioWidgetAudio,
+    //  когда виджет неактивен — немедленно ставим паузу
+    // ═══════════════════════════════════════════════════════════
+    document.addEventListener('play', (e) => {
+        if (!e.target || e.target.tagName !== 'AUDIO') return;
+        if (e.target.id !== 'radioWidgetAudio') return;
+        if (isWidgetActive()) return;
+
+        console.log('🩹 [RadioKill v2] Пойман play на неактивном radio — стоп');
+        try { e.target.pause(); } catch (err) {}
+        try { e.target.removeAttribute('src'); } catch (err) {}
+    }, true);
+
+    // То же для 'playing'
+    document.addEventListener('playing', (e) => {
+        if (!e.target || e.target.tagName !== 'AUDIO') return;
+        if (e.target.id !== 'radioWidgetAudio') return;
+        if (isWidgetActive()) return;
+
+        console.log('🩹 [RadioKill v2] Пойман playing на неактивном radio — стоп');
+        try { e.target.pause(); } catch (err) {}
+        try { e.target.removeAttribute('src'); } catch (err) {}
+    }, true);
+
+    // ═══════════════════════════════════════════════════════════
+    //  11. ИНИЦИАЛИЗАЦИЯ ПРИ СТАРТЕ
+    // ═══════════════════════════════════════════════════════════
+    installAudioCreationBlocker();
+
+    // Если при загрузке виджета нет, но audio есть — глушим
+    setTimeout(() => {
+        if (!isWidgetActive()) {
+            activateKill('startup — widget not active');
+        }
+    }, 2000);
+
+    // При смене экрана — перепроверяем
+    if (typeof showChatsScreen === 'function') {
+        const _origShowChats = showChatsScreen;
+        showChatsScreen = function() {
+            const r = _origShowChats.apply(this, arguments);
+            setTimeout(() => {
+                if (!isWidgetActive()) {
+                    activateKill('showChatsScreen');
+                }
+            }, 200);
+            return r;
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  API
+    // ═══════════════════════════════════════════════════════════
+    window.RadioKill = {
+        status: () => ({
+            killActive: KILL.active,
+            widgetActive: isWidgetActive(),
+            audioExists: !!document.getElementById('radioWidgetAudio'),
+            audioPaused: (() => {
+                const a = document.getElementById('radioWidgetAudio');
+                return a ? a.paused : null;
+            })(),
+            lastKillAgo: KILL.lastKillAt
+                ? Math.round((Date.now() - KILL.lastKillAt) / 1000) + 's'
+                : 'never',
+        }),
+        activate: (reason) => activateKill(reason || 'manual'),
+        deactivate: (reason) => deactivateKill(reason || 'manual'),
+        obliterate: () => obliterateAudio(),
+    };
+
+    console.log('🩹 [RadioKill v2] ✅ Готово:');
+    console.log('   • Перехвачен HTMLMediaElement.prototype.play');
+    console.log('   • MutationObserver ловит создание нового audio');
+    console.log('   • Watchdog каждые 500 мс');
+    console.log('   • KILL активируется при remove(radio)');
+    console.log('   • API: RadioKill.status() / .activate() / .deactivate()');
+})();
+</script><script>
+// ═══════════════════════════════════════════════════════════════
+//  🔇 ФИКС v3: ГЛУШИМ ТОСТ «ПОТОК НЕ ЗАПУСТИЛСЯ» + ЦИКЛ RETRY
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: RadioAutoRetry v2 в цикле пробует playStation(),
+//  каждая попытка падает (мы блокируем play) → showToast
+//  «Поток не запустился» каждые 500-6000 мс.
+//
+//  Решение:
+//   1. Глушим конкретный тост, если виджет неактивен.
+//   2. Останавливаем RadioAutoRetry при KILL.
+//   3. Глушим ensureAudio, если виджет неактивен — НЕ создаём
+//      новый audio.
+//   4. Перехватываем все showToast с этим текстом.
+// ═══════════════════════════════════════════════════════════════
+
+(function fixRadioStopToastsV3() {
+    'use strict';
+
+    console.log('🔇 [RadioToastFix v3] Установка…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХЕЛПЕР: виджет активен?
+    // ═══════════════════════════════════════════════════════════
+    function isWidgetActive() {
+        try {
+            if (typeof WidgetsRegistry === 'undefined') return true;
+            return WidgetsRegistry.isActive('radio');
+        } catch (e) { return true; }
+    }
+
+    function isKillActive() {
+        return (typeof RadioKill !== 'undefined' && RadioKill.status)
+            ? RadioKill.status().killActive
+            : false;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  1. ГЛУШИМ ТОСТ «Поток не запустился»
+    //  Перехватываем showToast глобально и фильтруем
+    // ═══════════════════════════════════════════════════════════
+    if (typeof window.showToast === 'function') {
+        if (!window.showToast._radioBlocked) {
+            const _origShowToast = window.showToast;
+
+            window.showToast = function(text, duration) {
+                // Блокируем только если это радио-тост И виджет неактивен
+                if (typeof text === 'string') {
+                    const isRadioError =
+                        text.includes('Поток не запустился') ||
+                        text.includes('Не удалось воспроизвести') ||
+                        text.includes('Станция недоступна');
+
+                    if (isRadioError && !isWidgetActive()) {
+                        console.log('🔇 [RadioToastFix v3] Заблокирован тост:', text);
+                        return;
+                    }
+                }
+                return _origShowToast.call(this, text, duration);
+            };
+            window.showToast._radioBlocked = true;
+            console.log('🔇 [RadioToastFix v3] showToast перехвачен');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  2. ОСТАНАВЛИВАЕМ RadioAutoRetry при KILL
+    //  Просто вызвать stop() недостаточно — модуль держит
+    //  внутреннее состояние R.active. Нужно ещё обнулить
+    //  таймеры через патч.
+    // ═══════════════════════════════════════════════════════════
+    if (typeof RadioAutoRetry !== 'undefined') {
+        // 2.1. Патчим start — уже есть в RadioKill, но на всякий
+        if (typeof RadioAutoRetry.start === 'function' && !RadioAutoRetry.start._v3) {
+            const _origStart = RadioAutoRetry.start;
+            RadioAutoRetry.start = function(type) {
+                if (!isWidgetActive() || isKillActive()) {
+                    console.log('🔇 [RadioToastFix v3] RadioAutoRetry.start заблокирован');
+                    return;
+                }
+                return _origStart.apply(this, arguments);
+            };
+            RadioAutoRetry.start._v3 = true;
+        }
+
+        // 2.2. Принудительно stop при любой ошибке audio
+        //  (RadioAutoRetry внутри слушает error и снова стартует —
+        //   надо перехватить)
+        if (typeof RadioAutoRetry.stop === 'function' && !RadioAutoRetry.stop._v3) {
+            const _origStop = RadioAutoRetry.stop;
+            RadioAutoRetry.stop = function(reason) {
+                return _origStop.call(this, reason || 'v3-force-stop');
+            };
+            RadioAutoRetry.stop._v3 = true;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  3. ГЛУШИМ ensureAudio — если виджет неактивен,
+    //     НЕ ДАЁМ создать новый audio (это главная причина тоста)
+    // ═══════════════════════════════════════════════════════════
+    //  ensureAudio — внутренняя функция RadioWidget v4, недоступна.
+    //  Но мы можем обойти через:
+    //    - MutationObserver на body (ловим создание audio#radioWidgetAudio)
+    //    - Перехват appendChild
+    //  ═══ MutationObserver УЖЕ ЕСТЬ в RadioKill v2 ═══
+    //  Но он удаляет audio, а не предотвращает его создание.
+    //  Из-за этого между созданием и удалением может проскочить
+    //  один цикл play() → error → тост.
+    //
+    //  Дополнительно: перехватываем document.body.appendChild
+    // ═══════════════════════════════════════════════════════════
+    if (!window._radioAppendBlocked) {
+        const _origAppendChild = Node.prototype.appendChild;
+
+        Node.prototype.appendChild = function(node) {
+            // Если это radio-audio и виджет неактивен — блокируем
+            if (node && node.nodeType === 1
+                && node.tagName === 'AUDIO'
+                && node.id === 'radioWidgetAudio'
+                && !isWidgetActive()) {
+                console.log('🔇 [RadioToastFix v3] appendChild(radioWidgetAudio) заблокирован');
+                // Возвращаем узел, но не добавляем его
+                // (чтобы код не упал с null)
+                try {
+                    node.muted = true;
+                    node.pause();
+                } catch (e) {}
+                // Не бросаем ошибку — просто не добавляем
+                return node;
+            }
+            return _origAppendChild.apply(this, arguments);
+        };
+
+        window._radioAppendBlocked = true;
+        console.log('🔇 [RadioToastFix v3] appendChild перехвачен');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  4. ПЕРЕХВАТ ОШИБКИ AUDIO — не даём RadioAutoRetry
+    //     среагировать на ошибку (он слушает 'error' в capture)
+    // ═══════════════════════════════════════════════════════════
+    document.addEventListener('error', (e) => {
+        if (!e.target || e.target.tagName !== 'AUDIO') return;
+        if (e.target.id !== 'radioWidgetAudio') return;
+        if (isWidgetActive() && !isKillActive()) return;
+
+        // Глушим — не даём обработчику RadioAutoRetry сработать
+        e.stopImmediatePropagation();
+        e.preventDefault();
+        console.log('🔇 [RadioToastFix v3] error заблокирован');
+
+        // Убираем audio
+        try {
+            e.target.muted = true;
+            e.target.pause();
+            e.target.removeAttribute('src');
+            e.target.load();
+            if (e.target.parentNode) e.target.parentNode.removeChild(e.target);
+        } catch (err) {}
+    }, true);   // capture — раньше всех
+
+    // То же для 'stalled' — RadioAutoRetry имеет обработчик с setTimeout
+    document.addEventListener('stalled', (e) => {
+        if (!e.target || e.target.tagName !== 'AUDIO') return;
+        if (e.target.id !== 'radioWidgetAudio') return;
+        if (isWidgetActive() && !isKillActive()) return;
+        e.stopImmediatePropagation();
+        e.preventDefault();
+        console.log('🔇 [RadioToastFix v3] stalled заблокирован');
+    }, true);
+
+    // ═══════════════════════════════════════════════════════════
+    //  5. WATCHDOG v3 — если появился audio при неактивном
+    //     виджете, немедленно убиваем БЕЗ error-эффектов
+    // ═══════════════════════════════════════════════════════════
+    let _watcher = new MutationObserver((mutations) => {
+        for (const m of mutations) {
+            for (const node of m.addedNodes) {
+                if (node.nodeType !== 1) continue;
+                if (node.id === 'radioWidgetAudio' && !isWidgetActive()) {
+                    console.log('🔇 [RadioToastFix v3] Пойман новый audio — уничтожаем');
+
+                    // Снимаем src ДО pause/load, чтобы не было error
+                    try {
+                        node.muted = true;
+                        node.srcObject = null;
+                        node.removeAttribute('src');
+                    } catch (e) {}
+                    try { node.pause(); } catch (e) {}
+                    try { node.load(); } catch (e) {}
+
+                    // Убираем из DOM через тик
+                    setTimeout(() => {
+                        try {
+                            if (node.parentNode) {
+                                node.parentNode.removeChild(node);
+                            }
+                        } catch (e) {}
+                    }, 10);
+                }
+            }
+        }
+    });
+
+    _watcher.observe(document.body, { childList: true, subtree: true });
+
+    // ═══════════════════════════════════════════════════════════
+    //  6. ПЕРИОДИЧЕСКАЯ ПРОВЕРКА — стоп RadioAutoRetry
+    //     если виджет неактивен
+    // ═══════════════════════════════════════════════════════════
+    setInterval(() => {
+        if (isWidgetActive()) return;
+        if (typeof RadioAutoRetry !== 'undefined'
+            && typeof RadioAutoRetry.status === 'function') {
+            try {
+                const st = RadioAutoRetry.status();
+                if (st && st.active) {
+                    console.log('🔇 [RadioToastFix v3] Принудительный stop RadioAutoRetry');
+                    try { RadioAutoRetry.stop('widget removed'); } catch (e) {}
+                }
+            } catch (e) {}
+        }
+    }, 1000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  API
+    // ═══════════════════════════════════════════════════════════
+    window.RadioToastFix = {
+        status: () => ({
+            widgetActive: isWidgetActive(),
+            killActive: isKillActive(),
+            autoRetryActive: (typeof RadioAutoRetry !== 'undefined'
+                && RadioAutoRetry.status)
+                ? RadioAutoRetry.status().active
+                : null,
+            showToastBlocked: !!window.showToast._radioBlocked,
+            appendChildBlocked: !!window._radioAppendBlocked,
+        }),
+        forceStopAll: () => {
+            try { if (typeof RadioAutoRetry !== 'undefined') RadioAutoRetry.stop('manual'); } catch (e) {}
+            const audio = document.getElementById('radioWidgetAudio');
+            if (audio) {
+                try {
+                    audio.muted = true;
+                    audio.removeAttribute('src');
+                    audio.pause();
+                    audio.load();
+                    audio.remove();
+                } catch (e) {}
+            }
+            console.log('🔇 [RadioToastFix v3] Принудительная остановка всего');
+        },
+    };
+
+    console.log('🔇 [RadioToastFix v3] ✅ Готово:');
+    console.log('   • Тост «Поток не запустился» глушится');
+    console.log('   • appendChild(radioWidgetAudio) блокируется');
+    console.log('   • RadioAutoRetry.stop() при неактивном виджете');
+    console.log('   • error и stalled глушатся в capture-фазе');
+    console.log('   • API: RadioToastFix.status() / .forceStopAll()');
+})();
+</script><script>
+// ═══════════════════════════════════════════════════════════════
+//  🗑️ УНИВЕРСАЛЬНОЕ МИНИ-МЕНЮ УДАЛЕНИЯ ВИДЖЕТА (LONG-PRESS)
+//  ─────────────────────────────────────────────────────────────
+//  • Работает для ЛЮБОГО виджета из WidgetsRegistry
+//  • Долгое нажатие (600 мс) → маленькое меню «Убрать виджет»
+//  • Работает и на мобиле (touch), и на десктопе (mousedown)
+//  • ПКМ (contextmenu) тоже открывает меню — для десктопа удобно
+//  • Не конфликтует с кликами по кнопкам внутри виджета
+//  • ClockWidget, Radio, Weather — все получат поддержку
+// ═══════════════════════════════════════════════════════════════
+
+(function installWidgetLongPressMenu() {
+    'use strict';
+
+    console.log('🗑️ [WidgetLongPress] Установка универсального long-press меню…');
+
+    const CFG = {
+        LONG_PRESS_MS: 600,
+        HAPTIC: 25,
+        // Какие элементы внутри виджета НЕ должны вызывать long-press
+        IGNORE_SELECTORS: [
+            'button',
+            'input',
+            'select',
+            'textarea',
+            'a',
+            '[data-radio-action]',
+            '.cw-edit',
+            '.wc-refresh-btn',
+        ].join(', '),
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОСТОЯНИЕ
+    // ═══════════════════════════════════════════════════════════
+    const LPM = {
+        pressTimer: null,
+        pressTarget: null,       // DOM-элемент карточки
+        widgetId: null,          // id виджета (из data-widget-id)
+        startX: 0,
+        startY: 0,
+        fired: false,
+        menuEl: null,
+        backdropEl: null,
+        longPressTriggered: false,
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  СТИЛИ
+    // ═══════════════════════════════════════════════════════════
+    if (!document.getElementById('widgetLongPressStyles')) {
+        const style = document.createElement('style');
+        style.id = 'widgetLongPressStyles';
+        style.textContent = `
+            /* ═══ Затемнение ═══ */
+            #widgetLpBackdrop {
+                position: fixed;
+                inset: 0;
+                background: rgba(0, 0, 0, 0.5);
+                backdrop-filter: blur(4px);
+                -webkit-backdrop-filter: blur(4px);
+                z-index: 9400;
+                display: none;
+                opacity: 0;
+                transition: opacity 0.18s ease;
+            }
+            #widgetLpBackdrop.show {
+                display: block;
+                opacity: 1;
+            }
+
+            /* ═══ Мини-меню ═══ */
+            #widgetLpMenu {
+                position: fixed;
+                z-index: 9401;
+                background: #1a1a2e;
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                border-radius: 16px;
+                padding: 8px;
+                display: none;
+                flex-direction: column;
+                gap: 4px;
+                box-shadow: 0 20px 60px rgba(0, 0, 0, 0.75),
+                            0 0 0 1px rgba(108, 92, 231, 0.15);
+                backdrop-filter: blur(24px);
+                -webkit-backdrop-filter: blur(24px);
+                min-width: 220px;
+                max-width: calc(100vw - 24px);
+                animation: wlpPop 0.2s cubic-bezier(0.22, 0.61, 0.36, 1);
+                transform-origin: center;
+                -webkit-tap-highlight-color: transparent;
+            }
+            #widgetLpMenu.show { display: flex; }
+
+            @keyframes wlpPop {
+                from { opacity: 0; transform: scale(0.9) translateY(-6px); }
+                to   { opacity: 1; transform: scale(1) translateY(0); }
+            }
+
+            /* ═══ Шапка с названием виджета ═══ */
+            #widgetLpMenu .wlp-header {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                padding: 8px 10px 10px;
+                border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+                margin-bottom: 4px;
+            }
+            #widgetLpMenu .wlp-header-icon {
+                width: 32px;
+                height: 32px;
+                border-radius: 10px;
+                background: linear-gradient(135deg,
+                    rgba(108, 92, 231, 0.3),
+                    rgba(0, 184, 148, 0.2));
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 16px;
+                flex-shrink: 0;
+            }
+            #widgetLpMenu .wlp-header-info {
+                flex: 1;
+                min-width: 0;
+            }
+            #widgetLpMenu .wlp-header-name {
+                font-size: 13px;
+                font-weight: 700;
+                color: #fff;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                margin-bottom: 2px;
+            }
+            #widgetLpMenu .wlp-header-sub {
+                font-size: 10px;
+                color: #888;
+            }
+
+            /* ═══ Пункт меню ═══ */
+            #widgetLpMenu .wlp-item {
+                display: flex;
+                align-items: center;
+                gap: 12px;
+                padding: 11px 14px;
+                border-radius: 10px;
+                cursor: pointer;
+                transition: background 0.15s ease, transform 0.1s ease;
+                user-select: none;
+                -webkit-user-select: none;
+                -webkit-tap-highlight-color: transparent;
+            }
+            #widgetLpMenu .wlp-item:hover {
+                background: rgba(255, 107, 107, 0.12);
+            }
+            #widgetLpMenu .wlp-item:active {
+                transform: scale(0.97);
+                background: rgba(255, 107, 107, 0.2);
+            }
+            #widgetLpMenu .wlp-item .wlp-icon {
+                width: 24px;
+                height: 24px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 16px;
+                flex-shrink: 0;
+            }
+            #widgetLpMenu .wlp-item .wlp-label {
+                flex: 1;
+                min-width: 0;
+                font-size: 14px;
+                font-weight: 600;
+                color: #ff6b6b;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+
+            /* ═══ Отмена ═══ */
+            #widgetLpMenu .wlp-cancel {
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                gap: 6px;
+                padding: 10px 14px;
+                margin-top: 2px;
+                border-radius: 10px;
+                background: rgba(255, 255, 255, 0.04);
+                border: 1px solid rgba(255, 255, 255, 0.06);
+                color: #888;
+                font-size: 13px;
+                font-weight: 600;
+                cursor: pointer;
+                transition: all 0.15s ease;
+                user-select: none;
+                -webkit-tap-highlight-color: transparent;
+                font-family: inherit;
+            }
+            #widgetLpMenu .wlp-cancel:hover {
+                background: rgba(255, 255, 255, 0.08);
+                color: #ccc;
+            }
+            #widgetLpMenu .wlp-cancel:active {
+                transform: scale(0.97);
+                background: rgba(255, 255, 255, 0.12);
+            }
+
+            /* ═══ Визуальный отклик при long-press ═══ */
+            .widget-card.wlp-pressing {
+                box-shadow:
+                    0 0 0 2px rgba(255, 107, 107, 0.5),
+                    0 6px 24px rgba(255, 107, 107, 0.3) !important;
+                transform: scale(0.985);
+                transition: all 0.15s ease;
+            }
+
+            /* ═══ На мобиле — bottom-sheet ═══ */
+            @media (max-width: 480px) {
+                #widgetLpMenu {
+                    left: 12px !important;
+                    right: 12px !important;
+                    bottom: 12px !important;
+                    top: auto !important;
+                    width: auto !important;
+                    min-width: 0;
+                    max-width: none;
+                    padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+                    animation: wlpSheet 0.24s cubic-bezier(0.22, 0.61, 0.36, 1);
+                }
+                @keyframes wlpSheet {
+                    from { opacity: 0; transform: translateY(20px); }
+                    to   { opacity: 1; transform: translateY(0); }
+                }
+                #widgetLpMenu .wlp-item { padding: 13px 14px; font-size: 15px; }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХЕЛПЕРЫ
+    // ═══════════════════════════════════════════════════════════
+    function showToastSafe(msg, dur) {
+        try { if (typeof showToast === 'function') showToast(msg, dur || 1500); } catch (e) {}
+    }
+
+    function isIgnoredTarget(target) {
+        if (!target || !target.closest) return false;
+        return !!target.closest(CFG.IGNORE_SELECTORS);
+    }
+
+    function getWidgetCard(target) {
+        if (!target || !target.closest) return null;
+        return target.closest('.widget-card[data-widget-id]');
+    }
+
+    function getWidgetInfo(widgetId) {
+        // Ищем в реестре
+        let name = widgetId;
+        let icon = '🧩';
+        let description = '';
+
+        try {
+            if (typeof WidgetsRegistry !== 'undefined'
+                && typeof WidgetsRegistry.available === 'function') {
+                const def = WidgetsRegistry.available().find(w => w.id === widgetId);
+                if (def) {
+                    name = def.name || widgetId;
+                    icon = def.icon || '🧩';
+                    description = def.description || '';
+                }
+            }
+        } catch (e) {}
+
+        return { name, icon, description };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОТКРЫТИЕ МЕНЮ
+    // ═══════════════════════════════════════════════════════════
+    function openMenu(widgetId, card, x, y) {
+        closeMenu();
+
+        LPM.widgetId = widgetId;
+        LPM.pressTarget = card;
+
+        // ─── Backdrop ───
+        const backdrop = document.createElement('div');
+        backdrop.id = 'widgetLpBackdrop';
+        backdrop.addEventListener('click', closeMenu);
+        document.body.appendChild(backdrop);
+        LPM.backdropEl = backdrop;
+
+        // ─── Меню ───
+        const info = getWidgetInfo(widgetId);
+        const menu = document.createElement('div');
+        menu.id = 'widgetLpMenu';
+        menu.innerHTML = `
+            <div class="wlp-header">
+                <div class="wlp-header-icon">${info.icon}</div>
+                <div class="wlp-header-info">
+                    <div class="wlp-header-name">${escapeHtml(info.name)}</div>
+                    <div class="wlp-header-sub">${escapeHtml(info.description || 'Виджет')}</div>
+                </div>
+            </div>
+            <div class="wlp-item" data-action="remove">
+                <span class="wlp-icon">🗑️</span>
+                <span class="wlp-label">Убрать этот виджет</span>
+            </div>
+            <div class="wlp-cancel" data-action="cancel">✕ Отмена</div>
+        `;
+        document.body.appendChild(menu);
+        LPM.menuEl = menu;
+
+        // ─── Позиционирование (десктоп) ───
+        if (window.innerWidth > 480) {
+            const menuRect = menu.getBoundingClientRect();
+            const margin = 10;
+            let left = (x || window.innerWidth / 2) - menuRect.width / 2;
+            let top = (y || window.innerHeight / 2) - menuRect.height / 2;
+
+            if (x != null && y != null) {
+                // Позиционируем относительно нажатия, но чуть выше
+                top = y - menuRect.height - 12;
+                if (top < margin) top = y + 20;
+            }
+
+            left = Math.max(margin, Math.min(left, window.innerWidth - menuRect.width - margin));
+            top = Math.max(margin, Math.min(top, window.innerHeight - menuRect.height - margin));
+
+            menu.style.left = left + 'px';
+            menu.style.top = top + 'px';
+        }
+
+        // ─── Показать с анимацией ───
+        requestAnimationFrame(() => {
+            backdrop.classList.add('show');
+            menu.classList.add('show');
+        });
+
+        // ─── Обработчики пунктов ───
+        menu.querySelectorAll('[data-action]').forEach(el => {
+            el.addEventListener('click', (e) => {
+                e.stopPropagation();
+                e.preventDefault();
+                const action = el.dataset.action;
+                if (action === 'remove') {
+                    removeWidget(widgetId);
+                } else if (action === 'cancel') {
+                    closeMenu();
+                }
+            });
+        });
+
+        // ─── Escape ───
+        setTimeout(() => {
+            document.addEventListener('keydown', onKeyDown, true);
+        }, 0);
+
+        if (navigator.vibrate) navigator.vibrate(CFG.HAPTIC);
+        try { if (typeof soundManager !== 'undefined') soundManager.play('click'); } catch (e) {}
+
+        console.log(`🗑️ [WidgetLongPress] Меню открыто для «${widgetId}»`);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  УДАЛЕНИЕ
+    // ═══════════════════════════════════════════════════════════
+    function removeWidget(widgetId) {
+        closeMenu();
+
+        const info = getWidgetInfo(widgetId);
+
+        try {
+            if (typeof WidgetsRegistry !== 'undefined'
+                && typeof WidgetsRegistry.remove === 'function') {
+                WidgetsRegistry.remove(widgetId);
+                showToastSafe(`🗑️ Виджет «${info.name}» убран`, 1800);
+                try { if (typeof soundManager !== 'undefined') soundManager.play('delete'); } catch (e) {}
+                if (navigator.vibrate) navigator.vibrate([20, 40, 20]);
+                console.log(`🗑️ [WidgetLongPress] Виджет «${widgetId}» удалён`);
+            } else {
+                showToastSafe('❌ Реестр виджетов недоступен', 2000);
+            }
+        } catch (e) {
+            console.error('🗑️ [WidgetLongPress] remove error:', e);
+            showToastSafe('❌ Не удалось удалить', 2000);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ЗАКРЫТИЕ
+    // ═══════════════════════════════════════════════════════════
+    function closeMenu() {
+        if (LPM.menuEl) {
+            LPM.menuEl.classList.remove('show');
+            const el = LPM.menuEl;
+            setTimeout(() => { try { el.remove(); } catch (e) {} }, 200);
+            LPM.menuEl = null;
+        }
+        if (LPM.backdropEl) {
+            LPM.backdropEl.classList.remove('show');
+            const el = LPM.backdropEl;
+            setTimeout(() => { try { el.remove(); } catch (e) {} }, 200);
+            LPM.backdropEl = null;
+        }
+        document.removeEventListener('keydown', onKeyDown, true);
+
+        LPM.widgetId = null;
+        LPM.pressTarget = null;
+    }
+
+    function onKeyDown(e) {
+        if (e.key === 'Escape' && LPM.menuEl) {
+            e.preventDefault();
+            e.stopPropagation();
+            closeMenu();
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  LONG-PRESS: НАЧАЛО
+    // ═══════════════════════════════════════════════════════════
+    function startPress(e) {
+        // Уже открыто меню — игнорируем
+        if (LPM.menuEl) return;
+
+        const card = getWidgetCard(e.target);
+        if (!card) return;
+
+        // Клик по интерактивному элементу внутри виджета — игнорируем
+        if (isIgnoredTarget(e.target)) return;
+
+        const widgetId = card.dataset.widgetId;
+        if (!widgetId) return;
+
+        // Координаты
+        let x = 0, y = 0;
+        if (e.touches && e.touches.length > 0) {
+            x = e.touches[0].clientX;
+            y = e.touches[0].clientY;
+        } else if (e.changedTouches && e.changedTouches.length > 0) {
+            x = e.changedTouches[0].clientX;
+            y = e.changedTouches[0].clientY;
+        } else {
+            x = e.clientX;
+            y = e.clientY;
+        }
+
+        LPM.startX = x;
+        LPM.startY = y;
+        LPM.fired = false;
+        LPM.longPressTriggered = false;
+        LPM.pressTarget = card;
+        LPM.widgetId = widgetId;
+
+        // Визуальный отклик
+        card.classList.add('wlp-pressing');
+
+        // Таймер
+        clearTimeout(LPM.pressTimer);
+        LPM.pressTimer = setTimeout(() => {
+            LPM.pressTimer = null;
+            LPM.fired = true;
+            LPM.longPressTriggered = true;
+            card.classList.remove('wlp-pressing');
+
+            // Открываем меню
+            openMenu(widgetId, card, x, y);
+        }, CFG.LONG_PRESS_MS);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  LONG-PRESS: ДВИЖЕНИЕ (отмена при скролле)
+    // ═══════════════════════════════════════════════════════════
+    function onMove(e) {
+        if (!LPM.pressTimer) return;
+
+        let x = 0, y = 0;
+        if (e.touches && e.touches.length > 0) {
+            x = e.touches[0].clientX;
+            y = e.touches[0].clientY;
+        } else {
+            x = e.clientX;
+            y = e.clientY;
+        }
+
+        const dx = Math.abs(x - LPM.startX);
+        const dy = Math.abs(y - LPM.startY);
+
+        if (dx > 10 || dy > 10) {
+            // Скролл — отменяем
+            cancelPress();
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  LONG-PRESS: КОНЕЦ
+    // ═══════════════════════════════════════════════════════════
+    function endPress(e) {
+        // Снимаем визуальный отклик
+        if (LPM.pressTarget) {
+            LPM.pressTarget.classList.remove('wlp-pressing');
+        }
+
+        // Отменяем таймер
+        clearTimeout(LPM.pressTimer);
+        LPM.pressTimer = null;
+
+        // Если был long-press — глушим следующий клик
+        if (LPM.fired) {
+            e.preventDefault?.();
+            e.stopImmediatePropagation?.();
+            LPM.fired = false;
+            // Даём чуть времени, чтобы клик после touchend не открыл
+            // что-то ещё (например, редактор часов)
+            setTimeout(() => {
+                LPM.longPressTriggered = false;
+            }, 300);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ОТМЕНА
+    // ═══════════════════════════════════════════════════════════
+    function cancelPress() {
+        if (LPM.pressTimer) {
+            clearTimeout(LPM.pressTimer);
+            LPM.pressTimer = null;
+        }
+        if (LPM.pressTarget) {
+            LPM.pressTarget.classList.remove('wlp-pressing');
+            LPM.pressTarget = null;
+        }
+        LPM.widgetId = null;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПОДПИСКА НА СОБЫТИЯ
+    //  Слушаем на document в capture-фазе, чтобы перехватить
+    //  раньше внутренних обработчиков виджетов.
+    // ═══════════════════════════════════════════════════════════
+
+    // ─── Touch ───
+    document.addEventListener('touchstart', (e) => {
+        startPress(e);
+    }, { capture: true, passive: true });
+
+    document.addEventListener('touchmove', (e) => {
+        onMove(e);
+    }, { capture: true, passive: true });
+
+    document.addEventListener('touchend', (e) => {
+        endPress(e);
+    }, { capture: true });
+
+    document.addEventListener('touchcancel', (e) => {
+        cancelPress();
+        if (LPM.pressTarget) {
+            LPM.pressTarget.classList.remove('wlp-pressing');
+            LPM.pressTarget = null;
+        }
+    }, { capture: true });
+
+    // ─── Mouse (десктоп) ───
+    document.addEventListener('mousedown', (e) => {
+        if (e.button !== 0) return;
+        startPress(e);
+    }, { capture: true });
+
+    document.addEventListener('mousemove', (e) => {
+        onMove(e);
+    }, { capture: true });
+
+    document.addEventListener('mouseup', (e) => {
+        endPress(e);
+    }, { capture: true });
+
+    // ─── ПКМ — тоже открываем меню (удобно на десктопе) ───
+    document.addEventListener('contextmenu', (e) => {
+        const card = getWidgetCard(e.target);
+        if (!card) return;
+        if (isIgnoredTarget(e.target)) return;
+        const widgetId = card.dataset.widgetId;
+        if (!widgetId) return;
+
+        e.preventDefault();
+        e.stopPropagation();
+
+        // Снимаем long-press таймер
+        cancelPress();
+
+        openMenu(widgetId, card, e.clientX, e.clientY);
+    }, { capture: true });
+
+    // ─── Перехват КЛИКА после long-press ───
+    // Чтобы клик по виджету не срабатывал, если только что был long-press
+    document.addEventListener('click', (e) => {
+        if (LPM.longPressTriggered) {
+            e.preventDefault?.();
+            e.stopImmediatePropagation?.();
+            LPM.longPressTriggered = false;
+        }
+    }, { capture: true });
+
+    // ─── Скролл — отменяем long-press ───
+    document.addEventListener('scroll', () => {
+        if (LPM.pressTimer) cancelPress();
+    }, { capture: true, passive: true });
+
+    // ═══════════════════════════════════════════════════════════
+    //  УТИЛИТА ESCAPE
+    // ═══════════════════════════════════════════════════════════
+    function escapeHtml(s) {
+        const d = document.createElement('div');
+        d.textContent = s == null ? '' : String(s);
+        return d.innerHTML;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУБЛИЧНОЕ API
+    // ═══════════════════════════════════════════════════════════
+    window.WidgetLongPress = {
+        isMenuOpen: () => !!LPM.menuEl,
+        closeMenu,
+        openMenuFor: (widgetId) => {
+            const card = document.querySelector(
+                `.widget-card[data-widget-id="${widgetId}"]`
+            );
+            if (card) {
+                const rect = card.getBoundingClientRect();
+                openMenu(widgetId, card, rect.left + rect.width / 2, rect.top);
+            } else {
+                showToastSafe('❌ Виджет не найден в DOM', 2000);
+            }
+        },
+        removeWidget,
+        status: () => ({
+            menuOpen: !!LPM.menuEl,
+            currentWidget: LPM.widgetId,
+            pressTimerActive: !!LPM.pressTimer,
+        }),
+        config: CFG,
+    };
+
+    console.log('🗑️ [WidgetLongPress] ✅ Готово:');
+    console.log('   • Работает для ВСЕХ виджетов (Clock, Radio, Weather и т.д.)');
+    console.log('   • Долгое нажатие 600 мс → мини-меню');
+    console.log('   • ПКМ на десктопе — тоже открывает меню');
+    console.log('   • На мобиле — bottom-sheet');
+    console.log('   • API: WidgetLongPress.openMenuFor("clock")');
+})();
+</script><script>
+// ═══════════════════════════════════════════════════════════════
+//  🩹 ОТКЛЮЧАЕМ СТАРЫЕ LONG-PRESS У РАДИО И ПОГОДЫ
+//  Теперь у нас единый WidgetLongPress — старые confirm()-ы
+//  не нужны, они конфликтуют.
+// ═══════════════════════════════════════════════════════════════
+(function disableOldWidgetLongPress() {
+    'use strict';
+
+    // Глушим confirm() только для виджетов (не для других мест)
+    if (typeof window.confirm === 'function' && !window.confirm._widgetLpBlocked) {
+        const _origConfirm = window.confirm;
+        window.confirm = function(message) {
+            if (typeof message === 'string'
+                && (message.includes('Удалить виджет')
+                    || message.includes('убрать виджет')
+                    || message.includes('Убрать виджет'))) {
+                console.log('🩹 [OldLongPressOff] Старый confirm() виджета заблокирован:', message);
+                return false;   // «нет» — не удаляем через старый механизм
+            }
+            return _origConfirm.apply(this, arguments);
+        };
+        window.confirm._widgetLpBlocked = true;
+        console.log('🩹 [OldLongPressOff] confirm() для виджетов отключён');
+    }
+})();
 </script>
 </body>
 </html>
