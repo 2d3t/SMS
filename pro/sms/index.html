@@ -77116,6 +77116,532 @@ if (_rawInvite) {
     console.log('   URL invite:', _rawInvite ? 'есть' : 'нет');
     console.log('   Активен PIN-режим:', window._invitePinActive);
 })();
+</script><script>
+// ═══════════════════════════════════════════════════════════════
+//  ⭐ ОСНОВНОЙ ГОРОД ДЛЯ ВИДЖЕТА ПОГОДЫ
+//  ─────────────────────────────────────────────────────────────
+//  • Тап по названию города в шапке → модалка поиска
+//  • «Сделать основным» в модалке → сохраняется в localStorage
+//  • detectLocationByIp() сначала смотрит сохранённый город
+//  • Кнопка 🔍 остаётся для разового просмотра
+//  • Сброс основного города — через меню действия виджета
+// ═══════════════════════════════════════════════════════════════
+
+(function installMainCitySelector() {
+    'use strict';
+
+    console.log('⭐ [MainCity] Установка выбора основного города…');
+
+    const STORAGE_KEY = 'smschat_main_city_v1';
+
+    // ═══════════════════════════════════════════════════════════
+    //  СОХРАНЕНИЕ / ЗАГРУЗКА
+    // ═══════════════════════════════════════════════════════════
+    function loadMainCity() {
+        try {
+            const raw = localStorage.getItem(STORAGE_KEY);
+            if (!raw) return null;
+            const data = JSON.parse(raw);
+            if (data && data.name && typeof data.lat === 'number' && typeof data.lon === 'number') {
+                return data;
+            }
+        } catch (e) {}
+        return null;
+    }
+
+    function saveMainCity(city) {
+        try {
+            if (city) {
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(city));
+                console.log('⭐ [MainCity] Сохранён основной город:', city.name);
+            } else {
+                localStorage.removeItem(STORAGE_KEY);
+                console.log('⭐ [MainCity] Основной город сброшен');
+            }
+        } catch (e) {
+            console.warn('⭐ [MainCity] save failed:', e);
+        }
+    }
+
+    function getMainCity() {
+        return loadMainCity();
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  🎯 ПАТЧ detectLocationByIp — отдаём сохранённый город
+    //  ═══════════════════════════════════════════════════════════
+    //  Проблема: WeatherWidget (v8) внутри IIFE создаёт свою
+    //  detectLocationByIp. Снаружи её не достать, но она вызывает
+    //  fetch('https://ipwho.is/') и 'http://ip-api.com/...'.
+    //  Мы можем перехватить именно этот fetch.
+    // ═══════════════════════════════════════════════════════════
+
+    const _origFetch = window.fetch.bind(window);
+    const IP_HOSTS = ['ipwho.is', 'ip-api.com'];
+
+    window.fetch = function(url, opts) {
+        const urlStr = typeof url === 'string' ? url : (url && url.url) || '';
+
+        // Перехватываем только IP-геолокацию
+        const isIpLookup = IP_HOSTS.some(h => urlStr.includes(h));
+        if (!isIpLookup) {
+            return _origFetch(url, opts);
+        }
+
+        const mainCity = getMainCity();
+        if (!mainCity) {
+            return _origFetch(url, opts);
+        }
+
+        console.log(`⭐ [MainCity] Подменяем ${urlStr.slice(0, 40)}… → ${mainCity.name}`);
+
+        // Возвращаем «фейковый» ответ в формате того API, который спрашивали
+        const isIpwho = urlStr.includes('ipwho.is');
+        const payload = isIpwho
+            ? {
+                success: true,
+                city: mainCity.name,
+                country: mainCity.country || '',
+                country_code: mainCity.cc || '',
+                latitude: mainCity.lat,
+                longitude: mainCity.lon,
+                timezone: { id: mainCity.tz || 'auto' },
+            }
+            : {
+                status: 'success',
+                city: mainCity.name,
+                country: mainCity.country || '',
+                countryCode: mainCity.cc || '',
+                lat: mainCity.lat,
+                lon: mainCity.lon,
+                timezone: mainCity.tz || 'auto',
+            };
+
+        return Promise.resolve(new Response(JSON.stringify(payload), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+        }));
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  🎯 ПАТЧ: при сохранении нового основного города
+    //     полностью сбрасываем кэш погоды и перезагружаем
+    // ═══════════════════════════════════════════════════════════
+    async function applyMainCity(city) {
+        saveMainCity(city);
+
+        // Сбрасываем кэш погоды (тот, что использует WeatherWidget)
+        try {
+            const CACHE_KEY = 'smschat_widgets_cache';
+            const raw = localStorage.getItem(CACHE_KEY);
+            if (raw) {
+                const cache = JSON.parse(raw);
+                Object.keys(cache).forEach(k => {
+                    if (k.startsWith('weather')) delete cache[k];
+                });
+                localStorage.setItem(CACHE_KEY, JSON.stringify(cache));
+                console.log('⭐ [MainCity] Кэш погоды сброшен');
+            }
+        } catch (e) {}
+
+        // Вызываем refresh виджета
+        try {
+            if (typeof WeatherWidget !== 'undefined'
+                && typeof WeatherWidget.refresh === 'function') {
+                await WeatherWidget.refresh();
+            }
+        } catch (e) {
+            console.warn('⭐ [MainCity] refresh failed:', e);
+        }
+
+        // Принудительно перерисовываем список чатов
+        try {
+            if (typeof renderChatsList === 'function') renderChatsList();
+        } catch (e) {}
+
+        // Toast
+        if (typeof showToast === 'function') {
+            showToast(`⭐ Основной город: ${city.name}`, 2500);
+        }
+        if (typeof soundManager !== 'undefined') {
+            try { soundManager.play('send'); } catch (e) {}
+        }
+        if (navigator.vibrate) navigator.vibrate([15, 30, 15]);
+    }
+
+    function clearMainCity() {
+        saveMainCity(null);
+        try {
+            const CACHE_KEY = 'smschat_widgets_cache';
+            const raw = localStorage.getItem(CACHE_KEY);
+            if (raw) {
+                const cache = JSON.parse(raw);
+                Object.keys(cache).forEach(k => {
+                    if (k.startsWith('weather')) delete cache[k];
+                });
+                localStorage.setItem(CACHE_KEY, JSON.stringify(cache));
+            }
+        } catch (e) {}
+        try {
+            if (typeof WeatherWidget !== 'undefined'
+                && typeof WeatherWidget.refresh === 'function') {
+                WeatherWidget.refresh();
+            }
+        } catch (e) {}
+        if (typeof showToast === 'function') showToast('↺ Основной город сброшен', 2000);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  КЛИК ПО НАЗВАНИЮ ГОРОДА В ШАПКЕ ВИДЖЕТА
+    //  ────────────────────────────────────────────────────────
+    //  Шапка виджета содержит:
+    //    .wc-title   →  «🇧🇾 Минск»
+    //    .wc-subtitle
+    //  Название города — внутри .wc-title.
+    //  Клик по нему → открывает модалку поиска.
+    // ═══════════════════════════════════════════════════════════
+
+    // Делегированный обработчик (capture, чтобы перехватить раньше
+    // возможных внутренних обработчиков карточки)
+    document.addEventListener('click', (e) => {
+        const titleEl = e.target.closest('.widget-card.weather .wc-title');
+        if (!titleEl) return;
+
+        // Игнорируем клики по кнопке 🔍 (она в .wc-header, но не в .wc-title)
+        // и по ⟳ (кнопка обновления, тоже вне .wc-title)
+        // (на всякий случай проверяем ближайшие интерактивные элементы)
+        if (e.target.closest('button')) return;
+
+        e.stopPropagation();
+        e.preventDefault();
+
+        console.log('⭐ [MainCity] Клик по названию города — открываем модалку');
+
+        // Открываем WeatherQuickLookup
+        if (typeof WeatherQuickLookup !== 'undefined'
+            && typeof WeatherQuickLookup.open === 'function') {
+            WeatherQuickLookup.open();
+        } else {
+            if (typeof showToast === 'function') {
+                showToast('❌ Модалка поиска недоступна', 2000);
+            }
+        }
+    }, true);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧ WeatherQuickLookup.search — добавляем кнопки
+    //  «Сделать основным» и «Сбросить» в результат
+    // ═══════════════════════════════════════════════════════════
+    //  WeatherQuickLookup v2 — IIFE, но он экспортирует объект
+    //  window.WeatherQuickLookup с методами open/close/search.
+    //  Метод renderFull внутри IIFE, снаружи не достать.
+    //
+    //  Решение: после каждого рендера результата добавляем свою
+    //  панель с кнопками через MutationObserver.
+    // ═══════════════════════════════════════════════════════════
+
+    function injectMainCityControls() {
+        const res = document.getElementById('wqlRes');
+        if (!res || !res.classList.contains('show')) return;
+        if (res.querySelector('.wql-main-city-panel')) return;
+
+        // Данные города берём из lastGeo — он хранится в IIFE.
+        // Достать его напрямую нельзя, но можно вытащить из DOM:
+        //   .wql-loc-n   → название
+        //   .wql-loc-s   → admin, country
+        const nameEl = res.querySelector('.wql-loc-n');
+        const subEl = res.querySelector('.wql-loc-s');
+        const flagEl = res.querySelector('.wql-loc-f');
+        if (!nameEl) return;
+
+        const name = nameEl.textContent.trim();
+        const sub = subEl ? subEl.textContent.trim() : '';
+        const flag = flagEl ? flagEl.textContent.trim() : '🌍';
+
+        // Проверяем, является ли этот город уже основным
+        const mainCity = getMainCity();
+        const isCurrentMain = mainCity && mainCity.name === name;
+
+        // Панель с кнопками
+        const panel = document.createElement('div');
+        panel.className = 'wql-main-city-panel';
+        panel.style.cssText = `
+            margin-top: 12px;
+            padding-top: 12px;
+            border-top: 1px dashed rgba(255,255,255,0.12);
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        `;
+
+        if (isCurrentMain) {
+            panel.innerHTML = `
+                <div style="
+                    display:flex;align-items:center;gap:8px;
+                    padding:10px 12px;
+                    background:rgba(0,184,148,0.12);
+                    border:1px solid rgba(0,184,148,0.4);
+                    border-radius:11px;
+                    color:#00b894;font-size:12px;font-weight:600;
+                ">
+                    <span style="font-size:18px;">⭐</span>
+                    <span style="flex:1;">Это ваш основной город</span>
+                </div>
+                <button class="wql-btn" id="wqlResetMainBtn" style="
+                    background:rgba(255,107,107,0.15);
+                    border:1px solid rgba(255,107,107,0.35);
+                    color:#ff6b6b;
+                ">↺ Сбросить (использовать IP-локацию)</button>
+            `;
+        } else {
+            panel.innerHTML = `
+                <button class="wql-btn" id="wqlSetMainBtn" style="
+                    background:linear-gradient(135deg,#feca57,#ff9f43);
+                    color:#1a1a2e;
+                ">⭐ Сделать основным городом</button>
+            `;
+        }
+
+        res.appendChild(panel);
+
+        // ─── Обработчики ───
+        const setBtn = panel.querySelector('#wqlSetMainBtn');
+        const resetBtn = panel.querySelector('#wqlResetMainBtn');
+
+        if (setBtn) {
+            setBtn.addEventListener('click', async (e) => {
+                e.stopPropagation();
+
+                // Получаем координаты города через geocoding API
+                // (потому что WeatherQuickLookup хранит их в своём
+                //  приватном lastGeo — из DOM не достать)
+                try {
+                    setBtn.disabled = true;
+                    setBtn.textContent = '⏳ Сохраняем…';
+
+                    const geoUrl = 'https://geocoding-api.open-meteo.com/v1/search'
+                        + `?name=${encodeURIComponent(name)}&count=1&language=ru&format=json`;
+                    const resGeo = await _origFetch(geoUrl);
+                    if (!resGeo.ok) throw new Error('Геокодинг недоступен');
+                    const geoData = await resGeo.json();
+                    if (!geoData.results || !geoData.results.length) {
+                        throw new Error('Город не найден');
+                    }
+
+                    const r = geoData.results[0];
+                    const city = {
+                        name: r.name,
+                        country: r.country || '',
+                        cc: r.country_code || '',
+                        lat: r.latitude,
+                        lon: r.longitude,
+                        tz: r.timezone || 'auto',
+                        admin: r.admin1 || '',
+                    };
+
+                    await applyMainCity(city);
+
+                    // Перерисовываем результат (кнопки переключатся)
+                    panel.remove();
+                    injectMainCityControls();
+
+                } catch (err) {
+                    console.error('⭐ [MainCity] set error:', err);
+                    if (typeof showToast === 'function') {
+                        showToast('❌ ' + (err.message || 'Ошибка'), 2500);
+                    }
+                    setBtn.disabled = false;
+                    setBtn.textContent = '⭐ Сделать основным городом';
+                }
+            });
+        }
+
+        if (resetBtn) {
+            resetBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                clearMainCity();
+                panel.remove();
+                // Закрываем модалку
+                if (typeof WeatherQuickLookup !== 'undefined'
+                    && typeof WeatherQuickLookup.close === 'function') {
+                    WeatherQuickLookup.close();
+                }
+            });
+        }
+    }
+
+    // Наблюдаем за появлением/изменением результата
+    const resObserver = new MutationObserver(() => {
+        const res = document.getElementById('wqlRes');
+        if (res && res.classList.contains('show')) {
+            // Небольшая задержка — дать WeatherQuickLookup дорисовать
+            setTimeout(injectMainCityControls, 30);
+            setTimeout(injectMainCityControls, 150);
+        }
+    });
+    resObserver.observe(document.body, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['class'],
+    });
+
+    // ─── Также при открытии модалки ───
+    document.addEventListener('click', (e) => {
+        // Клик по 🔍 в шапке погоды
+        if (e.target.closest('.wc-lookup-btn')) {
+            setTimeout(injectMainCityControls, 300);
+            setTimeout(injectMainCityControls, 800);
+        }
+        // Клик по названию города
+        if (e.target.closest('.widget-card.weather .wc-title')) {
+            setTimeout(injectMainCityControls, 300);
+            setTimeout(injectMainCityControls, 800);
+        }
+    }, true);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПУНКТ В МЕНЮ ДЕЙСТВИЙ ВИДЖЕТА (long-press)
+    //  Добавляем «⭐ Сменить основной город» и «↺ Сбросить»
+    // ═══════════════════════════════════════════════════════════
+    function injectWidgetMenuItems() {
+        const menu = document.getElementById('widgetLpMenu');
+        if (!menu) return;
+        if (menu.querySelector('[data-action="main-city"]')) return;
+
+        const widgetId = (typeof WidgetLongPress !== 'undefined'
+            && typeof WidgetLongPress.status === 'function')
+            ? WidgetLongPress.status().currentWidget
+            : null;
+
+        if (widgetId !== 'weather') return;
+
+        const hasMainCity = !!getMainCity();
+
+        const header = menu.querySelector('.wlp-header');
+        if (!header) return;
+
+        // Вставляем после шапки, перед пунктом «Убрать»
+        const removeItem = menu.querySelector('[data-action="remove"]');
+        const anchor = removeItem || menu.querySelector('.wlp-cancel');
+
+        if (hasMainCity) {
+            const city = getMainCity();
+            const infoItem = document.createElement('div');
+            infoItem.className = 'wlp-item';
+            infoItem.dataset.action = 'main-city-info';
+            infoItem.style.cssText = 'cursor:default;color:#feca57;background:rgba(254,202,87,0.08);';
+            infoItem.innerHTML = `
+                <span class="wlp-icon">⭐</span>
+                <span style="flex:1;font-size:12px;color:#feca57;font-weight:600;">
+                    Основной: ${escapeHtml(city.name)}
+                </span>
+            `;
+            if (anchor && anchor.parentNode) {
+                anchor.parentNode.insertBefore(infoItem, anchor);
+            }
+
+            const resetItem = document.createElement('div');
+            resetItem.className = 'wlp-item';
+            resetItem.dataset.action = 'main-city-reset';
+            resetItem.innerHTML = `
+                <span class="wlp-icon">↺</span>
+                <span class="wlp-label" style="color:#feca57;">Сбросить основной город</span>
+            `;
+            resetItem.addEventListener('click', (e) => {
+                e.stopPropagation();
+                if (typeof WidgetLongPress !== 'undefined'
+                    && typeof WidgetLongPress.closeMenu === 'function') {
+                    WidgetLongPress.closeMenu();
+                }
+                clearMainCity();
+            });
+            if (anchor && anchor.parentNode) {
+                anchor.parentNode.insertBefore(resetItem, anchor);
+            }
+        }
+
+        const changeItem = document.createElement('div');
+        changeItem.className = 'wlp-item';
+        changeItem.dataset.action = 'main-city';
+        changeItem.innerHTML = `
+            <span class="wlp-icon">🏙️</span>
+            <span class="wlp-label" style="color:#5CA8FF;">Выбрать основной город</span>
+        `;
+        changeItem.addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (typeof WidgetLongPress !== 'undefined'
+                && typeof WidgetLongPress.closeMenu === 'function') {
+                WidgetLongPress.closeMenu();
+            }
+            setTimeout(() => {
+                if (typeof WeatherQuickLookup !== 'undefined'
+                    && typeof WeatherQuickLookup.open === 'function') {
+                    WeatherQuickLookup.open();
+                }
+            }, 200);
+        });
+        if (anchor && anchor.parentNode) {
+            anchor.parentNode.insertBefore(changeItem, anchor);
+        }
+    }
+
+    const lpmObserver = new MutationObserver(() => {
+        if (document.getElementById('widgetLpMenu')) {
+            injectWidgetMenuItems();
+        }
+    });
+    lpmObserver.observe(document.body, { childList: true, subtree: true });
+
+    // ═══════════════════════════════════════════════════════════
+    //  УТИЛИТА
+    // ═══════════════════════════════════════════════════════════
+    function escapeHtml(s) {
+        const d = document.createElement('div');
+        d.textContent = s == null ? '' : String(s);
+        return d.innerHTML;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  API
+    // ═══════════════════════════════════════════════════════════
+    window.MainCity = {
+        get: getMainCity,
+        set: applyMainCity,
+        clear: clearMainCity,
+        status: () => {
+            const mc = getMainCity();
+            return {
+                hasMainCity: !!mc,
+                mainCity: mc,
+                widgetCardInDom: !!document.querySelector('.widget-card.weather'),
+                modalOpen: !!document.getElementById('wqlOv')?.classList.contains('show'),
+            };
+        },
+    };
+
+    // Применяем сохранённый город при старте — на случай,
+    // если виджет уже отрисован
+    const mc = getMainCity();
+    if (mc) {
+        console.log('⭐ [MainCity] Найден сохранённый основной город:', mc.name);
+        // Форсим refresh через 2 сек (после загрузки виджета)
+        setTimeout(() => {
+            try {
+                if (typeof WeatherWidget !== 'undefined'
+                    && typeof WeatherWidget.refresh === 'function') {
+                    WeatherWidget.refresh();
+                }
+            } catch (e) {}
+        }, 2000);
+    }
+
+    console.log('⭐ [MainCity] ✅ Готово:');
+    console.log('   • Тап по названию города → выбор');
+    console.log('   • В модалке — «⭐ Сделать основным»');
+    console.log('   • Долгий тап на виджете → «Сменить/Сбросить»');
+    console.log('   • API: MainCity.get() / .set(city) / .clear()');
+})();
 </script>
 </body>
 </html>
