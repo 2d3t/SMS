@@ -76503,38 +76503,86 @@ async function sendAnnouncement() {
     console.log('🚫 [WQLNoCtx] Системное меню в оверлее погоды заблокировано');
 })();
 // ═══════════════════════════════════════════════════════════════
-//  🔒 ОДНОРАЗОВЫЕ ИНВАЙТ-ССЫЛКИ — СЕРВЕРНАЯ АННУЛЯЦИЯ
+//  🔒 ОДНОРАЗОВЫЕ ИНВАЙТ-ССЫЛКИ v3 — ГРЯЗНЫЙ ХАК
 //  ─────────────────────────────────────────────────────────────
-//  Проблема: ссылка помечается использованной ТОЛЬКО в localStorage
-//  текущего браузера. Другой браузер = ссылка снова работает.
+//  Идея: перехватываем localStorage.setItem для ключа
+//  'smschat_used_invites_v1'. Как только markInviteUsed()
+//  записывает новый jti — мы:
+//    1. Читаем jti из свежего значения
+//    2. Достаём chatFile из URL-параметра invite
+//    3. Пишем jti в meta.json чата на GitHub
 //
-//  Решение: при использовании ссылки — записываем jti в meta.json
-//  чата (поле usedInvites). При валидации — читаем meta.json и
-//  проверяем, не использован ли jti кем-то другим.
+//  Плюс:
+//    • Патчим updateMeta — сохраняем usedInvites
+//    • Self-heal — проверка по URL при загрузке (если URL ещё не очищен)
+//    • Проверка на сервере при валидации новой ссылки
 // ═══════════════════════════════════════════════════════════════
 
-(function installServerSideInviteRevocation() {
+(function installInviteRevokeDirtyHack() {
     'use strict';
 
-    console.log('🔒 [InviteRevoke] Установка серверной аннуляции ссылок…');
+    console.log('🔒 [InviteRevoke v3-DIRTY] Установка грязного хака…');
 
     const CFG = {
-        // Сколько последних jti хранить в meta.json
         MAX_STORED_JTI: 50,
-        // Кэш meta.json на время сессии
-        META_CACHE_MS: 30 * 1000,
+        META_CACHE_MS: 5 * 1000,
+        RETRY_ATTEMPTS: 5,
+        RETRY_BASE_DELAY: 400,
+        LS_KEY: 'smschat_used_invites_v1',   // ключ, который пишет markInviteUsed
     };
 
-    // ─── Кэш meta.json ───
-    const _metaCache = new Map();   // chatFile → { data, ts }
+    // ═══════════════════════════════════════════════════════════
+    //  УТИЛИТЫ BASE64URL (на случай если нет глобальной)
+    // ═══════════════════════════════════════════════════════════
+    function b64UrlDecode(str) {
+        try {
+            let b64 = str.replace(/-/g, '+').replace(/_/g, '/');
+            while (b64.length % 4) b64 += '=';
+            const binary = atob(b64);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+            return new TextDecoder().decode(bytes);
+        } catch (e) {
+            return null;
+        }
+    }
 
     /**
-     * Читает meta.json чата с кэшем.
+     * Достаём payload из текущего URL (?invite=...)
+     * ВАЖНО: URL может быть уже очищен через history.replaceState.
+     * Поэтому эта функция работает только в момент вызова.
      */
-    async function fetchChatMeta(chatFile) {
-        const cached = _metaCache.get(chatFile);
-        if (cached && Date.now() - cached.ts < CFG.META_CACHE_MS) {
-            return cached.data;
+    function getInvitePayloadFromUrl() {
+        try {
+            const params = new URLSearchParams(location.search);
+            const rawParam = params.get('invite');
+            if (!rawParam) return null;
+
+            const dotIdx = rawParam.lastIndexOf('.');
+            if (dotIdx < 0) return null;
+
+            const payloadB64 = rawParam.slice(0, dotIdx);
+            const json = b64UrlDecode(payloadB64);
+            if (!json) return null;
+
+            return JSON.parse(json);
+        } catch (e) {
+            console.warn('🔒 [InviteRevoke v3] URL parse error:', e);
+            return null;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  КЭШ meta.json
+    // ═══════════════════════════════════════════════════════════
+    const _metaCache = new Map();
+
+    async function fetchMetaRaw(chatFile, forceRefresh) {
+        if (!forceRefresh) {
+            const cached = _metaCache.get(chatFile);
+            if (cached && Date.now() - cached.ts < CFG.META_CACHE_MS) {
+                return cached.data;
+            }
         }
 
         try {
@@ -76547,178 +76595,401 @@ async function sendAnnouncement() {
                 cache: 'no-store',
             });
 
-            if (res.status === 404) {
-                return { exists: false };
-            }
-            if (!res.ok) {
-                return null;
-            }
+            if (res.status === 404) return { exists: false };
+            if (!res.ok) return null;
 
             const data = await res.json();
             const content = JSON.parse(base64ToUtf8((data.content || '').replace(/\n/g, '')));
+            const result = { exists: true, content, sha: data.sha };
 
-            const result = {
-                exists: true,
-                content,
-                sha: data.sha,
-            };
             _metaCache.set(chatFile, { data: result, ts: Date.now() });
             return result;
         } catch (e) {
-            console.warn('🔒 [InviteRevoke] fetchChatMeta error:', e);
             return null;
         }
     }
 
-    /**
-     * Сбрасывает кэш meta для чата.
-     */
-    function invalidateMetaCache(chatFile) {
-        _metaCache.delete(chatFile);
-    }
-
-    /**
-     * Проверяет, не использован ли jti кем-то другим.
-     * Возвращает { used: true/false, usedBy, usedAt }.
-     */
+    // ═══════════════════════════════════════════════════════════
+    //  ПРОВЕРКА jti НА СЕРВЕРЕ
+    // ═══════════════════════════════════════════════════════════
     async function checkInviteUsedOnServer(chatFile, jti) {
         if (!chatFile || !jti) return { used: false };
 
-        const meta = await fetchChatMeta(chatFile);
-        if (!meta || !meta.exists || !meta.content) {
-            return { used: false };
-        }
+        const meta = await fetchMetaRaw(chatFile, true);   // force refresh
+        if (!meta || !meta.exists || !meta.content) return { used: false };
 
-        const usedInvites = Array.isArray(meta.content.usedInvites)
+        const list = Array.isArray(meta.content.usedInvites)
             ? meta.content.usedInvites
             : [];
 
-        const found = usedInvites.find(x =>
+        const found = list.find(x =>
             (typeof x === 'string' ? x : x.jti) === jti
         );
 
-        if (found) {
-            if (typeof found === 'string') {
-                return { used: true, usedBy: '—', usedAt: null };
-            }
-            return {
-                used: true,
-                usedBy: found.username || '—',
-                usedAt: found.usedAt ? new Date(found.usedAt) : null,
-            };
-        }
+        if (!found) return { used: false };
 
-        return { used: false };
+        if (typeof found === 'string') {
+            return { used: true, usedBy: '—', usedAt: null };
+        }
+        return {
+            used: true,
+            usedBy: found.username || '—',
+            usedAt: found.usedAt ? new Date(found.usedAt) : null,
+        };
     }
 
-    /**
-     * Записывает jti как использованный в meta.json чата.
-     * Пробует до 3 раз при конфликте.
-     */
+    // ═══════════════════════════════════════════════════════════
+    //  ЗАПИСЬ jti В meta.json
+    // ═══════════════════════════════════════════════════════════
+    const _pendingMarks = new Set();
+
     async function markInviteUsedOnServer(chatFile, jti, username) {
         if (!chatFile || !jti) return false;
+        if (_pendingMarks.has(jti)) {
+            console.log('🔒 [InviteRevoke v3] jti уже записывается:', jti);
+            return false;
+        }
+        _pendingMarks.add(jti);
 
-        for (let attempt = 0; attempt < 3; attempt++) {
-            try {
-                const meta = await fetchChatMeta(chatFile);
-                if (!meta || !meta.exists) {
-                    console.warn('🔒 [InviteRevoke] meta.json не найден для', chatFile);
+        console.log(`🔒 [InviteRevoke v3] Пишем jti на сервер: chat=${chatFile} jti=${jti.slice(0, 20)}…`);
+
+        try {
+            for (let attempt = 0; attempt < CFG.RETRY_ATTEMPTS; attempt++) {
+                try {
+                    const meta = await fetchMetaRaw(chatFile, true);
+                    if (!meta || !meta.exists) {
+                        console.warn('🔒 [InviteRevoke v3] meta.json не найден:', chatFile);
+                        return false;
+                    }
+
+                    const content = { ...meta.content };
+                    if (!Array.isArray(content.usedInvites)) {
+                        content.usedInvites = [];
+                    }
+
+                    // Уже есть — успех
+                    const exists = content.usedInvites.some(x =>
+                        (typeof x === 'string' ? x : x.jti) === jti
+                    );
+                    if (exists) {
+                        console.log('🔒 [InviteRevoke v3] jti уже в meta — успех');
+                        return true;
+                    }
+
+                    // Добавляем
+                    content.usedInvites.push({
+                        jti,
+                        username: username || '—',
+                        usedAt: Date.now(),
+                    });
+
+                    if (content.usedInvites.length > CFG.MAX_STORED_JTI) {
+                        content.usedInvites = content.usedInvites.slice(-CFG.MAX_STORED_JTI);
+                    }
+
+                    // PUT
+                    const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/chats/${chatFile}.meta.json`;
+                    const json = JSON.stringify(content);
+                    const encoded = utf8ToBase64(json);
+
+                    const body = {
+                        message: `🔒 Invite used (jti: ${jti.slice(0, 15)}…)`,
+                        content: encoded,
+                        sha: meta.sha,
+                    };
+
+                    const res = await fetch(url, {
+                        method: 'PUT',
+                        headers: {
+                            'Authorization': `token ${state.token}`,
+                            'Accept': 'application/vnd.github.v3+json',
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify(body),
+                        cache: 'no-store',
+                    });
+
+                    if (res.ok) {
+                        _metaCache.delete(chatFile);
+                        console.log('🔒 [InviteRevoke v3] ✅ jti записан на сервер');
+                        return true;
+                    }
+
+                    if (res.status === 409) {
+                        console.warn(`🔒 [InviteRevoke v3] 409 retry ${attempt + 1}/${CFG.RETRY_ATTEMPTS}`);
+                        const delay = CFG.RETRY_BASE_DELAY * Math.pow(1.6, attempt) + Math.random() * 300;
+                        await new Promise(r => setTimeout(r, delay));
+                        continue;
+                    }
+
+                    const errText = await res.text().catch(() => '');
+                    console.warn('🔒 [InviteRevoke v3] HTTP', res.status, errText.slice(0, 150));
                     return false;
+
+                } catch (e) {
+                    console.warn('🔒 [InviteRevoke v3] attempt error:', e);
+                    if (attempt < CFG.RETRY_ATTEMPTS - 1) {
+                        await new Promise(r => setTimeout(r, CFG.RETRY_BASE_DELAY * (attempt + 1)));
+                    }
                 }
+            }
 
-                const content = { ...meta.content };
-                if (!Array.isArray(content.usedInvites)) {
-                    content.usedInvites = [];
-                }
+            return false;
+        } finally {
+            _pendingMarks.delete(jti);
+        }
+    }
 
-                // Уже есть?
-                const exists = content.usedInvites.some(x =>
-                    (typeof x === 'string' ? x : x.jti) === jti
-                );
-                if (exists) {
-                    return true;
-                }
+    // ═══════════════════════════════════════════════════════════
+    //  🆕 ГЛАВНОЕ: ПЕРЕХВАТ localStorage.setItem
+    // ═══════════════════════════════════════════════════════════
+    //  markInviteUsed() внутри IIFE делает:
+    //      localStorage.setItem('smschat_used_invites_v1', JSON.stringify(used))
+    //
+    //  Мы перехватываем этот вызов и запускаем запись в meta.json.
+    // ═══════════════════════════════════════════════════════════
+    const _origSetItem = localStorage.setItem.bind(localStorage);
 
-                // Добавляем
-                content.usedInvites.push({
-                    jti,
-                    username: username || '—',
-                    usedAt: Date.now(),
-                });
+    localStorage.setItem = function(key, value) {
+        // Вызываем оригинал
+        const result = _origSetItem(key, value);
 
-                // Обрезаем до MAX
-                if (content.usedInvites.length > CFG.MAX_STORED_JTI) {
-                    content.usedInvites = content.usedInvites.slice(-CFG.MAX_STORED_JTI);
-                }
+        // Реагируем только на ключ used_invites
+        if (key === CFG.LS_KEY) {
+            try {
+                _handleUsedInvitesUpdate(value);
+            } catch (e) {
+                console.warn('🔒 [InviteRevoke v3] Ошибка обработки setItem:', e);
+            }
+        }
 
-                // Сохраняем
-                const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/chats/${chatFile}.meta.json`;
-                const json = JSON.stringify(content);
-                const encoded = utf8ToBase64(json);
+        return result;
+    };
 
-                const body = {
-                    message: `🔒 Invite used: ${jti}`,
-                    content: encoded,
-                    sha: meta.sha,
-                };
+    /**
+     * Обработчик изменения списка used_invites в localStorage.
+     * Находит НОВЫЙ jti (разница между старым и новым массивом)
+     * и пишет его в meta.json.
+     */
+    let _lastUsedInvitesArray = null;
 
-                const res = await fetch(url, {
-                    method: 'PUT',
-                    headers: {
-                        'Authorization': `token ${state.token}`,
-                        'Accept': 'application/vnd.github.v3+json',
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify(body),
-                    cache: 'no-store',
-                });
+    function _handleUsedInvitesUpdate(rawValue) {
+        try {
+            const newArr = JSON.parse(rawValue);
+            if (!Array.isArray(newArr)) return;
 
-                if (res.ok) {
-                    invalidateMetaCache(chatFile);
-                    console.log('🔒 [InviteRevoke] ✅ jti записан:', jti);
-                    return true;
-                }
+            // Ищем новый jti
+            const oldSet = new Set(_lastUsedInvitesArray || []);
+            const newJtis = newArr.filter(j => !oldSet.has(j));
 
-                if (res.status === 409) {
-                    // Конфликт — повторяем
-                    invalidateMetaCache(chatFile);
-                    await new Promise(r => setTimeout(r, 500 + Math.random() * 500));
+            _lastUsedInvitesArray = newArr.slice();
+
+            if (newJtis.length === 0) {
+                // Никаких новых — ничего не делаем
+                return;
+            }
+
+            console.log(`🔒 [InviteRevoke v3] localStorage: новых jti ${newJtis.length}:`, newJtis);
+
+            // Достаём payload из URL
+            const payload = getInvitePayloadFromUrl();
+            if (!payload) {
+                // URL уже очищен — но мы можем попытаться найти в новых jti
+                // совпадение с последним известным payload.
+                // Но проще: URL-очистка делается ПОСЛЕ markInviteUsed,
+                // поэтому в этот момент URL ещё должен быть.
+                console.warn('🔒 [InviteRevoke v3] URL пуст — не знаю chatFile');
+                return;
+            }
+
+            const chatFile = payload?.chat?.file;
+            if (!chatFile) {
+                console.warn('🔒 [InviteRevoke v3] В payload нет chatFile');
+                return;
+            }
+
+            // Для каждого нового jti — пишем
+            for (const jti of newJtis) {
+                // Проверяем, что jti из payload совпадает с новым
+                // (защита от случайных записей)
+                if (payload.jti && jti !== payload.jti) {
+                    console.warn('🔒 [InviteRevoke v3] jti из localStorage не совпадает с URL. Пропускаем.');
                     continue;
                 }
 
-                console.warn('🔒 [InviteRevoke] markInviteUsedOnServer HTTP', res.status);
-                return false;
-
-            } catch (e) {
-                console.warn('🔒 [InviteRevoke] markInviteUsedOnServer error:', e);
-                if (attempt < 2) {
-                    await new Promise(r => setTimeout(r, 500));
-                }
+                // Пишем на сервер асинхронно
+                markInviteUsedOnServer(chatFile, jti, payload.username || state.username)
+                    .catch(e => console.warn('🔒 [InviteRevoke v3] mark error:', e));
             }
+        } catch (e) {
+            console.warn('🔒 [InviteRevoke v3] _handleUsedInvitesUpdate error:', e);
         }
+    }
 
-        return false;
+    // При старте — загружаем текущий список
+    try {
+        const raw = localStorage.getItem(CFG.LS_KEY);
+        if (raw) {
+            _lastUsedInvitesArray = JSON.parse(raw);
+            if (!Array.isArray(_lastUsedInvitesArray)) _lastUsedInvitesArray = [];
+            console.log('🔒 [InviteRevoke v3] Загружено локальных jti:', _lastUsedInvitesArray.length);
+        } else {
+            _lastUsedInvitesArray = [];
+        }
+    } catch (e) {
+        _lastUsedInvitesArray = [];
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ПАТЧ: parseAndValidateInvite → проверяем сервер
+    //  🆕 ПАТЧ updateMeta — сохраняем usedInvites
     // ═══════════════════════════════════════════════════════════
-    if (typeof parseAndValidateInvite === 'function') {
+    // updateMeta полностью перезаписывает meta.json, теряя
+    // usedInvites. Патчим — при записи подмешиваем старые.
+    // ═══════════════════════════════════════════════════════════
+    if (typeof updateMeta === 'function' && !updateMeta._inviteRevokePatched) {
+        const _origUpdateMeta = updateMeta;
+
+        window.updateMeta = async function(file, version, count) {
+            // Читаем существующие usedInvites
+            let existingUsedInvites = [];
+            try {
+                const existing = await fetchMetaRaw(file, true);   // force refresh
+                if (existing && existing.exists && existing.content) {
+                    if (Array.isArray(existing.content.usedInvites)) {
+                        existingUsedInvites = existing.content.usedInvites;
+                    }
+                }
+            } catch (e) {}
+
+            // Собираем meta с usedInvites
+            const meta = {
+                v: 1,
+                version,
+                count,
+                updatedAt: new Date().toISOString(),
+            };
+            if (existingUsedInvites.length > 0) {
+                meta.usedInvites = existingUsedInvites;
+            }
+
+            const encoded = utf8ToBase64(JSON.stringify(meta));
+
+            for (let attempt = 0; attempt < 3; attempt++) {
+                try {
+                    const existing = await fetchMetaRaw(file, true);
+                    const body = {
+                        message: `📌 meta ${file}`,
+                        content: encoded,
+                    };
+                    if (existing && existing.exists) {
+                        body.sha = existing.sha;
+                    }
+
+                    const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/chats/${file}.meta.json`;
+                    const res = await fetch(url, {
+                        method: 'PUT',
+                        headers: getHeaders(state.token),
+                        body: JSON.stringify(body),
+                        cache: 'no-store',
+                    });
+
+                    if (res.ok) {
+                        _metaCache.delete(file);
+                        const lastRead = getLastReadId(file);
+                        if (!lastRead || version > lastRead) {
+                            setLastReadId(file, version);
+                        }
+                        if (state._lastSentMessageId && version === state._lastSentMessageId) {
+                            showToast('✅ Отправлено!', 1000);
+                        }
+                        return true;
+                    }
+
+                    if (res.status === 409) {
+                        await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+                        continue;
+                    }
+
+                    break;
+                } catch (e) {
+                    console.warn(`Meta update attempt ${attempt + 1} failed:`, e.message);
+                }
+            }
+
+            if (state._lastSentMessageId) {
+                showToast('⚠️ Не удалось подтвердить доставку — проверьте чат', 3000);
+            }
+            return false;
+        };
+
+        window.updateMeta._inviteRevokePatched = true;
+        console.log('🔒 [InviteRevoke v3] ✅ updateMeta пропатчен (сохраняет usedInvites)');
+    } else {
+        console.warn('🔒 [InviteRevoke v3] updateMeta НЕ пропатчен (не найден как глобальная или уже пропатчен)');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  🆕 SELF-HEAL: проверка по URL при загрузке
+    //  Если перехват localStorage не сработал (например markInviteUsed
+    //  не вызывается вообще) — пробуем сами найти jti в URL.
+    // ═══════════════════════════════════════════════════════════
+    async function selfHealFromUrl() {
+        try {
+            const payload = getInvitePayloadFromUrl();
+            if (!payload) {
+                console.log('🔒 [InviteRevoke v3] self-heal: URL уже очищен, нечего делать');
+                return;
+            }
+
+            const chatFile = payload?.chat?.file;
+            const jti = payload?.jti;
+            if (!chatFile || !jti) return;
+
+            // Проверяем, не истёк ли
+            if (payload.exp && Date.now() > payload.exp) {
+                console.log('🔒 [InviteRevoke v3] self-heal: ссылка истекла');
+                return;
+            }
+
+            // Ждём 2 секунды (вдруг localStorage-перехват уже сработал)
+            await new Promise(r => setTimeout(r, 2000));
+
+            // Проверяем, есть ли уже запись
+            const check = await checkInviteUsedOnServer(chatFile, jti);
+            if (!check.used) {
+                console.log('🔒 [InviteRevoke v3] self-heal: jti не записан, пишем');
+                await markInviteUsedOnServer(chatFile, jti, payload.username || state.username);
+            } else {
+                console.log('🔒 [InviteRevoke v3] self-heal: jti уже на сервере');
+            }
+        } catch (e) {
+            console.warn('🔒 [InviteRevoke v3] self-heal error:', e);
+        }
+    }
+
+    // Запускаем self-heal несколько раз с разными задержками —
+    // к моменту вызова state.token и state.isAuthorized должны быть готовы
+    setTimeout(selfHealFromUrl, 3000);
+    setTimeout(selfHealFromUrl, 8000);
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПРОВЕРКА ПЕРЕД ВХОДОМ
+    //  Патчим parseAndValidateInvite — при открытии ссылки
+    // ═══════════════════════════════════════════════════════════
+    if (typeof parseAndValidateInvite === 'function' && !parseAndValidateInvite._inviteRevokePatched) {
         const _origParse = parseAndValidateInvite;
 
         window.parseAndValidateInvite = async function(rawParam) {
-            // 1. Локальная валидация (подпись, TTL, локальный «used»)
             const localResult = await _origParse.call(this, rawParam);
             if (!localResult.ok) return localResult;
 
-            // 2. Серверная проверка — не использован ли этот jti кем-то ещё
             const chatFile = localResult.payload.chat.file;
             const jti = localResult.payload.jti;
 
             try {
                 const serverCheck = await checkInviteUsedOnServer(chatFile, jti);
                 if (serverCheck.used) {
-                    console.warn('🔒 [InviteRevoke] Ссылка уже использована (сервер):', serverCheck);
+                    console.warn('🔒 [InviteRevoke v3] Ссылка уже использована:', serverCheck);
                     return {
                         ok: false,
                         reason: 'used',
@@ -76726,93 +76997,87 @@ async function sendAnnouncement() {
                     };
                 }
             } catch (e) {
-                // Если не смогли проверить — пропускаем (лучше пустить, чем заблокировать навсегда)
-                console.warn('🔒 [InviteRevoke] Не удалось проверить на сервере:', e);
+                console.warn('🔒 [InviteRevoke v3] server check fail:', e);
             }
 
             return localResult;
         };
+
+        window.parseAndValidateInvite._inviteRevokePatched = true;
+        console.log('🔒 [InviteRevoke v3] ✅ parseAndValidateInvite пропатчен');
+    } else {
+        console.warn('🔒 [InviteRevoke v3] parseAndValidateInvite НЕ пропатчен');
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ПАТЧ: markInviteUsed → пишем на сервер
-    // ═══════════════════════════════════════════════════════════
-    if (typeof markInviteUsed === 'function') {
-        const _origMark = markInviteUsed;
-
-        window.markInviteUsed = async function(jti) {
-            // Локально
-            _origMark.call(this, jti);
-
-            // На сервере — но нужен chatFile. Достаём из payload.
-            // Так как markInviteUsed вызывается в handleIncomingInvite
-            // без chatFile — модифицируем вызов там (см. ниже).
-            return true;
-        };
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ПАТЧ: handleIncomingInvite — запись на сервер после входа
-    // ═══════════════════════════════════════════════════════════
-    if (typeof handleIncomingInvite === 'function') {
-        const _origHandle = handleIncomingInvite;
-
-        window.handleIncomingInvite = async function() {
-            const params = new URLSearchParams(location.search);
-            const rawParam = params.get('invite');
-            if (!rawParam) return false;
-
-            // Разбираем, чтобы получить jti и chatFile
-            let parsedPayload = null;
-            try {
-                const dotIdx = rawParam.lastIndexOf('.');
-                if (dotIdx > 0) {
-                    const payloadB64 = rawParam.slice(0, dotIdx);
-                    parsedPayload = JSON.parse(fromBase64Url(payloadB64));
-                }
-            } catch (e) {}
-
-            const result = await _origHandle.apply(this, arguments);
-
-            // После успешной обработки — пишем jti на сервер
-            if (result === true && parsedPayload && parsedPayload.jti && parsedPayload.chat?.file) {
-                // Небольшая задержка — чтобы chat уже был добавлен в state.chats
-                setTimeout(() => {
-                    markInviteUsedOnServer(
-                        parsedPayload.chat.file,
-                        parsedPayload.jti,
-                        parsedPayload.username || state.username
-                    ).catch(e => console.warn('🔒 [InviteRevoke] post-mark error:', e));
-                }, 1000);
-            }
-
-            return result;
-        };
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ОЧИСТКА СТАРЫХ jti В meta.json ПРИ ПЕРЕПОЛНЕНИИ
-    //  (уже реализовано в markInviteUsedOnServer — slice(-MAX))
-    // ═══════════════════════════════════════════════════════════
-
-    // ═══════════════════════════════════════════════════════════
-    //  API
+    //  🆕 ДИАГНОСТИКА — расширенная
     // ═══════════════════════════════════════════════════════════
     window.InviteRevoke = {
         check: checkInviteUsedOnServer,
         mark: markInviteUsedOnServer,
-        invalidateCache: invalidateMetaCache,
+        selfHeal: selfHealFromUrl,
+
+        // Полный отчёт
         status: () => ({
+            localStorageIntercepted: localStorage.setItem.name !== 'setItem' || localStorage.setItem.toString().indexOf('_handleUsedInvitesUpdate') >= 0,
+            updateMetaPatched: !!(window.updateMeta && window.updateMeta._inviteRevokePatched),
+            parsePatched: !!(window.parseAndValidateInvite && window.parseAndValidateInvite._inviteRevokePatched),
             cachedChats: Array.from(_metaCache.keys()),
-            cachedCount: _metaCache.size,
+            pendingMarks: Array.from(_pendingMarks),
+            lastLocalJtis: _lastUsedInvitesArray ? _lastUsedInvitesArray.slice(-5) : [],
+            // 🆕 Текущий URL ещё содержит invite?
+            urlHasInvite: new URLSearchParams(location.search).has('invite'),
+            currentPayloadFromUrl: (() => {
+                const p = getInvitePayloadFromUrl();
+                return p ? { chatFile: p.chat?.file, jti: p.jti, exp: p.exp } : null;
+            })(),
         }),
-        config: CFG,
+
+        // 🆕 Ручная проверка meta.json
+        debug: async (chatFile) => {
+            if (!chatFile) {
+                console.log('Использование: await InviteRevoke.debug("chat_xxx")');
+                return;
+            }
+            const meta = await fetchMetaRaw(chatFile, true);
+            console.log('=== meta.json ===');
+            console.log(meta?.content);
+            console.log('=== usedInvites ===');
+            console.log(meta?.content?.usedInvites);
+            return meta?.content?.usedInvites;
+        },
+
+        // 🆕 Принудительно записать jti (для ручной проверки)
+        forceMark: async (chatFile, jti, username) => {
+            if (!chatFile || !jti) {
+                console.log('Использование: await InviteRevoke.forceMark("chat_xxx", "inv_yyy", "Имя")');
+                return false;
+            }
+            return markInviteUsedOnServer(chatFile, jti, username || state.username);
+        },
+
+        // 🆕 Тест localStorage-перехвата
+        testLocalStorageHook: () => {
+            const testJti = 'test_' + Date.now();
+            const testArr = (_lastUsedInvitesArray || []).concat([testJti]);
+            localStorage.setItem(CFG.LS_KEY, JSON.stringify(testArr));
+            console.log('✅ localStorage-хук должен был сработать, ищи в консоли:');
+            console.log('   🔒 [InviteRevoke v3] localStorage: новых jti 1: [test_...]');
+            console.log('   Если записалось в meta — всё работает');
+            return testJti;
+        },
     };
 
-    console.log('🔒 [InviteRevoke] ✅ Готово:');
-    console.log('   • Ссылки аннулируются на сервере (meta.json.usedInvites)');
-    console.log('   • Работает между всеми браузерами и устройствами');
-    console.log('   • API: InviteRevoke.check(chatFile, jti)');
+    console.log('🔒 [InviteRevoke v3-DIRTY] ✅ Готово');
+    console.log('   • Перехват localStorage.setItem (грязный хак)');
+    console.log('   • Патч updateMeta');
+    console.log('   • Self-heal из URL');
+    console.log('   • API: InviteRevoke.status() / .testLocalStorageHook()');
+    console.log('');
+    console.log('🧪 Проверить работу хака:');
+    console.log('   1. InviteRevoke.status()');
+    console.log('   2. InviteRevoke.testLocalStorageHook()');
+    console.log('   3. Смотри в консоли что записалось');
 })();
 </script>
 </body>
