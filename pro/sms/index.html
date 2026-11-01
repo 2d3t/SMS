@@ -76504,5 +76504,414 @@ async function sendAnnouncement() {
 })();
 
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  🔧 ФИКС: PIN теперь ГАРАНТИРОВАННО показывается при создании
+//  ─────────────────────────────────────────────────────────────
+//  Проблема: TempInvite.build переопределён, но кнопка
+//  «Другие приложения…» вызывает внутренний buildInviteLink
+//  напрямую — без PIN. Из-за этого в showInviteModal payload
+//  не содержит pin, и блок не появляется.
+//
+//  Решение:
+//   1. Перехватываем КЛИК по кнопке создания ссылки в CAPTURE-фазе
+//   2. Сами генерируем PIN и сами строим URL (в обход внутренней)
+//   3. Показываем модалку с PIN напрямую
+//   4. Также патчим showInviteModal — если pin нет в payload,
+//      генерируем прямо там (для страховки)
+// ═══════════════════════════════════════════════════════════════
+
+(function fixInvitePinDisplay() {
+    'use strict';
+
+    console.log('🔧 [InvitePinFix] Установка фикса отображения PIN…');
+
+    // ═══════════════════════════════════════════════════════════
+    //  ХЕЛПЕРЫ (дублируем то, что нужно — модуль мог не загрузиться)
+    // ═══════════════════════════════════════════════════════════
+    const HMAC_PREFIX = 'smschat-invite-v1:';
+
+    function toBase64Url(str) {
+        const utf8 = new TextEncoder().encode(str);
+        let binary = '';
+        utf8.forEach(b => binary += String.fromCharCode(b));
+        return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
+
+    async function signPayload(payloadStr) {
+        const enc = new TextEncoder();
+        const key = await crypto.subtle.importKey(
+            'raw', enc.encode(HMAC_PREFIX),
+            { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+        );
+        const sig = await crypto.subtle.sign('HMAC', key, enc.encode(payloadStr));
+        const bytes = new Uint8Array(sig);
+        let binary = '';
+        bytes.forEach(b => binary += String.fromCharCode(b));
+        return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
+
+    function generatePin() {
+        const bytes = crypto.getRandomValues(new Uint8Array(2));
+        return ((bytes[0] << 8) | bytes[1]) % 1000;
+    }
+
+    function escapeHtmlSafe(s) {
+        const d = document.createElement('div');
+        d.textContent = s == null ? '' : String(s);
+        return d.innerHTML;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ГЛАВНАЯ ФУНКЦИЯ: построить ссылку + PIN САМИ
+    //  Дублирует логику buildInviteLink из TempInvite v2,
+    //  но добавляет pin в payload.
+    // ═══════════════════════════════════════════════════════════
+    async function buildInviteLinkWithPin(chatFile) {
+        if (!state.isAuthorized || !state.token) {
+            throw new Error('Нужна авторизация');
+        }
+        if (!chatFile) {
+            throw new Error('Чат не указан');
+        }
+
+        const password = state.savedPasswords[chatFile];
+        if (!password) {
+            throw new Error('Пароль чата не сохранён');
+        }
+
+        const chat = state.chats.find(c => c.file === chatFile);
+        if (!chat) {
+            throw new Error('Чат не найден');
+        }
+
+        const now = Date.now();
+        const jti = 'inv_' + now + '_' + Math.random().toString(36).slice(2, 10);
+
+        // 🆕 Генерируем PIN
+        const pin = generatePin();
+        console.log(`🔑 [InvitePinFix] PIN: ${String(pin).padStart(3, '0')}`);
+
+        const payload = {
+            v: 1,
+            jti,
+            iat: now,
+            exp: now + 2 * 60 * 1000,   // TTL = 2 минуты
+            chat: {
+                file: chatFile,
+                name: chat.name || chatFile,
+            },
+            token: state.token,
+            password: password,
+            username: state.username,
+            pin: pin,   // 🆕
+        };
+
+        const payloadB64 = toBase64Url(JSON.stringify(payload));
+        const signature = await signPayload(payloadB64);
+        const baseUrl = location.origin + location.pathname;
+        const url = `${baseUrl}?invite=${payloadB64}.${signature}`;
+
+        return { url, payload, pin };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ФИКС SHOWMODAL: если pin нет в payload — добавляем
+    //  Это страховка на случай, если модалка открыта не нашим
+    //  перехватом (например, через прямой вызов)
+    // ═══════════════════════════════════════════════════════════
+    function ensurePinInModal(url, payload) {
+        const modal = document.getElementById('inviteLinkModal');
+        if (!modal) {
+            console.warn('🔧 [InvitePinFix] Модалка #inviteLinkModal не найдена');
+            return;
+        }
+
+        const content = modal.querySelector('.form-modal-content');
+        if (!content) return;
+
+        // Уже есть?
+        if (content.querySelector('#invitePinBlock')) return;
+
+        // Получаем pin
+        let pin = payload && payload.pin != null ? payload.pin : null;
+
+        // 🆕 Если pin нет — генерируем и ПЕРЕСОБИРАЕМ URL
+        // (это страховочный случай, маловероятный)
+        if (pin == null) {
+            console.warn('🔧 [InvitePinFix] pin нет в payload — генерируем принудительно');
+
+            // Пробуем достать chatFile из payload
+            const chatFile = payload && payload.chat && payload.chat.file;
+            if (!chatFile) {
+                console.warn('🔧 [InvitePinFix] Нет chatFile — не можем пересобрать');
+                return;
+            }
+
+            // Генерируем pin и пересобираем URL
+            pin = generatePin();
+            payload.pin = pin;
+
+            // Пересобираем URL синхронно (без await — но async-функция
+            // не подходит для синхронного контекста; делаем через .then)
+            (async () => {
+                try {
+                    const payloadB64 = toBase64Url(JSON.stringify(payload));
+                    const signature = await signPayload(payloadB64);
+                    const baseUrl = location.origin + location.pathname;
+                    const newUrl = `${baseUrl}?invite=${payloadB64}.${signature}`;
+
+                    // Обновляем URL в модалке
+                    const linkBox = modal.querySelector('#invLinkBox');
+                    if (linkBox) linkBox.textContent = newUrl;
+
+                    // Сохраняем в data-атрибут для копирования
+                    modal.dataset.inviteUrl = newUrl;
+                    modal.dataset.invitePin = String(pin).padStart(3, '0');
+
+                    // Теперь вставляем PIN-блок
+                    insertPinBlock(modal, content, pin);
+
+                } catch (e) {
+                    console.error('🔧 [InvitePinFix] Пересборка URL failed:', e);
+                }
+            })();
+            return;
+        }
+
+        // PIN есть — вставляем блок
+        insertPinBlock(modal, content, pin);
+        modal.dataset.invitePin = String(pin).padStart(3, '0');
+    }
+
+    // ─── Вставка PIN-блока ───
+    function insertPinBlock(modal, content, pin) {
+        if (content.querySelector('#invitePinBlock')) return;
+
+        const pinStr = String(pin).padStart(3, '0');
+
+        const pinBlock = document.createElement('div');
+        pinBlock.id = 'invitePinBlock';
+        pinBlock.style.cssText = `
+            margin-bottom: 16px;
+            padding: 16px;
+            background: linear-gradient(135deg, rgba(255,107,107,0.15), rgba(254,202,87,0.10));
+            border: 2px solid rgba(255,107,107,0.45);
+            border-radius: 14px;
+            text-align: center;
+            animation: pinBlockIn 0.3s ease;
+        `;
+        pinBlock.innerHTML = `
+            <style>
+                @keyframes pinBlockIn {
+                    from { opacity: 0; transform: scale(0.92); }
+                    to { opacity: 1; transform: scale(1); }
+                }
+                #invitePinBlock .pin-digits {
+                    cursor: pointer;
+                    user-select: all;
+                    -webkit-user-select: all;
+                    transition: opacity 0.15s;
+                }
+                #invitePinBlock .pin-digits:active { opacity: 0.7; }
+            </style>
+            <div style="font-size: 11px; color: #ff8a8a; text-transform: uppercase;
+                        letter-spacing: 1px; font-weight: 800; margin-bottom: 10px;
+                        display: flex; align-items: center; justify-content: center; gap: 6px;">
+                <span>🔑</span>
+                <span>PIN-КОД ДЛЯ ВХОДА</span>
+            </div>
+            <div class="pin-digits" id="pinDigitsCopy" data-pin="${pinStr}"
+                 title="Нажмите, чтобы скопировать"
+                 style="font-size: 46px; font-weight: 900; letter-spacing: 10px;
+                        color: #fff; font-family: 'SF Mono', 'Courier New', monospace;
+                        text-shadow: 0 2px 12px rgba(255,107,107,0.6);
+                        margin-bottom: 12px; line-height: 1;
+                        padding-left: 10px;">
+                ${pinStr}
+            </div>
+            <button type="button" id="pinCopyBtn"
+                    style="width: 100%; padding: 10px; margin-bottom: 10px;
+                           background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15);
+                           border-radius: 10px; color: #fff; font-size: 13px; font-weight: 600;
+                           cursor: pointer; font-family: inherit;
+                           display: flex; align-items: center; justify-content: center; gap: 6px;">
+                <span>📋</span>
+                <span>Скопировать PIN</span>
+            </button>
+            <div style="font-size: 11px; color: #feca57; line-height: 1.5; padding: 8px 10px;
+                        background: rgba(254,202,87,0.08); border-radius: 8px;
+                        border: 1px solid rgba(254,202,87,0.2); margin-bottom: 8px;">
+                ⚠️ Сообщите этот PIN получателю <strong>ОТДЕЛЬНО</strong> от ссылки<br>
+                (голосом или в другом мессенджере)
+            </div>
+            <div style="font-size: 11px; color: #ff6b6b; font-weight: 700; line-height: 1.5;">
+                ⚠️ У получателя только <strong>ОДНА</strong> попытка — при ошибке ссылка сгорит
+            </div>
+        `;
+
+        // Вставляем после ссылки
+        const linkBox = content.querySelector('#invLinkBox');
+        if (linkBox) {
+            linkBox.parentNode.insertBefore(pinBlock, linkBox.nextSibling);
+        } else {
+            content.insertBefore(pinBlock, content.firstChild.nextSibling);
+        }
+
+        // ─── Копирование PIN по клику на цифры ───
+        const digits = pinBlock.querySelector('#pinDigitsCopy');
+        digits.addEventListener('click', () => copyPin(pinStr));
+
+        // ─── Кнопка копирования ───
+        const copyBtn = pinBlock.querySelector('#pinCopyBtn');
+        copyBtn.addEventListener('click', () => copyPin(pinStr));
+
+        console.log('🔧 [InvitePinFix] ✅ PIN-блок вставлен:', pinStr);
+    }
+
+    async function copyPin(pinStr) {
+        try {
+            await navigator.clipboard.writeText(pinStr);
+            if (typeof showToast === 'function') {
+                showToast(`📋 PIN ${pinStr} скопирован`, 1500);
+            }
+            if (navigator.vibrate) navigator.vibrate(20);
+            if (typeof soundManager !== 'undefined') {
+                try { soundManager.play('click'); } catch (e) {}
+            }
+        } catch (e) {
+            // Fallback
+            try {
+                const ta = document.createElement('textarea');
+                ta.value = pinStr;
+                ta.style.position = 'fixed';
+                ta.style.left = '-9999px';
+                document.body.appendChild(ta);
+                ta.select();
+                document.execCommand('copy');
+                document.body.removeChild(ta);
+                if (typeof showToast === 'function') {
+                    showToast(`📋 PIN ${pinStr} скопирован`, 1500);
+                }
+            } catch (err) {
+                if (typeof showToast === 'function') {
+                    showToast(`🔑 PIN: ${pinStr}`, 4000);
+                }
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ПАТЧ SHOWINVITEMODAL: страховка — если pin нет, генерим
+    // ═══════════════════════════════════════════════════════════
+    if (typeof window.showInviteLinkModal === 'function') {
+        const _orig = window.showInviteLinkModal;
+        window.showInviteLinkModal = function(url, payload) {
+            const result = _orig.call(this, url, payload);
+
+            // 🆕 После отрисовки оригинала — проверяем и вставляем PIN
+            setTimeout(() => {
+                ensurePinInModal(url, payload);
+            }, 30);
+            setTimeout(() => {
+                ensurePinInModal(url, payload);
+            }, 150);
+
+            return result;
+        };
+        console.log('🔧 [InvitePinFix] showInviteLinkModal пропатчен (страховка)');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ГЛАВНЫЙ ФИКС: ПЕРЕХВАТ КЛИКА ПО КНОПКЕ «ДРУГИЕ ПРИЛОЖЕНИЯ…»
+    //  Это ключевое — вызываем buildInviteLinkWithPin напрямую
+    // ═══════════════════════════════════════════════════════════
+    function handleInviteButtonClick(e) {
+        const btn = e.target.closest('#shareToExternalBtn');
+        if (!btn) return;
+
+        // Проверяем режим
+        let mode = (_shareToChat && _shareToChat.mode) || null;
+        if (!mode) {
+            const fname = (_shareToChat && _shareToChat.fileName) || '';
+            mode = /\.smschat$/i.test(fname) ? 'invite' : 'file';
+        }
+
+        // Не invite — пусть работает обычный шаринг (файл)
+        if (mode !== 'invite') return;
+
+        // Это invite — перехватываем
+        e.stopImmediatePropagation();
+        e.preventDefault();
+
+        let targetFile = (_shareToChat && _shareToChat.inviteChatFile)
+                      || (_shareToChat && _shareToChat.selectedFile)
+                      || state.chatFile;
+
+        if (!targetFile) {
+            if (typeof showToast === 'function') showToast('❌ Сначала выберите чат', 2500);
+            return;
+        }
+        if (!state.savedPasswords[targetFile]) {
+            if (typeof showToast === 'function') {
+                showToast('🔐 Пароль чата не сохранён — ссылку сделать нельзя', 3500);
+            }
+            return;
+        }
+
+        // Блокируем кнопку
+        btn.disabled = true;
+        const originalHTML = btn.innerHTML;
+        btn.innerHTML = `
+            <div style="width:40px;height:40px;border-radius:12px;background:rgba(108,92,231,0.3);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0;">⏳</div>
+            <div style="flex:1;min-width:0;text-align:left;">
+                <div style="font-size:14px;font-weight:600;color:#fff;">Создаём ссылку…</div>
+                <div style="font-size:11px;color:#888;margin-top:2px;">пару секунд</div>
+            </div>
+        `;
+
+        // Строим ссылку + PIN
+        buildInviteLinkWithPin(targetFile)
+            .then(({ url, payload, pin }) => {
+                // Закрываем модалку шаринга
+                const shareModal = document.getElementById('shareToChatModal');
+                if (shareModal) shareModal.classList.remove('active');
+
+                // Показываем модалку с PIN
+                if (typeof window.showInviteLinkModal === 'function') {
+                    window.showInviteLinkModal(url, payload);
+                } else if (typeof showInviteModal === 'function') {
+                    showInviteModal(url, payload);
+                }
+
+                if (typeof soundManager !== 'undefined') {
+                    try { soundManager.play('send'); } catch (e) {}
+                }
+            })
+            .catch((err) => {
+                console.error('🔧 [InvitePinFix] build failed:', err);
+                if (typeof showToast === 'function') {
+                    showToast('❌ ' + (err.message || 'Ошибка'), 3500);
+                }
+                if (typeof soundManager !== 'undefined') {
+                    try { soundManager.play('error'); } catch (e) {}
+                }
+            })
+            .finally(() => {
+                btn.disabled = false;
+                btn.innerHTML = originalHTML;
+            });
+    }
+
+    // Устанавливаем обработчик в CAPTURE-фазе — раньше всех остальных
+    document.addEventListener('click', handleInviteButtonClick, true);
+
+    console.log('🔧 [InvitePinFix] ✅ Готово:');
+    console.log('   • Клик по «Другие приложения…» перехвачен');
+    console.log('   • PIN генерируется и показывается ГАРАНТИРОВАННО');
+    console.log('   • Есть кнопка «Скопировать PIN»');
+    console.log('   • Есть страховка через showInviteLinkModal');
+})();
+</script>
 </body>
 </html>
