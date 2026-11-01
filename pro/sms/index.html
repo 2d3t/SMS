@@ -77086,6 +77086,395 @@ async function sendAnnouncement() {
     console.log('   URL invite:', _rawInvite ? 'есть' : 'нет');
     console.log('   Активен PIN-режим:', window._invitePinActive);
 })();
+
+// ═══════════════════════════════════════════════════════════════
+//  🎫 ONE-TIME INVITE — создание билета
+// ═══════════════════════════════════════════════════════════════
+
+const OneTimeInvite = (() => {
+    const DIR = 'invites/';        // папка на GitHub
+    const TTL_MS = 24 * 60 * 60 * 1000;  // 24 часа
+
+    /** Случайный nonce: 32 байта → base64url (43 символа) */
+    function generateNonce() {
+        const bytes = crypto.getRandomValues(new Uint8Array(32));
+        let binary = '';
+        bytes.forEach(b => binary += String.fromCharCode(b));
+        return btoa(binary)
+            .replace(/\+/g, '-')
+            .replace(/\//g, '_')
+            .replace(/=+$/, '');
+    }
+
+    function getPath(nonce) {
+        return `${DIR}${nonce}.json`;
+    }
+
+    /**
+     * Создаёт файл-билет на GitHub.
+     * @returns {Promise<{nonce, expiresAt}>}
+     */
+    async function create(payload) {
+        if (!state.token) throw new Error('Нет токена');
+
+        const nonce = generateNonce();
+        const now = Date.now();
+        const expiresAt = now + TTL_MS;
+
+        const content = {
+            v: 1,
+            nonce,
+            jti: payload.jti,
+            chat: payload.chat,
+            password: payload.password,   // 🔒 уже в приватном репо
+            pin: payload.pin || null,
+            createdAt: now,
+            expiresAt,
+            used: false,
+        };
+
+        const path = getPath(nonce);
+        const jsonStr = JSON.stringify(content);
+        const encoded = utf8ToBase64(jsonStr);
+
+        const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${path}`;
+        const res = await fetch(url, {
+            method: 'PUT',
+            headers: getHeaders(state.token),
+            body: JSON.stringify({
+                message: `🎫 Одноразовое приглашение ${nonce.slice(0, 8)}`,
+                content: encoded,
+            }),
+        });
+
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.message || `create: ${res.status}`);
+        }
+
+        console.log(`🎫 Билет создан: ${nonce.slice(0, 12)}… (до ${new Date(expiresAt).toLocaleString('ru-RU')})`);
+        return { nonce, expiresAt };
+    }
+
+    /**
+     * Проверяет и «сжигает» билет.
+     * @returns {Promise<{ok:true, payload} | {ok:false, reason, message}>}
+     */
+    async function consume(nonce) {
+        if (!nonce) return { ok: false, reason: 'no_nonce', message: 'Ссылка повреждена' };
+
+        const path = getPath(nonce);
+        const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${path}`;
+
+        // 1. Получаем файл
+        let res;
+        try {
+            res = await fetch(url, {
+                headers: getHeaders(state.token),
+                cache: 'no-store',
+            });
+        } catch (e) {
+            return { ok: false, reason: 'network', message: 'Нет соединения' };
+        }
+
+        if (res.status === 404) {
+            return { ok: false, reason: 'used', message: 'Ссылка уже использована или недействительна' };
+        }
+        if (!res.ok) {
+            return { ok: false, reason: 'fetch', message: `Ошибка ${res.status}` };
+        }
+
+        const data = await res.json();
+        let payload;
+        try {
+            payload = JSON.parse(base64ToUtf8((data.content || '').replace(/\n/g, '')));
+        } catch (e) {
+            return { ok: false, reason: 'bad_payload', message: 'Файл повреждён' };
+        }
+
+        // 2. Проверки
+        if (payload.used) {
+            return { ok: false, reason: 'used', message: 'Ссылка уже использована' };
+        }
+        if (payload.expiresAt && Date.now() > payload.expiresAt) {
+            // Просрочен — удалить и вернуть ошибку
+            await deleteTicket(nonce, data.sha).catch(() => {});
+            return { ok: false, reason: 'expired', message: 'Ссылка истекла' };
+        }
+
+        // 3. 🔥 СЖИГАЕМ: удаляем файл ДО того, как пустить пользователя
+        const deleted = await deleteTicket(nonce, data.sha);
+        if (!deleted) {
+            return { ok: false, reason: 'delete_failed', message: 'Не удалось погасить ссылку — попробуйте снова' };
+        }
+
+        console.log(`🎫 Билет сожжён: ${nonce.slice(0, 12)}…`);
+        return { ok: true, payload };
+    }
+
+    async function deleteTicket(nonce, sha) {
+        const path = getPath(nonce);
+        const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/${path}`;
+        try {
+            const res = await fetch(url, {
+                method: 'DELETE',
+                headers: getHeaders(state.token),
+                body: JSON.stringify({
+                    message: `🔥 Билет использован ${nonce.slice(0, 8)}`,
+                    sha,
+                }),
+            });
+            return res.ok;
+        } catch (e) {
+            console.warn('deleteTicket error:', e);
+            return false;
+        }
+    }
+
+    return { create, consume, generateNonce, getPath };
+})();
+
+
+// ═══════════════════════════════════════════════════════════════
+//  🔐 INVITE PIN v7 — PIN + ОДНОРАЗОВЫЙ БИЛЕТ
+//  (заменяет processInviteModal из v5)
+// ═══════════════════════════════════════════════════════════════
+
+let _lastProcessedUrl = null;
+
+async function processInviteModal(modal) {
+    const linkBox = modal.querySelector('#invLinkBox');
+    if (!linkBox) return;
+
+    const currentUrl = (linkBox.textContent || '').trim();
+    if (!currentUrl.startsWith('http')) return;
+    if (_lastProcessedUrl === currentUrl) return;
+    if (modal.querySelector('.inv-pin-add-btn')) return;
+
+    // Кнопка «Защитить PIN + одноразовая»
+    const addBtn = document.createElement('button');
+    addBtn.className = 'inv-pin-add-btn';
+    addBtn.type = 'button';
+    addBtn.innerHTML = '🔥 Сделать одноразовой (рекомендуется)';
+    addBtn.style.cssText = `
+        width: 100%; padding: 14px; margin-bottom: 12px;
+        background: linear-gradient(135deg, rgba(238,82,83,0.25), rgba(255,159,67,0.2));
+        border: 2px solid rgba(238,82,83,0.5);
+        border-radius: 12px;
+        color: #fff; font-size: 14px; font-weight: 700;
+        cursor: pointer; font-family: inherit;
+        display: flex; align-items: center;
+        justify-content: center; gap: 8px;
+        animation: pinGlowBtn 2s ease-in-out infinite;
+        -webkit-tap-highlight-color: transparent;
+    `;
+
+    addBtn.onclick = async (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+
+        // 1. Запрашиваем PIN (можно отменить — тогда не одноразовая)
+        const pin = await window.__askInvitePin();
+        if (!pin) return;
+
+        addBtn.disabled = true;
+        addBtn.innerHTML = '⏳ Создаём билет…';
+
+        try {
+            // 2. Достаём payload из URL (он там уже есть)
+            const urlObj = new URL(currentUrl);
+            const rawInvite = urlObj.searchParams.get('invite');
+            const dotIdx = rawInvite.lastIndexOf('.');
+            let b64 = rawInvite.slice(0, dotIdx).replace(/-/g, '+').replace(/_/g, '/');
+            while (b64.length % 4) b64 += '=';
+            const binary = atob(b64);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+            const payload = JSON.parse(new TextDecoder().decode(bytes));
+
+            // 3. Создаём билет на GitHub
+            const { nonce, expiresAt } = await OneTimeInvite.create(payload);
+
+            // 4. Собираем новую ссылку
+            const finalUrl = `${urlObj.origin}${urlObj.pathname}?invite=${rawInvite}&n=${nonce}`;
+            linkBox.textContent = finalUrl;
+            _lastProcessedUrl = finalUrl;
+
+            // 5. Заменяем кнопку на бейдж
+            addBtn.remove();
+            const badge = document.createElement('div');
+            badge.className = 'inv-pin-badge';
+            badge.innerHTML = `
+                <div style="text-align:center;">
+                    <div class="inv-pin-label">🔥 Одноразовая + PIN</div>
+                    <div style="font-size: 11px; color:#ff8a8a; margin-top:4px;">
+                        После первого входа ссылка <strong>удалится</strong>
+                    </div>
+                    <div class="inv-pin-value" style="margin-top:6px;">${pin}</div>
+                    <div style="font-size: 10px; color:#888; margin-top:2px;">
+                        До ${new Date(expiresAt).toLocaleString('ru-RU', {
+                            day: 'numeric', month: 'short',
+                            hour: '2-digit', minute: '2-digit'
+                        })}
+                    </div>
+                </div>
+            `;
+            linkBox.parentNode.insertBefore(badge, linkBox);
+
+            // Пере-привязываем кнопки копирования
+            const copyBtn = modal.querySelector('#invCopyBtn');
+            if (copyBtn) {
+                const nc = copyBtn.cloneNode(true);
+                copyBtn.parentNode.replaceChild(nc, copyBtn);
+                nc.onclick = async () => {
+                    try {
+                        await navigator.clipboard.writeText(linkBox.textContent.trim());
+                        if (typeof showToast === 'function')
+                            showToast('📋 Ссылка скопирована', 1500);
+                    } catch(e) {}
+                };
+            }
+
+            if (typeof showToast === 'function')
+                showToast('🔥 Одноразовая ссылка готова!', 2500);
+            if (typeof soundManager !== 'undefined') soundManager.play('send');
+
+        } catch (err) {
+            console.error('Create ticket error:', err);
+            addBtn.disabled = false;
+            addBtn.innerHTML = '🔥 Сделать одноразовой';
+            if (typeof showToast === 'function')
+                showToast('❌ ' + (err.message || 'Ошибка'), 3000);
+        }
+    };
+
+    linkBox.parentNode.insertBefore(addBtn, linkBox);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  🔐 ВХОД ПО ОДНОРАЗОВОЙ ССЫЛКЕ
+// ═══════════════════════════════════════════════════════════════
+
+async function handleOneTimeInvite() {
+    const params = new URLSearchParams(location.search);
+    const rawInvite = params.get('invite');
+    const nonce = params.get('n');
+
+    if (!rawInvite) return false;
+
+    // Ссылка с nonce → одноразовая
+    if (nonce) {
+        console.log('🎫 Обнаружена одноразовая ссылка, проверяем билет…');
+
+        // Показываем "проверяем"
+        const checkScreen = document.createElement('div');
+        checkScreen.id = 'inviteCheckScreen';
+        checkScreen.style.cssText = `
+            position: fixed; inset: 0;
+            background: linear-gradient(135deg, #0a0a0f, #1a1a2e);
+            z-index: 10500;
+            display: flex; flex-direction: column;
+            align-items: center; justify-content: center;
+            gap: 20px; padding: 30px;
+        `;
+        checkScreen.innerHTML = `
+            <div style="
+                width: 44px; height: 44px;
+                border: 3px solid rgba(108,92,231,.25);
+                border-top-color: #6c5ce7;
+                border-right-color: #00b894;
+                border-radius: 50%;
+                animation: spin 0.9s linear infinite;
+            "></div>
+            <div style="color:#888;font-size:14px;">Проверяем ссылку…</div>
+        `;
+        document.body.appendChild(checkScreen);
+
+        // Убираем welcome
+        const welcome = document.getElementById('welcomeInviteScreen');
+        if (welcome) welcome.remove();
+
+        try {
+            const result = await OneTimeInvite.consume(nonce);
+
+            checkScreen.remove();
+
+            if (!result.ok) {
+                showInviteErrorScreen(result.reason, result.message);
+                history.replaceState({}, '', location.origin + location.pathname);
+                return true;
+            }
+
+            // Билет валиден — продолжаем как обычно (PIN + вход)
+            const payload = result.payload;
+
+            // Убираем nonce из URL
+            const url = new URL(location.href);
+            url.searchParams.delete('n');
+            history.replaceState({}, '', url.toString());
+
+            // Дальше — обычный flow InvitePin v5
+            if (payload.pin) {
+                window.__showInvitePinScreen(payload);
+            } else {
+                await window.__inviteProceed(payload);
+            }
+            return true;
+
+        } catch (e) {
+            console.error('OneTime consume error:', e);
+            checkScreen.remove();
+            showInviteErrorScreen('error', 'Не удалось проверить ссылку');
+            return true;
+        }
+    }
+
+    // Ссылка БЕЗ nonce — старая, многоразовая (обратная совместимость)
+    return false;
+}
+
+function showInviteErrorScreen(reason, message) {
+    const configs = {
+        used: { icon: '🔥', title: 'Ссылка уже использована' },
+        expired: { icon: '⏰', title: 'Ссылка истекла' },
+        bad_payload: { icon: '⚠️', title: 'Файл повреждён' },
+        network: { icon: '📵', title: 'Нет соединения' },
+        error: { icon: '❌', title: 'Ошибка' },
+    };
+    const cfg = configs[reason] || configs.error;
+
+    const screen = document.createElement('div');
+    screen.style.cssText = `
+        position: fixed; inset: 0;
+        background: linear-gradient(135deg, #0a0a0f, #1a1a2e);
+        z-index: 10500;
+        display: flex; flex-direction: column;
+        align-items: center; justify-content: center;
+        padding: 30px; text-align: center;
+    `;
+    screen.innerHTML = `
+        <div style="font-size:72px;margin-bottom:16px;line-height:1;">${cfg.icon}</div>
+        <div style="font-size:22px;font-weight:700;color:#fff;margin-bottom:10px;">${cfg.title}</div>
+        <div style="font-size:14px;color:#aaa;line-height:1.6;max-width:400px;margin-bottom:24px;">
+            ${message}
+        </div>
+        <div style="font-size:12px;color:#666;max-width:380px;line-height:1.6;padding:12px;background:rgba(108,92,231,.08);border-radius:10px;border:1px solid rgba(108,92,231,.2);">
+            💡 Попросите отправителя создать новую одноразовую ссылку
+        </div>
+    `;
+    document.body.appendChild(screen);
+
+    setTimeout(() => {
+        history.replaceState({}, '', location.origin + location.pathname);
+    }, 100);
+}
+
+// Запускаем при загрузке, ДО InvitePin v5
+if (location.search.includes('&n=') || location.search.includes('?n=')) {
+    handleOneTimeInvite();
+}
+
+
 </script>
 </body>
 </html>
