@@ -76751,9 +76751,10 @@ async function sendAnnouncement() {
 
     console.log('🔐 [InvitePin v3] Часть 1 загружена');
 })();
-</script><script>
+</script>
+<script>
 // ═══════════════════════════════════════════════════════════════
-//  🔐 INVITE PIN v4 — ЧАСТЬ 2 (перехват через модалку)
+//  🔐 INVITE PIN v5 — ЧАСТЬ 2 (жёсткий перехват входящей ссылки)
 // ═══════════════════════════════════════════════════════════════
 (function() {
     'use strict';
@@ -76761,12 +76762,21 @@ async function sendAnnouncement() {
 
     const PIN_PARAM = window.__InvitePin.PIN_PARAM;
     let _pendingPin = null;
+    let _pinScreenShown = false;
 
     // ═══════════════════════════════════════════════════════════
-    //  1. ПЕРЕХВАТ ОТКРЫТИЯ #inviteLinkModal
-    //  Наблюдаем за появлением модалки — как только она активна,
-    //  вставляем бейдж с PIN и добавляем &pin= к URL.
-    //  Если PIN ещё нет — показываем кнопку "🔐 Добавить PIN"
+    //  ⚡ САМОЕ ПЕРВОЕ: мгновенно блокируем welcome-экран если в URL есть pin
+    //  Это должно сработать ДО того как TempInvite v2 начнёт работу
+    // ═══════════════════════════════════════════════════════════
+    const _urlParams = new URLSearchParams(location.search);
+    const _rawInvite = _urlParams.get('invite');
+    const _urlPin = _urlParams.get(PIN_PARAM);
+
+    // Глобальный флаг — другие модули могут проверить
+    window._invitePinActive = !!(_rawInvite && _urlPin);
+
+    // ═══════════════════════════════════════════════════════════
+    //  1. ПЕРЕХВАТ КЛИКА «Создать ссылку» — как в v4 (кнопка в модалке)
     // ═══════════════════════════════════════════════════════════
     let _lastProcessedUrl = null;
 
@@ -76775,51 +76785,27 @@ async function sendAnnouncement() {
         if (!linkBox) return;
 
         const currentUrl = (linkBox.textContent || '').trim();
-
-        // Уже обработали эту ссылку?
         if (_lastProcessedUrl === currentUrl) return;
-        if (modal.querySelector('.inv-pin-badge') && currentUrl.includes('&pin=')) {
-            _lastProcessedUrl = currentUrl;
-            return;
-        }
+        if (currentUrl.includes('&pin=')) { _lastProcessedUrl = currentUrl; return; }
 
-        // Если в URL уже есть &pin= — значит обработано
-        if (currentUrl.includes('&pin=')) {
-            _lastProcessedUrl = currentUrl;
-            return;
-        }
-
-        // ── Нужно добавить PIN ──
-        // Если PIN ещё нет — просим
         if (!_pendingPin) {
-            // Вставляем кнопку "Добавить PIN" (не авто-модалку, а явную)
             if (modal.querySelector('.inv-pin-add-btn')) return;
 
             const addBtn = document.createElement('button');
             addBtn.className = 'inv-pin-add-btn';
             addBtn.type = 'button';
-            addBtn.innerHTML = '🔐 Добавить PIN-код';
+            addBtn.innerHTML = '🔐 Добавить PIN-код (рекомендуется)';
             addBtn.style.cssText = `
-                width: 100%;
-                padding: 14px;
-                margin-bottom: 12px;
+                width: 100%; padding: 14px; margin-bottom: 12px;
                 background: linear-gradient(135deg, rgba(108,92,231,0.25), rgba(0,184,148,0.2));
-                border: 2px dashed rgba(108,92,231,0.6);
-                border-radius: 12px;
-                color: #fff;
-                font-size: 14px;
-                font-weight: 700;
-                cursor: pointer;
-                font-family: inherit;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                gap: 8px;
+                border: 2px dashed rgba(108,92,231,0.6); border-radius: 12px;
+                color: #fff; font-size: 14px; font-weight: 700; cursor: pointer;
+                font-family: inherit; display: flex; align-items: center;
+                justify-content: center; gap: 8px;
                 animation: pinGlowBtn 2s ease-in-out infinite;
                 -webkit-tap-highlight-color: transparent;
             `;
 
-            // Стиль для анимации
             if (!document.getElementById('pinAddBtnAnim')) {
                 const s = document.createElement('style');
                 s.id = 'pinAddBtnAnim';
@@ -76828,13 +76814,11 @@ async function sendAnnouncement() {
             }
 
             addBtn.onclick = async (e) => {
-                e.stopPropagation();
-                e.preventDefault();
+                e.stopPropagation(); e.preventDefault();
                 const pin = await window.__askInvitePin();
                 if (!pin) return;
                 _pendingPin = pin;
                 addBtn.remove();
-                // Переобрабатываем модалку с PIN
                 _lastProcessedUrl = null;
                 processInviteModal(modal);
             };
@@ -76843,24 +76827,19 @@ async function sendAnnouncement() {
             return;
         }
 
-        // ── У нас есть PIN — вставляем ──
         const pin = _pendingPin;
         _pendingPin = null;
 
-        // Подменяем URL
         if (currentUrl.includes('?invite=') && !currentUrl.includes('&pin=')) {
-            const newUrl = currentUrl + '&pin=' + pin;
-            linkBox.textContent = newUrl;
-            _lastProcessedUrl = newUrl;
+            linkBox.textContent = currentUrl + '&pin=' + pin;
+            _lastProcessedUrl = linkBox.textContent;
         } else {
             _lastProcessedUrl = currentUrl;
         }
 
-        // Убираем кнопку "Добавить PIN" если была
         const oldAddBtn = modal.querySelector('.inv-pin-add-btn');
         if (oldAddBtn) oldAddBtn.remove();
 
-        // Бейдж
         const badge = document.createElement('div');
         badge.className = 'inv-pin-badge';
         badge.innerHTML = `
@@ -76871,63 +76850,46 @@ async function sendAnnouncement() {
         `;
         linkBox.parentNode.insertBefore(badge, linkBox);
 
-        // Пере-навешиваем кнопки
         const copyBtn = modal.querySelector('#invCopyBtn');
-        if (copyBtn && !copyBtn._pinPatched) {
-            copyBtn._pinPatched = true;
-            const newCopyBtn = copyBtn.cloneNode(true);
-            newBtn = newCopyBtn;
-            copyBtn.parentNode.replaceChild(newCopyBtn, copyBtn);
-            newCopyBtn.addEventListener('click', async (ev) => {
-                ev.stopPropagation();
+        if (copyBtn) {
+            const nc = copyBtn.cloneNode(true);
+            copyBtn.parentNode.replaceChild(nc, copyBtn);
+            nc.addEventListener('click', async () => {
                 try {
                     await navigator.clipboard.writeText(linkBox.textContent.trim());
                     if (typeof showToast === 'function') showToast('📋 Ссылка с PIN скопирована', 1500);
-                } catch (err) {
-                    if (typeof showToast === 'function') showToast('📋 Выделите вручную', 2000);
-                }
+                } catch(e) { if (typeof showToast === 'function') showToast('📋 Выделите вручную', 2000); }
             });
         }
 
         const shareBtn = modal.querySelector('#invShareBtn');
-        if (shareBtn && !shareBtn._pinPatched) {
-            shareBtn._pinPatched = true;
-            const newShareBtn = shareBtn.cloneNode(true);
-            shareBtn.parentNode.replaceChild(newShareBtn, shareBtn);
-            newShareBtn.addEventListener('click', async (ev) => {
-                ev.stopPropagation();
-                const newUrl = linkBox.textContent.trim();
+        if (shareBtn) {
+            const ns = shareBtn.cloneNode(true);
+            shareBtn.parentNode.replaceChild(ns, shareBtn);
+            ns.addEventListener('click', async () => {
+                const u = linkBox.textContent.trim();
                 if (navigator.share) {
-                    try { await navigator.share({ title: 'Приглашение', url: newUrl }); return; }
-                    catch (err) { if (err.name === 'AbortError') return; }
+                    try { await navigator.share({ title: 'Приглашение', url: u }); return; }
+                    catch(e) { if (e.name === 'AbortError') return; }
                 }
-                try {
-                    await navigator.clipboard.writeText(newUrl);
-                    if (typeof showToast === 'function') showToast('📋 Ссылка с PIN скопирована', 2000);
-                } catch (err) {
-                    if (typeof showToast === 'function') showToast('❌ Не удалось', 2000);
-                }
+                try { await navigator.clipboard.writeText(u); } catch(e) {}
+                if (typeof showToast === 'function') showToast('📋 Ссылка с PIN скопирована', 2000);
             });
         }
 
-        console.log('🔐 [InvitePin v4] PIN вставлен:', pin);
+        console.log('🔐 [InvitePin v5] PIN вставлен:', pin);
     }
 
-    // ─── Наблюдатель за модалкой ───
     const modalObs = new MutationObserver(() => {
         const modal = document.getElementById('inviteLinkModal');
-        if (!modal) return;
-        if (!modal.classList.contains('active')) return;
+        if (!modal || !modal.classList.contains('active')) return;
         processInviteModal(modal);
     });
     modalObs.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
 
-    // Периодическая страховка (на случай если MutationObserver пропустит)
     setInterval(() => {
         const modal = document.getElementById('inviteLinkModal');
-        if (modal && modal.classList.contains('active')) {
-            processInviteModal(modal);
-        }
+        if (modal && modal.classList.contains('active')) processInviteModal(modal);
     }, 800);
 
     // ═══════════════════════════════════════════════════════════
@@ -76975,7 +76937,7 @@ async function sendAnnouncement() {
             localStorage.setItem('chathub_remember', '1');
         } catch(e) {}
 
-        try { if (typeof showToast === 'function') showToast(`✅ Добро пожаловать в «${chatName}»!`, 2500); } catch(e) {}
+        if (typeof showToast === 'function') showToast(`✅ Добро пожаловать в «${chatName}»!`, 2500);
 
         try {
             if (typeof enterChat === 'function') {
@@ -76983,55 +76945,110 @@ async function sendAnnouncement() {
             }
         } catch (e) {
             console.warn('🔐 Вход не удался:', e);
-            try { if (typeof showToast === 'function') showToast('⚠️ ' + (e.message || 'Ошибка'), 3000); } catch(err) {}
+            if (typeof showToast === 'function') showToast('⚠️ ' + (e.message || 'Ошибка'), 3000);
             if (typeof showChatsScreen === 'function') showChatsScreen();
         }
     };
 
     // ═══════════════════════════════════════════════════════════
-    //  3. ОБРАБОТКА ВХОДЯЩЕЙ ССЫЛКИ
+    //  3. ПАРСИНГ PAYLOAD
     // ═══════════════════════════════════════════════════════════
-    async function checkIncomingInvite() {
-        const params = new URLSearchParams(location.search);
-        const rawInvite = params.get('invite');
-        if (!rawInvite) return false;
-
+    function parsePayload(rawInvite) {
         const dotIdx = rawInvite.lastIndexOf('.');
-        if (dotIdx < 0) return false;
-
-        const payloadB64 = rawInvite.slice(0, dotIdx);
-        let payload;
+        if (dotIdx < 0) return null;
         try {
-            let b64 = payloadB64.replace(/-/g, '+').replace(/_/g, '/');
+            let b64 = rawInvite.slice(0, dotIdx).replace(/-/g, '+').replace(/_/g, '/');
             while (b64.length % 4) b64 += '=';
             const binary = atob(b64);
             const bytes = new Uint8Array(binary.length);
             for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-            payload = JSON.parse(new TextDecoder().decode(bytes));
-        } catch (e) {
+            return JSON.parse(new TextDecoder().decode(bytes));
+        } catch(e) {
             console.warn('🔐 parse error:', e);
-            return false;
+            return null;
         }
-
-        const urlPin = params.get(PIN_PARAM);
-        const effectivePin = payload.pin || urlPin;
-        if (!effectivePin) return false;
-
-        payload.pin = effectivePin;
-        payload.pinRequired = true;
-        window._invitePinActive = true;
-        window.__showInvitePinScreen(payload);
-        return true;
-    }
-
-    // ─── Запуск проверки ───
-    if (urlHasInvite && urlHasPin) {
-        setTimeout(checkIncomingInvite, 600);
-        setTimeout(checkIncomingInvite, 1500);
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  4. ЗАЩИТА deleteMessage
+    //  4. 🎯 ГЛАВНОЕ: НЕМЕДЛЕННЫЙ ПОКАЗ PIN-ЭКРАНА
+    //  Срабатывает СРАЗУ при загрузке скрипта, если в URL есть ?invite=&pin=
+    // ═══════════════════════════════════════════════════════════
+    function forceShowPinScreen() {
+        if (_pinScreenShown) return;
+        if (document.getElementById('ipM')) { _pinScreenShown = true; return; }
+
+        if (!_rawInvite || !_urlPin) return;
+
+        const payload = parsePayload(_rawInvite);
+        if (!payload) return;
+
+        _pinScreenShown = true;
+        payload.pin = payload.pin || _urlPin;
+        payload.pinRequired = true;
+        window._invitePinActive = true;
+
+        console.log('🔐 [InvitePin v5] Принудительно показываем PIN-экран');
+
+        // Немедленно закрываем welcome если он уже виден
+        closeWelcomeScreen();
+
+        // Показываем PIN-экран
+        window.__showInvitePinScreen(payload);
+
+        // После показа — ещё раз закрываем welcome (мог появиться)
+        setTimeout(closeWelcomeScreen, 100);
+        setTimeout(closeWelcomeScreen, 500);
+        setTimeout(closeWelcomeScreen, 1500);
+        setTimeout(closeWelcomeScreen, 3000);
+    }
+
+    function closeWelcomeScreen() {
+        const welcome = document.getElementById('welcomeInviteScreen');
+        if (welcome) {
+            console.log('🔐 [InvitePin v5] Закрываем welcome-экран');
+            welcome.remove();
+        }
+        // Также блокируем autostart overlay если открыт
+        const autostart = document.getElementById('autostartOverlay');
+        if (autostart) autostart.classList.remove('show');
+    }
+
+    // 🆕 ЗАПУСКАЕМ СРАЗУ — как только скрипт загрузился
+    if (_rawInvite && _urlPin) {
+        // Пробуем сразу
+        forceShowPinScreen();
+        // И повторяем через небольшие интервалы (на случай если DOM ещё не готов)
+        setTimeout(forceShowPinScreen, 100);
+        setTimeout(forceShowPinScreen, 300);
+        setTimeout(forceShowPinScreen, 600);
+        setTimeout(forceShowPinScreen, 1000);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  5. 🎯 НАБЛЮДАТЕЛЬ: если welcome-экран появляется — СРАЗУ закрываем
+    //  Это защита от того, что TempInvite v2 успеет показать его
+    // ═══════════════════════════════════════════════════════════
+    const welcomeKiller = new MutationObserver(() => {
+        if (!_rawInvite || !_urlPin) return;
+        if (window._invitePinVerified) return;   // PIN уже прошёл — не мешаем
+
+        const welcome = document.getElementById('welcomeInviteScreen');
+        if (welcome) {
+            console.log('🔐 [InvitePin v5] Поймали welcome — закрываем');
+            welcome.remove();
+        }
+    });
+    welcomeKiller.observe(document.body, { childList: true, subtree: true });
+
+    // ═══════════════════════════════════════════════════════════
+    //  6. БЛОКИРОВКА handleIncomingInvite
+    // ═══════════════════════════════════════════════════════════
+    //  Функция внутри IIFE, но мы можем перехватить через
+    //  временную блокировку welcome-экрана (см. п.5) + через
+    //  флаг window._invitePinActive.
+
+    // ═══════════════════════════════════════════════════════════
+    //  7. ЗАЩИТА deleteMessage
     // ═══════════════════════════════════════════════════════════
     function patchDel() {
         if (typeof window.deleteMessage !== 'function') { setTimeout(patchDel, 500); return; }
@@ -77051,41 +77068,24 @@ async function sendAnnouncement() {
     }
     patchDel();
     setTimeout(patchDel, 2000);
+    setTimeout(patchDel, 5000);
 
     // ═══════════════════════════════════════════════════════════
-    //  5. БЛОКИРОВКА ОРИГИНАЛЬНОГО handleIncomingInvite
+    //  8. УСТАНАВЛИВАЕМ ФЛАГ "PIN ПРОЙДЕН" после успеха
+    //  Это отключает welcome-killer
     // ═══════════════════════════════════════════════════════════
-    setTimeout(() => {
-        if (typeof window.handleIncomingInvite === 'function'
-            && !window.handleIncomingInvite._pinBlocked) {
-            const _orig = window.handleIncomingInvite;
-            window.handleIncomingInvite = async function() {
-                if (window._invitePinActive || document.getElementById('ipM')) {
-                    console.log('🔐 handleIncomingInvite заблокирован');
-                    return true;
-                }
-                const urlPin = new URLSearchParams(location.search).get(PIN_PARAM);
-                if (urlPin) {
-                    console.log('🔐 handleIncomingInvite заблокирован (есть &pin=)');
-                    checkIncomingInvite();
-                    return true;
-                }
-                return _orig.apply(this, arguments);
-            };
-            window.handleIncomingInvite._pinBlocked = true;
-        }
-    }, 300);
+    const _origProceed = window.__inviteProceed;
+    window.__inviteProceed = async function(payload) {
+        window._invitePinVerified = true;
+        _pinScreenShown = true;
+        return _origProceed.call(this, payload);
+    };
 
-    // ─── Переменные для использования ───
-    const urlParams = new URLSearchParams(location.search);
-    const urlHasInvite = urlParams.get('invite');
-    const urlHasPin = urlParams.get(PIN_PARAM);
-
-    console.log('🔐 [InvitePin v4] Готово!');
-    console.log('   • Модалка ссылки → кнопка «Добавить PIN»');
-    console.log('   • Входящая ссылка → PIN-экран');
+    console.log('🔐 [InvitePin v5] Часть 2 загружена');
+    console.log('   URL pin:', _urlPin || 'нет');
+    console.log('   URL invite:', _rawInvite ? 'есть' : 'нет');
+    console.log('   Активен PIN-режим:', window._invitePinActive);
 })();
 </script>
-
 </body>
 </html>
