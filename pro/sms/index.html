@@ -77118,529 +77118,419 @@ if (_rawInvite) {
 })();
 </script><script>
 // ═══════════════════════════════════════════════════════════════
-//  ⭐ ОСНОВНОЙ ГОРОД ДЛЯ ВИДЖЕТА ПОГОДЫ
-//  ─────────────────────────────────────────────────────────────
-//  • Тап по названию города в шапке → модалка поиска
-//  • «Сделать основным» в модалке → сохраняется в localStorage
-//  • detectLocationByIp() сначала смотрит сохранённый город
-//  • Кнопка 🔍 остаётся для разового просмотра
-//  • Сброс основного города — через меню действия виджета
+//  🏙️ MAIN CITY — короткий фикс
+//  Кнопка 🏙️ в шапке погоды → модалка выбора города
+//  Каждое открытие создаёт свежую модалку (нет залипания)
 // ═══════════════════════════════════════════════════════════════
-
-(function installMainCitySelector() {
+(function () {
     'use strict';
+    const KEY = 'smschat_main_city_v1';
+    let modal = null;
 
-    console.log('⭐ [MainCity] Установка выбора основного города…');
-
-    const STORAGE_KEY = 'smschat_main_city_v1';
-
-    // ═══════════════════════════════════════════════════════════
-    //  СОХРАНЕНИЕ / ЗАГРУЗКА
-    // ═══════════════════════════════════════════════════════════
-    function loadMainCity() {
-        try {
-            const raw = localStorage.getItem(STORAGE_KEY);
-            if (!raw) return null;
-            const data = JSON.parse(raw);
-            if (data && data.name && typeof data.lat === 'number' && typeof data.lon === 'number') {
-                return data;
-            }
-        } catch (e) {}
-        return null;
-    }
-
-    function saveMainCity(city) {
-        try {
-            if (city) {
-                localStorage.setItem(STORAGE_KEY, JSON.stringify(city));
-                console.log('⭐ [MainCity] Сохранён основной город:', city.name);
-            } else {
-                localStorage.removeItem(STORAGE_KEY);
-                console.log('⭐ [MainCity] Основной город сброшен');
-            }
-        } catch (e) {
-            console.warn('⭐ [MainCity] save failed:', e);
-        }
-    }
-
-    function getMainCity() {
-        return loadMainCity();
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  🎯 ПАТЧ detectLocationByIp — отдаём сохранённый город
-    //  ═══════════════════════════════════════════════════════════
-    //  Проблема: WeatherWidget (v8) внутри IIFE создаёт свою
-    //  detectLocationByIp. Снаружи её не достать, но она вызывает
-    //  fetch('https://ipwho.is/') и 'http://ip-api.com/...'.
-    //  Мы можем перехватить именно этот fetch.
-    // ═══════════════════════════════════════════════════════════
-
-    const _origFetch = window.fetch.bind(window);
-    const IP_HOSTS = ['ipwho.is', 'ip-api.com'];
-
-    window.fetch = function(url, opts) {
-        const urlStr = typeof url === 'string' ? url : (url && url.url) || '';
-
-        // Перехватываем только IP-геолокацию
-        const isIpLookup = IP_HOSTS.some(h => urlStr.includes(h));
-        if (!isIpLookup) {
-            return _origFetch(url, opts);
-        }
-
-        const mainCity = getMainCity();
-        if (!mainCity) {
-            return _origFetch(url, opts);
-        }
-
-        console.log(`⭐ [MainCity] Подменяем ${urlStr.slice(0, 40)}… → ${mainCity.name}`);
-
-        // Возвращаем «фейковый» ответ в формате того API, который спрашивали
-        const isIpwho = urlStr.includes('ipwho.is');
-        const payload = isIpwho
-            ? {
-                success: true,
-                city: mainCity.name,
-                country: mainCity.country || '',
-                country_code: mainCity.cc || '',
-                latitude: mainCity.lat,
-                longitude: mainCity.lon,
-                timezone: { id: mainCity.tz || 'auto' },
-            }
-            : {
-                status: 'success',
-                city: mainCity.name,
-                country: mainCity.country || '',
-                countryCode: mainCity.cc || '',
-                lat: mainCity.lat,
-                lon: mainCity.lon,
-                timezone: mainCity.tz || 'auto',
-            };
-
-        return Promise.resolve(new Response(JSON.stringify(payload), {
-            status: 200,
-            headers: { 'Content-Type': 'application/json' },
-        }));
+    const load = () => {
+        try { return JSON.parse(localStorage.getItem(KEY) || 'null'); }
+        catch (e) { return null; }
     };
-
-    // ═══════════════════════════════════════════════════════════
-    //  🎯 ПАТЧ: при сохранении нового основного города
-    //     полностью сбрасываем кэш погоды и перезагружаем
-    // ═══════════════════════════════════════════════════════════
-    async function applyMainCity(city) {
-        saveMainCity(city);
-
-        // Сбрасываем кэш погоды (тот, что использует WeatherWidget)
+    const save = (c) => {
+        try { c ? localStorage.setItem(KEY, JSON.stringify(c)) : localStorage.removeItem(KEY); }
+        catch (e) {}
+    };
+    const clearCache = () => {
         try {
-            const CACHE_KEY = 'smschat_widgets_cache';
-            const raw = localStorage.getItem(CACHE_KEY);
-            if (raw) {
-                const cache = JSON.parse(raw);
-                Object.keys(cache).forEach(k => {
-                    if (k.startsWith('weather')) delete cache[k];
-                });
-                localStorage.setItem(CACHE_KEY, JSON.stringify(cache));
-                console.log('⭐ [MainCity] Кэш погоды сброшен');
-            }
+            const raw = localStorage.getItem('smschat_widgets_cache');
+            if (!raw) return;
+            const c = JSON.parse(raw);
+            Object.keys(c).forEach(k => k.startsWith('weather') && delete c[k]);
+            localStorage.setItem('smschat_widgets_cache', JSON.stringify(c));
         } catch (e) {}
-
-        // Вызываем refresh виджета
-        try {
-            if (typeof WeatherWidget !== 'undefined'
-                && typeof WeatherWidget.refresh === 'function') {
-                await WeatherWidget.refresh();
-            }
-        } catch (e) {
-            console.warn('⭐ [MainCity] refresh failed:', e);
-        }
-
-        // Принудительно перерисовываем список чатов
-        try {
-            if (typeof renderChatsList === 'function') renderChatsList();
-        } catch (e) {}
-
-        // Toast
-        if (typeof showToast === 'function') {
-            showToast(`⭐ Основной город: ${city.name}`, 2500);
-        }
-        if (typeof soundManager !== 'undefined') {
-            try { soundManager.play('send'); } catch (e) {}
-        }
-        if (navigator.vibrate) navigator.vibrate([15, 30, 15]);
-    }
-
-    function clearMainCity() {
-        saveMainCity(null);
-        try {
-            const CACHE_KEY = 'smschat_widgets_cache';
-            const raw = localStorage.getItem(CACHE_KEY);
-            if (raw) {
-                const cache = JSON.parse(raw);
-                Object.keys(cache).forEach(k => {
-                    if (k.startsWith('weather')) delete cache[k];
-                });
-                localStorage.setItem(CACHE_KEY, JSON.stringify(cache));
-            }
-        } catch (e) {}
-        try {
-            if (typeof WeatherWidget !== 'undefined'
-                && typeof WeatherWidget.refresh === 'function') {
-                WeatherWidget.refresh();
-            }
-        } catch (e) {}
-        if (typeof showToast === 'function') showToast('↺ Основной город сброшен', 2000);
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  КЛИК ПО НАЗВАНИЮ ГОРОДА В ШАПКЕ ВИДЖЕТА
-    //  ────────────────────────────────────────────────────────
-    //  Шапка виджета содержит:
-    //    .wc-title   →  «🇧🇾 Минск»
-    //    .wc-subtitle
-    //  Название города — внутри .wc-title.
-    //  Клик по нему → открывает модалку поиска.
-    // ═══════════════════════════════════════════════════════════
-
-    // Делегированный обработчик (capture, чтобы перехватить раньше
-    // возможных внутренних обработчиков карточки)
-    document.addEventListener('click', (e) => {
-        const titleEl = e.target.closest('.widget-card.weather .wc-title');
-        if (!titleEl) return;
-
-        // Игнорируем клики по кнопке 🔍 (она в .wc-header, но не в .wc-title)
-        // и по ⟳ (кнопка обновления, тоже вне .wc-title)
-        // (на всякий случай проверяем ближайшие интерактивные элементы)
-        if (e.target.closest('button')) return;
-
-        e.stopPropagation();
-        e.preventDefault();
-
-        console.log('⭐ [MainCity] Клик по названию города — открываем модалку');
-
-        // Открываем WeatherQuickLookup
-        if (typeof WeatherQuickLookup !== 'undefined'
-            && typeof WeatherQuickLookup.open === 'function') {
-            WeatherQuickLookup.open();
-        } else {
-            if (typeof showToast === 'function') {
-                showToast('❌ Модалка поиска недоступна', 2000);
-            }
-        }
-    }, true);
-
-    // ═══════════════════════════════════════════════════════════
-    //  ПАТЧ WeatherQuickLookup.search — добавляем кнопки
-    //  «Сделать основным» и «Сбросить» в результат
-    // ═══════════════════════════════════════════════════════════
-    //  WeatherQuickLookup v2 — IIFE, но он экспортирует объект
-    //  window.WeatherQuickLookup с методами open/close/search.
-    //  Метод renderFull внутри IIFE, снаружи не достать.
-    //
-    //  Решение: после каждого рендера результата добавляем свою
-    //  панель с кнопками через MutationObserver.
-    // ═══════════════════════════════════════════════════════════
-
-    function injectMainCityControls() {
-        const res = document.getElementById('wqlRes');
-        if (!res || !res.classList.contains('show')) return;
-        if (res.querySelector('.wql-main-city-panel')) return;
-
-        // Данные города берём из lastGeo — он хранится в IIFE.
-        // Достать его напрямую нельзя, но можно вытащить из DOM:
-        //   .wql-loc-n   → название
-        //   .wql-loc-s   → admin, country
-        const nameEl = res.querySelector('.wql-loc-n');
-        const subEl = res.querySelector('.wql-loc-s');
-        const flagEl = res.querySelector('.wql-loc-f');
-        if (!nameEl) return;
-
-        const name = nameEl.textContent.trim();
-        const sub = subEl ? subEl.textContent.trim() : '';
-        const flag = flagEl ? flagEl.textContent.trim() : '🌍';
-
-        // Проверяем, является ли этот город уже основным
-        const mainCity = getMainCity();
-        const isCurrentMain = mainCity && mainCity.name === name;
-
-        // Панель с кнопками
-        const panel = document.createElement('div');
-        panel.className = 'wql-main-city-panel';
-        panel.style.cssText = `
-            margin-top: 12px;
-            padding-top: 12px;
-            border-top: 1px dashed rgba(255,255,255,0.12);
-            display: flex;
-            flex-direction: column;
-            gap: 8px;
-        `;
-
-        if (isCurrentMain) {
-            panel.innerHTML = `
-                <div style="
-                    display:flex;align-items:center;gap:8px;
-                    padding:10px 12px;
-                    background:rgba(0,184,148,0.12);
-                    border:1px solid rgba(0,184,148,0.4);
-                    border-radius:11px;
-                    color:#00b894;font-size:12px;font-weight:600;
-                ">
-                    <span style="font-size:18px;">⭐</span>
-                    <span style="flex:1;">Это ваш основной город</span>
-                </div>
-                <button class="wql-btn" id="wqlResetMainBtn" style="
-                    background:rgba(255,107,107,0.15);
-                    border:1px solid rgba(255,107,107,0.35);
-                    color:#ff6b6b;
-                ">↺ Сбросить (использовать IP-локацию)</button>
-            `;
-        } else {
-            panel.innerHTML = `
-                <button class="wql-btn" id="wqlSetMainBtn" style="
-                    background:linear-gradient(135deg,#feca57,#ff9f43);
-                    color:#1a1a2e;
-                ">⭐ Сделать основным городом</button>
-            `;
-        }
-
-        res.appendChild(panel);
-
-        // ─── Обработчики ───
-        const setBtn = panel.querySelector('#wqlSetMainBtn');
-        const resetBtn = panel.querySelector('#wqlResetMainBtn');
-
-        if (setBtn) {
-            setBtn.addEventListener('click', async (e) => {
-                e.stopPropagation();
-
-                // Получаем координаты города через geocoding API
-                // (потому что WeatherQuickLookup хранит их в своём
-                //  приватном lastGeo — из DOM не достать)
-                try {
-                    setBtn.disabled = true;
-                    setBtn.textContent = '⏳ Сохраняем…';
-
-                    const geoUrl = 'https://geocoding-api.open-meteo.com/v1/search'
-                        + `?name=${encodeURIComponent(name)}&count=1&language=ru&format=json`;
-                    const resGeo = await _origFetch(geoUrl);
-                    if (!resGeo.ok) throw new Error('Геокодинг недоступен');
-                    const geoData = await resGeo.json();
-                    if (!geoData.results || !geoData.results.length) {
-                        throw new Error('Город не найден');
-                    }
-
-                    const r = geoData.results[0];
-                    const city = {
-                        name: r.name,
-                        country: r.country || '',
-                        cc: r.country_code || '',
-                        lat: r.latitude,
-                        lon: r.longitude,
-                        tz: r.timezone || 'auto',
-                        admin: r.admin1 || '',
-                    };
-
-                    await applyMainCity(city);
-
-                    // Перерисовываем результат (кнопки переключатся)
-                    panel.remove();
-                    injectMainCityControls();
-
-                } catch (err) {
-                    console.error('⭐ [MainCity] set error:', err);
-                    if (typeof showToast === 'function') {
-                        showToast('❌ ' + (err.message || 'Ошибка'), 2500);
-                    }
-                    setBtn.disabled = false;
-                    setBtn.textContent = '⭐ Сделать основным городом';
-                }
-            });
-        }
-
-        if (resetBtn) {
-            resetBtn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                clearMainCity();
-                panel.remove();
-                // Закрываем модалку
-                if (typeof WeatherQuickLookup !== 'undefined'
-                    && typeof WeatherQuickLookup.close === 'function') {
-                    WeatherQuickLookup.close();
-                }
-            });
-        }
-    }
-
-    // Наблюдаем за появлением/изменением результата
-    const resObserver = new MutationObserver(() => {
-        const res = document.getElementById('wqlRes');
-        if (res && res.classList.contains('show')) {
-            // Небольшая задержка — дать WeatherQuickLookup дорисовать
-            setTimeout(injectMainCityControls, 30);
-            setTimeout(injectMainCityControls, 150);
-        }
-    });
-    resObserver.observe(document.body, {
-        childList: true,
-        subtree: true,
-        attributes: true,
-        attributeFilter: ['class'],
-    });
-
-    // ─── Также при открытии модалки ───
-    document.addEventListener('click', (e) => {
-        // Клик по 🔍 в шапке погоды
-        if (e.target.closest('.wc-lookup-btn')) {
-            setTimeout(injectMainCityControls, 300);
-            setTimeout(injectMainCityControls, 800);
-        }
-        // Клик по названию города
-        if (e.target.closest('.widget-card.weather .wc-title')) {
-            setTimeout(injectMainCityControls, 300);
-            setTimeout(injectMainCityControls, 800);
-        }
-    }, true);
-
-    // ═══════════════════════════════════════════════════════════
-    //  ПУНКТ В МЕНЮ ДЕЙСТВИЙ ВИДЖЕТА (long-press)
-    //  Добавляем «⭐ Сменить основной город» и «↺ Сбросить»
-    // ═══════════════════════════════════════════════════════════
-    function injectWidgetMenuItems() {
-        const menu = document.getElementById('widgetLpMenu');
-        if (!menu) return;
-        if (menu.querySelector('[data-action="main-city"]')) return;
-
-        const widgetId = (typeof WidgetLongPress !== 'undefined'
-            && typeof WidgetLongPress.status === 'function')
-            ? WidgetLongPress.status().currentWidget
-            : null;
-
-        if (widgetId !== 'weather') return;
-
-        const hasMainCity = !!getMainCity();
-
-        const header = menu.querySelector('.wlp-header');
-        if (!header) return;
-
-        // Вставляем после шапки, перед пунктом «Убрать»
-        const removeItem = menu.querySelector('[data-action="remove"]');
-        const anchor = removeItem || menu.querySelector('.wlp-cancel');
-
-        if (hasMainCity) {
-            const city = getMainCity();
-            const infoItem = document.createElement('div');
-            infoItem.className = 'wlp-item';
-            infoItem.dataset.action = 'main-city-info';
-            infoItem.style.cssText = 'cursor:default;color:#feca57;background:rgba(254,202,87,0.08);';
-            infoItem.innerHTML = `
-                <span class="wlp-icon">⭐</span>
-                <span style="flex:1;font-size:12px;color:#feca57;font-weight:600;">
-                    Основной: ${escapeHtml(city.name)}
-                </span>
-            `;
-            if (anchor && anchor.parentNode) {
-                anchor.parentNode.insertBefore(infoItem, anchor);
-            }
-
-            const resetItem = document.createElement('div');
-            resetItem.className = 'wlp-item';
-            resetItem.dataset.action = 'main-city-reset';
-            resetItem.innerHTML = `
-                <span class="wlp-icon">↺</span>
-                <span class="wlp-label" style="color:#feca57;">Сбросить основной город</span>
-            `;
-            resetItem.addEventListener('click', (e) => {
-                e.stopPropagation();
-                if (typeof WidgetLongPress !== 'undefined'
-                    && typeof WidgetLongPress.closeMenu === 'function') {
-                    WidgetLongPress.closeMenu();
-                }
-                clearMainCity();
-            });
-            if (anchor && anchor.parentNode) {
-                anchor.parentNode.insertBefore(resetItem, anchor);
-            }
-        }
-
-        const changeItem = document.createElement('div');
-        changeItem.className = 'wlp-item';
-        changeItem.dataset.action = 'main-city';
-        changeItem.innerHTML = `
-            <span class="wlp-icon">🏙️</span>
-            <span class="wlp-label" style="color:#5CA8FF;">Выбрать основной город</span>
-        `;
-        changeItem.addEventListener('click', (e) => {
-            e.stopPropagation();
-            if (typeof WidgetLongPress !== 'undefined'
-                && typeof WidgetLongPress.closeMenu === 'function') {
-                WidgetLongPress.closeMenu();
-            }
-            setTimeout(() => {
-                if (typeof WeatherQuickLookup !== 'undefined'
-                    && typeof WeatherQuickLookup.open === 'function') {
-                    WeatherQuickLookup.open();
-                }
-            }, 200);
-        });
-        if (anchor && anchor.parentNode) {
-            anchor.parentNode.insertBefore(changeItem, anchor);
-        }
-    }
-
-    const lpmObserver = new MutationObserver(() => {
-        if (document.getElementById('widgetLpMenu')) {
-            injectWidgetMenuItems();
-        }
-    });
-    lpmObserver.observe(document.body, { childList: true, subtree: true });
-
-    // ═══════════════════════════════════════════════════════════
-    //  УТИЛИТА
-    // ═══════════════════════════════════════════════════════════
-    function escapeHtml(s) {
+    };
+    const toast = (m, d) => { try { showToast && showToast(m, d || 2000); } catch (e) {} };
+    const flag = (cc) => {
+        if (!cc || cc.length !== 2) return '🌍';
+        const A = 0x1F1E6;
+        try { return String.fromCodePoint(A + cc.charCodeAt(0) - 65, A + cc.charCodeAt(1) - 65); }
+        catch (e) { return '🌍'; }
+    };
+    const esc = (s) => {
         const d = document.createElement('div');
         d.textContent = s == null ? '' : String(s);
         return d.innerHTML;
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  API
-    // ═══════════════════════════════════════════════════════════
-    window.MainCity = {
-        get: getMainCity,
-        set: applyMainCity,
-        clear: clearMainCity,
-        status: () => {
-            const mc = getMainCity();
-            return {
-                hasMainCity: !!mc,
-                mainCity: mc,
-                widgetCardInDom: !!document.querySelector('.widget-card.weather'),
-                modalOpen: !!document.getElementById('wqlOv')?.classList.contains('show'),
-            };
-        },
     };
 
-    // Применяем сохранённый город при старте — на случай,
-    // если виджет уже отрисован
-    const mc = getMainCity();
-    if (mc) {
-        console.log('⭐ [MainCity] Найден сохранённый основной город:', mc.name);
-        // Форсим refresh через 2 сек (после загрузки виджета)
-        setTimeout(() => {
-            try {
-                if (typeof WeatherWidget !== 'undefined'
-                    && typeof WeatherWidget.refresh === 'function') {
-                    WeatherWidget.refresh();
-                }
-            } catch (e) {}
-        }, 2000);
+    // ─── Патч fetch: IP-геолокация → сохранённый город ───
+    if (!window._mcFetchPatched) {
+        const _fetch = window.fetch.bind(window);
+        window.fetch = function (url, opts) {
+            const u = typeof url === 'string' ? url : (url && url.url) || '';
+            const isIp = u.includes('ipwho.is') || u.includes('ip-api.com');
+            if (!isIp) return _fetch(url, opts);
+            const mc = load();
+            if (!mc) return _fetch(url, opts);
+
+            const isIpwho = u.includes('ipwho.is');
+            const payload = isIpwho
+                ? { success: true, city: mc.name, country: mc.country || '',
+                    country_code: mc.cc || '', latitude: mc.lat, longitude: mc.lon,
+                    timezone: { id: mc.tz || 'auto' } }
+                : { status: 'success', city: mc.name, country: mc.country || '',
+                    countryCode: mc.cc || '', lat: mc.lat, lon: mc.lon,
+                    timezone: mc.tz || 'auto' };
+            return Promise.resolve(new Response(JSON.stringify(payload), {
+                status: 200, headers: { 'Content-Type': 'application/json' }
+            }));
+        };
+        window._mcFetchPatched = true;
     }
 
-    console.log('⭐ [MainCity] ✅ Готово:');
-    console.log('   • Тап по названию города → выбор');
-    console.log('   • В модалке — «⭐ Сделать основным»');
-    console.log('   • Долгий тап на виджете → «Сменить/Сбросить»');
-    console.log('   • API: MainCity.get() / .set(city) / .clear()');
+    // ─── Стили ───
+    if (!document.getElementById('mcStyles')) {
+        const s = document.createElement('style');
+        s.id = 'mcStyles';
+        s.textContent = `
+        .widget-card.weather .wc-city-btn{width:26px;height:26px;border-radius:50%;
+            border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.06);
+            color:#aaa;font-size:12px;cursor:pointer;display:flex;align-items:center;
+            justify-content:center;flex-shrink:0;margin-left:4px;padding:0;line-height:1;
+            transition:.15s;-webkit-tap-highlight-color:transparent}
+        .widget-card.weather .wc-city-btn:hover{background:rgba(254,202,87,.2);
+            border-color:rgba(254,202,87,.5);color:#feca57}
+        .widget-card.weather .wc-city-btn:active{transform:scale(.88)}
+        .widget-card.weather .wc-city-btn.has-main{background:rgba(254,202,87,.2);
+            border-color:rgba(254,202,87,.5);color:#feca57}
+        #mcOv{position:fixed;inset:0;background:rgba(0,0,0,.75);backdrop-filter:blur(10px);
+            z-index:9450;display:none;align-items:center;justify-content:center;padding:16px}
+        #mcOv.show{display:flex}
+        #mcOv .mcCard{background:#1a1a2e;border:1px solid rgba(254,202,87,.35);
+            border-radius:18px;max-width:400px;width:100%;max-height:88vh;
+            display:flex;flex-direction:column;overflow:hidden;
+            box-shadow:0 24px 72px rgba(0,0,0,.75)}
+        #mcOv .mcHd{display:flex;align-items:center;gap:10px;padding:14px 16px;
+            border-bottom:1px solid rgba(255,255,255,.08);
+            background:linear-gradient(135deg,rgba(254,202,87,.15),rgba(255,159,67,.08))}
+        #mcOv .mcHdI{width:34px;height:34px;border-radius:10px;
+            background:linear-gradient(135deg,#feca57,#ff9f43);
+            display:flex;align-items:center;justify-content:center;font-size:17px;flex-shrink:0}
+        #mcOv .mcHdT{flex:1;font-size:15px;font-weight:700;color:#fff}
+        #mcOv .mcX{width:32px;height:32px;border-radius:50%;border:none;
+            background:rgba(255,255,255,.06);color:#888;font-size:14px;cursor:pointer}
+        #mcOv .mcBd{padding:14px;overflow-y:auto;flex:1;display:flex;
+            flex-direction:column;gap:10px;min-height:0}
+        #mcOv .mcCur{padding:10px 12px;background:rgba(254,202,87,.1);
+            border:1px solid rgba(254,202,87,.3);border-radius:10px;
+            display:flex;align-items:center;gap:10px;font-size:13px;color:#fff}
+        #mcOv .mcCur span:first-child{font-size:18px}
+        #mcOv .mcCur .mcReset{margin-left:auto;width:28px;height:28px;border-radius:50%;
+            border:1px solid rgba(255,107,107,.3);background:rgba(255,107,107,.12);
+            color:#ff6b6b;font-size:13px;cursor:pointer;padding:0}
+        #mcOv .mcRow{display:flex;gap:8px}
+        #mcOv .mcIn{flex:1;padding:11px 13px;background:rgba(255,255,255,.06);
+            border:1px solid rgba(255,255,255,.1);border-radius:10px;color:#fff;
+            font-size:15px;outline:none;font-family:inherit;min-width:0}
+        #mcOv .mcIn:focus{border-color:#feca57}
+        #mcOv .mcGo{padding:11px 16px;border-radius:10px;border:none;
+            background:linear-gradient(135deg,#feca57,#ff9f43);color:#1a1a2e;
+            font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;flex-shrink:0}
+        #mcOv .mcGo:disabled{opacity:.4;cursor:not-allowed}
+        #mcOv .mcSg{display:flex;flex-wrap:wrap;gap:5px}
+        #mcOv .mcSg button{padding:5px 11px;border-radius:14px;
+            border:1px solid rgba(254,202,87,.3);background:rgba(254,202,87,.08);
+            color:#feca57;font-size:11px;font-weight:600;cursor:pointer;
+            font-family:inherit;white-space:nowrap}
+        #mcOv .mcSg button:active{transform:scale(.94)}
+        #mcOv .mcRes{display:flex;flex-direction:column;gap:5px;flex:1;
+            min-height:80px;overflow-y:auto;padding-right:4px}
+        #mcOv .mcIt{display:flex;align-items:center;gap:10px;padding:10px 12px;
+            background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);
+            border-radius:10px;cursor:pointer;transition:.15s;
+            -webkit-tap-highlight-color:transparent}
+        #mcOv .mcIt:hover{background:rgba(254,202,87,.1);
+            border-color:rgba(254,202,87,.4)}
+        #mcOv .mcIt:active{transform:scale(.98)}
+        #mcOv .mcItF{font-size:18px;flex-shrink:0}
+        #mcOv .mcItI{flex:1;min-width:0}
+        #mcOv .mcItN{font-size:13px;font-weight:700;color:#fff;
+            white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:2px}
+        #mcOv .mcItS{font-size:11px;color:#888;
+            white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+        #mcOv .mcItA{color:rgba(254,202,87,.5);font-size:16px;flex-shrink:0}
+        #mcOv .mcLoad{text-align:center;padding:24px;color:#888;font-size:12px}
+        #mcOv .mcSp{width:28px;height:28px;border:3px solid rgba(254,202,87,.25);
+            border-top-color:#feca57;border-radius:50%;margin:0 auto 8px;
+            animation:mcSpin .8s linear infinite}
+        @keyframes mcSpin{to{transform:rotate(360deg)}}
+        #mcOv .mcEmpty{text-align:center;padding:24px;color:#666;font-size:12px;line-height:1.5}
+        #mcOv .mcEmptyI{font-size:32px;margin-bottom:8px;opacity:.5}
+        `;
+        document.head.appendChild(s);
+    }
+
+    // ─── Открыть модалку (создаём заново каждый раз) ───
+    function openModal() {
+        if (modal) { try { modal.remove(); } catch (e) {} modal = null; }
+        const mc = load();
+
+        modal = document.createElement('div');
+        modal.id = 'mcOv';
+        modal.className = 'show';
+        modal.innerHTML = `
+            <div class="mcCard" onclick="event.stopPropagation()">
+                <div class="mcHd">
+                    <div class="mcHdI">🏙️</div>
+                    <div class="mcHdT">Основной город</div>
+                    <button class="mcX" id="mcX">✕</button>
+                </div>
+                <div class="mcBd">
+                    ${mc ? `
+                        <div class="mcCur">
+                            <span>⭐</span>
+                            <span>${esc(mc.name)}${mc.country ? ' · ' + esc(mc.country) : ''}</span>
+                            <button class="mcReset" id="mcReset" title="Сбросить">↺</button>
+                        </div>
+                    ` : ''}
+                    <div class="mcRow">
+                        <input class="mcIn" id="mcIn" placeholder="Город (например: Париж)" maxlength="60" autocomplete="off">
+                        <button class="mcGo" id="mcGo">Найти</button>
+                    </div>
+                    <div class="mcSg" id="mcSg">
+                        ${['Минск','Москва','Киев','Варшава','Берлин','Париж','Лондон','Нью-Йорк','Токио'].map(c => `<button data-c="${c}">${c}</button>`).join('')}
+                    </div>
+                    <div class="mcRes" id="mcRes">
+                        <div class="mcEmpty"><div class="mcEmptyI">🔍</div>Введите город</div>
+                    </div>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+        document.body.style.overflow = 'hidden';
+
+        modal.querySelector('#mcX').onclick = closeModal;
+        modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
+
+        const input = modal.querySelector('#mcIn');
+        const goBtn = modal.querySelector('#mcGo');
+
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') { e.preventDefault(); doSearch(input.value); }
+        });
+        goBtn.onclick = () => doSearch(input.value);
+
+        modal.querySelectorAll('#mcSg button').forEach(b => {
+            b.onclick = () => { input.value = b.dataset.c; doSearch(b.dataset.c); };
+        });
+
+        const resetBtn = modal.querySelector('#mcReset');
+        if (resetBtn) {
+            resetBtn.onclick = () => {
+                if (!confirm('Сбросить основной город?')) return;
+                save(null);
+                clearCache();
+                refreshWidget();
+                closeModal();
+                toast('↺ Сброшено', 1500);
+            };
+        }
+
+        setTimeout(() => input.focus(), 150);
+        if (navigator.vibrate) navigator.vibrate(10);
+    }
+
+    function closeModal() {
+        if (!modal) return;
+        modal.classList.remove('show');
+        const m = modal;
+        setTimeout(() => { try { m.remove(); } catch (e) {} }, 150);
+        modal = null;
+        document.body.style.overflow = '';
+    }
+
+    // ─── Поиск ───
+    async function doSearch(q) {
+        if (!modal) return;
+        q = String(q || '').trim();
+        if (q.length < 2) return toast('Введите название города', 1500);
+
+        const res = modal.querySelector('#mcRes');
+        const go = modal.querySelector('#mcGo');
+        res.innerHTML = `<div class="mcLoad"><div class="mcSp"></div>Ищем «${esc(q)}»…</div>`;
+        go.disabled = true;
+
+        try {
+            const url = 'https://geocoding-api.open-meteo.com/v1/search'
+                + `?name=${encodeURIComponent(q)}&count=8&language=ru&format=json`;
+            const r = await fetch(url);
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            const d = await r.json();
+            if (!d.results || !d.results.length) {
+                res.innerHTML = `<div class="mcEmpty"><div class="mcEmptyI">😕</div>Не найдено</div>`;
+                return;
+            }
+            renderResults(d.results);
+        } catch (e) {
+            res.innerHTML = `<div class="mcEmpty"><div class="mcEmptyI">⚠️</div>${esc(e.message || 'Ошибка')}</div>`;
+        } finally {
+            go.disabled = false;
+        }
+    }
+
+    function renderResults(arr) {
+        const res = modal.querySelector('#mcRes');
+        res.innerHTML = arr.map((r, i) => {
+            const f = flag(r.country_code || '');
+            const sub = [r.admin1, r.country].filter(Boolean).join(', ');
+            return `<div class="mcIt" data-i="${i}">
+                <div class="mcItF">${f}</div>
+                <div class="mcItI">
+                    <div class="mcItN">${esc(r.name)}</div>
+                    <div class="mcItS">${esc(sub || '—')}</div>
+                </div>
+                <div class="mcItA">›</div>
+            </div>`;
+        }).join('');
+
+        res.querySelectorAll('.mcIt').forEach(el => {
+            el.onclick = () => {
+                const r = arr[+el.dataset.i];
+                if (r) selectCity(r);
+            };
+        });
+    }
+
+    async function selectCity(g) {
+        const city = {
+            name: g.name,
+            country: g.country || '',
+            cc: g.country_code || '',
+            lat: g.latitude,
+            lon: g.longitude,
+            tz: g.timezone || 'auto',
+        };
+        save(city);
+        clearCache();
+        closeModal();
+        toast(`⭐ ${city.name}`, 2000);
+        if (navigator.vibrate) navigator.vibrate([15, 30, 15]);
+        refreshWidget();
+    }
+
+    async function refreshWidget() {
+        try {
+            if (typeof WeatherWidget !== 'undefined' && WeatherWidget.refresh) {
+                await WeatherWidget.refresh();
+            }
+        } catch (e) {}
+        setTimeout(() => { try { renderChatsList && renderChatsList(); } catch (e) {} }, 100);
+    }
+
+    // ─── Кнопка 🏙️ в шапке ───
+    function injectBtn() {
+        const c = document.getElementById('chatsList');
+        if (!c) return;
+        const card = c.querySelector('.widget-card.weather');
+        if (!card) return;
+        if (card.querySelector('.wc-city-btn')) return;
+        const hd = card.querySelector('.wc-header');
+        if (!hd) return;
+
+        const b = document.createElement('button');
+        b.className = 'wc-city-btn';
+        b.type = 'button';
+        const mc = load();
+        if (mc) { b.classList.add('has-main'); b.textContent = '⭐'; }
+        else b.textContent = '🏙️';
+        b.title = 'Выбрать основной город';
+        b.onclick = (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            openModal();
+        };
+        hd.appendChild(b);
+    }
+
+    new MutationObserver(injectBtn).observe(document.body, { childList: true, subtree: true });
+    setInterval(injectBtn, 1500);
+    setTimeout(injectBtn, 1500);
+
+    // ─── Клик по названию города в шапке (страховка) ───
+    document.addEventListener('click', (e) => {
+        const t = e.target.closest('.widget-card.weather .wc-title');
+        if (!t) return;
+        if (e.target.closest('button')) return;
+        e.stopPropagation();
+        e.preventDefault();
+        openModal();
+    }, true);
+
+    // ─── API ───
+    window.MainCity = {
+        get: load,
+        set: (c) => { save(c); clearCache(); refreshWidget(); },
+        clear: () => { save(null); clearCache(); refreshWidget(); },
+    };
+
+    console.log('🏙️ [MainCity] Готово — кнопка 🏙️ в шапке погоды');
+})();
+</script>
+<script>
+// 🏙️ Флаг основного города в шапке виджета
+(function () {
+    'use strict';
+
+    const KEY = 'smschat_main_city_v1';
+
+    function load() {
+        try { return JSON.parse(localStorage.getItem(KEY) || 'null'); }
+        catch (e) { return null; }
+    }
+
+    function flagOf(cc) {
+        if (!cc || cc.length !== 2) return '';
+        const A = 0x1F1E6;
+        try {
+            return String.fromCodePoint(
+                A + cc.charCodeAt(0) - 65,
+                A + cc.charCodeAt(1) - 65
+            );
+        } catch (e) { return ''; }
+    }
+
+    // Заменяем 🌍 (или что-то другое) на реальный флаг в .wc-title
+    function fixFlag() {
+        const mc = load();
+        if (!mc || !mc.cc) return;
+
+        const titleEl = document.querySelector('.widget-card.weather .wc-title');
+        if (!titleEl) return;
+
+        const realFlag = flagOf(mc.cc);
+        if (!realFlag) return;
+
+        // Берём текст, отрезаем первый символ (старый флаг/эмодзи) и ставим новый
+        const text = titleEl.textContent || '';
+        // Ищем первый пробел — до него обычно стоит флаг
+        const spaceIdx = text.indexOf(' ');
+        if (spaceIdx < 0) {
+            titleEl.textContent = realFlag + ' ' + text;
+            return;
+        }
+
+        const rest = text.slice(spaceIdx + 1).trim();
+        const newText = realFlag + ' ' + rest;
+
+        if (titleEl.textContent !== newText) {
+            titleEl.textContent = newText;
+        }
+    }
+
+    // Наблюдаем за перерисовками виджета
+    new MutationObserver(fixFlag).observe(document.body, {
+        childList: true, subtree: true
+    });
+
+    setInterval(fixFlag, 1200);
+    setTimeout(fixFlag, 800);
+    setTimeout(fixFlag, 2000);
+
+    console.log('🏙️ [MainCity flag] Патч флага установлен');
 })();
 </script>
 </body>
