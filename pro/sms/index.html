@@ -77412,6 +77412,255 @@ async function sendAnnouncement() {
     console.log('   • При ошибке PIN — ссылка сгорает');
     console.log('   • API: WelcomePinFix.status()');
 })();
+
+// ═══════════════════════════════════════════════════════════════
+// 🔒 ЕДИНЫЙ ФИКС PIN-КОДА ДЛЯ ЭКРАНА ПРИГЛАШЕНИЯ (ФИНАЛЬНЫЙ)
+// ═══════════════════════════════════════════════════════════════
+
+(function installFinalInvitePinFix() {
+    'use strict';
+    console.log('🔒 [FinalPinFix] Установка…');
+
+    const FIX = { currentPayload: null, observer: null };
+
+    // ─── base64url → JSON ───
+    function extractPayloadFromUrl() {
+        try {
+            const raw = new URLSearchParams(location.search).get('invite');
+            if (!raw) return null;
+            const dot = raw.lastIndexOf('.');
+            if (dot < 0) return null;
+            let b64 = raw.slice(0, dot).replace(/-/g, '+').replace(/_/g, '/');
+            while (b64.length % 4) b64 += '=';
+            const bin = atob(b64);
+            const bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            return JSON.parse(new TextDecoder().decode(bytes));
+        } catch (e) { return null; }
+    }
+
+    // ─── Пометить, что ссылка сгорела (локально + GitHub) ───
+    async function burnInvite(payload) {
+        try {
+            const key = 'smschat_burned_invites_v1';
+            const raw = localStorage.getItem(key);
+            const burned = raw ? JSON.parse(raw) : {};
+            burned[payload.jti] = Date.now() + 60 * 60 * 1000;
+            localStorage.setItem(key, JSON.stringify(burned));
+        } catch (e) {}
+        if (payload.token) {
+            (async () => {
+                try {
+                    const prevT = state.token, prevU = state.username;
+                    state.token = payload.token;
+                    state.username = 'burner_' + Date.now();
+                    if (typeof InvitePin !== 'undefined' && InvitePin.burn) {
+                        await InvitePin.burn(payload.jti);
+                    }
+                    state.token = prevT;
+                    state.username = prevU;
+                } catch (e) {}
+            })();
+        }
+    }
+
+    // ─── Встроить PIN в уже отрисованный экран ───
+    function injectPin(screen) {
+        if (!screen) return false;
+        if (screen.querySelector('#wisPinInput')) return true;
+
+        const payload = FIX.currentPayload || extractPayloadFromUrl();
+        if (!payload || payload.pin == null) {
+            // PIN не требуется
+            return true;
+        }
+        FIX.currentPayload = payload;
+
+        const nameInput = screen.querySelector('#wisNameInput');
+        const submitBtn = screen.querySelector('#wisSubmitBtn');
+        if (!nameInput || !submitBtn) {
+            console.warn('🔒 [FinalPinFix] Нет nameInput или submitBtn');
+            return false;
+        }
+
+        // ─── Создаём блок PIN ───
+        const wrap = document.createElement('div');
+        wrap.className = 'wis-input-wrap';
+        wrap.style.marginBottom = '14px';
+        wrap.innerHTML = `
+            <input type="text" id="wisPinInput" placeholder="PIN (3 цифры)"
+                   maxlength="3" inputmode="numeric" pattern="[0-9]*"
+                   autocomplete="off" spellcheck="false"
+                   style="letter-spacing:12px;font-size:24px;font-weight:800;
+                          font-family:'SF Mono','Courier New',monospace;
+                          text-align:center;padding:16px 18px;padding-left:28px;">
+            <div style="font-size:11px;color:#feca57;text-align:center;
+                        margin-top:8px;line-height:1.4;max-width:380px;
+                        margin-left:auto;margin-right:auto;">
+                🔑 Введите PIN-код от отправителя<br>
+                <span style="color:#ff6b6b;font-weight:600;">
+                    ⚠️ Одна попытка — при ошибке ссылка сгорит
+                </span>
+            </div>
+        `;
+        nameInput.parentNode.insertBefore(wrap, nameInput.parentNode.nextSibling);
+
+        const pinInput = wrap.querySelector('#wisPinInput');
+        pinInput.addEventListener('input', () => {
+            pinInput.value = pinInput.value.replace(/\D/g, '').slice(0, 3);
+        });
+
+        // ─── ПЕРЕХВАТ SUBMIT в CAPTURE-фазе ───
+        // Срабатывает РАНЬШЕ старого обработчика и его глушит
+        screen.addEventListener('click', async (e) => {
+            if (!e.target.closest('#wisSubmitBtn')) return;
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            await handleSubmit(screen, nameInput, pinInput, payload);
+        }, true);
+
+        // ─── Enter в PIN → сразу submit ───
+        pinInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                e.stopPropagation();
+                handleSubmit(screen, nameInput, pinInput, payload);
+            }
+        });
+
+        // Фокус
+        setTimeout(() => nameInput.focus(), 150);
+        console.log('🔒 [FinalPinFix] ✅ PIN-блок встроен');
+        return true;
+    }
+
+    // ─── Обработка submit ───
+    async function handleSubmit(screen, nameInput, pinInput, payload) {
+        const name = nameInput.value.trim();
+        const pin = pinInput.value.trim();
+
+        if (name.length < 2) {
+            showToast('❌ Имя от 2 символов', 2000); nameInput.focus(); return;
+        }
+        if (pin.length !== 3) {
+            pinInput.style.borderColor = '#ff6b6b';
+            setTimeout(() => pinInput.style.borderColor = '', 600);
+            showToast('🔑 Введите 3 цифры', 2000); pinInput.focus(); return;
+        }
+
+        const expected = String(payload.pin).padStart(3, '0');
+        const entered = pin.padStart(3, '0');
+
+        if (entered !== expected) {
+            // ❌ СЖИГАЕМ ССЫЛКУ
+            await burnInvite(payload);
+            screen.innerHTML = `
+                <div class="wis-icon" style="animation:none;">🔒</div>
+                <div class="wis-title" style="color:#ff6b6b;">Ссылка сгорела</div>
+                <div class="wis-sub" style="color:#888;line-height:1.6;">
+                    PIN-код был неверным.<br>Это приглашение больше не действует.
+                </div>
+                <button class="wis-btn" style="background:linear-gradient(135deg,#ff6b6b,#ee5253);"
+                        id="wisBurnOkBtn">Понятно</button>
+            `;
+            screen.querySelector('#wisBurnOkBtn').onclick = () => {
+                history.replaceState({}, '', location.origin + location.pathname);
+                screen.remove();
+            };
+            if (navigator.vibrate) navigator.vibrate([100, 50, 100, 50, 200]);
+            return;
+        }
+
+        // ✅ PIN верный — стандартная логика входа
+        console.log('✅ [FinalPinFix] PIN верный, вход');
+        try {
+            state.username = name;
+            state.token = payload.token;
+            state.isAuthorized = true;
+            try {
+                localStorage.setItem('chathub_username', name);
+                localStorage.setItem('chathub_token', payload.token);
+                localStorage.setItem('chathub_remember', '1');
+                localStorage.setItem('chathub_session_source', 'invite');
+            } catch (e) {}
+
+            if (typeof loadChatsList === 'function') loadChatsList();
+            if (typeof loadSavedPasswords === 'function') loadSavedPasswords();
+
+            const chatFile = payload.chat.file;
+            const chatName = payload.chat.name || chatFile;
+            if (!state.chats.find(c => c.file === chatFile)) {
+                state.chats.push({ name: chatName, file: chatFile, createdAt: new Date().toISOString() });
+            }
+            if (typeof saveChatsList === 'function') saveChatsList();
+
+            state.savedPasswords[chatFile] = payload.password;
+            if (typeof saveSavedPasswords === 'function') saveSavedPasswords();
+
+            const uEl = document.getElementById('usernameInput');
+            const tEl = document.getElementById('tokenInput');
+            if (uEl) uEl.value = name;
+            if (tEl) tEl.value = payload.token;
+            const rEl = document.getElementById('rememberMeInput');
+            if (rEl) rEl.checked = true;
+            const rwEl = document.getElementById('rememberWarning');
+            if (rwEl) rwEl.style.display = 'block';
+
+            await enterChat(chatFile, chatName, payload.password);
+            screen.remove();
+            if (typeof showToast === 'function') {
+                showToast(`✅ Добро пожаловать в «${chatName}», ${name}!`, 3000);
+            }
+        } catch (e) {
+            console.error('🔒 [FinalPinFix] вход:', e);
+            showToast('❌ ' + (e.message || 'Ошибка'), 3500);
+        }
+    }
+
+    // ─── Observer на появление экрана ───
+    function startObserver() {
+        if (FIX.observer) FIX.observer.disconnect();
+        FIX.observer = new MutationObserver((mutations) => {
+            for (const m of mutations) {
+                for (const node of m.addedNodes) {
+                    if (node.nodeType !== 1) continue;
+                    if (node.id === 'welcomeInviteScreen'
+                        || (node.querySelector && node.querySelector('#welcomeInviteScreen'))) {
+                        const screen = document.getElementById('welcomeInviteScreen');
+                        if (screen) {
+                            setTimeout(() => injectPin(screen), 30);
+                            setTimeout(() => injectPin(screen), 150);
+                            setTimeout(() => injectPin(screen), 400);
+                        }
+                        return;
+                    }
+                }
+            }
+        });
+        FIX.observer.observe(document.body, { childList: true, subtree: true });
+    }
+
+    startObserver();
+
+    // Если экран уже есть
+    setTimeout(() => {
+        const screen = document.getElementById('welcomeInviteScreen');
+        if (screen) injectPin(screen);
+    }, 800);
+
+    // Проверка на старте: если в URL pin есть — сохраняем
+    setTimeout(() => {
+        const p = extractPayloadFromUrl();
+        if (p && p.pin != null) {
+            FIX.currentPayload = p;
+            console.log(`🔒 [FinalPinFix] payload: pin=${String(p.pin).padStart(3, '0')}`);
+        }
+    }, 500);
+
+    window.FinalPinFix = { injectNow: () => injectPin(document.getElementById('welcomeInviteScreen')),
+                           payload: () => FIX.currentPayload };
+})();
+
 </script>
 
 </body>
