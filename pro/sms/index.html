@@ -77089,199 +77089,87 @@ async function sendAnnouncement() {
 </script>
 <script>
 // ═══════════════════════════════════════════════════════════════
-//  🚫 INVITE PIN BLOCKER v1
+//  🚫 INVITE PIN BLOCKER v2 (ИСПРАВЛЕННЫЙ)
 //  Гарантирует: без правильного PIN в чат попасть НЕЛЬЗЯ.
-//  • Блокирующий "замок" на весь экран после отмены / 5 неудач
-//  • Закрывает welcome, autostart, chatScreen
-//  • Очищает все следы сессии (state, localStorage)
-//  • Возвращает пользователя в "чистое" состояние
+//  • Правильно распознаёт статус PIN (введён или нет)
+//  • Не блокирует переходы внутри приложения после успешного входа
+//  • Показывает блокирующий экран только при отмене или 5 неудачах
 // ═══════════════════════════════════════════════════════════════
-(function installInvitePinBlocker() {
+(function installInvitePinBlockerV2() {
     'use strict';
 
     if (!window.__InvitePin) {
-        console.warn('🔒 [PinBlocker] __InvitePin не найден — патч не установлен');
+        console.warn('🔒 [PinBlocker v2] __InvitePin не найден');
         return;
     }
 
     const BLOCKER_ID = 'invitePinBlocker';
     let _blockerShown = false;
 
-    // ═══════════════════════════════════════════════════════════
-    //  СТИЛИ БЛОКИРУЮЩЕГО ЭКРАНА
-    // ═══════════════════════════════════════════════════════════
+    // ─── Стили ───
     if (!document.getElementById('invitePinBlockerStyles')) {
         const s = document.createElement('style');
         s.id = 'invitePinBlockerStyles';
         s.textContent = `
             #invitePinBlocker {
-                position: fixed;
-                inset: 0;
+                position: fixed; inset: 0;
                 background: linear-gradient(135deg, #0a0a0f 0%, #1a1a2e 100%);
-                z-index: 20000;   /* выше ВСЕГО */
-                display: none;
-                flex-direction: column;
-                align-items: center;
-                justify-content: center;
-                padding: 30px 20px;
-                text-align: center;
+                z-index: 20000;
+                display: none; flex-direction: column;
+                align-items: center; justify-content: center;
+                padding: 30px 20px; text-align: center;
                 animation: ipbFade 0.35s ease;
             }
             #invitePinBlocker.show { display: flex; }
-            @keyframes ipbFade {
-                from { opacity: 0; }
-                to   { opacity: 1; }
-            }
-            #invitePinBlocker .ipb-icon {
-                font-size: 90px;
-                line-height: 1;
-                margin-bottom: 20px;
-                animation: ipbIconPulse 2.4s ease-in-out infinite;
-                filter: drop-shadow(0 8px 24px rgba(255,107,107,0.4));
-            }
-            @keyframes ipbIconPulse {
-                0%, 100% { transform: scale(1); opacity: 1; }
-                50%      { transform: scale(1.06); opacity: 0.85; }
-            }
-            #invitePinBlocker .ipb-title {
-                font-size: 26px;
-                font-weight: 800;
-                color: #fff;
-                margin-bottom: 12px;
-                line-height: 1.2;
-                max-width: 400px;
-            }
-            #invitePinBlocker .ipb-message {
-                font-size: 15px;
-                color: #aaa;
-                line-height: 1.6;
-                max-width: 400px;
-                margin-bottom: 12px;
-            }
-            #invitePinBlocker .ipb-hint {
-                background: rgba(108, 92, 231, 0.1);
-                border: 1px solid rgba(108, 92, 231, 0.3);
-                border-radius: 14px;
-                padding: 14px 18px;
-                font-size: 13px;
-                color: #a78bfa;
-                line-height: 1.55;
-                max-width: 400px;
-                margin-bottom: 28px;
-            }
-            #invitePinBlocker .ipb-hint strong {
-                color: #fff;
-            }
-            #invitePinBlocker .ipb-btn {
-                padding: 14px 32px;
-                border-radius: 14px;
-                border: none;
-                background: linear-gradient(135deg, #6c5ce7, #00b894);
-                color: #fff;
-                font-size: 16px;
-                font-weight: 700;
-                cursor: pointer;
-                font-family: inherit;
-                transition: transform 0.15s;
-                -webkit-tap-highlight-color: transparent;
-                box-shadow: 0 8px 24px rgba(108, 92, 231, 0.4);
-            }
-            #invitePinBlocker .ipb-btn:active {
-                transform: scale(0.96);
-            }
-            #invitePinBlocker .ipb-err {
-                font-size: 11px;
-                color: #666;
-                margin-top: 20px;
-                letter-spacing: 0.3px;
-                max-width: 400px;
-            }
-            #invitePinBlocker .ipb-err code {
-                background: rgba(255, 255, 255, 0.06);
-                padding: 2px 6px;
-                border-radius: 4px;
-                color: #a78bfa;
-                font-size: 10px;
-            }
+            @keyframes ipbFade { from { opacity: 0; } to { opacity: 1; } }
+            #invitePinBlocker .ipb-icon { font-size: 90px; line-height: 1; margin-bottom: 20px; animation: ipbIconPulse 2.4s ease-in-out infinite; filter: drop-shadow(0 8px 24px rgba(255,107,107,0.4)); }
+            @keyframes ipbIconPulse { 0%, 100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.06); opacity: 0.85; } }
+            #invitePinBlocker .ipb-title { font-size: 26px; font-weight: 800; color: #fff; margin-bottom: 12px; line-height: 1.2; max-width: 400px; }
+            #invitePinBlocker .ipb-message { font-size: 15px; color: #aaa; line-height: 1.6; max-width: 400px; margin-bottom: 12px; }
+            #invitePinBlocker .ipb-hint { background: rgba(108, 92, 231, 0.1); border: 1px solid rgba(108, 92, 231, 0.3); border-radius: 14px; padding: 14px 18px; font-size: 13px; color: #a78bfa; line-height: 1.55; max-width: 400px; margin-bottom: 28px; }
+            #invitePinBlocker .ipb-hint strong { color: #fff; }
+            #invitePinBlocker .ipb-btn { padding: 14px 32px; border-radius: 14px; border: none; background: linear-gradient(135deg, #6c5ce7, #00b894); color: #fff; font-size: 16px; font-weight: 700; cursor: pointer; font-family: inherit; transition: transform 0.15s; -webkit-tap-highlight-color: transparent; box-shadow: 0 8px 24px rgba(108, 92, 231, 0.4); }
+            #invitePinBlocker .ipb-btn:active { transform: scale(0.96); }
+            #invitePinBlocker .ipb-err { font-size: 11px; color: #666; margin-top: 20px; letter-spacing: 0.3px; max-width: 400px; }
+            #invitePinBlocker .ipb-err code { background: rgba(255, 255, 255, 0.06); padding: 2px 6px; border-radius: 4px; color: #a78bfa; font-size: 10px; }
         `;
         document.head.appendChild(s);
     }
 
-    // ═══════════════════════════════════════════════════════════
-    //  ПОКАЗ БЛОКИРУЮЩЕГО ЭКРАНА
-    // ═══════════════════════════════════════════════════════════
     function showBlocker(reason) {
         if (_blockerShown) return;
         _blockerShown = true;
 
-        console.log('🔒 [PinBlocker] Блокировка доступа к чату. Причина:', reason);
+        console.log('🔒 [PinBlocker v2] Блокировка:', reason);
 
-        // ─── 1. Убиваем PIN-модалку если открыта ───
-        const pinModal = document.getElementById('ipM');
-        if (pinModal) pinModal.remove();
-
-        // ─── 2. Убиваем PIN-выбор PIN ───
-        const pinSelect = document.getElementById('ipS');
-        if (pinSelect) pinSelect.remove();
-
-        // ─── 3. Убиваем welcome-экран ───
-        const welcome = document.getElementById('welcomeInviteScreen');
-        if (welcome) welcome.remove();
-
-        // ─── 4. Убиваем autostart ───
-        const autostart = document.getElementById('autostartOverlay');
-        if (autostart) autostart.classList.remove('show');
-
-        // ─── 5. Убиваем инвайт-модалку ───
-        const inviteModal = document.getElementById('inviteLinkModal');
-        if (inviteModal) inviteModal.classList.remove('active');
-
-        // ─── 6. Убиваем все остальные оверлеи ───
+        // Убиваем модалки и оверлеи
+        ['ipM', 'ipS', 'welcomeInviteScreen', 'inviteLinkModal'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.remove();
+        });
         document.querySelectorAll('.image-modal.active').forEach(m => m.classList.remove('active'));
 
-        // ─── 7. СКРЫВАЕМ ВСЕ ЭКРАНЫ ПРИЛОЖЕНИЯ ───
-        const screens = ['authScreen', 'chatsScreen', 'chatScreen'];
-        screens.forEach(id => {
+        // Скрываем экраны
+        ['authScreen', 'chatsScreen', 'chatScreen'].forEach(id => {
             const el = document.getElementById(id);
             if (el) el.style.display = 'none';
         });
 
-        // ─── 8. СБРАСЫВАЕМ СОСТОЯНИЕ (сессию, чат, всё) ───
+        // Сбрасываем сессию (но НЕ трогаем сохранённые пароли)
         try {
             if (typeof stopPolling === 'function') stopPolling();
-            if (typeof audioRecorder !== 'undefined' && audioRecorder?.cancel) {
-                try { audioRecorder.cancel(); } catch(e) {}
-            }
-
-            // Обнуляем state
             if (typeof state !== 'undefined') {
                 state.isAuthorized = false;
                 state.chatFile = null;
-                state.chatName = null;
                 state.chatPassword = '';
                 state.salt = null;
                 state.messages = [];
-                state.sha = null;
-                state.lastMessageCount = 0;
-                state._chatEntered = false;
             }
-
-            // Обнуляем крипто-ключ
             if (typeof CRYPTO !== 'undefined') CRYPTO._key = null;
-
-            // Обнуляем историю
             if (typeof resetHistoryState === 'function') resetHistoryState();
+        } catch(e) {}
 
-            // Очищаем кэш вложений
-            if (typeof clearAttachmentCache === 'function') clearAttachmentCache();
-
-            // 🆕 НЕ трогаем сохранённые пароли и чаты —
-            //    но и не заходим никуда
-        } catch (e) {
-            console.warn('🔒 [PinBlocker] Ошибка сброса state:', e);
-        }
-
-        // ─── 9. Очищаем URL ───
+        // Очищаем URL
         try {
             const url = new URL(location.href);
             url.searchParams.delete('invite');
@@ -77289,241 +77177,93 @@ async function sendAnnouncement() {
             history.replaceState({}, '', url.toString());
         } catch (e) {}
 
-        // ─── 10. Показываем блокирующий экран ───
+        // Показываем блокер
         let blocker = document.getElementById(BLOCKER_ID);
         if (blocker) blocker.remove();
-
         blocker = document.createElement('div');
         blocker.id = BLOCKER_ID;
 
-        const config = getBlockerConfig(reason);
+        const configs = {
+            cancelled: { icon: '🚫', title: 'Вход отменён', message: 'Вы закрыли ввод PIN-кода.', hint: 'Попросите отправителя <strong>создать новую ссылку</strong>.', button: 'Вернуться на главную' },
+            max_attempts: { icon: '🔒', title: 'Ссылка заблокирована', message: 'Слишком много неверных попыток.', hint: 'Попросите <strong>новую ссылку</strong> с другим PIN.', button: 'Вернуться на главную' },
+            default: { icon: '🔒', title: 'Доступ запрещён', message: 'Невозможно войти в чат.', hint: 'Проверьте ссылку или попросите <strong>создать новую</strong>.', button: 'Вернуться на главную' }
+        };
+        const cfg = configs[reason] || configs.default;
 
         blocker.innerHTML = `
-            <div class="ipb-icon">${config.icon}</div>
-            <div class="ipb-title">${config.title}</div>
-            <div class="ipb-message">${config.message}</div>
-            <div class="ipb-hint">${config.hint}</div>
-            <button class="ipb-btn" id="ipbOkBtn">${config.button}</button>
-            <div class="ipb-err">
-                Причина: <code>${escapeHtmlSafe(reason)}</code>
-            </div>
+            <div class="ipb-icon">${cfg.icon}</div>
+            <div class="ipb-title">${cfg.title}</div>
+            <div class="ipb-message">${cfg.message}</div>
+            <div class="ipb-hint">${cfg.hint}</div>
+            <button class="ipb-btn" id="ipbOkBtn">${cfg.button}</button>
+            <div class="ipb-err">Причина: <code>${reason}</code></div>
         `;
         document.body.appendChild(blocker);
-
         requestAnimationFrame(() => blocker.classList.add('show'));
 
-        // ─── 11. Обработчик кнопки ───
         blocker.querySelector('#ipbOkBtn').addEventListener('click', () => {
-            // Перенаправляем на чистый URL — перезагрузка приложения
-            try {
-                const cleanUrl = location.origin + location.pathname;
-                location.replace(cleanUrl);
-            } catch (e) {
-                location.reload();
-            }
+            location.replace(location.origin + location.pathname);
         });
 
-        // ─── 12. Блокируем hardware back ───
-        const backBlocker = () => {
-            history.pushState(null, '', location.href);
-        };
         history.pushState(null, '', location.href);
-        window.addEventListener('popstate', backBlocker);
-
-        // ─── 13. Блокируем F5 / Ctrl+R / Escape (частично) ───
-        const keyBlocker = (e) => {
-            // Не блокируем F5 и Ctrl+R — перезагрузка допустима
-            // Но блокируем Escape от закрытия блокера
-            if (e.key === 'Escape') {
-                e.preventDefault();
-                e.stopPropagation();
-            }
-        };
-        document.addEventListener('keydown', keyBlocker, true);
-
-        console.log('🔒 [PinBlocker] Блокирующий экран показан');
+        window.addEventListener('popstate', () => history.pushState(null, '', location.href));
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); }
+        }, true);
     }
 
-    // ─── Конфиг сообщения в зависимости от причины ───
-    function getBlockerConfig(reason) {
-        if (reason === 'cancelled') {
-            return {
-                icon: '🚫',
-                title: 'Вход отменён',
-                message: 'Вы закрыли ввод PIN-кода. Доступ к чату невозможен без правильного PIN.',
-                hint: 'Попросите отправителя <strong>создать новую ссылку</strong> и передать вам PIN-код отдельным сообщением.',
-                button: 'Вернуться на главную',
-            };
+    // 1. Перехват кнопки "Отмена"
+    document.addEventListener('click', (e) => {
+        const btn = e.target.closest('#ipCan');
+        if (!btn) return;
+        e.stopImmediatePropagation();
+        e.preventDefault();
+        showBlocker('cancelled');
+    }, true);
+
+    // 2. Перехват 5 неудач
+    new MutationObserver(() => {
+        const errEl = document.querySelector('#ipM .ipErr.show');
+        if (!errEl) return;
+        if (errEl.textContent.includes('Слишком много попыток')) {
+            setTimeout(() => showBlocker('max_attempts'), 2000);
         }
-        if (reason === 'max_attempts') {
-            return {
-                icon: '🔒',
-                title: 'Ссылка заблокирована',
-                message: 'Слишком много неверных попыток ввода PIN. Эта ссылка больше не работает.',
-                hint: 'Для безопасности вход заблокирован. Попросите <strong>новую ссылку</strong> с другим PIN-кодом.',
-                button: 'Вернуться на главную',
-            };
-        }
-        if (reason === 'no_pin') {
-            return {
-                icon: '⚠️',
-                title: 'PIN не указан',
-                message: 'В ссылке отсутствует PIN-код, но он требуется для входа.',
-                hint: 'Попросите отправителя <strong>пересоздать ссылку</strong> с PIN-кодом.',
-                button: 'Вернуться на главную',
-            };
-        }
-        return {
-            icon: '🔒',
-            title: 'Доступ запрещён',
-            message: 'Невозможно войти в чат по этой ссылке.',
-            hint: 'Проверьте ссылку или попросите отправителя <strong>создать новую</strong>.',
-            button: 'Вернуться на главную',
-        };
-    }
+    }).observe(document.body, { childList: true, subtree: true });
 
-    function escapeHtmlSafe(s) {
-        const d = document.createElement('div');
-        d.textContent = s == null ? '' : String(s);
-        return d.innerHTML;
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ХУК НА ОТМЕНУ PIN-ЭКРАНА
-    //  В __InvitePin v3 кнопка "Отмена" просто закрывает модалку.
-    //  Перехватываем это и показываем блокер.
-    // ═══════════════════════════════════════════════════════════
-    function hookPinCancel() {
-        // Патчим __showInvitePinScreen — после показа подменяем
-        // обработчик кнопки "Отмена"
-        if (window.__showInvitePinScreen && !window.__showInvitePinScreen._pinHooked) {
-            const _origShow = window.__showInvitePinScreen;
-            window.__showInvitePinScreen = function(payload) {
-                const result = _origShow.call(this, payload);
-
-                // Даём DOM дорисоваться
-                setTimeout(() => {
-                    const cancelBtn = document.getElementById('ipCan');
-                    if (cancelBtn && !cancelBtn._blockerHooked) {
-                        cancelBtn._blockerHooked = true;
-                        // Заменяем обработчик
-                        const newBtn = cancelBtn.cloneNode(true);
-                        cancelBtn.parentNode.replaceChild(newBtn, cancelBtn);
-                        newBtn.addEventListener('click', (e) => {
-                            e.stopPropagation();
-                            e.preventDefault();
-                            console.log('🔒 [PinBlocker] Пользователь отменил ввод PIN');
-                            showBlocker('cancelled');
-                        });
-                    }
-                }, 50);
-            };
-            window.__showInvitePinScreen._pinHooked = true;
-            console.log('🔒 [PinBlocker] Хук на отмену PIN установлен');
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ХУК НА 5 НЕУДАЧ
-    //  В __InvitePin verify() при left <= 0 показывает сообщение
-    //  и через 5 сек закрывает модалку. Перехватываем это.
-    // ═══════════════════════════════════════════════════════════
-    function hookMaxAttempts() {
-        // Смотрим за появлением err-сообщения "Слишком много попыток"
-        const observer = new MutationObserver(() => {
-            const errEl = document.querySelector('#ipM .ipErr.show');
-            if (!errEl) return;
-
-            const text = errEl.textContent || '';
-            if (text.includes('Слишком много попыток') ||
-                text.includes('Ссылка заблокирована')) {
-                console.log('🔒 [PinBlocker] Достигнут лимит попыток');
-                // Даём 2 сек посмотреть, потом блокер
-                setTimeout(() => {
-                    showBlocker('max_attempts');
-                }, 2000);
-            }
-        });
-
-        observer.observe(document.body, { childList: true, subtree: true });
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ГЛОБАЛЬНАЯ ЗАЩИТА: если _invitePinActive и мы пытаемся
-    //  войти в чат без _invitePinVerified — блокируем
-    // ═══════════════════════════════════════════════════════════
+    // 3. 🆕 ИСПРАВЛЕНИЕ: Гард работает ТОЛЬКО когда PIN ещё не введён
     function installGlobalGuard() {
-        // Патчим enterChat
         if (typeof enterChat === 'function' && !enterChat._pinGuarded) {
             const _origEnter = enterChat;
             enterChat = async function(...args) {
-                // Если PIN-режим активен, но PIN ещё не подтверждён — блок
+                // Блокируем только если PIN требуется И ещё не проверен
                 if (window._invitePinActive && !window._invitePinVerified) {
-                    console.log('🔒 [PinBlocker] Попытка входа без PIN — блокируем');
-                    showBlocker('no_pin');
-                    throw new Error('PIN verification required');
+                    console.log('🔒 [PinBlocker v2] Попытка входа без PIN');
+                    showBlocker('default');
+                    throw new Error('PIN required');
                 }
                 return _origEnter.apply(this, args);
             };
             enterChat._pinGuarded = true;
         }
-
-        // Патчим showChatScreen
-        if (typeof showChatScreen === 'function' && !showChatScreen._pinGuarded) {
-            const _origShow = showChatScreen;
-            showChatScreen = function(...args) {
-                if (window._invitePinActive && !window._invitePinVerified) {
-                    console.log('🔒 [PinBlocker] showChatScreen без PIN — блокируем');
-                    showBlocker('no_pin');
-                    return;
-                }
-                return _origShow.apply(this, args);
-            };
-            showChatScreen._pinGuarded = true;
-        }
     }
 
-    // ═══════════════════════════════════════════════════════════
-    //  ПЕРЕХВАТ КЛИКА "Отмена" НА САМОМ ДЕЛЕ
-    //  (более ранний хук — до отрисовки __showInvitePinScreen)
-    // ═══════════════════════════════════════════════════════════
-    document.addEventListener('click', (e) => {
-        const btn = e.target.closest('#ipCan');
-        if (!btn) return;
-
-        e.stopImmediatePropagation();
-        e.preventDefault();
-
-        console.log('🔒 [PinBlocker] Отмена PIN — блокируем');
-        showBlocker('cancelled');
-    }, true);   // capture-фаза — раньше всех
-
-    // ═══════════════════════════════════════════════════════════
-    //  ЗАПУСК
-    // ═══════════════════════════════════════════════════════════
-    hookPinCancel();
-    hookMaxAttempts();
+    // Устанавливаем и периодически проверяем
     installGlobalGuard();
+    setInterval(installGlobalGuard, 1000);
 
-    // Периодическая проверка (на случай если гард не установился)
-    setInterval(() => {
-        if (!installGlobalGuard) return;
-        installGlobalGuard();
-    }, 1000);
+    // 4. Устанавливаем флаг после успешного прохождения PIN
+    if (window.__inviteProceed) {
+        const _origProceed = window.__inviteProceed;
+        window.__inviteProceed = async function(payload) {
+            window._invitePinVerified = true;   // ⬅️ Это разрешает вход
+            window._invitePinActive = false;     // ⬅️ Отключаем режим блокировки
+            return _origProceed.call(this, payload);
+        };
+    }
 
-    // Экспорт для отладки
-    window.InvitePinBlocker = {
-        show: showBlocker,
-        status: () => ({
-            blockerShown: _blockerShown,
-            pinActive: window._invitePinActive,
-            pinVerified: window._invitePinVerified,
-            blockerInDom: !!document.getElementById(BLOCKER_ID),
-        }),
-    };
-
-    console.log('🔒 [PinBlocker] Готов');
+    console.log('🔒 [PinBlocker v2] Готов');
 })();
 </script>
+
 </body>
 </html>
