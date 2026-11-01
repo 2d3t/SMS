@@ -76502,1166 +76502,318 @@ async function sendAnnouncement() {
 
     console.log('🚫 [WQLNoCtx] Системное меню в оверлее погоды заблокировано');
 })();
-
-</script>
-<script>
 // ═══════════════════════════════════════════════════════════════
-//  🔧 ФИКС: PIN теперь ГАРАНТИРОВАННО показывается при создании
+//  🔒 ОДНОРАЗОВЫЕ ИНВАЙТ-ССЫЛКИ — СЕРВЕРНАЯ АННУЛЯЦИЯ
 //  ─────────────────────────────────────────────────────────────
-//  Проблема: TempInvite.build переопределён, но кнопка
-//  «Другие приложения…» вызывает внутренний buildInviteLink
-//  напрямую — без PIN. Из-за этого в showInviteModal payload
-//  не содержит pin, и блок не появляется.
+//  Проблема: ссылка помечается использованной ТОЛЬКО в localStorage
+//  текущего браузера. Другой браузер = ссылка снова работает.
 //
-//  Решение:
-//   1. Перехватываем КЛИК по кнопке создания ссылки в CAPTURE-фазе
-//   2. Сами генерируем PIN и сами строим URL (в обход внутренней)
-//   3. Показываем модалку с PIN напрямую
-//   4. Также патчим showInviteModal — если pin нет в payload,
-//      генерируем прямо там (для страховки)
+//  Решение: при использовании ссылки — записываем jti в meta.json
+//  чата (поле usedInvites). При валидации — читаем meta.json и
+//  проверяем, не использован ли jti кем-то другим.
 // ═══════════════════════════════════════════════════════════════
 
-(function fixInvitePinDisplay() {
+(function installServerSideInviteRevocation() {
     'use strict';
 
-    console.log('🔧 [InvitePinFix] Установка фикса отображения PIN…');
+    console.log('🔒 [InviteRevoke] Установка серверной аннуляции ссылок…');
 
-    // ═══════════════════════════════════════════════════════════
-    //  ХЕЛПЕРЫ (дублируем то, что нужно — модуль мог не загрузиться)
-    // ═══════════════════════════════════════════════════════════
-    const HMAC_PREFIX = 'smschat-invite-v1:';
-
-    function toBase64Url(str) {
-        const utf8 = new TextEncoder().encode(str);
-        let binary = '';
-        utf8.forEach(b => binary += String.fromCharCode(b));
-        return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-    }
-
-    async function signPayload(payloadStr) {
-        const enc = new TextEncoder();
-        const key = await crypto.subtle.importKey(
-            'raw', enc.encode(HMAC_PREFIX),
-            { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
-        );
-        const sig = await crypto.subtle.sign('HMAC', key, enc.encode(payloadStr));
-        const bytes = new Uint8Array(sig);
-        let binary = '';
-        bytes.forEach(b => binary += String.fromCharCode(b));
-        return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-    }
-
-    function generatePin() {
-        const bytes = crypto.getRandomValues(new Uint8Array(2));
-        return ((bytes[0] << 8) | bytes[1]) % 1000;
-    }
-
-    function escapeHtmlSafe(s) {
-        const d = document.createElement('div');
-        d.textContent = s == null ? '' : String(s);
-        return d.innerHTML;
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ГЛАВНАЯ ФУНКЦИЯ: построить ссылку + PIN САМИ
-    //  Дублирует логику buildInviteLink из TempInvite v2,
-    //  но добавляет pin в payload.
-    // ═══════════════════════════════════════════════════════════
-    async function buildInviteLinkWithPin(chatFile) {
-        if (!state.isAuthorized || !state.token) {
-            throw new Error('Нужна авторизация');
-        }
-        if (!chatFile) {
-            throw new Error('Чат не указан');
-        }
-
-        const password = state.savedPasswords[chatFile];
-        if (!password) {
-            throw new Error('Пароль чата не сохранён');
-        }
-
-        const chat = state.chats.find(c => c.file === chatFile);
-        if (!chat) {
-            throw new Error('Чат не найден');
-        }
-
-        const now = Date.now();
-        const jti = 'inv_' + now + '_' + Math.random().toString(36).slice(2, 10);
-
-        // 🆕 Генерируем PIN
-        const pin = generatePin();
-        console.log(`🔑 [InvitePinFix] PIN: ${String(pin).padStart(3, '0')}`);
-
-        const payload = {
-            v: 1,
-            jti,
-            iat: now,
-            exp: now + 2 * 60 * 1000,   // TTL = 2 минуты
-            chat: {
-                file: chatFile,
-                name: chat.name || chatFile,
-            },
-            token: state.token,
-            password: password,
-            username: state.username,
-            pin: pin,   // 🆕
-        };
-
-        const payloadB64 = toBase64Url(JSON.stringify(payload));
-        const signature = await signPayload(payloadB64);
-        const baseUrl = location.origin + location.pathname;
-        const url = `${baseUrl}?invite=${payloadB64}.${signature}`;
-
-        return { url, payload, pin };
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ФИКС SHOWMODAL: если pin нет в payload — добавляем
-    //  Это страховка на случай, если модалка открыта не нашим
-    //  перехватом (например, через прямой вызов)
-    // ═══════════════════════════════════════════════════════════
-    function ensurePinInModal(url, payload) {
-        const modal = document.getElementById('inviteLinkModal');
-        if (!modal) {
-            console.warn('🔧 [InvitePinFix] Модалка #inviteLinkModal не найдена');
-            return;
-        }
-
-        const content = modal.querySelector('.form-modal-content');
-        if (!content) return;
-
-        // Уже есть?
-        if (content.querySelector('#invitePinBlock')) return;
-
-        // Получаем pin
-        let pin = payload && payload.pin != null ? payload.pin : null;
-
-        // 🆕 Если pin нет — генерируем и ПЕРЕСОБИРАЕМ URL
-        // (это страховочный случай, маловероятный)
-        if (pin == null) {
-            console.warn('🔧 [InvitePinFix] pin нет в payload — генерируем принудительно');
-
-            // Пробуем достать chatFile из payload
-            const chatFile = payload && payload.chat && payload.chat.file;
-            if (!chatFile) {
-                console.warn('🔧 [InvitePinFix] Нет chatFile — не можем пересобрать');
-                return;
-            }
-
-            // Генерируем pin и пересобираем URL
-            pin = generatePin();
-            payload.pin = pin;
-
-            // Пересобираем URL синхронно (без await — но async-функция
-            // не подходит для синхронного контекста; делаем через .then)
-            (async () => {
-                try {
-                    const payloadB64 = toBase64Url(JSON.stringify(payload));
-                    const signature = await signPayload(payloadB64);
-                    const baseUrl = location.origin + location.pathname;
-                    const newUrl = `${baseUrl}?invite=${payloadB64}.${signature}`;
-
-                    // Обновляем URL в модалке
-                    const linkBox = modal.querySelector('#invLinkBox');
-                    if (linkBox) linkBox.textContent = newUrl;
-
-                    // Сохраняем в data-атрибут для копирования
-                    modal.dataset.inviteUrl = newUrl;
-                    modal.dataset.invitePin = String(pin).padStart(3, '0');
-
-                    // Теперь вставляем PIN-блок
-                    insertPinBlock(modal, content, pin);
-
-                } catch (e) {
-                    console.error('🔧 [InvitePinFix] Пересборка URL failed:', e);
-                }
-            })();
-            return;
-        }
-
-        // PIN есть — вставляем блок
-        insertPinBlock(modal, content, pin);
-        modal.dataset.invitePin = String(pin).padStart(3, '0');
-    }
-
-    // ─── Вставка PIN-блока ───
-    function insertPinBlock(modal, content, pin) {
-        if (content.querySelector('#invitePinBlock')) return;
-
-        const pinStr = String(pin).padStart(3, '0');
-
-        const pinBlock = document.createElement('div');
-        pinBlock.id = 'invitePinBlock';
-        pinBlock.style.cssText = `
-            margin-bottom: 16px;
-            padding: 16px;
-            background: linear-gradient(135deg, rgba(255,107,107,0.15), rgba(254,202,87,0.10));
-            border: 2px solid rgba(255,107,107,0.45);
-            border-radius: 14px;
-            text-align: center;
-            animation: pinBlockIn 0.3s ease;
-        `;
-        pinBlock.innerHTML = `
-            <style>
-                @keyframes pinBlockIn {
-                    from { opacity: 0; transform: scale(0.92); }
-                    to { opacity: 1; transform: scale(1); }
-                }
-                #invitePinBlock .pin-digits {
-                    cursor: pointer;
-                    user-select: all;
-                    -webkit-user-select: all;
-                    transition: opacity 0.15s;
-                }
-                #invitePinBlock .pin-digits:active { opacity: 0.7; }
-            </style>
-            <div style="font-size: 11px; color: #ff8a8a; text-transform: uppercase;
-                        letter-spacing: 1px; font-weight: 800; margin-bottom: 10px;
-                        display: flex; align-items: center; justify-content: center; gap: 6px;">
-                <span>🔑</span>
-                <span>PIN-КОД ДЛЯ ВХОДА</span>
-            </div>
-            <div class="pin-digits" id="pinDigitsCopy" data-pin="${pinStr}"
-                 title="Нажмите, чтобы скопировать"
-                 style="font-size: 46px; font-weight: 900; letter-spacing: 10px;
-                        color: #fff; font-family: 'SF Mono', 'Courier New', monospace;
-                        text-shadow: 0 2px 12px rgba(255,107,107,0.6);
-                        margin-bottom: 12px; line-height: 1;
-                        padding-left: 10px;">
-                ${pinStr}
-            </div>
-            <button type="button" id="pinCopyBtn"
-                    style="width: 100%; padding: 10px; margin-bottom: 10px;
-                           background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15);
-                           border-radius: 10px; color: #fff; font-size: 13px; font-weight: 600;
-                           cursor: pointer; font-family: inherit;
-                           display: flex; align-items: center; justify-content: center; gap: 6px;">
-                <span>📋</span>
-                <span>Скопировать PIN</span>
-            </button>
-            <div style="font-size: 11px; color: #feca57; line-height: 1.5; padding: 8px 10px;
-                        background: rgba(254,202,87,0.08); border-radius: 8px;
-                        border: 1px solid rgba(254,202,87,0.2); margin-bottom: 8px;">
-                ⚠️ Сообщите этот PIN получателю <strong>ОТДЕЛЬНО</strong> от ссылки<br>
-                (голосом или в другом мессенджере)
-            </div>
-            <div style="font-size: 11px; color: #ff6b6b; font-weight: 700; line-height: 1.5;">
-                ⚠️ У получателя только <strong>ОДНА</strong> попытка — при ошибке ссылка сгорит
-            </div>
-        `;
-
-        // Вставляем после ссылки
-        const linkBox = content.querySelector('#invLinkBox');
-        if (linkBox) {
-            linkBox.parentNode.insertBefore(pinBlock, linkBox.nextSibling);
-        } else {
-            content.insertBefore(pinBlock, content.firstChild.nextSibling);
-        }
-
-        // ─── Копирование PIN по клику на цифры ───
-        const digits = pinBlock.querySelector('#pinDigitsCopy');
-        digits.addEventListener('click', () => copyPin(pinStr));
-
-        // ─── Кнопка копирования ───
-        const copyBtn = pinBlock.querySelector('#pinCopyBtn');
-        copyBtn.addEventListener('click', () => copyPin(pinStr));
-
-        console.log('🔧 [InvitePinFix] ✅ PIN-блок вставлен:', pinStr);
-    }
-
-    async function copyPin(pinStr) {
-        try {
-            await navigator.clipboard.writeText(pinStr);
-            if (typeof showToast === 'function') {
-                showToast(`📋 PIN ${pinStr} скопирован`, 1500);
-            }
-            if (navigator.vibrate) navigator.vibrate(20);
-            if (typeof soundManager !== 'undefined') {
-                try { soundManager.play('click'); } catch (e) {}
-            }
-        } catch (e) {
-            // Fallback
-            try {
-                const ta = document.createElement('textarea');
-                ta.value = pinStr;
-                ta.style.position = 'fixed';
-                ta.style.left = '-9999px';
-                document.body.appendChild(ta);
-                ta.select();
-                document.execCommand('copy');
-                document.body.removeChild(ta);
-                if (typeof showToast === 'function') {
-                    showToast(`📋 PIN ${pinStr} скопирован`, 1500);
-                }
-            } catch (err) {
-                if (typeof showToast === 'function') {
-                    showToast(`🔑 PIN: ${pinStr}`, 4000);
-                }
-            }
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ПАТЧ SHOWINVITEMODAL: страховка — если pin нет, генерим
-    // ═══════════════════════════════════════════════════════════
-    if (typeof window.showInviteLinkModal === 'function') {
-        const _orig = window.showInviteLinkModal;
-        window.showInviteLinkModal = function(url, payload) {
-            const result = _orig.call(this, url, payload);
-
-            // 🆕 После отрисовки оригинала — проверяем и вставляем PIN
-            setTimeout(() => {
-                ensurePinInModal(url, payload);
-            }, 30);
-            setTimeout(() => {
-                ensurePinInModal(url, payload);
-            }, 150);
-
-            return result;
-        };
-        console.log('🔧 [InvitePinFix] showInviteLinkModal пропатчен (страховка)');
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ГЛАВНЫЙ ФИКС: ПЕРЕХВАТ КЛИКА ПО КНОПКЕ «ДРУГИЕ ПРИЛОЖЕНИЯ…»
-    //  Это ключевое — вызываем buildInviteLinkWithPin напрямую
-    // ═══════════════════════════════════════════════════════════
-    function handleInviteButtonClick(e) {
-        const btn = e.target.closest('#shareToExternalBtn');
-        if (!btn) return;
-
-        // Проверяем режим
-        let mode = (_shareToChat && _shareToChat.mode) || null;
-        if (!mode) {
-            const fname = (_shareToChat && _shareToChat.fileName) || '';
-            mode = /\.smschat$/i.test(fname) ? 'invite' : 'file';
-        }
-
-        // Не invite — пусть работает обычный шаринг (файл)
-        if (mode !== 'invite') return;
-
-        // Это invite — перехватываем
-        e.stopImmediatePropagation();
-        e.preventDefault();
-
-        let targetFile = (_shareToChat && _shareToChat.inviteChatFile)
-                      || (_shareToChat && _shareToChat.selectedFile)
-                      || state.chatFile;
-
-        if (!targetFile) {
-            if (typeof showToast === 'function') showToast('❌ Сначала выберите чат', 2500);
-            return;
-        }
-        if (!state.savedPasswords[targetFile]) {
-            if (typeof showToast === 'function') {
-                showToast('🔐 Пароль чата не сохранён — ссылку сделать нельзя', 3500);
-            }
-            return;
-        }
-
-        // Блокируем кнопку
-        btn.disabled = true;
-        const originalHTML = btn.innerHTML;
-        btn.innerHTML = `
-            <div style="width:40px;height:40px;border-radius:12px;background:rgba(108,92,231,0.3);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0;">⏳</div>
-            <div style="flex:1;min-width:0;text-align:left;">
-                <div style="font-size:14px;font-weight:600;color:#fff;">Создаём ссылку…</div>
-                <div style="font-size:11px;color:#888;margin-top:2px;">пару секунд</div>
-            </div>
-        `;
-
-        // Строим ссылку + PIN
-        buildInviteLinkWithPin(targetFile)
-            .then(({ url, payload, pin }) => {
-                // Закрываем модалку шаринга
-                const shareModal = document.getElementById('shareToChatModal');
-                if (shareModal) shareModal.classList.remove('active');
-
-                // Показываем модалку с PIN
-                if (typeof window.showInviteLinkModal === 'function') {
-                    window.showInviteLinkModal(url, payload);
-                } else if (typeof showInviteModal === 'function') {
-                    showInviteModal(url, payload);
-                }
-
-                if (typeof soundManager !== 'undefined') {
-                    try { soundManager.play('send'); } catch (e) {}
-                }
-            })
-            .catch((err) => {
-                console.error('🔧 [InvitePinFix] build failed:', err);
-                if (typeof showToast === 'function') {
-                    showToast('❌ ' + (err.message || 'Ошибка'), 3500);
-                }
-                if (typeof soundManager !== 'undefined') {
-                    try { soundManager.play('error'); } catch (e) {}
-                }
-            })
-            .finally(() => {
-                btn.disabled = false;
-                btn.innerHTML = originalHTML;
-            });
-    }
-
-    // Устанавливаем обработчик в CAPTURE-фазе — раньше всех остальных
-    document.addEventListener('click', handleInviteButtonClick, true);
-
-    console.log('🔧 [InvitePinFix] ✅ Готово:');
-    console.log('   • Клик по «Другие приложения…» перехвачен');
-    console.log('   • PIN генерируется и показывается ГАРАНТИРОВАННО');
-    console.log('   • Есть кнопка «Скопировать PIN»');
-    console.log('   • Есть страховка через showInviteLinkModal');
-})();
-</script>
-<script>
-// ═══════════════════════════════════════════════════════════════
-//  🔧 ФИКС v2: ЭКРАН ВВОДА PIN ГАРАНТИРОВАННО ПОКАЗЫВАЕТСЯ
-//  ─────────────────────────────────────────────────────────────
-//  Проблема: старый showWelcomeScreen не знает про PIN,
-//  а переопределить его напрямую нельзя (внутри IIFE TempInvite).
-//
-//  Решение:
-//   1. Ловим появление #welcomeInviteScreen в DOM (MutationObserver)
-//   2. Если в нём НЕТ поля #wisPinInput — дорисовываем САМИ
-//   3. Патчим обработчик кнопки "Войти в чат"
-//   4. Встраиваем проверку PIN прямо в старую логику submit
-// ═══════════════════════════════════════════════════════════════
-
-(function fixWelcomeScreenPinV2() {
-    'use strict';
-
-    console.log('🔧 [WelcomePinFix v2] Установка…');
-
-    // ═══════════════════════════════════════════════════════════
-    //  СОСТОЯНИЕ
-    // ═══════════════════════════════════════════════════════════
-    const FIX = {
-        // Извлечённый payload из URL (если есть)
-        currentPayload: null,
-        // Уже встроили PIN в текущий экран?
-        injected: false,
-        // Observer на экран
-        observer: null,
+    const CFG = {
+        // Сколько последних jti хранить в meta.json
+        MAX_STORED_JTI: 50,
+        // Кэш meta.json на время сессии
+        META_CACHE_MS: 30 * 1000,
     };
 
-    // ═══════════════════════════════════════════════════════════
-    //  ХЕЛПЕРЫ
-    // ═══════════════════════════════════════════════════════════
-    function escapeHtml(s) {
-        const d = document.createElement('div');
-        d.textContent = s == null ? '' : String(s);
-        return d.innerHTML;
-    }
+    // ─── Кэш meta.json ───
+    const _metaCache = new Map();   // chatFile → { data, ts }
 
-    // ─── Извлечь payload из URL ───
-    async function extractPayloadFromUrl() {
+    /**
+     * Читает meta.json чата с кэшем.
+     */
+    async function fetchChatMeta(chatFile) {
+        const cached = _metaCache.get(chatFile);
+        if (cached && Date.now() - cached.ts < CFG.META_CACHE_MS) {
+            return cached.data;
+        }
+
         try {
-            const params = new URLSearchParams(location.search);
-            const raw = params.get('invite');
-            if (!raw) return null;
+            const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/chats/${chatFile}.meta.json`;
+            const res = await fetch(url, {
+                headers: {
+                    'Authorization': `token ${state.token}`,
+                    'Accept': 'application/vnd.github.v3+json',
+                },
+                cache: 'no-store',
+            });
 
-            const dotIdx = raw.lastIndexOf('.');
-            if (dotIdx < 0) return null;
+            if (res.status === 404) {
+                return { exists: false };
+            }
+            if (!res.ok) {
+                return null;
+            }
 
-            const payloadB64 = raw.slice(0, dotIdx);
-            // base64url → base64
-            let b64 = payloadB64.replace(/-/g, '+').replace(/_/g, '/');
-            while (b64.length % 4) b64 += '=';
-            const binary = atob(b64);
-            const bytes = new Uint8Array(binary.length);
-            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-            const json = new TextDecoder().decode(bytes);
-            return JSON.parse(json);
+            const data = await res.json();
+            const content = JSON.parse(base64ToUtf8((data.content || '').replace(/\n/g, '')));
+
+            const result = {
+                exists: true,
+                content,
+                sha: data.sha,
+            };
+            _metaCache.set(chatFile, { data: result, ts: Date.now() });
+            return result;
         } catch (e) {
-            console.warn('🔧 [WelcomePinFix v2] extractPayload error:', e);
+            console.warn('🔒 [InviteRevoke] fetchChatMeta error:', e);
             return null;
         }
     }
 
-    // ═══════════════════════════════════════════════════════════
-    //  ВСТРАИВАНИЕ PIN В ЭКРАН ПРИВЕТСТВИЯ
-    // ═══════════════════════════════════════════════════════════
-    async function injectPinIntoWelcomeScreen() {
-        const screen = document.getElementById('welcomeInviteScreen');
-        if (!screen) return false;
+    /**
+     * Сбрасывает кэш meta для чата.
+     */
+    function invalidateMetaCache(chatFile) {
+        _metaCache.delete(chatFile);
+    }
 
-        // Уже встроили — пропускаем
-        if (screen.querySelector('#wisPinInput')) {
-            console.log('🔧 [WelcomePinFix v2] PIN уже встроен');
-            return true;
+    /**
+     * Проверяет, не использован ли jti кем-то другим.
+     * Возвращает { used: true/false, usedBy, usedAt }.
+     */
+    async function checkInviteUsedOnServer(chatFile, jti) {
+        if (!chatFile || !jti) return { used: false };
+
+        const meta = await fetchChatMeta(chatFile);
+        if (!meta || !meta.exists || !meta.content) {
+            return { used: false };
         }
 
-        // Есть ли payload вообще?
-        const payload = FIX.currentPayload || await extractPayloadFromUrl();
-        if (!payload) {
-            console.log('🔧 [WelcomePinFix v2] Нет payload — PIN не нужен');
-            return false;
-        }
+        const usedInvites = Array.isArray(meta.content.usedInvites)
+            ? meta.content.usedInvites
+            : [];
 
-        FIX.currentPayload = payload;
+        const found = usedInvites.find(x =>
+            (typeof x === 'string' ? x : x.jti) === jti
+        );
 
-        // Нужен ли PIN?
-        if (payload.pin == null) {
-            console.log('🔧 [WelcomePinFix v2] PIN не требуется (старая ссылка)');
-            return false;
-        }
-
-        console.log(`🔧 [WelcomePinFix v2] Встраиваю PIN (${String(payload.pin).padStart(3, '0')}) в экран`);
-
-        // Находим input для имени
-        const nameInput = screen.querySelector('#wisNameInput');
-        if (!nameInput) {
-            console.warn('🔧 [WelcomePinFix v2] #wisNameInput не найден');
-            return false;
-        }
-
-        // Находим кнопку "Войти"
-        const submitBtn = screen.querySelector('#wisSubmitBtn');
-        if (!submitBtn) {
-            console.warn('🔧 [WelcomePinFix v2] #wisSubmitBtn не найден');
-            return false;
-        }
-
-        // ═══════════════════════════════════════════════════════
-        //  СОЗДАЁМ БЛОК PIN
-        // ═══════════════════════════════════════════════════════
-        const pinWrap = document.createElement('div');
-        pinWrap.className = 'wis-input-wrap';
-        pinWrap.id = 'wisPinWrap';
-        pinWrap.style.cssText = 'margin-bottom: 14px;';
-        pinWrap.innerHTML = `
-            <input type="text" id="wisPinInput" placeholder="PIN (3 цифры)"
-                   maxlength="3" inputmode="numeric" pattern="[0-9]*"
-                   autocomplete="off" spellcheck="false"
-                   style="letter-spacing: 12px; font-size: 24px; font-weight: 800;
-                          font-family: 'SF Mono', 'Courier New', monospace;
-                          text-align: center; padding: 16px 18px;
-                          padding-left: 28px;">
-            <div id="wisPinHint" style="
-                font-size: 11px; color: #feca57; text-align: center;
-                margin-top: 8px; line-height: 1.4; max-width: 380px;
-                margin-left: auto; margin-right: auto;
-            ">
-                🔑 Введите PIN-код, который вам сообщил отправитель<br>
-                <span style="color: #ff6b6b; font-weight: 600;">⚠️ Одна попытка — при ошибке ссылка сгорит</span>
-            </div>
-        `;
-
-        // Вставляем ПОСЛЕ input имени
-        nameInput.parentNode.insertBefore(pinWrap, nameInput.parentNode.nextSibling);
-
-        // Добавляем CSS для PIN-инпута
-        if (!document.getElementById('wisPinFixStyles')) {
-            const style = document.createElement('style');
-            style.id = 'wisPinFixStyles';
-            style.textContent = `
-                #welcomeInviteScreen #wisPinInput:focus {
-                    border-color: #ff6b6b !important;
-                    background: rgba(255,255,255,0.08) !important;
-                    box-shadow: 0 0 0 4px rgba(255,107,107,0.15) !important;
-                }
-                #welcomeInviteScreen #wisPinInput.invalid {
-                    border-color: #ff6b6b !important;
-                    animation: wisPinShake 0.4s ease;
-                }
-                @keyframes wisPinShake {
-                    0%, 100% { transform: translateX(0); }
-                    25% { transform: translateX(-8px); }
-                    75% { transform: translateX(8px); }
-                }
-                #welcomeInviteScreen #wisPinInput.valid {
-                    border-color: #00b894 !important;
-                    background: rgba(0,184,148,0.06) !important;
-                }
-            `;
-            document.head.appendChild(style);
-        }
-
-        const pinInput = pinWrap.querySelector('#wisPinInput');
-
-        // ─── Только цифры в PIN ───
-        pinInput.addEventListener('input', () => {
-            pinInput.value = pinInput.value.replace(/\D/g, '').slice(0, 3);
-            pinInput.classList.remove('invalid', 'valid');
-        });
-
-        // ─── Enter в поле имени → фокус на PIN ───
-        nameInput.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') {
-                e.preventDefault();
-                pinInput.focus();
+        if (found) {
+            if (typeof found === 'string') {
+                return { used: true, usedBy: '—', usedAt: null };
             }
-        });
+            return {
+                used: true,
+                usedBy: found.username || '—',
+                usedAt: found.usedAt ? new Date(found.usedAt) : null,
+            };
+        }
 
-        // ─── Enter в PIN → проверка и отправка ───
-        pinInput.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') {
-                e.preventDefault();
-                handleSubmitWithPin(screen, nameInput, pinInput, submitBtn, payload);
+        return { used: false };
+    }
+
+    /**
+     * Записывает jti как использованный в meta.json чата.
+     * Пробует до 3 раз при конфликте.
+     */
+    async function markInviteUsedOnServer(chatFile, jti, username) {
+        if (!chatFile || !jti) return false;
+
+        for (let attempt = 0; attempt < 3; attempt++) {
+            try {
+                const meta = await fetchChatMeta(chatFile);
+                if (!meta || !meta.exists) {
+                    console.warn('🔒 [InviteRevoke] meta.json не найден для', chatFile);
+                    return false;
+                }
+
+                const content = { ...meta.content };
+                if (!Array.isArray(content.usedInvites)) {
+                    content.usedInvites = [];
+                }
+
+                // Уже есть?
+                const exists = content.usedInvites.some(x =>
+                    (typeof x === 'string' ? x : x.jti) === jti
+                );
+                if (exists) {
+                    return true;
+                }
+
+                // Добавляем
+                content.usedInvites.push({
+                    jti,
+                    username: username || '—',
+                    usedAt: Date.now(),
+                });
+
+                // Обрезаем до MAX
+                if (content.usedInvites.length > CFG.MAX_STORED_JTI) {
+                    content.usedInvites = content.usedInvites.slice(-CFG.MAX_STORED_JTI);
+                }
+
+                // Сохраняем
+                const url = `https://api.github.com/repos/${CONFIG.repoOwner}/${CONFIG.repoName}/contents/chats/${chatFile}.meta.json`;
+                const json = JSON.stringify(content);
+                const encoded = utf8ToBase64(json);
+
+                const body = {
+                    message: `🔒 Invite used: ${jti}`,
+                    content: encoded,
+                    sha: meta.sha,
+                };
+
+                const res = await fetch(url, {
+                    method: 'PUT',
+                    headers: {
+                        'Authorization': `token ${state.token}`,
+                        'Accept': 'application/vnd.github.v3+json',
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(body),
+                    cache: 'no-store',
+                });
+
+                if (res.ok) {
+                    invalidateMetaCache(chatFile);
+                    console.log('🔒 [InviteRevoke] ✅ jti записан:', jti);
+                    return true;
+                }
+
+                if (res.status === 409) {
+                    // Конфликт — повторяем
+                    invalidateMetaCache(chatFile);
+                    await new Promise(r => setTimeout(r, 500 + Math.random() * 500));
+                    continue;
+                }
+
+                console.warn('🔒 [InviteRevoke] markInviteUsedOnServer HTTP', res.status);
+                return false;
+
+            } catch (e) {
+                console.warn('🔒 [InviteRevoke] markInviteUsedOnServer error:', e);
+                if (attempt < 2) {
+                    await new Promise(r => setTimeout(r, 500));
+                }
             }
-        });
+        }
 
-        // ═══════════════════════════════════════════════════════
-        //  ПЕРЕХВАТ КНОПКИ "ВОЙТИ В ЧАТ"
-        // ═══════════════════════════════════════════════════════
-        //  Удаляем старые обработчики через клонирование
-        const newSubmitBtn = submitBtn.cloneNode(true);
-        submitBtn.parentNode.replaceChild(newSubmitBtn, submitBtn);
-
-        newSubmitBtn.addEventListener('click', (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            handleSubmitWithPin(screen, nameInput, pinInput, newSubmitBtn, payload);
-        });
-
-        // Фокус на имя
-        setTimeout(() => nameInput.focus(), 200);
-
-        FIX.injected = true;
-        return true;
+        return false;
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ОБРАБОТКА ОТПРАВКИ С ПРОВЕРКОЙ PIN
+    //  ПАТЧ: parseAndValidateInvite → проверяем сервер
     // ═══════════════════════════════════════════════════════════
-    async function handleSubmitWithPin(screen, nameInput, pinInput, submitBtn, payload) {
-        const name = nameInput.value.trim();
-        const pinValue = pinInput.value.trim();
+    if (typeof parseAndValidateInvite === 'function') {
+        const _origParse = parseAndValidateInvite;
 
-        // ─── Валидация имени ───
-        if (name.length < 2) {
-            if (typeof showToast === 'function') {
-                showToast('❌ Имя должно быть не короче 2 символов', 2000);
-            }
-            nameInput.focus();
-            return;
-        }
-        if (name.length > 20) {
-            if (typeof showToast === 'function') {
-                showToast('❌ Имя не должно быть длиннее 20 символов', 2000);
-            }
-            nameInput.focus();
-            return;
-        }
+        window.parseAndValidateInvite = async function(rawParam) {
+            // 1. Локальная валидация (подпись, TTL, локальный «used»)
+            const localResult = await _origParse.call(this, rawParam);
+            if (!localResult.ok) return localResult;
 
-        // ─── Валидация PIN ───
-        if (pinValue.length !== 3) {
-            pinInput.classList.add('invalid');
-            setTimeout(() => pinInput.classList.remove('invalid'), 500);
-            if (typeof showToast === 'function') {
-                showToast('🔑 Введите 3 цифры PIN', 2000);
-            }
-            pinInput.focus();
-            return;
-        }
+            // 2. Серверная проверка — не использован ли этот jti кем-то ещё
+            const chatFile = localResult.payload.chat.file;
+            const jti = localResult.payload.jti;
 
-        // ─── Проверка PIN ───
-        const expectedPin = String(payload.pin).padStart(3, '0');
-        const enteredPin = pinValue.padStart(3, '0');
-
-        if (enteredPin !== expectedPin) {
-            // ❌ НЕВЕРНЫЙ PIN — ссылка сгорает НАВСЕГДА
-            console.log('❌ [WelcomePinFix v2] Неверный PIN! Ссылка сгорает.');
-
-            submitBtn.disabled = true;
-            submitBtn.textContent = '❌ Неверный PIN';
-            pinInput.classList.add('invalid');
-            pinInput.disabled = true;
-            nameInput.disabled = true;
-
-            if (navigator.vibrate) navigator.vibrate([100, 50, 100, 50, 200]);
-            if (typeof soundManager !== 'undefined') {
-                try { soundManager.play('error'); } catch (e) {}
-            }
-
-            // 1. Локальное сжигание
             try {
-                if (typeof InvitePin !== 'undefined' && InvitePin.markBurned) {
-                    InvitePin.markBurned(payload.jti);
-                } else {
-                    // Fallback
-                    const key = 'smschat_burned_invites_v1';
-                    const raw = localStorage.getItem(key);
-                    const burned = raw ? JSON.parse(raw) : {};
-                    burned[payload.jti] = Date.now() + 60 * 60 * 1000;
-                    localStorage.setItem(key, JSON.stringify(burned));
+                const serverCheck = await checkInviteUsedOnServer(chatFile, jti);
+                if (serverCheck.used) {
+                    console.warn('🔒 [InviteRevoke] Ссылка уже использована (сервер):', serverCheck);
+                    return {
+                        ok: false,
+                        reason: 'used',
+                        message: `Ссылка уже использована${serverCheck.usedBy !== '—' ? ` пользователем «${serverCheck.usedBy}»` : ''}. Попросите новую.`,
+                    };
                 }
             } catch (e) {
-                console.warn('Не удалось пометить burned:', e);
+                // Если не смогли проверить — пропускаем (лучше пустить, чем заблокировать навсегда)
+                console.warn('🔒 [InviteRevoke] Не удалось проверить на сервере:', e);
             }
 
-            // 2. Удалённое сжигание (GitHub)
-            if (payload.token) {
-                (async () => {
-                    try {
-                        const prevToken = state.token;
-                        const prevUser = state.username;
-                        state.token = payload.token;
-                        state.username = 'burner_' + Date.now();
-                        if (typeof InvitePin !== 'undefined' && InvitePin.burn) {
-                            await InvitePin.burn(payload.jti);
-                        }
-                        state.token = prevToken;
-                        state.username = prevUser;
-                    } catch (e) {
-                        console.warn('GitHub burn failed:', e);
-                    }
-                })();
-            }
-
-            // 3. Меняем экран через 2 сек
-            setTimeout(() => {
-                screen.innerHTML = `
-                    <div class="wis-icon" style="animation: none;">🔒</div>
-                    <div class="wis-title" style="color: #ff6b6b;">Ссылка сгорела</div>
-                    <div class="wis-sub" style="color: #888; line-height: 1.6;">
-                        PIN-код был неверным.<br>
-                        Это приглашение больше не действует.<br><br>
-                        <strong style="color: #feca57;">Попросите отправителя создать новую ссылку.</strong>
-                    </div>
-                    <button class="wis-btn" id="wisBurnOkBtn"
-                            style="background: linear-gradient(135deg, #ff6b6b, #ee5253);">
-                        Понятно
-                    </button>
-                `;
-                screen.querySelector('#wisBurnOkBtn').addEventListener('click', () => {
-                    history.replaceState({}, '', location.origin + location.pathname);
-                    screen.remove();
-                });
-                if (navigator.vibrate) navigator.vibrate([100, 50, 100]);
-            }, 2000);
-
-            return;
-        }
-
-        // ✅ PIN ВЕРНЫЙ — продолжаем вход
-        console.log('✅ [WelcomePinFix v2] PIN верный, продолжаем вход');
-
-        pinInput.classList.add('valid');
-        submitBtn.disabled = true;
-        submitBtn.textContent = '⏳ Подключаемся…';
-
-        try {
-            // Применяем данные
-            state.username = name;
-            state.token = payload.token;
-            state.isAuthorized = true;
-
-            // Сохраняем сессию
-            try {
-                localStorage.setItem('chathub_username', name);
-                localStorage.setItem('chathub_token', payload.token);
-                localStorage.setItem('chathub_remember', '1');
-                localStorage.setItem('chathub_session_source', 'invite');
-            } catch (e) {}
-
-            // Загружаем списки
-            if (typeof loadChatsList === 'function') loadChatsList();
-            if (typeof loadSavedPasswords === 'function') loadSavedPasswords();
-
-            // Добавляем чат
-            const chatFile = payload.chat.file;
-            const chatName = payload.chat.name || chatFile;
-            if (!state.chats.find(c => c.file === chatFile)) {
-                state.chats.push({
-                    name: chatName,
-                    file: chatFile,
-                    createdAt: new Date().toISOString()
-                });
-            }
-            if (typeof saveChatsList === 'function') saveChatsList();
-
-            // Пароль
-            state.savedPasswords[chatFile] = payload.password;
-            if (typeof saveSavedPasswords === 'function') saveSavedPasswords();
-
-            // Заполняем поля авторизации
-            const usernameInputEl = document.getElementById('usernameInput');
-            const tokenInputEl = document.getElementById('tokenInput');
-            const rememberMeInputEl = document.getElementById('rememberMeInput');
-            const rememberWarningEl = document.getElementById('rememberWarning');
-            if (usernameInputEl) usernameInputEl.value = name;
-            if (tokenInputEl) tokenInputEl.value = payload.token;
-            if (rememberMeInputEl) rememberMeInputEl.checked = true;
-            if (rememberWarningEl) rememberWarningEl.style.display = 'block';
-
-            // Входим в чат
-            await enterChat(chatFile, chatName, payload.password);
-
-            // Финальное сохранение
-            try {
-                localStorage.setItem('chathub_username', name);
-                localStorage.setItem('chathub_token', payload.token);
-                localStorage.setItem('chathub_remember', '1');
-            } catch (e) {}
-
-            screen.remove();
-            if (typeof showToast === 'function') {
-                showToast(`✅ Добро пожаловать в «${chatName}», ${name}!`, 3000);
-            }
-            if (typeof soundManager !== 'undefined') {
-                try { soundManager.play('notification'); } catch (e) {}
-            }
-        } catch (e) {
-            console.error('🔧 [WelcomePinFix v2] Вход failed:', e);
-            submitBtn.disabled = false;
-            submitBtn.textContent = 'Войти в чат';
-            if (typeof showToast === 'function') {
-                showToast('❌ Не удалось войти: ' + (e.message || 'ошибка'), 4000);
-            }
-        }
+            return localResult;
+        };
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  MUTATIONOBSERVER: ждём появления экрана приветствия
+    //  ПАТЧ: markInviteUsed → пишем на сервер
     // ═══════════════════════════════════════════════════════════
-    function startObserver() {
-        if (FIX.observer) FIX.observer.disconnect();
+    if (typeof markInviteUsed === 'function') {
+        const _origMark = markInviteUsed;
 
-        FIX.observer = new MutationObserver((mutations) => {
-            for (const m of mutations) {
-                for (const node of m.addedNodes) {
-                    if (node.nodeType !== 1) continue;
+        window.markInviteUsed = async function(jti) {
+            // Локально
+            _origMark.call(this, jti);
 
-                    // Появился #welcomeInviteScreen
-                    if (node.id === 'welcomeInviteScreen') {
-                        console.log('🔧 [WelcomePinFix v2] Экран приветствия обнаружен');
-                        setTimeout(injectPinIntoWelcomeScreen, 50);
-                        setTimeout(injectPinIntoWelcomeScreen, 200);
-                        setTimeout(injectPinIntoWelcomeScreen, 500);
-                        return;
-                    }
-                    if (node.querySelector && node.querySelector('#welcomeInviteScreen')) {
-                        setTimeout(injectPinIntoWelcomeScreen, 50);
-                        setTimeout(injectPinIntoWelcomeScreen, 200);
-                        setTimeout(injectPinIntoWelcomeScreen, 500);
-                        return;
-                    }
-                }
-            }
-        });
-
-        FIX.observer.observe(document.body, {
-            childList: true,
-            subtree: true,
-        });
-
-        console.log('🔧 [WelcomePinFix v2] Observer на экран приветствия запущен');
+            // На сервере — но нужен chatFile. Достаём из payload.
+            // Так как markInviteUsed вызывается в handleIncomingInvite
+            // без chatFile — модифицируем вызов там (см. ниже).
+            return true;
+        };
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ПАТЧ SHOWWELCOMESCREEN (если доступен)
-    //  Пытаемся перехватить через window._showWelcomeScreenWithPin
+    //  ПАТЧ: handleIncomingInvite — запись на сервер после входа
     // ═══════════════════════════════════════════════════════════
-    // Если ранее загруженный installSecureInvitePin установил
-    // window._showWelcomeScreenWithPin — а handleIncomingInvite
-    // его не вызывает (внутренняя копия) — используем Observer.
-    // Это покрывает все случаи.
+    if (typeof handleIncomingInvite === 'function') {
+        const _origHandle = handleIncomingInvite;
 
-    // ═══════════════════════════════════════════════════════════
-    //  ПАТЧ 2: handleIncomingInvite — гарантируем вызов нашей версии
-    //  Переопределяем ЕЩЁ РАЗ, чтобы точно перехватить
-    // ═══════════════════════════════════════════════════════════
-    // Это на случай если внутренний tryHandleInvite вызывает
-    // глобальный handleIncomingInvite — тогда сработает наша версия
-    if (typeof window.handleIncomingInvite === 'function') {
-        const _origHandle = window.handleIncomingInvite;
         window.handleIncomingInvite = async function() {
+            const params = new URLSearchParams(location.search);
+            const rawParam = params.get('invite');
+            if (!rawParam) return false;
+
+            // Разбираем, чтобы получить jti и chatFile
+            let parsedPayload = null;
+            try {
+                const dotIdx = rawParam.lastIndexOf('.');
+                if (dotIdx > 0) {
+                    const payloadB64 = rawParam.slice(0, dotIdx);
+                    parsedPayload = JSON.parse(fromBase64Url(payloadB64));
+                }
+            } catch (e) {}
+
             const result = await _origHandle.apply(this, arguments);
-            // После — проверяем, есть ли PIN в экране
-            setTimeout(injectPinIntoWelcomeScreen, 100);
-            setTimeout(injectPinIntoWelcomeScreen, 300);
+
+            // После успешной обработки — пишем jti на сервер
+            if (result === true && parsedPayload && parsedPayload.jti && parsedPayload.chat?.file) {
+                // Небольшая задержка — чтобы chat уже был добавлен в state.chats
+                setTimeout(() => {
+                    markInviteUsedOnServer(
+                        parsedPayload.chat.file,
+                        parsedPayload.jti,
+                        parsedPayload.username || state.username
+                    ).catch(e => console.warn('🔒 [InviteRevoke] post-mark error:', e));
+                }, 1000);
+            }
+
             return result;
         };
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  ЗАПУСК
+    //  ОЧИСТКА СТАРЫХ jti В meta.json ПРИ ПЕРЕПОЛНЕНИИ
+    //  (уже реализовано в markInviteUsedOnServer — slice(-MAX))
     // ═══════════════════════════════════════════════════════════
-    startObserver();
-
-    // При загрузке — если экран уже есть
-    setTimeout(() => {
-        if (document.getElementById('welcomeInviteScreen')) {
-            injectPinIntoWelcomeScreen();
-        }
-    }, 1000);
 
     // ═══════════════════════════════════════════════════════════
     //  API
     // ═══════════════════════════════════════════════════════════
-    window.WelcomePinFix = {
-        injectNow: () => injectPinIntoWelcomeScreen(),
-        extractPayload: () => extractPayloadFromUrl(),
-        status: () => {
-            const screen = document.getElementById('welcomeInviteScreen');
-            return {
-                screenExists: !!screen,
-                pinInjected: !!screen?.querySelector('#wisPinInput'),
-                payloadExtracted: !!FIX.currentPayload,
-                payloadPin: FIX.currentPayload?.pin,
-                payloadJti: FIX.currentPayload?.jti,
-            };
-        },
+    window.InviteRevoke = {
+        check: checkInviteUsedOnServer,
+        mark: markInviteUsedOnServer,
+        invalidateCache: invalidateMetaCache,
+        status: () => ({
+            cachedChats: Array.from(_metaCache.keys()),
+            cachedCount: _metaCache.size,
+        }),
+        config: CFG,
     };
 
-    console.log('🔧 [WelcomePinFix v2] ✅ Готово:');
-    console.log('   • Observer следит за #welcomeInviteScreen');
-    console.log('   • Если PIN не встроен — дорисовываем');
-    console.log('   • Кнопка «Войти» перехвачена');
-    console.log('   • При ошибке PIN — ссылка сгорает');
-    console.log('   • API: WelcomePinFix.status()');
+    console.log('🔒 [InviteRevoke] ✅ Готово:');
+    console.log('   • Ссылки аннулируются на сервере (meta.json.usedInvites)');
+    console.log('   • Работает между всеми браузерами и устройствами');
+    console.log('   • API: InviteRevoke.check(chatFile, jti)');
 })();
-
-// ═══════════════════════════════════════════════════════════════
-// 🔒 ЕДИНЫЙ ФИКС PIN-КОДА ДЛЯ ЭКРАНА ПРИГЛАШЕНИЯ (ФИНАЛЬНЫЙ)
-// ═══════════════════════════════════════════════════════════════
-
-(function installFinalInvitePinFix() {
-    'use strict';
-    console.log('🔒 [FinalPinFix] Установка…');
-
-    const FIX = { currentPayload: null, observer: null };
-
-    // ─── base64url → JSON ───
-    function extractPayloadFromUrl() {
-        try {
-            const raw = new URLSearchParams(location.search).get('invite');
-            if (!raw) return null;
-            const dot = raw.lastIndexOf('.');
-            if (dot < 0) return null;
-            let b64 = raw.slice(0, dot).replace(/-/g, '+').replace(/_/g, '/');
-            while (b64.length % 4) b64 += '=';
-            const bin = atob(b64);
-            const bytes = new Uint8Array(bin.length);
-            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-            return JSON.parse(new TextDecoder().decode(bytes));
-        } catch (e) { return null; }
-    }
-
-    // ─── Пометить, что ссылка сгорела (локально + GitHub) ───
-    async function burnInvite(payload) {
-        try {
-            const key = 'smschat_burned_invites_v1';
-            const raw = localStorage.getItem(key);
-            const burned = raw ? JSON.parse(raw) : {};
-            burned[payload.jti] = Date.now() + 60 * 60 * 1000;
-            localStorage.setItem(key, JSON.stringify(burned));
-        } catch (e) {}
-        if (payload.token) {
-            (async () => {
-                try {
-                    const prevT = state.token, prevU = state.username;
-                    state.token = payload.token;
-                    state.username = 'burner_' + Date.now();
-                    if (typeof InvitePin !== 'undefined' && InvitePin.burn) {
-                        await InvitePin.burn(payload.jti);
-                    }
-                    state.token = prevT;
-                    state.username = prevU;
-                } catch (e) {}
-            })();
-        }
-    }
-
-    // ─── Встроить PIN в уже отрисованный экран ───
-    function injectPin(screen) {
-        if (!screen) return false;
-        if (screen.querySelector('#wisPinInput')) return true;
-
-        const payload = FIX.currentPayload || extractPayloadFromUrl();
-        if (!payload || payload.pin == null) {
-            // PIN не требуется
-            return true;
-        }
-        FIX.currentPayload = payload;
-
-        const nameInput = screen.querySelector('#wisNameInput');
-        const submitBtn = screen.querySelector('#wisSubmitBtn');
-        if (!nameInput || !submitBtn) {
-            console.warn('🔒 [FinalPinFix] Нет nameInput или submitBtn');
-            return false;
-        }
-
-        // ─── Создаём блок PIN ───
-        const wrap = document.createElement('div');
-        wrap.className = 'wis-input-wrap';
-        wrap.style.marginBottom = '14px';
-        wrap.innerHTML = `
-            <input type="text" id="wisPinInput" placeholder="PIN (3 цифры)"
-                   maxlength="3" inputmode="numeric" pattern="[0-9]*"
-                   autocomplete="off" spellcheck="false"
-                   style="letter-spacing:12px;font-size:24px;font-weight:800;
-                          font-family:'SF Mono','Courier New',monospace;
-                          text-align:center;padding:16px 18px;padding-left:28px;">
-            <div style="font-size:11px;color:#feca57;text-align:center;
-                        margin-top:8px;line-height:1.4;max-width:380px;
-                        margin-left:auto;margin-right:auto;">
-                🔑 Введите PIN-код от отправителя<br>
-                <span style="color:#ff6b6b;font-weight:600;">
-                    ⚠️ Одна попытка — при ошибке ссылка сгорит
-                </span>
-            </div>
-        `;
-        nameInput.parentNode.insertBefore(wrap, nameInput.parentNode.nextSibling);
-
-        const pinInput = wrap.querySelector('#wisPinInput');
-        pinInput.addEventListener('input', () => {
-            pinInput.value = pinInput.value.replace(/\D/g, '').slice(0, 3);
-        });
-
-        // ─── ПЕРЕХВАТ SUBMIT в CAPTURE-фазе ───
-        // Срабатывает РАНЬШЕ старого обработчика и его глушит
-        screen.addEventListener('click', async (e) => {
-            if (!e.target.closest('#wisSubmitBtn')) return;
-            e.preventDefault();
-            e.stopImmediatePropagation();
-            await handleSubmit(screen, nameInput, pinInput, payload);
-        }, true);
-
-        // ─── Enter в PIN → сразу submit ───
-        pinInput.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') {
-                e.preventDefault();
-                e.stopPropagation();
-                handleSubmit(screen, nameInput, pinInput, payload);
-            }
-        });
-
-        // Фокус
-        setTimeout(() => nameInput.focus(), 150);
-        console.log('🔒 [FinalPinFix] ✅ PIN-блок встроен');
-        return true;
-    }
-
-    // ─── Обработка submit ───
-    async function handleSubmit(screen, nameInput, pinInput, payload) {
-        const name = nameInput.value.trim();
-        const pin = pinInput.value.trim();
-
-        if (name.length < 2) {
-            showToast('❌ Имя от 2 символов', 2000); nameInput.focus(); return;
-        }
-        if (pin.length !== 3) {
-            pinInput.style.borderColor = '#ff6b6b';
-            setTimeout(() => pinInput.style.borderColor = '', 600);
-            showToast('🔑 Введите 3 цифры', 2000); pinInput.focus(); return;
-        }
-
-        const expected = String(payload.pin).padStart(3, '0');
-        const entered = pin.padStart(3, '0');
-
-        if (entered !== expected) {
-            // ❌ СЖИГАЕМ ССЫЛКУ
-            await burnInvite(payload);
-            screen.innerHTML = `
-                <div class="wis-icon" style="animation:none;">🔒</div>
-                <div class="wis-title" style="color:#ff6b6b;">Ссылка сгорела</div>
-                <div class="wis-sub" style="color:#888;line-height:1.6;">
-                    PIN-код был неверным.<br>Это приглашение больше не действует.
-                </div>
-                <button class="wis-btn" style="background:linear-gradient(135deg,#ff6b6b,#ee5253);"
-                        id="wisBurnOkBtn">Понятно</button>
-            `;
-            screen.querySelector('#wisBurnOkBtn').onclick = () => {
-                history.replaceState({}, '', location.origin + location.pathname);
-                screen.remove();
-            };
-            if (navigator.vibrate) navigator.vibrate([100, 50, 100, 50, 200]);
-            return;
-        }
-
-        // ✅ PIN верный — стандартная логика входа
-        console.log('✅ [FinalPinFix] PIN верный, вход');
-        try {
-            state.username = name;
-            state.token = payload.token;
-            state.isAuthorized = true;
-            try {
-                localStorage.setItem('chathub_username', name);
-                localStorage.setItem('chathub_token', payload.token);
-                localStorage.setItem('chathub_remember', '1');
-                localStorage.setItem('chathub_session_source', 'invite');
-            } catch (e) {}
-
-            if (typeof loadChatsList === 'function') loadChatsList();
-            if (typeof loadSavedPasswords === 'function') loadSavedPasswords();
-
-            const chatFile = payload.chat.file;
-            const chatName = payload.chat.name || chatFile;
-            if (!state.chats.find(c => c.file === chatFile)) {
-                state.chats.push({ name: chatName, file: chatFile, createdAt: new Date().toISOString() });
-            }
-            if (typeof saveChatsList === 'function') saveChatsList();
-
-            state.savedPasswords[chatFile] = payload.password;
-            if (typeof saveSavedPasswords === 'function') saveSavedPasswords();
-
-            const uEl = document.getElementById('usernameInput');
-            const tEl = document.getElementById('tokenInput');
-            if (uEl) uEl.value = name;
-            if (tEl) tEl.value = payload.token;
-            const rEl = document.getElementById('rememberMeInput');
-            if (rEl) rEl.checked = true;
-            const rwEl = document.getElementById('rememberWarning');
-            if (rwEl) rwEl.style.display = 'block';
-
-            await enterChat(chatFile, chatName, payload.password);
-            screen.remove();
-            if (typeof showToast === 'function') {
-                showToast(`✅ Добро пожаловать в «${chatName}», ${name}!`, 3000);
-            }
-        } catch (e) {
-            console.error('🔒 [FinalPinFix] вход:', e);
-            showToast('❌ ' + (e.message || 'Ошибка'), 3500);
-        }
-    }
-
-    // ─── Observer на появление экрана ───
-    function startObserver() {
-        if (FIX.observer) FIX.observer.disconnect();
-        FIX.observer = new MutationObserver((mutations) => {
-            for (const m of mutations) {
-                for (const node of m.addedNodes) {
-                    if (node.nodeType !== 1) continue;
-                    if (node.id === 'welcomeInviteScreen'
-                        || (node.querySelector && node.querySelector('#welcomeInviteScreen'))) {
-                        const screen = document.getElementById('welcomeInviteScreen');
-                        if (screen) {
-                            setTimeout(() => injectPin(screen), 30);
-                            setTimeout(() => injectPin(screen), 150);
-                            setTimeout(() => injectPin(screen), 400);
-                        }
-                        return;
-                    }
-                }
-            }
-        });
-        FIX.observer.observe(document.body, { childList: true, subtree: true });
-    }
-
-    startObserver();
-
-    // Если экран уже есть
-    setTimeout(() => {
-        const screen = document.getElementById('welcomeInviteScreen');
-        if (screen) injectPin(screen);
-    }, 800);
-
-    // Проверка на старте: если в URL pin есть — сохраняем
-    setTimeout(() => {
-        const p = extractPayloadFromUrl();
-        if (p && p.pin != null) {
-            FIX.currentPayload = p;
-            console.log(`🔒 [FinalPinFix] payload: pin=${String(p.pin).padStart(3, '0')}`);
-        }
-    }, 500);
-
-    window.FinalPinFix = { injectNow: () => injectPin(document.getElementById('welcomeInviteScreen')),
-                           payload: () => FIX.currentPayload };
-})();
-
 </script>
-
 </body>
 </html>
